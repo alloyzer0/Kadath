@@ -1,0 +1,14 @@
+.{
+    .name = .kadath,
+    .version = "0.1.0",
+    .fingerprint = 0x82c8941c923cd535,
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "app",
+        "modules",
+        "LICENSE",
+    },
+}
