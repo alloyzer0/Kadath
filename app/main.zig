@@ -10,5 +10,8 @@ pub fn main() !void {
     };
     defer host.deinit();
 
-    host.run();
+    host.run() catch |err| {
+        std.log.err("Runtime loop failed: {s}", .{@errorName(err)});
+        return err;
+    };
 }

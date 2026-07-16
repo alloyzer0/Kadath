@@ -1,4 +1,6 @@
 const std = @import("std");
+const WindowExtent = @import("main.zig").WindowExtent;
+const PumpResult = @import("main.zig").PumpResult;
 
 const c = @cImport({
     @cDefine("UNICODE", "1");
@@ -13,7 +15,8 @@ pub const Platform = struct {
     instance: c.HINSTANCE = null,
     window: c.HWND = null,
     class_registered: bool = false,
-    timer: std.time.Timer = undefined,
+    qpc_frequency: i64 = 0,
+    qpc_start: i64 = 0,
 
     pub fn init() !Platform {
         var self = Platform{};
@@ -23,9 +26,12 @@ pub const Platform = struct {
     }
 
     fn initialize(self: *Platform) !void {
-        self.timer = std.time.Timer.start() catch {
+        if (c.QueryPerformanceFrequency(@ptrCast(&self.qpc_frequency)) == 0) {
             return error.MonotonicClockUnavailable;
-        };
+        }
+        if (c.QueryPerformanceCounter(@ptrCast(&self.qpc_start)) == 0) {
+            return error.MonotonicClockUnavailable;
+        }
 
         self.instance = c.GetModuleHandleW(null);
         if (self.instance == null) {
@@ -81,24 +87,64 @@ pub const Platform = struct {
             self.class_registered = false;
         }
         self.instance = null;
+        std.log.info("Platform shutdown complete", .{});
     }
 
-    pub fn pumpEvents(self: *Platform) bool {
+    pub fn pumpEvents(self: *Platform) PumpResult {
+        _ = self;
+        var result = PumpResult{};
         var message: c.MSG = undefined;
         while (c.PeekMessageW(&message, null, 0, 0, c.PM_REMOVE) != 0) {
             if (message.message == c.WM_QUIT) {
-                self.window = null;
-                return true;
+                result.quit_requested = true;
+                break;
             }
             _ = c.TranslateMessage(&message);
             _ = c.DispatchMessageW(&message);
         }
-        return false;
+        return result;
     }
 
     pub fn nowSeconds(self: *Platform) f64 {
-        const elapsed_ns = self.timer.read();
-        return @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, std.time.ns_per_s);
+        var current: i64 = 0;
+        if (c.QueryPerformanceCounter(@ptrCast(&current)) == 0 or self.qpc_frequency <= 0) {
+            return 0.0;
+        }
+        const elapsed_ticks = current - self.qpc_start;
+        return @as(f64, @floatFromInt(elapsed_ticks)) /
+            @as(f64, @floatFromInt(self.qpc_frequency));
+    }
+
+    pub fn sleepMilliseconds(self: *Platform, milliseconds: u32) void {
+        _ = self;
+        c.Sleep(milliseconds);
+    }
+
+    pub fn nativeWindowHandle(self: *Platform) usize {
+        if (self.window) |window| {
+            return @intFromPtr(window);
+        }
+        return 0;
+    }
+
+    pub fn nativeInstanceHandle(self: *Platform) usize {
+        if (self.instance) |instance| {
+            return @intFromPtr(instance);
+        }
+        return 0;
+    }
+
+    pub fn clientExtent(self: *Platform) WindowExtent {
+        if (self.window) |window| {
+            var rect: c.RECT = undefined;
+            if (c.GetClientRect(window, &rect) != 0 and rect.right > rect.left and rect.bottom > rect.top) {
+                return .{
+                    .width = @intCast(rect.right - rect.left),
+                    .height = @intCast(rect.bottom - rect.top),
+                };
+            }
+        }
+        return .{};
     }
 };
 
@@ -110,7 +156,8 @@ fn windowProc(
 ) callconv(.winapi) c.LRESULT {
     switch (message) {
         c.WM_CLOSE => {
-            _ = c.DestroyWindow(window);
+            // RHI 必须先释放 Surface/Device；Host 收到 WM_QUIT 后再逆序销毁 Platform。
+            c.PostQuitMessage(0);
             return 0;
         },
         c.WM_DESTROY => {
