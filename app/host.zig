@@ -4,19 +4,22 @@ const PlatformExtent = @import("platform").WindowExtent;
 const rhi = @import("rhi");
 const Rhi = rhi.Rhi;
 const resource = @import("resource");
+const world_api = @import("world");
+const World = world_api.World;
 const Renderer2D = @import("renderer2d").Renderer2D;
 const SpriteInstance = @import("renderer2d").SpriteInstance;
+
+const test_texture_id: world_api.TextureId = 1;
 
 pub const Host = struct {
     platform: Platform,
     rhi: Rhi,
     renderer2d: Renderer2D,
     texture: rhi.TextureHandle,
-    sprite: SpriteInstance = .{
-        .position = .{ 0.0, 0.0 },
-        .size = .{ 320.0, 240.0 },
-        .color = .{ 1.0, 1.0, 1.0, 1.0 },
-    },
+    world: World,
+    sprite_entity: world_api.EntityId,
+    render_sprites: [1]world_api.RenderSprite = undefined,
+    render_count: usize = 0,
     quit_requested: bool = false,
     last_time_seconds: f64 = 0.0,
     frame_count: u64 = 0,
@@ -46,20 +49,35 @@ pub const Host = struct {
         });
         errdefer backend.destroyTexture(texture);
 
+        var runtime_world = try World.init();
+        errdefer runtime_world.deinit();
+        const sprite_entity = try runtime_world.spawnSprite(.{
+            .position = .{ 312.0, 130.0 },
+            .size = .{ 320.0, 240.0 },
+            .color = .{ 1.0, 1.0, 1.0, 1.0 },
+            .texture_id = test_texture_id,
+        });
+
         var self = Host{
             .platform = platform,
             .rhi = backend,
             .renderer2d = renderer2d,
             .texture = texture,
+            .world = runtime_world,
+            .sprite_entity = sprite_entity,
         };
         const now = self.platform.nowSeconds();
         self.last_time_seconds = now;
         self.last_heartbeat_seconds = now;
-        std.log.info("Runtime host initialized with Vulkan RHI", .{});
+        std.log.info("Runtime host initialized with Vulkan RHI and World entity={d}", .{sprite_entity});
         return self;
     }
 
     pub fn deinit(self: *Host) void {
+        self.world.despawn(self.sprite_entity) catch |err| {
+            std.log.err("World sprite despawn failed: {s}", .{@errorName(err)});
+        };
+        self.world.deinit();
         self.rhi.destroyTexture(self.texture);
         self.renderer2d.deinit(&self.rhi);
         self.rhi.deinit();
@@ -87,7 +105,7 @@ pub const Host = struct {
 
             self.syncExternalResults();
             self.runFixedUpdates(delta);
-            self.extractRender();
+            try self.extractRender();
 
             try self.submitRender();
 
@@ -97,12 +115,20 @@ pub const Host = struct {
     }
 
     fn submitRender(self: *Host) !void {
+        if (self.render_count == 0) return error.WorldProducedNoRenderSprite;
         const extent: PlatformExtent = self.platform.clientExtent();
+        const extracted = self.render_sprites[0];
+        const texture = try self.resolveTexture(extracted.texture_id);
+        const sprite = SpriteInstance{
+            .position = extracted.position,
+            .size = extracted.size,
+            .color = extracted.color,
+        };
         const outcome = try self.renderer2d.render(
             &self.rhi,
             .{ .width = extent.width, .height = extent.height },
-            self.sprite,
-            self.texture,
+            sprite,
+            texture,
         );
         if (outcome == .recreated) {
             std.log.debug("Renderer2D swapchain recreation completed", .{});
@@ -118,16 +144,16 @@ pub const Host = struct {
         _ = delta_seconds;
     }
 
-    fn extractRender(self: *Host) void {
-        const extent = self.platform.clientExtent();
-        if (extent.width == 0 or extent.height == 0) return;
+    fn extractRender(self: *Host) !void {
+        // World 只写入稳定 POD 快照；渲染提交阶段不读取 World 内部存储。
+        const sprites = try self.world.extractSprites(&self.render_sprites);
+        self.render_count = sprites.len;
+    }
 
-        const width: f32 = @floatFromInt(extent.width);
-        const height: f32 = @floatFromInt(extent.height);
-        self.sprite.position = .{
-            width * 0.5 - self.sprite.size[0] * 0.5,
-            height * 0.5 - self.sprite.size[1] * 0.5,
-        };
+    fn resolveTexture(self: *Host, texture_id: world_api.TextureId) !rhi.TextureHandle {
+        // 逻辑资源身份在 Host 边界映射为 GPU handle，禁止泄漏到 World。
+        if (texture_id != test_texture_id) return error.UnknownWorldTexture;
+        return self.texture;
     }
 
     fn endFrame(self: *Host, now_seconds: f64, delta_seconds: f64) void {

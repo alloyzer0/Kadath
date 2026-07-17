@@ -20,6 +20,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const world_mod = b.createModule(.{
+        .root_source_file = b.path("modules/world/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    world_mod.addIncludePath(b.path("abi"));
 
     const renderer2d_mod = b.createModule(.{
         .root_source_file = b.path("modules/renderer2d/src/main.zig"),
@@ -37,6 +43,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("rhi", rhi_mod);
     exe_mod.addImport("resource", resource_mod);
     exe_mod.addImport("renderer2d", renderer2d_mod);
+    exe_mod.addImport("world", world_mod);
 
     if (target.result.os.tag == .windows) {
         platform_mod.linkSystemLibrary("user32", .{});
@@ -84,6 +91,42 @@ pub fn build(b: *std.Build) void {
         .name = "kadath",
         .root_module = exe_mod,
     });
+
+    if (target.result.os.tag == .windows) {
+        const rust_target = switch (target.result.cpu.arch) {
+            .x86_64 => "x86_64-pc-windows-gnu",
+            else => @panic("P2-M0-05 currently supports only x86_64 Windows Rust linking"),
+        };
+        const cargo_target_dir = b.pathFromRoot(".zig-cache/cargo");
+        const cargo_build = b.addSystemCommand(&.{
+            "cargo",
+            "build",
+            "--manifest-path",
+            b.pathFromRoot("Cargo.toml"),
+            "--target",
+            rust_target,
+            "--target-dir",
+            cargo_target_dir,
+        });
+        if (optimize != .Debug) cargo_build.addArg("--release");
+
+        // Cargo 产物必须先生成，再由 Zig 的 GNU 链接器合入同一可执行文件。
+        exe.step.dependOn(&cargo_build.step);
+        const rust_profile = if (optimize == .Debug) "debug" else "release";
+        exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile }) });
+        const gcc_runtime_dir = b.option([]const u8, "mingw-gcc-runtime-dir", "Directory containing libgcc_eh.a for Rust panic unwinding") orelse
+            "C:\\ProgramTools\\mingw64\\lib\\gcc\\x86_64-w64-mingw32\\14.2.0";
+        exe.root_module.addLibraryPath(.{ .cwd_relative = gcc_runtime_dir });
+        exe.root_module.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+        exe.root_module.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
+        exe.root_module.linkSystemLibrary("kernel32", .{});
+        exe.root_module.linkSystemLibrary("dbghelp", .{});
+        exe.root_module.linkSystemLibrary("advapi32", .{});
+        exe.root_module.linkSystemLibrary("bcrypt", .{});
+        exe.root_module.linkSystemLibrary("ntdll", .{});
+        exe.root_module.linkSystemLibrary("userenv", .{});
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

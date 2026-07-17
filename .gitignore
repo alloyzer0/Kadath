@@ -3,3 +3,7 @@
 zig-out/
 *.exe
 *.pdb
+target/
+runtime-*.log
+runtime-*.png
+shader-check/

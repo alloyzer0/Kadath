@@ -7,6 +7,9 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "Cargo.toml",
+        "Cargo.lock",
+        "abi",
         "app",
         "modules",
         "LICENSE",
