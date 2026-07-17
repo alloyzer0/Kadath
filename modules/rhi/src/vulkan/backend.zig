@@ -6,6 +6,77 @@ const c = surface_bridge.C;
 const allocator = std.heap.page_allocator;
 const api_version: u32 = 1 << 22;
 
+const max_pipelines: usize = 8;
+
+const PipelineSlot = struct {
+    desc: ?types.GraphicsPipelineDesc = null,
+    layout: c.VkPipelineLayout = null,
+    pipeline: c.VkPipeline = null,
+};
+
+pub const FrameEncoder = struct {
+    rhi: *Rhi,
+    image_index: u32,
+    acquire_result: c.VkResult,
+    frame_token: u64,
+    bound_pipeline: types.PipelineHandle = types.invalid_pipeline,
+    recording: bool = true,
+    finished: bool = false,
+
+    pub fn bindPipeline(self: *FrameEncoder, pipeline: types.PipelineHandle) !void {
+        if (!self.recording or self.finished) return error.FrameAlreadyFinished;
+        try self.rhi.validateFrame(self);
+        try self.rhi.validatePipeline(pipeline);
+        const slot = self.rhi.pipelineSlot(pipeline) orelse return error.InvalidPipeline;
+        c.vkCmdBindPipeline(self.rhi.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, slot.pipeline);
+        self.bound_pipeline = pipeline;
+    }
+
+    pub fn pushConstants(self: *FrameEncoder, bytes: []const u8) !void {
+        if (!self.recording or self.finished) return error.FrameAlreadyFinished;
+        try self.rhi.validateFrame(self);
+        if (self.bound_pipeline == types.invalid_pipeline) return error.InvalidPipeline;
+        const slot = self.rhi.pipelineSlot(self.bound_pipeline) orelse return error.InvalidPipeline;
+        const desc = slot.desc orelse return error.InvalidPipeline;
+        if (bytes.len > desc.push_constant_size) return error.PipelinePushConstantTooLarge;
+        if (bytes.len % 4 != 0) return error.PushConstantAlignment;
+        c.vkCmdPushConstants(
+            self.rhi.command_buffer,
+            slot.layout,
+            @intCast(c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT),
+            0,
+            @intCast(bytes.len),
+            @ptrCast(bytes.ptr),
+        );
+    }
+
+    pub fn draw(self: *FrameEncoder, vertex_count: u32) !void {
+        if (!self.recording or self.finished) return error.FrameAlreadyFinished;
+        try self.rhi.validateFrame(self);
+        if (self.bound_pipeline == types.invalid_pipeline) return error.InvalidPipeline;
+        if (vertex_count == 0) return error.InvalidDrawCount;
+        c.vkCmdDraw(self.rhi.command_buffer, vertex_count, 1, 0, 0);
+    }
+
+    // Completes a partially recorded frame so acquire/fence state stays reusable.
+    // The original rendering error remains the caller's result; this is not a normal recovery path.
+    pub fn consumeFailedFrame(self: *FrameEncoder) void {
+        if (!self.recording or self.finished) return;
+        _ = self.rhi.finishFrame(self) catch |err| {
+            std.log.err("RHI failed to consume a partially recorded frame: {s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn finish(self: *FrameEncoder) !types.FrameOutcome {
+        return try self.rhi.finishFrame(self);
+    }
+};
+
+pub const BeginFrameResult = union(enum) {
+    ready: FrameEncoder,
+    skipped_minimized,
+    recreated,
+};
 pub const Rhi = struct {
     instance: c.VkInstance = null,
     surface: c.VkSurfaceKHR = null,
@@ -29,6 +100,10 @@ pub const Rhi = struct {
     image_available: c.VkSemaphore = null,
     render_finished: ?[]c.VkSemaphore = null,
     in_flight: c.VkFence = null,
+    pipeline_slots: [max_pipelines]PipelineSlot = [_]PipelineSlot{.{}} ** max_pipelines,
+    render_pass_generation: u64 = 0,
+    next_frame_token: u64 = 0,
+    active_frame_token: ?u64 = null,
 
     pub fn init(window_handle: usize, instance_handle: usize, requested_extent: types.Extent2D) !Rhi {
         var self = Rhi{};
@@ -56,6 +131,7 @@ pub const Rhi = struct {
             _ = c.vkDeviceWaitIdle(self.device);
         }
         self.destroySwapchainResources();
+        self.destroyPipelineLayouts();
         if (self.in_flight != null and self.device != null) {
             c.vkDestroyFence(self.device, self.in_flight, null);
             self.in_flight = null;
@@ -83,18 +159,66 @@ pub const Rhi = struct {
             self.instance = null;
         }
         std.log.info("Vulkan RHI shutdown complete", .{});
+        self.active_frame_token = null;
     }
 
-    pub fn drawFrame(self: *Rhi, requested_extent: types.Extent2D) !types.FrameOutcome {
+    pub fn createGraphicsPipeline(self: *Rhi, desc: types.GraphicsPipelineDesc) !types.PipelineHandle {
+        if (desc.push_constant_size == 0 or desc.push_constant_size > 128 or desc.push_constant_size % 4 != 0) {
+            return error.InvalidPushConstantSize;
+        }
+        if (desc.vertex_shader.len == 0 or desc.vertex_shader.len % 4 != 0 or
+            desc.fragment_shader.len == 0 or desc.fragment_shader.len % 4 != 0)
+        {
+            return error.InvalidShaderCode;
+        }
+        for (&self.pipeline_slots, 0..) |*slot, index| {
+            if (slot.desc == null) {
+                const layout = try self.createPipelineLayout(desc.push_constant_size);
+                slot.layout = layout;
+                slot.desc = desc;
+                errdefer {
+                    c.vkDestroyPipelineLayout(self.device, slot.layout, null);
+                    slot.* = .{};
+                }
+                if (self.render_pass != null) {
+                    try self.rebuildPipelineSlot(slot);
+                }
+                const handle: types.PipelineHandle = @intCast(index + 1);
+                std.log.info("RHI graphics pipeline created: handle={d}", .{handle});
+                return handle;
+            }
+        }
+        return error.PipelineLimitReached;
+    }
+
+    pub fn destroyGraphicsPipeline(self: *Rhi, handle: types.PipelineHandle) void {
+        const slot = self.pipelineSlot(handle) orelse return;
+        if (self.device != null) {
+            _ = c.vkDeviceWaitIdle(self.device);
+        }
+        if (slot.pipeline != null) {
+            c.vkDestroyPipeline(self.device, slot.pipeline, null);
+        }
+        if (slot.layout != null) {
+            c.vkDestroyPipelineLayout(self.device, slot.layout, null);
+        }
+        slot.* = .{};
+    }
+
+    pub fn beginFrame(
+        self: *Rhi,
+        requested_extent: types.Extent2D,
+        clear_color: [4]f32,
+    ) !BeginFrameResult {
+        if (self.active_frame_token != null) return error.FrameAlreadyActive;
         if (requested_extent.width == 0 or requested_extent.height == 0) {
             return .skipped_minimized;
         }
-
         if (self.swapchain == null or
             requested_extent.width != self.requested_extent.width or
             requested_extent.height != self.requested_extent.height)
         {
-            return try self.recreateForFrame(requested_extent);
+            return try self.recreateBeginResult(requested_extent);
         }
 
         try check(c.vkWaitForFences(self.device, 1, &self.in_flight, c.VK_TRUE, std.math.maxInt(u64)), "vkWaitForFences");
@@ -109,18 +233,72 @@ pub const Rhi = struct {
             &image_index,
         );
         if (acquire_result == c.VK_ERROR_OUT_OF_DATE_KHR) {
-            return try self.recreateForFrame(requested_extent);
+            return try self.recreateBeginResult(requested_extent);
         }
         if (acquire_result != c.VK_SUCCESS and acquire_result != c.VK_SUBOPTIMAL_KHR) {
             try check(acquire_result, "vkAcquireNextImageKHR");
         }
 
-        try check(c.vkResetFences(self.device, 1, &self.in_flight), "vkResetFences");
+        const framebuffers = self.framebuffers orelse return error.FramebuffersUnavailable;
+        if (image_index >= framebuffers.len) return error.InvalidSwapchainImage;
         try check(c.vkResetCommandBuffer(self.command_buffer, 0), "vkResetCommandBuffer");
-        try self.recordClear(image_index);
-        const render_finished = self.render_finished orelse return error.PresentSemaphoresUnavailable;
-        if (image_index >= render_finished.len) return error.InvalidSwapchainImage;
 
+        var begin_info = std.mem.zeroes(c.VkCommandBufferBeginInfo);
+        begin_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        try check(c.vkBeginCommandBuffer(self.command_buffer, &begin_info), "vkBeginCommandBuffer");
+
+        var clear_value = std.mem.zeroes(c.VkClearValue);
+        clear_value.color.float32[0] = clear_color[0];
+        clear_value.color.float32[1] = clear_color[1];
+        clear_value.color.float32[2] = clear_color[2];
+        clear_value.color.float32[3] = clear_color[3];
+
+        var pass_info = std.mem.zeroes(c.VkRenderPassBeginInfo);
+        pass_info.sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        pass_info.renderPass = self.render_pass;
+        pass_info.framebuffer = framebuffers[image_index];
+        pass_info.renderArea.offset = .{ .x = 0, .y = 0 };
+        pass_info.renderArea.extent = .{ .width = self.swapchain_extent.width, .height = self.swapchain_extent.height };
+        pass_info.clearValueCount = 1;
+        pass_info.pClearValues = &clear_value;
+        c.vkCmdBeginRenderPass(self.command_buffer, &pass_info, c.VK_SUBPASS_CONTENTS_INLINE);
+
+        var viewport = std.mem.zeroes(c.VkViewport);
+        viewport.width = @floatFromInt(self.swapchain_extent.width);
+        viewport.height = @floatFromInt(self.swapchain_extent.height);
+        viewport.minDepth = 0.0;
+        viewport.maxDepth = 1.0;
+        c.vkCmdSetViewport(self.command_buffer, 0, 1, &viewport);
+
+        var scissor = std.mem.zeroes(c.VkRect2D);
+        scissor.extent = .{ .width = self.swapchain_extent.width, .height = self.swapchain_extent.height };
+        c.vkCmdSetScissor(self.command_buffer, 0, 1, &scissor);
+
+        self.next_frame_token +%= 1;
+        if (self.next_frame_token == 0) self.next_frame_token = 1;
+        const frame_token = self.next_frame_token;
+        self.active_frame_token = frame_token;
+        return .{ .ready = .{
+            .rhi = self,
+            .image_index = image_index,
+            .acquire_result = acquire_result,
+            .frame_token = frame_token,
+        } };
+    }
+
+    fn finishFrame(self: *Rhi, encoder: *FrameEncoder) !types.FrameOutcome {
+        if (encoder.finished) return error.FrameAlreadyFinished;
+        if (!encoder.recording) return error.NoActiveFrame;
+        try self.validateFrame(encoder);
+        errdefer self.active_frame_token = null;
+        c.vkCmdEndRenderPass(self.command_buffer);
+        try check(c.vkEndCommandBuffer(self.command_buffer), "vkEndCommandBuffer");
+        encoder.recording = false;
+
+        const render_finished = self.render_finished orelse return error.PresentSemaphoresUnavailable;
+        if (encoder.image_index >= render_finished.len) return error.InvalidSwapchainImage;
+
+        try check(c.vkResetFences(self.device, 1, &self.in_flight), "vkResetFences");
         var wait_stage: u32 = @intCast(c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
         var submit_info = std.mem.zeroes(c.VkSubmitInfo);
         submit_info.sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -130,25 +308,58 @@ pub const Rhi = struct {
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &self.command_buffer;
         submit_info.signalSemaphoreCount = 1;
-        submit_info.pSignalSemaphores = &render_finished[image_index];
+        submit_info.pSignalSemaphores = &render_finished[encoder.image_index];
         try check(c.vkQueueSubmit(self.queue, 1, &submit_info, self.in_flight), "vkQueueSubmit");
 
         var present_info = std.mem.zeroes(c.VkPresentInfoKHR);
         present_info.sType = c.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present_info.waitSemaphoreCount = 1;
-        present_info.pWaitSemaphores = &render_finished[image_index];
+        present_info.pWaitSemaphores = &render_finished[encoder.image_index];
         present_info.swapchainCount = 1;
         present_info.pSwapchains = &self.swapchain;
-        present_info.pImageIndices = &image_index;
+        present_info.pImageIndices = &encoder.image_index;
         const present_result = c.vkQueuePresentKHR(self.queue, &present_info);
+        encoder.finished = true;
+        self.active_frame_token = null;
         if (present_result == c.VK_ERROR_OUT_OF_DATE_KHR or
             present_result == c.VK_SUBOPTIMAL_KHR or
-            acquire_result == c.VK_SUBOPTIMAL_KHR)
+            encoder.acquire_result == c.VK_SUBOPTIMAL_KHR)
         {
-            return try self.recreateForFrame(requested_extent);
+            return try self.recreateForFrame(self.requested_extent);
         }
         try check(present_result, "vkQueuePresentKHR");
         return .presented;
+    }
+
+    fn validateFrame(self: *Rhi, encoder: *const FrameEncoder) !void {
+        const active_token = self.active_frame_token orelse return error.NoActiveFrame;
+        if (active_token != encoder.frame_token) return error.StaleFrameEncoder;
+    }
+
+    fn pipelineSlot(self: *Rhi, handle: types.PipelineHandle) ?*PipelineSlot {
+        if (handle == types.invalid_pipeline or handle > @as(types.PipelineHandle, max_pipelines)) return null;
+        const index: usize = @intCast(handle - 1);
+        return &self.pipeline_slots[index];
+    }
+
+    fn validatePipeline(self: *Rhi, handle: types.PipelineHandle) !void {
+        const slot = self.pipelineSlot(handle) orelse return error.InvalidPipeline;
+        if (slot.desc == null) return error.InvalidPipeline;
+        if (slot.pipeline == null) return error.PipelineNotReady;
+    }
+
+    fn createPipelineLayout(self: *Rhi, push_constant_size: u32) !c.VkPipelineLayout {
+        var range = std.mem.zeroes(c.VkPushConstantRange);
+        range.stageFlags = @intCast(c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT);
+        range.offset = 0;
+        range.size = push_constant_size;
+        var info = std.mem.zeroes(c.VkPipelineLayoutCreateInfo);
+        info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        info.pushConstantRangeCount = 1;
+        info.pPushConstantRanges = &range;
+        var layout: c.VkPipelineLayout = null;
+        try check(c.vkCreatePipelineLayout(self.device, &info, null, &layout), "vkCreatePipelineLayout");
+        return layout;
     }
 
     fn createInstance(self: *Rhi) !void {
@@ -403,6 +614,8 @@ pub const Rhi = struct {
         try self.createRenderFinishedSemaphores(actual_image_count);
 
         try self.createRenderPass();
+        self.render_pass_generation += 1;
+        try self.rebuildAllPipelines();
         try self.createImageViewsAndFramebuffers();
         std.log.info("Vulkan swapchain created: format={d}, extent={d}x{d}, images={d}", .{
             self.swapchain_format,
@@ -507,6 +720,7 @@ pub const Rhi = struct {
     }
 
     fn destroySwapchainResources(self: *Rhi) void {
+        self.destroyPipelineObjects();
         if (self.framebuffers) |framebuffers| {
             for (framebuffers) |framebuffer| {
                 if (framebuffer != null) c.vkDestroyFramebuffer(self.device, framebuffer, null);
@@ -544,6 +758,14 @@ pub const Rhi = struct {
         self.requested_extent = .{};
     }
 
+    fn recreateBeginResult(self: *Rhi, requested_extent: types.Extent2D) !BeginFrameResult {
+        return switch (try self.recreateForFrame(requested_extent)) {
+            .recreated => .recreated,
+            .skipped_minimized => .skipped_minimized,
+            .presented => error.InvalidRecreateOutcome,
+        };
+    }
+
     fn recreateForFrame(self: *Rhi, requested_extent: types.Extent2D) !types.FrameOutcome {
         self.recreateSwapchain(requested_extent) catch |err| switch (err) {
             error.SurfaceSuspended => return .skipped_minimized,
@@ -570,30 +792,154 @@ pub const Rhi = struct {
         std.log.info("Vulkan swapchain recreated", .{});
     }
 
-    fn recordClear(self: *Rhi, image_index: u32) !void {
-        var begin_info = std.mem.zeroes(c.VkCommandBufferBeginInfo);
-        begin_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        try check(c.vkBeginCommandBuffer(self.command_buffer, &begin_info), "vkBeginCommandBuffer");
+    fn rebuildAllPipelines(self: *Rhi) !void {
+        for (&self.pipeline_slots) |*slot| {
+            if (slot.desc != null) {
+                try self.rebuildPipelineSlot(slot);
+            }
+        }
+    }
 
-        var clear_value = std.mem.zeroes(c.VkClearValue);
-        clear_value.color.float32[0] = 0.035;
-        clear_value.color.float32[1] = 0.10;
-        clear_value.color.float32[2] = 0.22;
-        clear_value.color.float32[3] = 1.0;
+    fn rebuildPipelineSlot(self: *Rhi, slot: *PipelineSlot) !void {
+        const desc = slot.desc orelse return;
+        if (self.render_pass == null) return;
+        if (slot.pipeline != null) {
+            c.vkDestroyPipeline(self.device, slot.pipeline, null);
+            slot.pipeline = null;
+        }
 
-        var pass_info = std.mem.zeroes(c.VkRenderPassBeginInfo);
-        pass_info.sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        pass_info.renderPass = self.render_pass;
-        const framebuffers = self.framebuffers orelse return error.FramebuffersUnavailable;
-        if (image_index >= framebuffers.len) return error.InvalidSwapchainImage;
-        pass_info.framebuffer = framebuffers[image_index];
-        pass_info.renderArea.offset = .{ .x = 0, .y = 0 };
-        pass_info.renderArea.extent = .{ .width = self.swapchain_extent.width, .height = self.swapchain_extent.height };
-        pass_info.clearValueCount = 1;
-        pass_info.pClearValues = &clear_value;
-        c.vkCmdBeginRenderPass(self.command_buffer, &pass_info, c.VK_SUBPASS_CONTENTS_INLINE);
-        c.vkCmdEndRenderPass(self.command_buffer);
-        try check(c.vkEndCommandBuffer(self.command_buffer), "vkEndCommandBuffer");
+        const vertex_module = try self.createShaderModule(desc.vertex_shader, "vertex");
+        defer c.vkDestroyShaderModule(self.device, vertex_module, null);
+        const fragment_module = try self.createShaderModule(desc.fragment_shader, "fragment");
+        defer c.vkDestroyShaderModule(self.device, fragment_module, null);
+
+        const entry_point: [*:0]const u8 = "main";
+        var stages = [_]c.VkPipelineShaderStageCreateInfo{
+            .{
+                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = c.VK_SHADER_STAGE_VERTEX_BIT,
+                .module = vertex_module,
+                .pName = entry_point,
+            },
+            .{
+                .sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+                .module = fragment_module,
+                .pName = entry_point,
+            },
+        };
+
+        var vertex_input = std.mem.zeroes(c.VkPipelineVertexInputStateCreateInfo);
+        vertex_input.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        var input_assembly = std.mem.zeroes(c.VkPipelineInputAssemblyStateCreateInfo);
+        input_assembly.sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        input_assembly.topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        input_assembly.primitiveRestartEnable = c.VK_FALSE;
+
+        var viewport_state = std.mem.zeroes(c.VkPipelineViewportStateCreateInfo);
+        viewport_state.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewport_state.viewportCount = 1;
+        viewport_state.scissorCount = 1;
+
+        var rasterization = std.mem.zeroes(c.VkPipelineRasterizationStateCreateInfo);
+        rasterization.sType = c.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterization.depthClampEnable = c.VK_FALSE;
+        rasterization.rasterizerDiscardEnable = c.VK_FALSE;
+        rasterization.polygonMode = c.VK_POLYGON_MODE_FILL;
+        rasterization.cullMode = c.VK_CULL_MODE_NONE;
+        rasterization.frontFace = c.VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterization.depthBiasEnable = c.VK_FALSE;
+        rasterization.lineWidth = 1.0;
+
+        var multisample = std.mem.zeroes(c.VkPipelineMultisampleStateCreateInfo);
+        multisample.sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisample.rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT;
+
+        var blend_attachment = std.mem.zeroes(c.VkPipelineColorBlendAttachmentState);
+        blend_attachment.blendEnable = c.VK_TRUE;
+        blend_attachment.srcColorBlendFactor = c.VK_BLEND_FACTOR_SRC_ALPHA;
+        blend_attachment.dstColorBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend_attachment.colorBlendOp = c.VK_BLEND_OP_ADD;
+        blend_attachment.srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE;
+        blend_attachment.dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend_attachment.alphaBlendOp = c.VK_BLEND_OP_ADD;
+        blend_attachment.colorWriteMask = c.VK_COLOR_COMPONENT_R_BIT |
+            c.VK_COLOR_COMPONENT_G_BIT |
+            c.VK_COLOR_COMPONENT_B_BIT |
+            c.VK_COLOR_COMPONENT_A_BIT;
+
+        var color_blend = std.mem.zeroes(c.VkPipelineColorBlendStateCreateInfo);
+        color_blend.sType = c.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        color_blend.logicOpEnable = c.VK_FALSE;
+        color_blend.attachmentCount = 1;
+        color_blend.pAttachments = &blend_attachment;
+
+        var dynamic_states = [_]c.VkDynamicState{
+            c.VK_DYNAMIC_STATE_VIEWPORT,
+            c.VK_DYNAMIC_STATE_SCISSOR,
+        };
+        var dynamic_state = std.mem.zeroes(c.VkPipelineDynamicStateCreateInfo);
+        dynamic_state.sType = c.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamic_state.dynamicStateCount = dynamic_states.len;
+        dynamic_state.pDynamicStates = &dynamic_states;
+
+        var pipeline_info = std.mem.zeroes(c.VkGraphicsPipelineCreateInfo);
+        pipeline_info.sType = c.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeline_info.stageCount = stages.len;
+        pipeline_info.pStages = &stages;
+        pipeline_info.pVertexInputState = &vertex_input;
+        pipeline_info.pInputAssemblyState = &input_assembly;
+        pipeline_info.pViewportState = &viewport_state;
+        pipeline_info.pRasterizationState = &rasterization;
+        pipeline_info.pMultisampleState = &multisample;
+        pipeline_info.pColorBlendState = &color_blend;
+        pipeline_info.pDynamicState = &dynamic_state;
+        pipeline_info.layout = slot.layout;
+        pipeline_info.renderPass = self.render_pass;
+        pipeline_info.subpass = 0;
+
+        try check(
+            c.vkCreateGraphicsPipelines(self.device, null, 1, &pipeline_info, null, &slot.pipeline),
+            "vkCreateGraphicsPipelines",
+        );
+        std.log.info("RHI graphics pipeline rebuilt (generation={d})", .{self.render_pass_generation});
+    }
+
+    fn createShaderModule(self: *Rhi, bytes: []const u8, stage: []const u8) !c.VkShaderModule {
+        if (bytes.len == 0 or bytes.len % 4 != 0) {
+            std.log.err("Invalid {s} SPIR-V byte length: {d}", .{ stage, bytes.len });
+            return error.InvalidShaderCode;
+        }
+        const words = try allocator.alloc(u32, bytes.len / 4);
+        defer allocator.free(words);
+        @memcpy(std.mem.sliceAsBytes(words), bytes);
+
+        var info = std.mem.zeroes(c.VkShaderModuleCreateInfo);
+        info.sType = c.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        info.codeSize = bytes.len;
+        info.pCode = words.ptr;
+        var module: c.VkShaderModule = null;
+        try check(c.vkCreateShaderModule(self.device, &info, null, &module), "vkCreateShaderModule");
+        return module;
+    }
+
+    fn destroyPipelineObjects(self: *Rhi) void {
+        for (&self.pipeline_slots) |*slot| {
+            if (slot.pipeline != null) {
+                c.vkDestroyPipeline(self.device, slot.pipeline, null);
+                slot.pipeline = null;
+            }
+        }
+    }
+
+    fn destroyPipelineLayouts(self: *Rhi) void {
+        for (&self.pipeline_slots) |*slot| {
+            if (slot.layout != null) {
+                c.vkDestroyPipelineLayout(self.device, slot.layout, null);
+            }
+            slot.* = .{};
+        }
     }
 
     fn check(result: c.VkResult, stage: []const u8) !void {

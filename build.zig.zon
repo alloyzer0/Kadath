@@ -10,5 +10,6 @@
         "app",
         "modules",
         "LICENSE",
+        "shaders",
     },
 }
