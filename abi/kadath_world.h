@@ -18,11 +18,17 @@ typedef uint32_t kadath_resource_id_t;
 #define KADATH_ENTITY_INVALID 0ULL
 #define KADATH_RESOURCE_INVALID 0U
 
+typedef struct kadath_world_input_snapshot_t {
+    int8_t move_x;
+    int8_t move_y;
+} kadath_world_input_snapshot_t;
+
 typedef struct kadath_world_sprite_spawn_desc_t {
     float position[2];
     float size[2];
     float color[4];
     kadath_resource_id_t texture_id;
+    float move_speed;
 } kadath_world_sprite_spawn_desc_t;
 
 typedef struct kadath_world_render_sprite_t {
@@ -45,6 +51,13 @@ int32_t kadath_world_spawn_sprite(
     kadath_world_t world,
     const kadath_world_sprite_spawn_desc_t* desc,
     kadath_entity_id_t* out_entity
+);
+
+// Thread-compatible. The input POD is borrowed for the duration of this call.
+int32_t kadath_world_step_fixed(
+    kadath_world_t world,
+    float dt_seconds,
+    const kadath_world_input_snapshot_t* input
 );
 
 // Thread-compatible. Invalid or stale generation IDs return KADATH_ERR_WORLD_INVALID_ENTITY.

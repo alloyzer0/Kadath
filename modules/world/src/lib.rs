@@ -20,6 +20,7 @@ struct SpriteRecord {
     size: [f32; 2],
     color: [f32; 4],
     texture_id: abi::kadath_resource_id_t,
+    move_speed: f32,
 }
 
 struct EntitySlot {
@@ -38,7 +39,10 @@ impl WorldState {
         &mut self,
         desc: &abi::kadath_world_sprite_spawn_desc_t,
     ) -> Result<abi::kadath_entity_id_t, WorldError> {
-        if desc.texture_id == abi::KADATH_RESOURCE_INVALID {
+        if desc.texture_id == abi::KADATH_RESOURCE_INVALID
+            || !desc.move_speed.is_finite()
+            || desc.move_speed < 0.0
+        {
             return Err(WorldError::InvalidArgument);
         }
 
@@ -47,6 +51,7 @@ impl WorldState {
             size: desc.size,
             color: desc.color,
             texture_id: desc.texture_id,
+            move_speed: desc.move_speed,
         };
 
         if let Some(index) = self.free_indices.pop() {
@@ -66,6 +71,27 @@ impl WorldState {
         Ok(encode_entity(index, 1))
     }
 
+    fn step_fixed(
+        &mut self,
+        dt_seconds: f32,
+        input: &abi::kadath_world_input_snapshot_t,
+    ) -> Result<(), WorldError> {
+        if !dt_seconds.is_finite()
+            || dt_seconds < 0.0
+            || !(-1..=1).contains(&input.move_x)
+            || !(-1..=1).contains(&input.move_y)
+        {
+            return Err(WorldError::InvalidArgument);
+        }
+        for slot in &mut self.slots {
+            let Some(sprite) = slot.sprite.as_mut() else {
+                continue;
+            };
+            sprite.position[0] += f32::from(input.move_x) * sprite.move_speed * dt_seconds;
+            sprite.position[1] += f32::from(input.move_y) * sprite.move_speed * dt_seconds;
+        }
+        Ok(())
+    }
     fn despawn(&mut self, entity: abi::kadath_entity_id_t) -> Result<(), WorldError> {
         let (index, generation) = decode_entity(entity).ok_or(WorldError::InvalidEntity)?;
         self.free_indices
@@ -189,6 +215,24 @@ pub extern "C" fn kadath_world_spawn_sprite(
 }
 
 #[no_mangle]
+pub extern "C" fn kadath_world_step_fixed(
+    world: abi::kadath_world_t,
+    dt_seconds: f32,
+    input: *const abi::kadath_world_input_snapshot_t,
+) -> i32 {
+    ffi_boundary(|| {
+        let (Some(world), Some(input)) = (unsafe { world.cast::<WorldState>().as_mut() }, unsafe {
+            input.as_ref()
+        }) else {
+            return abi::KADATH_ERR_INVALID_ARGUMENT as i32;
+        };
+        world
+            .step_fixed(dt_seconds, input)
+            .map(|()| abi::KADATH_OK as i32)
+            .unwrap_or_else(error_code)
+    })
+}
+#[no_mangle]
 pub extern "C" fn kadath_world_despawn(
     world: abi::kadath_world_t,
     entity: abi::kadath_entity_id_t,
@@ -249,6 +293,7 @@ mod tests {
             size: [32.0, 48.0],
             color: [1.0, 0.5, 0.25, 1.0],
             texture_id,
+            move_speed: 100.0,
         }
     }
 
@@ -275,6 +320,48 @@ mod tests {
         assert_eq!(replacement as u32, stale as u32);
     }
 
+    #[test]
+    fn fixed_step_is_deterministic_and_zero_input_is_stable() {
+        let mut first = WorldState::default();
+        let mut second = WorldState::default();
+        first.spawn_sprite(&sprite_desc(1)).unwrap();
+        second.spawn_sprite(&sprite_desc(1)).unwrap();
+        let input = abi::kadath_world_input_snapshot_t {
+            move_x: -1,
+            move_y: 0,
+        };
+        for _ in 0..10 {
+            first.step_fixed(1.0 / 60.0, &input).unwrap();
+            second.step_fixed(1.0 / 60.0, &input).unwrap();
+        }
+
+        let zero = abi::kadath_world_input_snapshot_t {
+            move_x: 0,
+            move_y: 0,
+        };
+        first.step_fixed(1.0, &zero).unwrap();
+        second.step_fixed(1.0, &zero).unwrap();
+        let mut first_output = [abi::kadath_world_render_sprite_t::default(); 1];
+        let mut second_output = [abi::kadath_world_render_sprite_t::default(); 1];
+        first.extract_sprites(&mut first_output).unwrap();
+        second.extract_sprites(&mut second_output).unwrap();
+        assert_eq!(first_output[0].position, second_output[0].position);
+    }
+    #[test]
+    fn fixed_step_moves_sprite_from_input_snapshot() {
+        let mut world = WorldState::default();
+        let entity = world.spawn_sprite(&sprite_desc(1)).unwrap();
+        let input = abi::kadath_world_input_snapshot_t {
+            move_x: 1,
+            move_y: -1,
+        };
+        world.step_fixed(0.5, &input).unwrap();
+
+        let mut output = [abi::kadath_world_render_sprite_t::default(); 1];
+        world.extract_sprites(&mut output).unwrap();
+        assert_eq!(output[0].entity_id, entity);
+        assert_eq!(output[0].position, [60.0, -30.0]);
+    }
     #[test]
     fn extract_reports_small_caller_buffer() {
         let mut world = WorldState::default();

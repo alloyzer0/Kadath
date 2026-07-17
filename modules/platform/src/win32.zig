@@ -1,6 +1,7 @@
 const std = @import("std");
 const WindowExtent = @import("main.zig").WindowExtent;
 const PumpResult = @import("main.zig").PumpResult;
+const InputSnapshot = @import("main.zig").InputSnapshot;
 
 const c = @cImport({
     @cDefine("UNICODE", "1");
@@ -17,6 +18,10 @@ pub const Platform = struct {
     class_registered: bool = false,
     qpc_frequency: i64 = 0,
     qpc_start: i64 = 0,
+    left_down: bool = false,
+    right_down: bool = false,
+    up_down: bool = false,
+    down_down: bool = false,
 
     pub fn init() !Platform {
         var self = Platform{};
@@ -91,20 +96,54 @@ pub const Platform = struct {
     }
 
     pub fn pumpEvents(self: *Platform) PumpResult {
-        _ = self;
         var result = PumpResult{};
         var message: c.MSG = undefined;
         while (c.PeekMessageW(&message, null, 0, 0, c.PM_REMOVE) != 0) {
+            if (message.hwnd == self.window) self.consumeInputMessage(&message);
             if (message.message == c.WM_QUIT) {
+                self.clearInput();
                 result.quit_requested = true;
                 break;
             }
             _ = c.TranslateMessage(&message);
             _ = c.DispatchMessageW(&message);
         }
+        result.input = self.sampleInput();
         return result;
     }
 
+    fn consumeInputMessage(self: *Platform, message: *const c.MSG) void {
+        switch (message.message) {
+            c.WM_KEYDOWN, c.WM_SYSKEYDOWN => self.setDirectionalKey(message.wParam, true),
+            c.WM_KEYUP, c.WM_SYSKEYUP => self.setDirectionalKey(message.wParam, false),
+            c.WM_KILLFOCUS => self.clearInput(),
+            else => {},
+        }
+    }
+
+    fn setDirectionalKey(self: *Platform, key: c.WPARAM, is_down: bool) void {
+        switch (key) {
+            c.VK_LEFT => self.left_down = is_down,
+            c.VK_RIGHT => self.right_down = is_down,
+            c.VK_UP => self.up_down = is_down,
+            c.VK_DOWN => self.down_down = is_down,
+            else => {},
+        }
+    }
+
+    fn clearInput(self: *Platform) void {
+        self.left_down = false;
+        self.right_down = false;
+        self.up_down = false;
+        self.down_down = false;
+    }
+
+    fn sampleInput(self: *Platform) InputSnapshot {
+        return .{
+            .move_x = if (self.right_down and !self.left_down) 1 else if (self.left_down and !self.right_down) -1 else 0,
+            .move_y = if (self.down_down and !self.up_down) 1 else if (self.up_down and !self.down_down) -1 else 0,
+        };
+    }
     pub fn nowSeconds(self: *Platform) f64 {
         var current: i64 = 0;
         if (c.QueryPerformanceCounter(@ptrCast(&current)) == 0 or self.qpc_frequency <= 0) {

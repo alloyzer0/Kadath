@@ -5,8 +5,14 @@ pub const WindowExtent = struct {
     height: u32 = 0,
 };
 
+pub const InputSnapshot = extern struct {
+    move_x: i8 = 0,
+    move_y: i8 = 0,
+};
+
 pub const PumpResult = struct {
     quit_requested: bool = false,
+    input: InputSnapshot = .{},
 };
 
 pub const Platform = if (builtin.os.tag == .windows)
@@ -23,7 +29,7 @@ else
 
         pub fn pumpEvents(self: *@This()) PumpResult {
             _ = self;
-            return .{ .quit_requested = true };
+            return .{ .quit_requested = true, .input = .{} };
         }
 
         pub fn nowSeconds(self: *@This()) f64 {

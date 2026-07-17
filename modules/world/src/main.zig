@@ -9,11 +9,17 @@ pub const invalid_entity: EntityId = 0;
 pub const TextureId = u32;
 pub const invalid_texture: TextureId = 0;
 
+pub const InputSnapshot = extern struct {
+    move_x: i8 = 0,
+    move_y: i8 = 0,
+};
+
 pub const SpriteSpawnDesc = struct {
     position: [2]f32,
     size: [2]f32,
     color: [4]f32,
     texture_id: TextureId,
+    move_speed: f32,
 };
 
 pub const RenderSprite = extern struct {
@@ -57,11 +63,19 @@ pub const World = struct {
         c_desc.size = desc.size;
         c_desc.color = desc.color;
         c_desc.texture_id = desc.texture_id;
+        c_desc.move_speed = desc.move_speed;
         var entity: c.kadath_entity_id_t = c.KADATH_ENTITY_INVALID;
         try check(c.kadath_world_spawn_sprite(self.handle, &c_desc, &entity));
         return entity;
     }
 
+    pub fn stepFixed(self: *World, dt_seconds: f32, input: InputSnapshot) !void {
+        var c_input = c.kadath_world_input_snapshot_t{
+            .move_x = input.move_x,
+            .move_y = input.move_y,
+        };
+        try check(c.kadath_world_step_fixed(self.handle, dt_seconds, &c_input));
+    }
     pub fn despawn(self: *World, entity: EntityId) !void {
         try check(c.kadath_world_despawn(self.handle, entity));
     }

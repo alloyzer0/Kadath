@@ -1,6 +1,7 @@
 const std = @import("std");
 const Platform = @import("platform").Platform;
 const PlatformExtent = @import("platform").WindowExtent;
+const InputSnapshot = @import("platform").InputSnapshot;
 const rhi = @import("rhi");
 const Rhi = rhi.Rhi;
 const resource = @import("resource");
@@ -10,6 +11,8 @@ const Renderer2D = @import("renderer2d").Renderer2D;
 const SpriteInstance = @import("renderer2d").SpriteInstance;
 
 const test_texture_id: world_api.TextureId = 1;
+const fixed_dt_seconds: f64 = 1.0 / 60.0;
+const max_fixed_steps_per_frame: u8 = 4;
 
 pub const Host = struct {
     platform: Platform,
@@ -22,6 +25,7 @@ pub const Host = struct {
     render_count: usize = 0,
     quit_requested: bool = false,
     last_time_seconds: f64 = 0.0,
+    accumulator_seconds: f64 = 0.0,
     frame_count: u64 = 0,
     last_heartbeat_seconds: f64 = 0.0,
 
@@ -56,6 +60,7 @@ pub const Host = struct {
             .size = .{ 320.0, 240.0 },
             .color = .{ 1.0, 1.0, 1.0, 1.0 },
             .texture_id = test_texture_id,
+            .move_speed = 180.0,
         });
 
         var self = Host{
@@ -104,7 +109,7 @@ pub const Host = struct {
             self.last_time_seconds = now;
 
             self.syncExternalResults();
-            self.runFixedUpdates(delta);
+            try self.runFixedUpdates(delta, events.input);
             try self.extractRender();
 
             try self.submitRender();
@@ -139,9 +144,20 @@ pub const Host = struct {
         _ = self;
     }
 
-    fn runFixedUpdates(self: *Host, delta_seconds: f64) void {
-        _ = self;
-        _ = delta_seconds;
+    fn runFixedUpdates(self: *Host, delta_seconds: f64, input: InputSnapshot) !void {
+        // 限制单帧可累积时间，避免暂停/调试断点后进入死亡螺旋。
+        self.accumulator_seconds += @min(delta_seconds, 0.25);
+        var steps: u8 = 0;
+        while (self.accumulator_seconds >= fixed_dt_seconds and steps < max_fixed_steps_per_frame) : (steps += 1) {
+            try self.world.stepFixed(@floatCast(fixed_dt_seconds), .{
+                .move_x = input.move_x,
+                .move_y = input.move_y,
+            });
+            self.accumulator_seconds -= fixed_dt_seconds;
+        }
+        if (steps == max_fixed_steps_per_frame and self.accumulator_seconds >= fixed_dt_seconds) {
+            self.accumulator_seconds = @mod(self.accumulator_seconds, fixed_dt_seconds);
+        }
     }
 
     fn extractRender(self: *Host) !void {
@@ -159,10 +175,20 @@ pub const Host = struct {
     fn endFrame(self: *Host, now_seconds: f64, delta_seconds: f64) void {
         self.frame_count += 1;
         if (now_seconds - self.last_heartbeat_seconds >= 1.0) {
-            std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s", .{
-                self.frame_count,
-                delta_seconds,
-            });
+            if (self.render_count > 0) {
+                const sprite = self.render_sprites[0];
+                std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, position=({d:.2},{d:.2})", .{
+                    self.frame_count,
+                    delta_seconds,
+                    sprite.position[0],
+                    sprite.position[1],
+                });
+            } else {
+                std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s", .{
+                    self.frame_count,
+                    delta_seconds,
+                });
+            }
             self.last_heartbeat_seconds = now_seconds;
         }
     }
