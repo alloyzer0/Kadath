@@ -3,6 +3,9 @@ pub const Extent2D = types.Extent2D;
 pub const FrameOutcome = types.FrameOutcome;
 pub const PipelineHandle = types.PipelineHandle;
 pub const invalid_pipeline = types.invalid_pipeline;
+pub const TextureHandle = types.TextureHandle;
+pub const invalid_texture = types.invalid_texture;
+pub const TextureUploadDesc = types.TextureUploadDesc;
 pub const GraphicsPipelineDesc = types.GraphicsPipelineDesc;
 
 const backend = @import("vulkan/backend.zig");

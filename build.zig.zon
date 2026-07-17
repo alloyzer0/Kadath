@@ -11,5 +11,6 @@
         "modules",
         "LICENSE",
         "shaders",
+        "assets",
     },
 }

@@ -7,6 +7,20 @@ const allocator = std.heap.page_allocator;
 const api_version: u32 = 1 << 22;
 
 const max_pipelines: usize = 8;
+const max_textures: usize = 8;
+
+const TextureSlot = struct {
+    image: c.VkImage = null,
+    memory: c.VkDeviceMemory = null,
+    view: c.VkImageView = null,
+    sampler: c.VkSampler = null,
+    descriptor_set: c.VkDescriptorSet = null,
+};
+
+const BufferAllocation = struct {
+    buffer: c.VkBuffer = null,
+    memory: c.VkDeviceMemory = null,
+};
 
 const PipelineSlot = struct {
     desc: ?types.GraphicsPipelineDesc = null,
@@ -30,6 +44,27 @@ pub const FrameEncoder = struct {
         const slot = self.rhi.pipelineSlot(pipeline) orelse return error.InvalidPipeline;
         c.vkCmdBindPipeline(self.rhi.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, slot.pipeline);
         self.bound_pipeline = pipeline;
+    }
+
+    pub fn bindTexture(self: *FrameEncoder, texture: types.TextureHandle) !void {
+        if (!self.recording or self.finished) return error.FrameAlreadyFinished;
+        try self.rhi.validateFrame(self);
+        if (self.bound_pipeline == types.invalid_pipeline) return error.InvalidPipeline;
+        const pipeline = self.rhi.pipelineSlot(self.bound_pipeline) orelse return error.InvalidPipeline;
+        const desc = pipeline.desc orelse return error.InvalidPipeline;
+        if (!desc.uses_texture) return error.TextureBindingUnsupported;
+        const slot = self.rhi.textureSlot(texture) orelse return error.InvalidTexture;
+        if (slot.descriptor_set == null) return error.InvalidTexture;
+        c.vkCmdBindDescriptorSets(
+            self.rhi.command_buffer,
+            c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipeline.layout,
+            0,
+            1,
+            &slot.descriptor_set,
+            0,
+            null,
+        );
     }
 
     pub fn pushConstants(self: *FrameEncoder, bytes: []const u8) !void {
@@ -104,6 +139,9 @@ pub const Rhi = struct {
     render_pass_generation: u64 = 0,
     next_frame_token: u64 = 0,
     active_frame_token: ?u64 = null,
+    texture_slots: [max_textures]TextureSlot = [_]TextureSlot{.{}} ** max_textures,
+    descriptor_pool: c.VkDescriptorPool = null,
+    texture_descriptor_set_layout: c.VkDescriptorSetLayout = null,
 
     pub fn init(window_handle: usize, instance_handle: usize, requested_extent: types.Extent2D) !Rhi {
         var self = Rhi{};
@@ -113,6 +151,7 @@ pub const Rhi = struct {
         try surface_bridge.create(self.instance, window_handle, instance_handle, &self.surface);
         try self.selectPhysicalDevice();
         try self.createDevice();
+        try self.createTextureDescriptors();
         try self.createCommandPool();
         try self.createSyncObjects();
         if (requested_extent.width != 0 and requested_extent.height != 0) {
@@ -131,7 +170,9 @@ pub const Rhi = struct {
             _ = c.vkDeviceWaitIdle(self.device);
         }
         self.destroySwapchainResources();
+        self.destroyTextureObjects();
         self.destroyPipelineLayouts();
+        self.destroyTextureDescriptors();
         if (self.in_flight != null and self.device != null) {
             c.vkDestroyFence(self.device, self.in_flight, null);
             self.in_flight = null;
@@ -173,7 +214,7 @@ pub const Rhi = struct {
         }
         for (&self.pipeline_slots, 0..) |*slot, index| {
             if (slot.desc == null) {
-                const layout = try self.createPipelineLayout(desc.push_constant_size);
+                const layout = try self.createPipelineLayout(desc.push_constant_size, desc.uses_texture);
                 slot.layout = layout;
                 slot.desc = desc;
                 errdefer {
@@ -205,6 +246,41 @@ pub const Rhi = struct {
         slot.* = .{};
     }
 
+    pub fn createTexture(self: *Rhi, desc: types.TextureUploadDesc) !types.TextureHandle {
+        if (self.active_frame_token != null) return error.TextureCreationDuringFrame;
+        try check(c.vkDeviceWaitIdle(self.device), "vkDeviceWaitIdle(texture upload)");
+        if (desc.width == 0 or desc.height == 0) return error.InvalidTextureExtent;
+        const pixel_count = try std.math.mul(usize, @intCast(desc.width), @intCast(desc.height));
+        const expected_size = try std.math.mul(usize, pixel_count, 4);
+        if (desc.rgba8.len != expected_size) return error.InvalidTextureByteCount;
+
+        for (&self.texture_slots, 0..) |*destination, index| {
+            if (destination.image != null) continue;
+
+            var texture = TextureSlot{};
+            errdefer self.destroyTextureSlot(&texture);
+            try self.createTextureImage(&texture, desc);
+            try self.createTextureViewSamplerDescriptor(&texture);
+            destination.* = texture;
+
+            const handle: types.TextureHandle = @intCast(index + 1);
+            std.log.info("RHI texture created: handle={d}, extent={d}x{d}", .{
+                handle,
+                desc.width,
+                desc.height,
+            });
+            return handle;
+        }
+        return error.TextureLimitReached;
+    }
+
+    pub fn destroyTexture(self: *Rhi, handle: types.TextureHandle) void {
+        const slot = self.textureSlot(handle) orelse return;
+        if (self.device != null) {
+            _ = c.vkDeviceWaitIdle(self.device);
+        }
+        self.destroyTextureSlot(slot);
+    }
     pub fn beginFrame(
         self: *Rhi,
         requested_extent: types.Extent2D,
@@ -342,13 +418,21 @@ pub const Rhi = struct {
         return &self.pipeline_slots[index];
     }
 
+    fn textureSlot(self: *Rhi, handle: types.TextureHandle) ?*TextureSlot {
+        if (handle == types.invalid_texture or handle > @as(types.TextureHandle, max_textures)) return null;
+        const index: usize = @intCast(handle - 1);
+        const slot = &self.texture_slots[index];
+        if (slot.image == null) return null;
+        return slot;
+    }
+
     fn validatePipeline(self: *Rhi, handle: types.PipelineHandle) !void {
         const slot = self.pipelineSlot(handle) orelse return error.InvalidPipeline;
         if (slot.desc == null) return error.InvalidPipeline;
         if (slot.pipeline == null) return error.PipelineNotReady;
     }
 
-    fn createPipelineLayout(self: *Rhi, push_constant_size: u32) !c.VkPipelineLayout {
+    fn createPipelineLayout(self: *Rhi, push_constant_size: u32, uses_texture: bool) !c.VkPipelineLayout {
         var range = std.mem.zeroes(c.VkPushConstantRange);
         range.stageFlags = @intCast(c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT);
         range.offset = 0;
@@ -357,6 +441,12 @@ pub const Rhi = struct {
         info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         info.pushConstantRangeCount = 1;
         info.pPushConstantRanges = &range;
+        var set_layouts = [_]c.VkDescriptorSetLayout{self.texture_descriptor_set_layout};
+        if (uses_texture) {
+            if (self.texture_descriptor_set_layout == null) return error.TextureDescriptorsUnavailable;
+            info.setLayoutCount = 1;
+            info.pSetLayouts = &set_layouts;
+        }
         var layout: c.VkPipelineLayout = null;
         try check(c.vkCreatePipelineLayout(self.device, &info, null, &layout), "vkCreatePipelineLayout");
         return layout;
@@ -625,6 +715,234 @@ pub const Rhi = struct {
         });
     }
 
+    fn createTextureDescriptors(self: *Rhi) !void {
+        var binding = std.mem.zeroes(c.VkDescriptorSetLayoutBinding);
+        binding.binding = 0;
+        binding.descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binding.descriptorCount = 1;
+        binding.stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        var layout_info = std.mem.zeroes(c.VkDescriptorSetLayoutCreateInfo);
+        layout_info.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layout_info.bindingCount = 1;
+        layout_info.pBindings = &binding;
+        try check(c.vkCreateDescriptorSetLayout(
+            self.device,
+            &layout_info,
+            null,
+            &self.texture_descriptor_set_layout,
+        ), "vkCreateDescriptorSetLayout(texture)");
+
+        var pool_size = std.mem.zeroes(c.VkDescriptorPoolSize);
+        pool_size.type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        pool_size.descriptorCount = max_textures;
+
+        var pool_info = std.mem.zeroes(c.VkDescriptorPoolCreateInfo);
+        pool_info.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.flags = c.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        pool_info.maxSets = max_textures;
+        pool_info.poolSizeCount = 1;
+        pool_info.pPoolSizes = &pool_size;
+        try check(c.vkCreateDescriptorPool(
+            self.device,
+            &pool_info,
+            null,
+            &self.descriptor_pool,
+        ), "vkCreateDescriptorPool(texture)");
+    }
+
+    fn destroyTextureDescriptors(self: *Rhi) void {
+        if (self.descriptor_pool != null) {
+            c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
+            self.descriptor_pool = null;
+        }
+        if (self.texture_descriptor_set_layout != null) {
+            c.vkDestroyDescriptorSetLayout(self.device, self.texture_descriptor_set_layout, null);
+            self.texture_descriptor_set_layout = null;
+        }
+    }
+
+    fn createTextureImage(self: *Rhi, destination: *TextureSlot, desc: types.TextureUploadDesc) !void {
+        var image_info = std.mem.zeroes(c.VkImageCreateInfo);
+        image_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType = c.VK_IMAGE_TYPE_2D;
+        image_info.format = c.VK_FORMAT_R8G8B8A8_SRGB;
+        image_info.extent = .{ .width = desc.width, .height = desc.height, .depth = 1 };
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
+        image_info.samples = c.VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = c.VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = c.VK_IMAGE_USAGE_TRANSFER_DST_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT;
+        image_info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+        image_info.initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED;
+        try check(c.vkCreateImage(self.device, &image_info, null, &destination.image), "vkCreateImage(texture)");
+
+        var requirements: c.VkMemoryRequirements = undefined;
+        c.vkGetImageMemoryRequirements(self.device, destination.image, &requirements);
+        var memory_info = std.mem.zeroes(c.VkMemoryAllocateInfo);
+        memory_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memory_info.allocationSize = requirements.size;
+        memory_info.memoryTypeIndex = try self.findMemoryType(requirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        try check(c.vkAllocateMemory(self.device, &memory_info, null, &destination.memory), "vkAllocateMemory(texture)");
+        try check(c.vkBindImageMemory(self.device, destination.image, destination.memory, 0), "vkBindImageMemory(texture)");
+
+        const staging = try self.createBuffer(
+            @intCast(desc.rgba8.len),
+            c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        );
+        defer self.destroyBuffer(staging);
+
+        var mapped: ?*anyopaque = null;
+        try check(c.vkMapMemory(self.device, staging.memory, 0, @intCast(desc.rgba8.len), 0, &mapped), "vkMapMemory(texture)");
+        const mapped_bytes: [*]u8 = @ptrCast(mapped.?);
+        @memcpy(mapped_bytes[0..desc.rgba8.len], desc.rgba8);
+        c.vkUnmapMemory(self.device, staging.memory);
+        try self.uploadTexture(staging.buffer, destination.image, desc.width, desc.height);
+    }
+
+    fn createTextureViewSamplerDescriptor(self: *Rhi, destination: *TextureSlot) !void {
+        var view_info = std.mem.zeroes(c.VkImageViewCreateInfo);
+        view_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = destination.image;
+        view_info.viewType = c.VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = c.VK_FORMAT_R8G8B8A8_SRGB;
+        view_info.subresourceRange.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.layerCount = 1;
+        try check(c.vkCreateImageView(self.device, &view_info, null, &destination.view), "vkCreateImageView(texture)");
+
+        var sampler_info = std.mem.zeroes(c.VkSamplerCreateInfo);
+        sampler_info.sType = c.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler_info.magFilter = c.VK_FILTER_LINEAR;
+        sampler_info.minFilter = c.VK_FILTER_LINEAR;
+        sampler_info.mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sampler_info.addressModeU = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampler_info.addressModeV = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampler_info.addressModeW = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampler_info.maxLod = 1.0;
+        try check(c.vkCreateSampler(self.device, &sampler_info, null, &destination.sampler), "vkCreateSampler(texture)");
+
+        var allocate_info = std.mem.zeroes(c.VkDescriptorSetAllocateInfo);
+        allocate_info.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocate_info.descriptorPool = self.descriptor_pool;
+        allocate_info.descriptorSetCount = 1;
+        allocate_info.pSetLayouts = &self.texture_descriptor_set_layout;
+        try check(c.vkAllocateDescriptorSets(self.device, &allocate_info, &destination.descriptor_set), "vkAllocateDescriptorSets(texture)");
+
+        var descriptor_image = std.mem.zeroes(c.VkDescriptorImageInfo);
+        descriptor_image.sampler = destination.sampler;
+        descriptor_image.imageView = destination.view;
+        descriptor_image.imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        var write = std.mem.zeroes(c.VkWriteDescriptorSet);
+        write.sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = destination.descriptor_set;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &descriptor_image;
+        c.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+    }
+
+    fn uploadTexture(self: *Rhi, staging: c.VkBuffer, image: c.VkImage, width: u32, height: u32) !void {
+        try check(c.vkResetCommandBuffer(self.command_buffer, 0), "vkResetCommandBuffer(texture)");
+        var begin_info = std.mem.zeroes(c.VkCommandBufferBeginInfo);
+        begin_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        try check(c.vkBeginCommandBuffer(self.command_buffer, &begin_info), "vkBeginCommandBuffer(texture)");
+
+        var barrier = std.mem.zeroes(c.VkImageMemoryBarrier);
+        barrier.sType = c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = c.VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &barrier);
+
+        var copy = std.mem.zeroes(c.VkBufferImageCopy);
+        copy.imageSubresource.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = .{ .width = width, .height = height, .depth = 1 };
+        c.vkCmdCopyBufferToImage(self.command_buffer, staging, image, c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+        barrier.srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT;
+        barrier.oldLayout = c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_TRANSFER_BIT, c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
+
+        try check(c.vkEndCommandBuffer(self.command_buffer), "vkEndCommandBuffer(texture)");
+        try check(c.vkResetFences(self.device, 1, &self.in_flight), "vkResetFences(texture)");
+        var submit = std.mem.zeroes(c.VkSubmitInfo);
+        submit.sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &self.command_buffer;
+        try check(c.vkQueueSubmit(self.queue, 1, &submit, self.in_flight), "vkQueueSubmit(texture)");
+        try check(c.vkWaitForFences(self.device, 1, &self.in_flight, c.VK_TRUE, std.math.maxInt(u64)), "vkWaitForFences(texture)");
+    }
+
+    fn createBuffer(self: *Rhi, size: c.VkDeviceSize, usage: u32, properties: u32) !BufferAllocation {
+        var info = std.mem.zeroes(c.VkBufferCreateInfo);
+        info.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        info.size = size;
+        info.usage = usage;
+        info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+        var allocation = BufferAllocation{};
+        errdefer self.destroyBuffer(allocation);
+        try check(c.vkCreateBuffer(self.device, &info, null, &allocation.buffer), "vkCreateBuffer(texture staging)");
+
+        var requirements: c.VkMemoryRequirements = undefined;
+        c.vkGetBufferMemoryRequirements(self.device, allocation.buffer, &requirements);
+        var memory_info = std.mem.zeroes(c.VkMemoryAllocateInfo);
+        memory_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memory_info.allocationSize = requirements.size;
+        memory_info.memoryTypeIndex = try self.findMemoryType(requirements.memoryTypeBits, properties);
+        try check(c.vkAllocateMemory(self.device, &memory_info, null, &allocation.memory), "vkAllocateMemory(texture staging)");
+        try check(c.vkBindBufferMemory(self.device, allocation.buffer, allocation.memory, 0), "vkBindBufferMemory(texture staging)");
+        return allocation;
+    }
+
+    fn destroyBuffer(self: *Rhi, allocation: BufferAllocation) void {
+        if (allocation.buffer != null) c.vkDestroyBuffer(self.device, allocation.buffer, null);
+        if (allocation.memory != null) c.vkFreeMemory(self.device, allocation.memory, null);
+    }
+
+    fn destroyTextureSlot(self: *Rhi, slot: *TextureSlot) void {
+        if (slot.descriptor_set != null and self.descriptor_pool != null) {
+            _ = c.vkFreeDescriptorSets(self.device, self.descriptor_pool, 1, &slot.descriptor_set);
+        }
+        if (slot.sampler != null) c.vkDestroySampler(self.device, slot.sampler, null);
+        if (slot.view != null) c.vkDestroyImageView(self.device, slot.view, null);
+        if (slot.image != null) c.vkDestroyImage(self.device, slot.image, null);
+        if (slot.memory != null) c.vkFreeMemory(self.device, slot.memory, null);
+        slot.* = .{};
+    }
+
+    fn destroyTextureObjects(self: *Rhi) void {
+        for (&self.texture_slots) |*slot| {
+            if (slot.image != null) self.destroyTextureSlot(slot);
+        }
+    }
+
+    fn findMemoryType(self: *Rhi, type_bits: u32, properties: u32) !u32 {
+        var memory_properties: c.VkPhysicalDeviceMemoryProperties = undefined;
+        c.vkGetPhysicalDeviceMemoryProperties(self.physical_device, &memory_properties);
+        for (0..@intCast(memory_properties.memoryTypeCount)) |index| {
+            const bit: u32 = @as(u32, 1) << @intCast(index);
+            if ((type_bits & bit) != 0 and
+                (memory_properties.memoryTypes[index].propertyFlags & properties) == properties)
+            {
+                return @intCast(index);
+            }
+        }
+        return error.NoCompatibleMemoryType;
+    }
     fn createRenderFinishedSemaphores(self: *Rhi, count: u32) !void {
         const semaphores = try allocator.alloc(c.VkSemaphore, count);
         @memset(semaphores, null);

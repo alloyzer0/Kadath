@@ -45,6 +45,7 @@ pub const Renderer2D = struct {
                 .vertex_shader = vertex_shader,
                 .fragment_shader = fragment_shader,
                 .push_constant_size = @sizeOf(QuadPushConstants),
+                .uses_texture = true,
             }),
         };
     }
@@ -62,6 +63,7 @@ pub const Renderer2D = struct {
         backend: *rhi.Rhi,
         extent: rhi.Extent2D,
         sprite: SpriteInstance,
+        texture: rhi.TextureHandle,
     ) !rhi.FrameOutcome {
         const begin = try backend.beginFrame(extent, .{ 0.035, 0.10, 0.22, 1.0 });
         switch (begin) {
@@ -84,6 +86,7 @@ pub const Renderer2D = struct {
                 };
 
                 try encoder.bindPipeline(self.pipeline);
+                try encoder.bindTexture(texture);
                 try encoder.pushConstants(std.mem.asBytes(&push));
                 try encoder.draw(6);
                 return try encoder.finish();
