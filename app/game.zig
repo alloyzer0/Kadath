@@ -103,6 +103,21 @@ test "session enters lost when hazard overlaps player" {
     try std.testing.expect(session.phase == .playing);
 }
 
+test "session prioritizes hazard loss when goal overlaps in the same snapshot" {
+    var session = GameSession{};
+    const player = body(1, .{ 170.0, 0.0 }, .{ 20.0, 20.0 });
+    const hazard = body(3, .{ 180.0, 0.0 }, .{ 20.0, 20.0 });
+    const goal = body(2, .{ 180.0, 0.0 }, .{ 20.0, 20.0 });
+
+    // 关键规则：Host 先提交 Hazard 接触；Lost 终态必须拒绝同帧后续 Goal 结果。
+    try std.testing.expect(session.observeHazard(player, hazard));
+    try std.testing.expect(session.phase == .lost);
+    try std.testing.expect(!session.observeGoal(player, goal));
+    try std.testing.expect(session.phase == .lost);
+    try std.testing.expect(session.restart());
+    try std.testing.expect(session.phase == .playing);
+}
+
 test "session enters lost when fixed-step timer expires" {
     var session = GameSession{};
     try std.testing.expect(!session.tickFixed(2.5));
