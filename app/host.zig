@@ -1,4 +1,5 @@
 const std = @import("std");
+const game = @import("game.zig");
 const Platform = @import("platform").Platform;
 const PlatformExtent = @import("platform").WindowExtent;
 const InputSnapshot = @import("platform").InputSnapshot;
@@ -22,6 +23,7 @@ pub const Host = struct {
     world: World,
     sprite_entity: world_api.EntityId,
     world_extent: PlatformExtent,
+    session: game.GameSession = .{},
     render_sprites: [1]world_api.RenderSprite = undefined,
     render_count: usize = 0,
     quit_requested: bool = false,
@@ -76,6 +78,7 @@ pub const Host = struct {
             .world = runtime_world,
             .sprite_entity = sprite_entity,
             .world_extent = extent,
+            .session = .{},
         };
         const now = self.platform.nowSeconds();
         self.last_time_seconds = now;
@@ -134,7 +137,10 @@ pub const Host = struct {
         const sprite = SpriteInstance{
             .position = extracted.position,
             .size = extracted.size,
-            .color = extracted.color,
+            .color = if (self.session.phase == .won)
+                .{ 0.20, 0.95, 0.35, 1.0 }
+            else
+                extracted.color,
         };
         const outcome = try self.renderer2d.render(
             &self.rhi,
@@ -171,9 +177,10 @@ pub const Host = struct {
         self.accumulator_seconds += @min(delta_seconds, 0.25);
         var steps: u8 = 0;
         while (self.accumulator_seconds >= fixed_dt_seconds and steps < max_fixed_steps_per_frame) : (steps += 1) {
+            const step_input = if (self.session.acceptsInput()) input else InputSnapshot{};
             try self.world.stepFixed(@floatCast(fixed_dt_seconds), .{
-                .move_x = input.move_x,
-                .move_y = input.move_y,
+                .move_x = step_input.move_x,
+                .move_y = step_input.move_y,
             });
             self.accumulator_seconds -= fixed_dt_seconds;
         }
@@ -186,6 +193,13 @@ pub const Host = struct {
         // World 只写入稳定 POD 快照；渲染提交阶段不读取 World 内部存储。
         const sprites = try self.world.extractSprites(&self.render_sprites);
         self.render_count = sprites.len;
+        if (self.render_count > 0 and self.session.observePlayer(
+            self.render_sprites[0].position,
+            self.render_sprites[0].size,
+            self.world_extent.width,
+        )) {
+            std.log.info("Game session won: player reached the right World Bounds", .{});
+        }
     }
 
     fn resolveTexture(self: *Host, texture_id: world_api.TextureId) !rhi.TextureHandle {
@@ -199,9 +213,10 @@ pub const Host = struct {
         if (now_seconds - self.last_heartbeat_seconds >= 1.0) {
             if (self.render_count > 0) {
                 const sprite = self.render_sprites[0];
-                std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, position=({d:.2},{d:.2})", .{
+                std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, phase={s}, position=({d:.2},{d:.2})", .{
                     self.frame_count,
                     delta_seconds,
+                    @tagName(self.session.phase),
                     sprite.position[0],
                     sprite.position[1],
                 });
