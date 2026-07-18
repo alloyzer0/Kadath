@@ -18,19 +18,18 @@ pub const GameSession = struct {
         return true;
     }
 
-    pub fn observePlayer(
+    pub fn observeGoal(
         self: *GameSession,
-        position: [2]f32,
-        size: [2]f32,
-        world_width: u32,
+        player_position: [2]f32,
+        player_size: [2]f32,
+        goal_position: [2]f32,
+        goal_size: [2]f32,
     ) bool {
         if (self.phase != .playing) return false;
-        if (!std.math.isFinite(position[0]) or !std.math.isFinite(size[0])) return false;
+        if (!finiteRect(player_position, player_size) or !finiteRect(goal_position, goal_size)) return false;
 
-        const right_edge = position[0] + size[0];
-        const width: f32 = @floatFromInt(world_width);
-        // World 已负责 clamp；epsilon 只吸收浮点累积误差，避免边界快照漏掉胜利。
-        if (right_edge >= width - 0.5) {
+        // 目标判定只消费两个 World 快照，不再把窗口边界当成玩法数据。
+        if (overlaps(player_position, player_size, goal_position, goal_size)) {
             self.phase = .won;
             return true;
         }
@@ -38,15 +37,35 @@ pub const GameSession = struct {
     }
 };
 
-test "session changes to won once at the right goal" {
+fn finiteRect(position: [2]f32, size: [2]f32) bool {
+    return std.math.isFinite(position[0]) and std.math.isFinite(position[1]) and
+        std.math.isFinite(size[0]) and std.math.isFinite(size[1]) and
+        size[0] >= 0.0 and size[1] >= 0.0;
+}
+
+fn overlaps(
+    first_position: [2]f32,
+    first_size: [2]f32,
+    second_position: [2]f32,
+    second_size: [2]f32,
+) bool {
+    const first_right = first_position[0] + first_size[0];
+    const first_bottom = first_position[1] + first_size[1];
+    const second_right = second_position[0] + second_size[0];
+    const second_bottom = second_position[1] + second_size[1];
+    return first_position[0] < second_right and first_right > second_position[0] and
+        first_position[1] < second_bottom and first_bottom > second_position[1];
+}
+
+test "session changes to won once on goal overlap" {
     var session = GameSession{};
     try std.testing.expect(session.acceptsInput());
-    try std.testing.expect(!session.observePlayer(.{ 100.0, 0.0 }, .{ 20.0, 20.0 }, 200));
+    try std.testing.expect(!session.observeGoal(.{ 100.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
     try std.testing.expect(session.phase == .playing);
-    try std.testing.expect(session.observePlayer(.{ 180.0, 0.0 }, .{ 20.0, 20.0 }, 200));
+    try std.testing.expect(session.observeGoal(.{ 170.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
     try std.testing.expect(session.phase == .won);
     try std.testing.expect(!session.acceptsInput());
-    try std.testing.expect(!session.observePlayer(.{ 0.0, 0.0 }, .{ 20.0, 20.0 }, 200));
+    try std.testing.expect(!session.observeGoal(.{ 0.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
     try std.testing.expect(session.restart());
     try std.testing.expect(session.phase == .playing);
     try std.testing.expect(session.acceptsInput());
@@ -55,6 +74,6 @@ test "session changes to won once at the right goal" {
 
 test "session ignores non-finite player snapshots" {
     var session = GameSession{};
-    try std.testing.expect(!session.observePlayer(.{ std.math.nan(f32), 0.0 }, .{ 20.0, 20.0 }, 200));
+    try std.testing.expect(!session.observeGoal(.{ std.math.nan(f32), 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
     try std.testing.expect(session.phase == .playing);
 }

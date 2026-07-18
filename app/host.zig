@@ -15,6 +15,7 @@ const test_texture_id: world_api.TextureId = 1;
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
 const player_start_position = [2]f32{ 312.0, 130.0 };
+const goal_position = [2]f32{ 700.0, 200.0 };
 
 fn playerSpawnDesc() world_api.SpriteSpawnDesc {
     return .{
@@ -26,6 +27,16 @@ fn playerSpawnDesc() world_api.SpriteSpawnDesc {
     };
 }
 
+fn goalSpawnDesc() world_api.SpriteSpawnDesc {
+    return .{
+        .position = goal_position,
+        .size = .{ 96.0, 96.0 },
+        .color = .{ 1.0, 0.75, 0.10, 1.0 },
+        .texture_id = test_texture_id,
+        .move_speed = 0.0,
+    };
+}
+
 pub const Host = struct {
     platform: Platform,
     rhi: Rhi,
@@ -33,9 +44,10 @@ pub const Host = struct {
     texture: rhi.TextureHandle,
     world: World,
     sprite_entity: world_api.EntityId,
+    goal_entity: world_api.EntityId,
     world_extent: PlatformExtent,
     session: game.GameSession = .{},
-    render_sprites: [1]world_api.RenderSprite = undefined,
+    render_sprites: [2]world_api.RenderSprite = undefined,
     render_count: usize = 0,
     quit_requested: bool = false,
     last_time_seconds: f64 = 0.0,
@@ -74,6 +86,7 @@ pub const Host = struct {
             .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
         });
         const sprite_entity = try runtime_world.spawnSprite(playerSpawnDesc());
+        const goal_entity = try runtime_world.spawnSprite(goalSpawnDesc());
 
         var self = Host{
             .platform = platform,
@@ -82,19 +95,23 @@ pub const Host = struct {
             .texture = texture,
             .world = runtime_world,
             .sprite_entity = sprite_entity,
+            .goal_entity = goal_entity,
             .world_extent = extent,
             .session = .{},
         };
         const now = self.platform.nowSeconds();
         self.last_time_seconds = now;
         self.last_heartbeat_seconds = now;
-        std.log.info("Runtime host initialized with Vulkan RHI and World entity={d}", .{sprite_entity});
+        std.log.info("Runtime host initialized with Vulkan RHI entities: player={d}, goal={d}", .{ sprite_entity, goal_entity });
         return self;
     }
 
     pub fn deinit(self: *Host) void {
         self.world.despawn(self.sprite_entity) catch |err| {
             std.log.err("World sprite despawn failed: {s}", .{@errorName(err)});
+        };
+        self.world.despawn(self.goal_entity) catch |err| {
+            std.log.err("World goal despawn failed: {s}", .{@errorName(err)});
         };
         self.world.deinit();
         self.rhi.destroyTexture(self.texture);
@@ -138,21 +155,31 @@ pub const Host = struct {
     fn submitRender(self: *Host) !void {
         if (self.render_count == 0) return error.WorldProducedNoRenderSprite;
         const extent: PlatformExtent = self.platform.clientExtent();
-        const extracted = self.render_sprites[0];
-        const texture = try self.resolveTexture(extracted.texture_id);
-        const sprite = SpriteInstance{
-            .position = extracted.position,
-            .size = extracted.size,
-            .color = if (self.session.phase == .won)
-                .{ 0.20, 0.95, 0.35, 1.0 }
-            else
-                extracted.color,
+        const goal = self.renderSprite(self.goal_entity) orelse return error.WorldProducedNoGoalSprite;
+        const player = self.renderSprite(self.sprite_entity) orelse return error.WorldProducedNoPlayerSprite;
+        _ = try self.resolveTexture(goal.texture_id);
+        _ = try self.resolveTexture(player.texture_id);
+        // 固定目标先画、玩家后画，避免重开后的 slot 顺序改变可见层级。
+        const instances = [_]SpriteInstance{
+            .{
+                .position = goal.position,
+                .size = goal.size,
+                .color = goal.color,
+            },
+            .{
+                .position = player.position,
+                .size = player.size,
+                .color = if (self.session.phase == .won)
+                    .{ 0.20, 0.95, 0.35, 1.0 }
+                else
+                    player.color,
+            },
         };
-        const outcome = try self.renderer2d.render(
+        const outcome = try self.renderer2d.renderSprites(
             &self.rhi,
             .{ .width = extent.width, .height = extent.height },
-            sprite,
-            texture,
+            instances[0..],
+            self.texture,
         );
         if (outcome == .recreated) {
             std.log.debug("Renderer2D swapchain recreation completed", .{});
@@ -219,12 +246,17 @@ pub const Host = struct {
         // World 只写入稳定 POD 快照；渲染提交阶段不读取 World 内部存储。
         const sprites = try self.world.extractSprites(&self.render_sprites);
         self.render_count = sprites.len;
-        if (self.render_count > 0 and self.session.observePlayer(
-            self.render_sprites[0].position,
-            self.render_sprites[0].size,
-            self.world_extent.width,
-        )) {
-            std.log.info("Game session won: player reached the right World Bounds", .{});
+        if (self.renderSprite(self.sprite_entity)) |player_sprite| {
+            if (self.renderSprite(self.goal_entity)) |goal_sprite| {
+                if (self.session.observeGoal(
+                    player_sprite.position,
+                    player_sprite.size,
+                    goal_sprite.position,
+                    goal_sprite.size,
+                )) {
+                    std.log.info("Game session won: player={d} overlapped goal={d}", .{ self.sprite_entity, self.goal_entity });
+                }
+            }
         }
     }
 
@@ -234,11 +266,18 @@ pub const Host = struct {
         return self.texture;
     }
 
+    fn renderSprite(self: *const Host, entity: world_api.EntityId) ?world_api.RenderSprite {
+        for (self.render_sprites[0..self.render_count]) |sprite| {
+            if (sprite.entity_id == entity) return sprite;
+        }
+        return null;
+    }
+
     fn endFrame(self: *Host, now_seconds: f64, delta_seconds: f64) void {
         self.frame_count += 1;
         if (now_seconds - self.last_heartbeat_seconds >= 1.0) {
             if (self.render_count > 0) {
-                const sprite = self.render_sprites[0];
+                const sprite = self.renderSprite(self.sprite_entity) orelse return;
                 std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, phase={s}, position=({d:.2},{d:.2})", .{
                     self.frame_count,
                     delta_seconds,

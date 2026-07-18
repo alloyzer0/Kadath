@@ -65,6 +65,17 @@ pub const Renderer2D = struct {
         sprite: SpriteInstance,
         texture: rhi.TextureHandle,
     ) !rhi.FrameOutcome {
+        const sprites = [_]SpriteInstance{sprite};
+        return self.renderSprites(backend, extent, sprites[0..], texture);
+    }
+
+    pub fn renderSprites(
+        self: *Renderer2D,
+        backend: *rhi.Rhi,
+        extent: rhi.Extent2D,
+        sprites: []const SpriteInstance,
+        texture: rhi.TextureHandle,
+    ) !rhi.FrameOutcome {
         const begin = try backend.beginFrame(extent, .{ 0.035, 0.10, 0.22, 1.0 });
         switch (begin) {
             .skipped_minimized => return .skipped_minimized,
@@ -75,20 +86,23 @@ pub const Renderer2D = struct {
 
                 const width: f32 = @floatFromInt(extent.width);
                 const height: f32 = @floatFromInt(extent.height);
-                const push = QuadPushConstants{
-                    .rect_ndc = .{
-                        sprite.position[0] / width * 2.0 - 1.0,
-                        1.0 - sprite.position[1] / height * 2.0,
-                        sprite.size[0] / width * 2.0,
-                        sprite.size[1] / height * 2.0,
-                    },
-                    .color = sprite.color,
-                };
+                for (sprites) |sprite| {
+                    const push = QuadPushConstants{
+                        .rect_ndc = .{
+                            sprite.position[0] / width * 2.0 - 1.0,
+                            1.0 - sprite.position[1] / height * 2.0,
+                            sprite.size[0] / width * 2.0,
+                            sprite.size[1] / height * 2.0,
+                        },
+                        .color = sprite.color,
+                    };
 
-                try encoder.bindPipeline(self.pipeline);
-                try encoder.bindTexture(texture);
-                try encoder.pushConstants(std.mem.asBytes(&push));
-                try encoder.draw(6);
+                    // 同一帧共享 pipeline/texture，只重复录制每个 sprite 的 push constants 与 quad。
+                    try encoder.bindPipeline(self.pipeline);
+                    try encoder.bindTexture(texture);
+                    try encoder.pushConstants(std.mem.asBytes(&push));
+                    try encoder.draw(6);
+                }
                 return try encoder.finish();
             },
         }
