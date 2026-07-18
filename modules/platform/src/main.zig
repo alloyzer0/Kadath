@@ -8,6 +8,7 @@ pub const WindowExtent = struct {
 pub const InputSnapshot = extern struct {
     move_x: i8 = 0,
     move_y: i8 = 0,
+    restart_pressed: u8 = 0,
 };
 
 pub const PumpResult = struct {

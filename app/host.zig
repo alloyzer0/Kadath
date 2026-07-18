@@ -14,6 +14,17 @@ const SpriteInstance = @import("renderer2d").SpriteInstance;
 const test_texture_id: world_api.TextureId = 1;
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
+const player_start_position = [2]f32{ 312.0, 130.0 };
+
+fn playerSpawnDesc() world_api.SpriteSpawnDesc {
+    return .{
+        .position = player_start_position,
+        .size = .{ 320.0, 240.0 },
+        .color = .{ 1.0, 1.0, 1.0, 1.0 },
+        .texture_id = test_texture_id,
+        .move_speed = 180.0,
+    };
+}
 
 pub const Host = struct {
     platform: Platform,
@@ -62,13 +73,7 @@ pub const Host = struct {
             .min = .{ 0.0, 0.0 },
             .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
         });
-        const sprite_entity = try runtime_world.spawnSprite(.{
-            .position = .{ 312.0, 130.0 },
-            .size = .{ 320.0, 240.0 },
-            .color = .{ 1.0, 1.0, 1.0, 1.0 },
-            .texture_id = test_texture_id,
-            .move_speed = 180.0,
-        });
+        const sprite_entity = try runtime_world.spawnSprite(playerSpawnDesc());
 
         var self = Host{
             .platform = platform,
@@ -109,6 +114,7 @@ pub const Host = struct {
                 std.log.info("Runtime exit requested", .{});
                 break;
             }
+            if (events.input.restart_pressed != 0) try self.restartGame();
 
             const now = self.platform.nowSeconds();
             const delta = if (now >= self.last_time_seconds)
@@ -155,6 +161,26 @@ pub const Host = struct {
 
     fn syncExternalResults(self: *Host) void {
         _ = self;
+    }
+
+    fn restartGame(self: *Host) !void {
+        if (self.session.phase != .won) return;
+
+        // 先创建替代实体；spawn 失败时旧玩家仍完整保留，不会留下空世界。
+        const previous_entity = self.sprite_entity;
+        const replacement_entity = try self.world.spawnSprite(playerSpawnDesc());
+        errdefer self.world.despawn(replacement_entity) catch {};
+        try self.world.despawn(previous_entity);
+
+        self.sprite_entity = replacement_entity;
+        std.debug.assert(self.session.restart());
+        self.accumulator_seconds = 0.0;
+        self.render_count = 0;
+        std.log.info("Game session restarted: entity={d}, position=({d:.2},{d:.2})", .{
+            replacement_entity,
+            player_start_position[0],
+            player_start_position[1],
+        });
     }
 
     fn syncWorldBounds(self: *Host) !void {

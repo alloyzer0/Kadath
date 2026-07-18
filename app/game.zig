@@ -12,6 +12,12 @@ pub const GameSession = struct {
         return self.phase == .playing;
     }
 
+    pub fn restart(self: *GameSession) bool {
+        if (self.phase != .won) return false;
+        self.phase = .playing;
+        return true;
+    }
+
     pub fn observePlayer(
         self: *GameSession,
         position: [2]f32,
@@ -41,6 +47,10 @@ test "session changes to won once at the right goal" {
     try std.testing.expect(session.phase == .won);
     try std.testing.expect(!session.acceptsInput());
     try std.testing.expect(!session.observePlayer(.{ 0.0, 0.0 }, .{ 20.0, 20.0 }, 200));
+    try std.testing.expect(session.restart());
+    try std.testing.expect(session.phase == .playing);
+    try std.testing.expect(session.acceptsInput());
+    try std.testing.expect(!session.restart());
 }
 
 test "session ignores non-finite player snapshots" {

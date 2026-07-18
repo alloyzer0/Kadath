@@ -22,6 +22,8 @@ pub const Platform = struct {
     right_down: bool = false,
     up_down: bool = false,
     down_down: bool = false,
+    restart_down: bool = false,
+    restart_pressed: bool = false,
 
     pub fn init() !Platform {
         var self = Platform{};
@@ -114,19 +116,24 @@ pub const Platform = struct {
 
     fn consumeInputMessage(self: *Platform, message: *const c.MSG) void {
         switch (message.message) {
-            c.WM_KEYDOWN, c.WM_SYSKEYDOWN => self.setDirectionalKey(message.wParam, true),
-            c.WM_KEYUP, c.WM_SYSKEYUP => self.setDirectionalKey(message.wParam, false),
+            c.WM_KEYDOWN, c.WM_SYSKEYDOWN => self.setKeyState(message.wParam, true),
+            c.WM_KEYUP, c.WM_SYSKEYUP => self.setKeyState(message.wParam, false),
             c.WM_KILLFOCUS => self.clearInput(),
             else => {},
         }
     }
 
-    fn setDirectionalKey(self: *Platform, key: c.WPARAM, is_down: bool) void {
+    fn setKeyState(self: *Platform, key: c.WPARAM, is_down: bool) void {
         switch (key) {
             c.VK_LEFT => self.left_down = is_down,
             c.VK_RIGHT => self.right_down = is_down,
             c.VK_UP => self.up_down = is_down,
             c.VK_DOWN => self.down_down = is_down,
+            'R' => {
+                // 自动重复 KeyDown 到达时 restart_down 已为 true，因此只保留首次按下沿。
+                if (is_down and !self.restart_down) self.restart_pressed = true;
+                self.restart_down = is_down;
+            },
             else => {},
         }
     }
@@ -136,12 +143,17 @@ pub const Platform = struct {
         self.right_down = false;
         self.up_down = false;
         self.down_down = false;
+        self.restart_down = false;
+        self.restart_pressed = false;
     }
 
     fn sampleInput(self: *Platform) InputSnapshot {
+        const restart_pressed: u8 = @intFromBool(self.restart_pressed);
+        self.restart_pressed = false;
         return .{
             .move_x = if (self.right_down and !self.left_down) 1 else if (self.left_down and !self.right_down) -1 else 0,
             .move_y = if (self.down_down and !self.up_down) 1 else if (self.up_down and !self.down_down) -1 else 0,
+            .restart_pressed = restart_pressed,
         };
     }
     pub fn nowSeconds(self: *Platform) f64 {
