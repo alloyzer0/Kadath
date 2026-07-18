@@ -23,6 +23,11 @@ typedef struct kadath_world_input_snapshot_t {
     int8_t move_y;
 } kadath_world_input_snapshot_t;
 
+typedef struct kadath_world_bounds_t {
+    float min[2];
+    float max[2];
+} kadath_world_bounds_t;
+
 typedef struct kadath_world_sprite_spawn_desc_t {
     float position[2];
     float size[2];
@@ -45,6 +50,12 @@ int32_t kadath_world_create(kadath_world_t* out_world);
 
 // Thread-compatible. Ownership: consumes the world handle exactly once.
 int32_t kadath_world_destroy(kadath_world_t world);
+
+// Thread-compatible. Bounds are copied during this call and immediately constrain live sprites.
+int32_t kadath_world_set_bounds(
+    kadath_world_t world,
+    const kadath_world_bounds_t* bounds
+);
 
 // Thread-compatible. The descriptor is borrowed for the duration of this call.
 int32_t kadath_world_spawn_sprite(

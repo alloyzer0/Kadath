@@ -14,6 +14,11 @@ pub const InputSnapshot = extern struct {
     move_y: i8 = 0,
 };
 
+pub const WorldBounds = extern struct {
+    min: [2]f32,
+    max: [2]f32,
+};
+
 pub const SpriteSpawnDesc = struct {
     position: [2]f32,
     size: [2]f32,
@@ -67,6 +72,14 @@ pub const World = struct {
         var entity: c.kadath_entity_id_t = c.KADATH_ENTITY_INVALID;
         try check(c.kadath_world_spawn_sprite(self.handle, &c_desc, &entity));
         return entity;
+    }
+
+    pub fn setBounds(self: *World, bounds: WorldBounds) !void {
+        var c_bounds = c.kadath_world_bounds_t{
+            .min = bounds.min,
+            .max = bounds.max,
+        };
+        try check(c.kadath_world_set_bounds(self.handle, &c_bounds));
     }
 
     pub fn stepFixed(self: *World, dt_seconds: f32, input: InputSnapshot) !void {

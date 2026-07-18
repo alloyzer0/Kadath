@@ -23,6 +23,12 @@ struct SpriteRecord {
     move_speed: f32,
 }
 
+#[derive(Clone, Copy)]
+struct WorldBounds {
+    min: [f32; 2],
+    max: [f32; 2],
+}
+
 struct EntitySlot {
     generation: u32,
     sprite: Option<SpriteRecord>,
@@ -32,9 +38,34 @@ struct EntitySlot {
 struct WorldState {
     slots: Vec<EntitySlot>,
     free_indices: Vec<u32>,
+    bounds: Option<WorldBounds>,
 }
 
 impl WorldState {
+    fn set_bounds(&mut self, bounds: &abi::kadath_world_bounds_t) -> Result<(), WorldError> {
+        if !bounds
+            .min
+            .iter()
+            .chain(bounds.max.iter())
+            .all(|value| value.is_finite())
+            || !(0..2).all(|axis| bounds.min[axis] < bounds.max[axis])
+        {
+            return Err(WorldError::InvalidArgument);
+        }
+
+        let bounds = WorldBounds {
+            min: bounds.min,
+            max: bounds.max,
+        };
+        self.bounds = Some(bounds);
+        for slot in &mut self.slots {
+            if let Some(sprite) = slot.sprite.as_mut() {
+                constrain_sprite(sprite, bounds);
+            }
+        }
+        Ok(())
+    }
+
     fn spawn_sprite(
         &mut self,
         desc: &abi::kadath_world_sprite_spawn_desc_t,
@@ -42,17 +73,26 @@ impl WorldState {
         if desc.texture_id == abi::KADATH_RESOURCE_INVALID
             || !desc.move_speed.is_finite()
             || desc.move_speed < 0.0
+            || !desc.position.iter().all(|value| value.is_finite())
+            || !desc
+                .size
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            || !desc.color.iter().all(|value| value.is_finite())
         {
             return Err(WorldError::InvalidArgument);
         }
 
-        let record = SpriteRecord {
+        let mut record = SpriteRecord {
             position: desc.position,
             size: desc.size,
             color: desc.color,
             texture_id: desc.texture_id,
             move_speed: desc.move_speed,
         };
+        if let Some(bounds) = self.bounds {
+            constrain_sprite(&mut record, bounds);
+        }
 
         if let Some(index) = self.free_indices.pop() {
             let slot = &mut self.slots[index as usize];
@@ -83,12 +123,16 @@ impl WorldState {
         {
             return Err(WorldError::InvalidArgument);
         }
+        let bounds = self.bounds;
         for slot in &mut self.slots {
             let Some(sprite) = slot.sprite.as_mut() else {
                 continue;
             };
             sprite.position[0] += f32::from(input.move_x) * sprite.move_speed * dt_seconds;
             sprite.position[1] += f32::from(input.move_y) * sprite.move_speed * dt_seconds;
+            if let Some(bounds) = bounds {
+                constrain_sprite(sprite, bounds);
+            }
         }
         Ok(())
     }
@@ -140,6 +184,14 @@ impl WorldState {
     }
 }
 
+fn constrain_sprite(sprite: &mut SpriteRecord, bounds: WorldBounds) {
+    for axis in 0..2 {
+        // 缩窗后精灵可能比世界更大；将该轴钉在 min，避免产生反向 clamp 区间。
+        let max_position = (bounds.max[axis] - sprite.size[axis]).max(bounds.min[axis]);
+        sprite.position[axis] = sprite.position[axis].clamp(bounds.min[axis], max_position);
+    }
+}
+
 fn encode_entity(index: u32, generation: u32) -> abi::kadath_entity_id_t {
     ((generation as u64) << 32) | index as u64
 }
@@ -187,6 +239,26 @@ pub extern "C" fn kadath_world_destroy(world: abi::kadath_world_t) -> i32 {
         // create 转移给调用方的唯一所有权在此收回；同一 handle 只能 destroy 一次。
         unsafe { drop(Box::from_raw(world.cast::<WorldState>())) };
         abi::KADATH_OK as i32
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn kadath_world_set_bounds(
+    world: abi::kadath_world_t,
+    bounds: *const abi::kadath_world_bounds_t,
+) -> i32 {
+    ffi_boundary(|| {
+        let (Some(world), Some(bounds)) =
+            (unsafe { world.cast::<WorldState>().as_mut() }, unsafe {
+                bounds.as_ref()
+            })
+        else {
+            return abi::KADATH_ERR_INVALID_ARGUMENT as i32;
+        };
+        world
+            .set_bounds(bounds)
+            .map(|()| abi::KADATH_OK as i32)
+            .unwrap_or_else(error_code)
     })
 }
 
@@ -295,6 +367,78 @@ mod tests {
             texture_id,
             move_speed: 100.0,
         }
+    }
+
+    fn world_bounds(min: [f32; 2], max: [f32; 2]) -> abi::kadath_world_bounds_t {
+        abi::kadath_world_bounds_t { min, max }
+    }
+
+    #[test]
+    fn fixed_step_stops_sprite_at_each_world_edge() {
+        let mut world = WorldState::default();
+        world
+            .set_bounds(&world_bounds([0.0, 0.0], [100.0, 100.0]))
+            .unwrap();
+        world.spawn_sprite(&sprite_desc(1)).unwrap();
+
+        world
+            .step_fixed(
+                2.0,
+                &abi::kadath_world_input_snapshot_t {
+                    move_x: 1,
+                    move_y: 1,
+                },
+            )
+            .unwrap();
+        let mut output = [abi::kadath_world_render_sprite_t::default(); 1];
+        world.extract_sprites(&mut output).unwrap();
+        assert_eq!(output[0].position, [68.0, 52.0]);
+
+        world
+            .step_fixed(
+                2.0,
+                &abi::kadath_world_input_snapshot_t {
+                    move_x: -1,
+                    move_y: -1,
+                },
+            )
+            .unwrap();
+        world.extract_sprites(&mut output).unwrap();
+        assert_eq!(output[0].position, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn shrinking_bounds_immediately_constrains_existing_sprite() {
+        let mut world = WorldState::default();
+        world.spawn_sprite(&sprite_desc(1)).unwrap();
+        world
+            .set_bounds(&world_bounds([5.0, 7.0], [25.0, 30.0]))
+            .unwrap();
+
+        let mut output = [abi::kadath_world_render_sprite_t::default(); 1];
+        world.extract_sprites(&mut output).unwrap();
+        // 精灵宽高均超过新边界，因此两个轴都按退化语义固定到 min。
+        assert_eq!(output[0].position, [5.0, 7.0]);
+    }
+
+    #[test]
+    fn invalid_world_bounds_are_rejected() {
+        let mut world = WorldState::default();
+        let zero_width = world_bounds([1.0, 0.0], [1.0, 10.0]);
+        assert_eq!(
+            world.set_bounds(&zero_width),
+            Err(WorldError::InvalidArgument)
+        );
+        assert_eq!(
+            error_code(WorldError::InvalidArgument),
+            abi::KADATH_ERR_INVALID_ARGUMENT as i32
+        );
+
+        let non_finite = world_bounds([0.0, 0.0], [f32::NAN, 10.0]);
+        assert_eq!(
+            world.set_bounds(&non_finite),
+            Err(WorldError::InvalidArgument)
+        );
     }
 
     #[test]

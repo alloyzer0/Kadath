@@ -21,6 +21,7 @@ pub const Host = struct {
     texture: rhi.TextureHandle,
     world: World,
     sprite_entity: world_api.EntityId,
+    world_extent: PlatformExtent,
     render_sprites: [1]world_api.RenderSprite = undefined,
     render_count: usize = 0,
     quit_requested: bool = false,
@@ -55,6 +56,10 @@ pub const Host = struct {
 
         var runtime_world = try World.init();
         errdefer runtime_world.deinit();
+        try runtime_world.setBounds(.{
+            .min = .{ 0.0, 0.0 },
+            .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
+        });
         const sprite_entity = try runtime_world.spawnSprite(.{
             .position = .{ 312.0, 130.0 },
             .size = .{ 320.0, 240.0 },
@@ -70,6 +75,7 @@ pub const Host = struct {
             .texture = texture,
             .world = runtime_world,
             .sprite_entity = sprite_entity,
+            .world_extent = extent,
         };
         const now = self.platform.nowSeconds();
         self.last_time_seconds = now;
@@ -109,6 +115,7 @@ pub const Host = struct {
             self.last_time_seconds = now;
 
             self.syncExternalResults();
+            try self.syncWorldBounds();
             try self.runFixedUpdates(delta, events.input);
             try self.extractRender();
 
@@ -142,6 +149,21 @@ pub const Host = struct {
 
     fn syncExternalResults(self: *Host) void {
         _ = self;
+    }
+
+    fn syncWorldBounds(self: *Host) !void {
+        const extent = self.platform.clientExtent();
+        // 最小化时客户区可能为零；保留最后一个有效边界，等待恢复后的真实尺寸。
+        if (extent.width == 0 or extent.height == 0 or
+            (extent.width == self.world_extent.width and extent.height == self.world_extent.height))
+        {
+            return;
+        }
+        try self.world.setBounds(.{
+            .min = .{ 0.0, 0.0 },
+            .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
+        });
+        self.world_extent = extent;
     }
 
     fn runFixedUpdates(self: *Host, delta_seconds: f64, input: InputSnapshot) !void {
