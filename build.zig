@@ -136,6 +136,22 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(exe);
 
+    // 分发目录以 bin 为运行工作目录，资产必须与 exe 保持稳定的相对位置。
+    const install_assets = b.addInstallDirectory(.{
+        .source_dir = b.path("assets"),
+        .install_dir = .bin,
+        .install_subdir = "assets",
+    });
+    b.getInstallStep().dependOn(&install_assets.step);
+    const install_package_readme = b.addInstallFile(
+        b.path("packaging/README.txt"),
+        "README.txt",
+    );
+    b.getInstallStep().dependOn(&install_package_readme.step);
+
+    const package_step = b.step("package", "Build the distributable runtime directory");
+    package_step.dependOn(b.getInstallStep());
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
