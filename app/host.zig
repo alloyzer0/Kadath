@@ -1,4 +1,5 @@
 const std = @import("std");
+const collision = @import("collision.zig");
 const game = @import("game.zig");
 const Platform = @import("platform").Platform;
 const PlatformExtent = @import("platform").WindowExtent;
@@ -298,31 +299,17 @@ pub const Host = struct {
         // World 只写入稳定 POD 快照；渲染提交阶段不读取 World 内部存储。
         const sprites = try self.world.extractSprites(&self.render_sprites);
         self.render_count = sprites.len;
+
+        const player = self.collisionBody(self.sprite_entity) orelse return error.WorldProducedNoPlayerSprite;
+        const hazard = self.collisionBody(self.hazard_entity) orelse return error.WorldProducedNoHazardSprite;
         // 失败判定优先，避免同帧同时接触 Hazard/Goal 时被误判为成功。
-        if (self.renderSprite(self.sprite_entity)) |player_sprite| {
-            if (self.renderSprite(self.hazard_entity)) |hazard_sprite| {
-                if (self.session.observeHazard(
-                    player_sprite.position,
-                    player_sprite.size,
-                    hazard_sprite.position,
-                    hazard_sprite.size,
-                )) {
-                    std.log.info("Game session lost: player={d} hit hazard={d}", .{ self.sprite_entity, self.hazard_entity });
-                }
-            }
+        if (self.session.observeHazard(player, hazard)) {
+            std.log.info("Game session lost: player={d} hit hazard={d}", .{ self.sprite_entity, self.hazard_entity });
         }
         if (self.session.phase == .playing) {
-            if (self.renderSprite(self.sprite_entity)) |player_sprite| {
-                if (self.renderSprite(self.goal_entity)) |goal_sprite| {
-                    if (self.session.observeGoal(
-                        player_sprite.position,
-                        player_sprite.size,
-                        goal_sprite.position,
-                        goal_sprite.size,
-                    )) {
-                        std.log.info("Game session won: player={d} overlapped goal={d}", .{ self.sprite_entity, self.goal_entity });
-                    }
-                }
+            const goal = self.collisionBody(self.goal_entity) orelse return error.WorldProducedNoGoalSprite;
+            if (self.session.observeGoal(player, goal)) {
+                std.log.info("Game session won: player={d} overlapped goal={d}", .{ self.sprite_entity, self.goal_entity });
             }
         }
     }
@@ -338,6 +325,17 @@ pub const Host = struct {
             if (sprite.entity_id == entity) return sprite;
         }
         return null;
+    }
+    fn collisionBody(self: *const Host, entity: world_api.EntityId) ?collision.Body {
+        const sprite = self.renderSprite(entity) orelse return null;
+        // 关键映射：玩法碰撞只消费 World 快照值，不持有 World 或 Renderer2D 内部状态。
+        return .{
+            .entity_id = entity,
+            .aabb = .{
+                .position = sprite.position,
+                .size = sprite.size,
+            },
+        };
     }
 
     fn endFrame(self: *Host, now_seconds: f64, delta_seconds: f64) void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const collision = @import("collision.zig");
 
 pub const Phase = enum {
     playing,
@@ -37,15 +38,12 @@ pub const GameSession = struct {
 
     pub fn observeHazard(
         self: *GameSession,
-        player_position: [2]f32,
-        player_size: [2]f32,
-        hazard_position: [2]f32,
-        hazard_size: [2]f32,
+        player: collision.Body,
+        hazard: collision.Body,
     ) bool {
         if (self.phase != .playing) return false;
-        if (!finiteRect(player_position, player_size) or !finiteRect(hazard_position, hazard_size)) return false;
 
-        if (overlaps(player_position, player_size, hazard_position, hazard_size)) {
+        if (collision.queryContact(player, hazard) != null) {
             self.phase = .lost;
             return true;
         }
@@ -54,16 +52,13 @@ pub const GameSession = struct {
 
     pub fn observeGoal(
         self: *GameSession,
-        player_position: [2]f32,
-        player_size: [2]f32,
-        goal_position: [2]f32,
-        goal_size: [2]f32,
+        player: collision.Body,
+        goal: collision.Body,
     ) bool {
         if (self.phase != .playing) return false;
-        if (!finiteRect(player_position, player_size) or !finiteRect(goal_position, goal_size)) return false;
 
-        // 目标判定只消费两个 World 快照，不再把窗口边界当成玩法数据。
-        if (overlaps(player_position, player_size, goal_position, goal_size)) {
+        // 玩法状态只消费 Contact 结果，几何有效性与重叠语义统一留在 collision 模块。
+        if (collision.queryContact(player, goal) != null) {
             self.phase = .won;
             return true;
         }
@@ -71,35 +66,25 @@ pub const GameSession = struct {
     }
 };
 
-fn finiteRect(position: [2]f32, size: [2]f32) bool {
-    return std.math.isFinite(position[0]) and std.math.isFinite(position[1]) and
-        std.math.isFinite(size[0]) and std.math.isFinite(size[1]) and
-        size[0] >= 0.0 and size[1] >= 0.0;
-}
-
-fn overlaps(
-    first_position: [2]f32,
-    first_size: [2]f32,
-    second_position: [2]f32,
-    second_size: [2]f32,
-) bool {
-    const first_right = first_position[0] + first_size[0];
-    const first_bottom = first_position[1] + first_size[1];
-    const second_right = second_position[0] + second_size[0];
-    const second_bottom = second_position[1] + second_size[1];
-    return first_position[0] < second_right and first_right > second_position[0] and
-        first_position[1] < second_bottom and first_bottom > second_position[1];
+fn body(entity_id: collision.EntityId, position: [2]f32, size: [2]f32) collision.Body {
+    return .{
+        .entity_id = entity_id,
+        .aabb = .{
+            .position = position,
+            .size = size,
+        },
+    };
 }
 
 test "session changes to won once on goal overlap" {
     var session = GameSession{};
     try std.testing.expect(session.acceptsInput());
-    try std.testing.expect(!session.observeGoal(.{ 100.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(!session.observeGoal(body(1, .{ 100.0, 0.0 }, .{ 20.0, 20.0 }), body(2, .{ 180.0, 0.0 }, .{ 20.0, 20.0 })));
     try std.testing.expect(session.phase == .playing);
-    try std.testing.expect(session.observeGoal(.{ 170.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(session.observeGoal(body(1, .{ 170.0, 0.0 }, .{ 20.0, 20.0 }), body(2, .{ 180.0, 0.0 }, .{ 20.0, 20.0 })));
     try std.testing.expect(session.phase == .won);
     try std.testing.expect(!session.acceptsInput());
-    try std.testing.expect(!session.observeGoal(.{ 0.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(!session.observeGoal(body(1, .{ 0.0, 0.0 }, .{ 20.0, 20.0 }), body(2, .{ 180.0, 0.0 }, .{ 20.0, 20.0 })));
     try std.testing.expect(session.restart());
     try std.testing.expect(session.phase == .playing);
     try std.testing.expect(session.acceptsInput());
@@ -109,9 +94,9 @@ test "session changes to won once on goal overlap" {
 
 test "session enters lost when hazard overlaps player" {
     var session = GameSession{};
-    try std.testing.expect(!session.observeHazard(.{ 100.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(!session.observeHazard(body(1, .{ 100.0, 0.0 }, .{ 20.0, 20.0 }), body(3, .{ 180.0, 0.0 }, .{ 20.0, 20.0 })));
     try std.testing.expect(session.phase == .playing);
-    try std.testing.expect(session.observeHazard(.{ 170.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(session.observeHazard(body(1, .{ 170.0, 0.0 }, .{ 20.0, 20.0 }), body(3, .{ 180.0, 0.0 }, .{ 20.0, 20.0 })));
     try std.testing.expect(session.phase == .lost);
     try std.testing.expect(!session.acceptsInput());
     try std.testing.expect(session.restart());
@@ -132,7 +117,7 @@ test "session enters lost when fixed-step timer expires" {
 
 test "session ignores non-finite player snapshots" {
     var session = GameSession{};
-    try std.testing.expect(!session.observeGoal(.{ std.math.nan(f32), 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(!session.observeGoal(body(1, .{ std.math.nan(f32), 0.0 }, .{ 20.0, 20.0 }), body(2, .{ 180.0, 0.0 }, .{ 20.0, 20.0 })));
     try std.testing.expect(!session.tickFixed(std.math.nan(f32)));
     try std.testing.expect(session.phase == .playing);
 }
