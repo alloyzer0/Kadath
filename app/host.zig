@@ -169,10 +169,11 @@ pub const Host = struct {
             .{
                 .position = player.position,
                 .size = player.size,
-                .color = if (self.session.phase == .won)
-                    .{ 0.20, 0.95, 0.35, 1.0 }
-                else
-                    player.color,
+                .color = switch (self.session.phase) {
+                    .won => .{ 0.20, 0.95, 0.35, 1.0 },
+                    .lost => .{ 0.95, 0.20, 0.20, 1.0 },
+                    .playing => player.color,
+                },
             },
         };
         const outcome = try self.renderer2d.renderSprites(
@@ -191,7 +192,7 @@ pub const Host = struct {
     }
 
     fn restartGame(self: *Host) !void {
-        if (self.session.phase != .won) return;
+        if (self.session.phase == .playing) return;
 
         // 先创建替代实体；spawn 失败时旧玩家仍完整保留，不会留下空世界。
         const previous_entity = self.sprite_entity;
@@ -230,6 +231,9 @@ pub const Host = struct {
         self.accumulator_seconds += @min(delta_seconds, 0.25);
         var steps: u8 = 0;
         while (self.accumulator_seconds >= fixed_dt_seconds and steps < max_fixed_steps_per_frame) : (steps += 1) {
+            if (self.session.tickFixed(@floatCast(fixed_dt_seconds))) {
+                std.log.info("Game session lost: timer expired", .{});
+            }
             const step_input = if (self.session.acceptsInput()) input else InputSnapshot{};
             try self.world.stepFixed(@floatCast(fixed_dt_seconds), .{
                 .move_x = step_input.move_x,

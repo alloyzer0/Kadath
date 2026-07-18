@@ -3,19 +3,36 @@ const std = @import("std");
 pub const Phase = enum {
     playing,
     won,
+    lost,
 };
+
+pub const time_limit_seconds: f32 = 3.0;
 
 pub const GameSession = struct {
     phase: Phase = .playing,
+    time_remaining_seconds: f32 = time_limit_seconds,
 
     pub fn acceptsInput(self: *const GameSession) bool {
         return self.phase == .playing;
     }
 
     pub fn restart(self: *GameSession) bool {
-        if (self.phase != .won) return false;
+        if (self.phase == .playing) return false;
         self.phase = .playing;
+        self.time_remaining_seconds = time_limit_seconds;
         return true;
+    }
+
+    pub fn tickFixed(self: *GameSession, dt_seconds: f32) bool {
+        if (self.phase != .playing) return false;
+        if (!std.math.isFinite(dt_seconds) or dt_seconds < 0.0) return false;
+        if (dt_seconds >= self.time_remaining_seconds) {
+            self.time_remaining_seconds = 0.0;
+            self.phase = .lost;
+            return true;
+        }
+        self.time_remaining_seconds -= dt_seconds;
+        return false;
     }
 
     pub fn observeGoal(
@@ -70,10 +87,24 @@ test "session changes to won once on goal overlap" {
     try std.testing.expect(session.phase == .playing);
     try std.testing.expect(session.acceptsInput());
     try std.testing.expect(!session.restart());
+    try std.testing.expect(session.time_remaining_seconds == time_limit_seconds);
+}
+
+test "session enters lost when fixed-step timer expires" {
+    var session = GameSession{};
+    try std.testing.expect(!session.tickFixed(2.5));
+    try std.testing.expect(session.phase == .playing);
+    try std.testing.expect(session.tickFixed(0.5));
+    try std.testing.expect(session.phase == .lost);
+    try std.testing.expect(!session.acceptsInput());
+    try std.testing.expect(session.restart());
+    try std.testing.expect(session.phase == .playing);
+    try std.testing.expect(session.time_remaining_seconds == time_limit_seconds);
 }
 
 test "session ignores non-finite player snapshots" {
     var session = GameSession{};
     try std.testing.expect(!session.observeGoal(.{ std.math.nan(f32), 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(!session.tickFixed(std.math.nan(f32)));
     try std.testing.expect(session.phase == .playing);
 }
