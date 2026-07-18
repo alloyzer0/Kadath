@@ -20,6 +20,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const audio_mod = b.createModule(.{
+        .root_source_file = b.path("modules/audio/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const world_mod = b.createModule(.{
         .root_source_file = b.path("modules/world/src/main.zig"),
         .target = target,
@@ -42,12 +47,14 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("platform", platform_mod);
     exe_mod.addImport("rhi", rhi_mod);
     exe_mod.addImport("resource", resource_mod);
+    exe_mod.addImport("audio", audio_mod);
     exe_mod.addImport("renderer2d", renderer2d_mod);
     exe_mod.addImport("world", world_mod);
 
     if (target.result.os.tag == .windows) {
         platform_mod.linkSystemLibrary("user32", .{});
         platform_mod.linkSystemLibrary("gdi32", .{});
+        audio_mod.linkSystemLibrary("winmm", .{});
 
         // Work around Zig 0.16 translating unused MinGW fortified wchar wrappers in ReleaseSafe.
         platform_mod.addCMacro("_FORTIFY_SOURCE", "0");

@@ -1,4 +1,5 @@
 const std = @import("std");
+const audio_api = @import("audio");
 const collision = @import("collision.zig");
 const game = @import("game.zig");
 const Platform = @import("platform").Platform;
@@ -56,6 +57,7 @@ pub const Host = struct {
     platform: Platform,
     rhi: Rhi,
     renderer2d: Renderer2D,
+    audio: audio_api.Audio,
     texture: rhi.TextureHandle,
     world: World,
     sprite_entity: world_api.EntityId,
@@ -111,6 +113,7 @@ pub const Host = struct {
             .platform = platform,
             .rhi = backend,
             .renderer2d = renderer2d,
+            .audio = audio_api.Audio.init(),
             .texture = texture,
             .world = runtime_world,
             .sprite_entity = sprite_entity,
@@ -129,6 +132,7 @@ pub const Host = struct {
     }
 
     pub fn deinit(self: *Host) void {
+        self.audio.deinit();
         self.world.despawn(self.sprite_entity) catch |err| {
             std.log.err("World sprite despawn failed: {s}", .{@errorName(err)});
         };
@@ -267,6 +271,7 @@ pub const Host = struct {
         var steps: u8 = 0;
         while (self.accumulator_seconds >= fixed_dt_seconds and steps < max_fixed_steps_per_frame) : (steps += 1) {
             if (self.session.tickFixed(@floatCast(fixed_dt_seconds))) {
+                self.audio.play(.lost);
                 std.log.info("Game session lost: timer expired", .{});
             }
             if (self.session.acceptsInput()) try self.stepHazard(@floatCast(fixed_dt_seconds));
@@ -304,11 +309,13 @@ pub const Host = struct {
         const hazard = self.collisionBody(self.hazard_entity) orelse return error.WorldProducedNoHazardSprite;
         // 失败判定优先，避免同帧同时接触 Hazard/Goal 时被误判为成功。
         if (self.session.observeHazard(player, hazard)) {
+            self.audio.play(.lost);
             std.log.info("Game session lost: player={d} hit hazard={d}", .{ self.sprite_entity, self.hazard_entity });
         }
         if (self.session.phase == .playing) {
             const goal = self.collisionBody(self.goal_entity) orelse return error.WorldProducedNoGoalSprite;
             if (self.session.observeGoal(player, goal)) {
+                self.audio.play(.won);
                 std.log.info("Game session won: player={d} overlapped goal={d}", .{ self.sprite_entity, self.goal_entity });
             }
         }
