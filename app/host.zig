@@ -16,7 +16,10 @@ const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
 const player_start_position = [2]f32{ 312.0, 130.0 };
 const goal_position = [2]f32{ 700.0, 200.0 };
-const hazard_position = [2]f32{ 650.0, 300.0 };
+const hazard_position = [2]f32{ 650.0, 280.0 };
+const hazard_min_y: f32 = 245.0;
+const hazard_max_y: f32 = 330.0;
+const hazard_speed: f32 = 80.0;
 
 fn playerSpawnDesc() world_api.SpriteSpawnDesc {
     return .{
@@ -57,6 +60,8 @@ pub const Host = struct {
     sprite_entity: world_api.EntityId,
     goal_entity: world_api.EntityId,
     hazard_entity: world_api.EntityId,
+    hazard_y: f32,
+    hazard_direction: f32,
     world_extent: PlatformExtent,
     session: game.GameSession = .{},
     render_sprites: [3]world_api.RenderSprite = undefined,
@@ -110,6 +115,8 @@ pub const Host = struct {
             .sprite_entity = sprite_entity,
             .goal_entity = goal_entity,
             .hazard_entity = hazard_entity,
+            .hazard_y = hazard_position[1],
+            .hazard_direction = 1.0,
             .world_extent = extent,
             .session = .{},
         };
@@ -225,6 +232,9 @@ pub const Host = struct {
         try self.world.despawn(previous_entity);
 
         self.sprite_entity = replacement_entity;
+        self.hazard_y = hazard_position[1];
+        self.hazard_direction = 1.0;
+        try self.world.setSpritePosition(self.hazard_entity, hazard_position);
         std.debug.assert(self.session.restart());
         self.accumulator_seconds = 0.0;
         self.render_count = 0;
@@ -258,6 +268,7 @@ pub const Host = struct {
             if (self.session.tickFixed(@floatCast(fixed_dt_seconds))) {
                 std.log.info("Game session lost: timer expired", .{});
             }
+            if (self.session.acceptsInput()) try self.stepHazard(@floatCast(fixed_dt_seconds));
             const step_input = if (self.session.acceptsInput()) input else InputSnapshot{};
             try self.world.stepFixed(@floatCast(fixed_dt_seconds), .{
                 .move_x = step_input.move_x,
@@ -268,6 +279,19 @@ pub const Host = struct {
         if (steps == max_fixed_steps_per_frame and self.accumulator_seconds >= fixed_dt_seconds) {
             self.accumulator_seconds = @mod(self.accumulator_seconds, fixed_dt_seconds);
         }
+    }
+
+    fn stepHazard(self: *Host, dt_seconds: f32) !void {
+        self.hazard_y += self.hazard_direction * hazard_speed * dt_seconds;
+        if (self.hazard_y > hazard_max_y) {
+            self.hazard_y = hazard_max_y - (self.hazard_y - hazard_max_y);
+            self.hazard_direction = -1.0;
+        } else if (self.hazard_y < hazard_min_y) {
+            self.hazard_y = hazard_min_y + (hazard_min_y - self.hazard_y);
+            self.hazard_direction = 1.0;
+        }
+        // 巡逻状态由 Host 驱动，最终位置仍通过 World 受控 setter 提交。
+        try self.world.setSpritePosition(self.hazard_entity, .{ hazard_position[0], self.hazard_y });
     }
 
     fn extractRender(self: *Host) !void {
@@ -321,12 +345,13 @@ pub const Host = struct {
         if (now_seconds - self.last_heartbeat_seconds >= 1.0) {
             if (self.render_count > 0) {
                 const sprite = self.renderSprite(self.sprite_entity) orelse return;
-                std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, phase={s}, position=({d:.2},{d:.2})", .{
+                std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, phase={s}, position=({d:.2},{d:.2}), hazard_y={d:.2}", .{
                     self.frame_count,
                     delta_seconds,
                     @tagName(self.session.phase),
                     sprite.position[0],
                     sprite.position[1],
+                    self.hazard_y,
                 });
             } else {
                 std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s", .{

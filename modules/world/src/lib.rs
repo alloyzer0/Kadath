@@ -66,6 +66,29 @@ impl WorldState {
         Ok(())
     }
 
+    fn set_sprite_position(
+        &mut self,
+        entity: abi::kadath_entity_id_t,
+        position: &abi::kadath_world_position_t,
+    ) -> Result<(), WorldError> {
+        if !position.value.iter().all(|value| value.is_finite()) {
+            return Err(WorldError::InvalidArgument);
+        }
+        let (index, generation) = decode_entity(entity).ok_or(WorldError::InvalidEntity)?;
+        let bounds = self.bounds;
+        let slot = self
+            .slots
+            .get_mut(index as usize)
+            .filter(|slot| slot.generation == generation && slot.sprite.is_some())
+            .ok_or(WorldError::InvalidEntity)?;
+        let sprite = slot.sprite.as_mut().ok_or(WorldError::InvalidEntity)?;
+        sprite.position = position.value;
+        if let Some(bounds) = bounds {
+            constrain_sprite(sprite, bounds);
+        }
+        Ok(())
+    }
+
     fn spawn_sprite(
         &mut self,
         desc: &abi::kadath_world_sprite_spawn_desc_t,
@@ -263,6 +286,27 @@ pub extern "C" fn kadath_world_set_bounds(
 }
 
 #[no_mangle]
+pub extern "C" fn kadath_world_set_sprite_position(
+    world: abi::kadath_world_t,
+    entity: abi::kadath_entity_id_t,
+    position: *const abi::kadath_world_position_t,
+) -> i32 {
+    ffi_boundary(|| {
+        let (Some(world), Some(position)) =
+            (unsafe { world.cast::<WorldState>().as_mut() }, unsafe {
+                position.as_ref()
+            })
+        else {
+            return abi::KADATH_ERR_INVALID_ARGUMENT as i32;
+        };
+        world
+            .set_sprite_position(entity, position)
+            .map(|()| abi::KADATH_OK as i32)
+            .unwrap_or_else(error_code)
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn kadath_world_spawn_sprite(
     world: abi::kadath_world_t,
     desc: *const abi::kadath_world_sprite_spawn_desc_t,
@@ -438,6 +482,46 @@ mod tests {
         assert_eq!(
             world.set_bounds(&non_finite),
             Err(WorldError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn set_position_clamps_and_rejects_stale_entity() {
+        let mut world = WorldState::default();
+        world
+            .set_bounds(&world_bounds([0.0, 0.0], [100.0, 100.0]))
+            .unwrap();
+        let entity = world.spawn_sprite(&sprite_desc(1)).unwrap();
+        world
+            .set_sprite_position(
+                entity,
+                &abi::kadath_world_position_t {
+                    value: [90.0, 90.0],
+                },
+            )
+            .unwrap();
+        let mut output = [abi::kadath_world_render_sprite_t::default(); 1];
+        world.extract_sprites(&mut output).unwrap();
+        assert_eq!(output[0].position, [68.0, 52.0]);
+
+        world.despawn(entity).unwrap();
+        assert_eq!(
+            world.set_sprite_position(
+                entity,
+                &abi::kadath_world_position_t {
+                    value: [10.0, 10.0]
+                },
+            ),
+            Err(WorldError::InvalidEntity)
+        );
+        assert_eq!(
+            world.set_sprite_position(
+                abi::KADATH_ENTITY_INVALID as abi::kadath_entity_id_t,
+                &abi::kadath_world_position_t {
+                    value: [10.0, 10.0]
+                },
+            ),
+            Err(WorldError::InvalidEntity)
         );
     }
 

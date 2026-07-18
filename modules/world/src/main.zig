@@ -19,6 +19,10 @@ pub const WorldBounds = extern struct {
     max: [2]f32,
 };
 
+pub const WorldPosition = extern struct {
+    value: [2]f32,
+};
+
 pub const SpriteSpawnDesc = struct {
     position: [2]f32,
     size: [2]f32,
@@ -80,6 +84,11 @@ pub const World = struct {
             .max = bounds.max,
         };
         try check(c.kadath_world_set_bounds(self.handle, &c_bounds));
+    }
+
+    pub fn setSpritePosition(self: *World, entity: EntityId, position: [2]f32) !void {
+        var c_position = c.kadath_world_position_t{ .value = position };
+        try check(c.kadath_world_set_sprite_position(self.handle, entity, &c_position));
     }
 
     pub fn stepFixed(self: *World, dt_seconds: f32, input: InputSnapshot) !void {

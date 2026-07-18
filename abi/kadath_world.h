@@ -28,6 +28,10 @@ typedef struct kadath_world_bounds_t {
     float max[2];
 } kadath_world_bounds_t;
 
+typedef struct kadath_world_position_t {
+    float value[2];
+} kadath_world_position_t;
+
 typedef struct kadath_world_sprite_spawn_desc_t {
     float position[2];
     float size[2];
@@ -55,6 +59,13 @@ int32_t kadath_world_destroy(kadath_world_t world);
 int32_t kadath_world_set_bounds(
     kadath_world_t world,
     const kadath_world_bounds_t* bounds
+);
+
+// Thread-compatible. Position is copied during this call and bounds are applied.
+int32_t kadath_world_set_sprite_position(
+    kadath_world_t world,
+    kadath_entity_id_t entity,
+    const kadath_world_position_t* position
 );
 
 // Thread-compatible. The descriptor is borrowed for the duration of this call.
