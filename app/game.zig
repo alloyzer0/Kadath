@@ -35,6 +35,23 @@ pub const GameSession = struct {
         return false;
     }
 
+    pub fn observeHazard(
+        self: *GameSession,
+        player_position: [2]f32,
+        player_size: [2]f32,
+        hazard_position: [2]f32,
+        hazard_size: [2]f32,
+    ) bool {
+        if (self.phase != .playing) return false;
+        if (!finiteRect(player_position, player_size) or !finiteRect(hazard_position, hazard_size)) return false;
+
+        if (overlaps(player_position, player_size, hazard_position, hazard_size)) {
+            self.phase = .lost;
+            return true;
+        }
+        return false;
+    }
+
     pub fn observeGoal(
         self: *GameSession,
         player_position: [2]f32,
@@ -88,6 +105,17 @@ test "session changes to won once on goal overlap" {
     try std.testing.expect(session.acceptsInput());
     try std.testing.expect(!session.restart());
     try std.testing.expect(session.time_remaining_seconds == time_limit_seconds);
+}
+
+test "session enters lost when hazard overlaps player" {
+    var session = GameSession{};
+    try std.testing.expect(!session.observeHazard(.{ 100.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(session.phase == .playing);
+    try std.testing.expect(session.observeHazard(.{ 170.0, 0.0 }, .{ 20.0, 20.0 }, .{ 180.0, 0.0 }, .{ 20.0, 20.0 }));
+    try std.testing.expect(session.phase == .lost);
+    try std.testing.expect(!session.acceptsInput());
+    try std.testing.expect(session.restart());
+    try std.testing.expect(session.phase == .playing);
 }
 
 test "session enters lost when fixed-step timer expires" {

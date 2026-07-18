@@ -16,6 +16,7 @@ const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
 const player_start_position = [2]f32{ 312.0, 130.0 };
 const goal_position = [2]f32{ 700.0, 200.0 };
+const hazard_position = [2]f32{ 650.0, 300.0 };
 
 fn playerSpawnDesc() world_api.SpriteSpawnDesc {
     return .{
@@ -37,6 +38,16 @@ fn goalSpawnDesc() world_api.SpriteSpawnDesc {
     };
 }
 
+fn hazardSpawnDesc() world_api.SpriteSpawnDesc {
+    return .{
+        .position = hazard_position,
+        .size = .{ 96.0, 96.0 },
+        .color = .{ 0.95, 0.20, 0.20, 1.0 },
+        .texture_id = test_texture_id,
+        .move_speed = 0.0,
+    };
+}
+
 pub const Host = struct {
     platform: Platform,
     rhi: Rhi,
@@ -45,9 +56,10 @@ pub const Host = struct {
     world: World,
     sprite_entity: world_api.EntityId,
     goal_entity: world_api.EntityId,
+    hazard_entity: world_api.EntityId,
     world_extent: PlatformExtent,
     session: game.GameSession = .{},
-    render_sprites: [2]world_api.RenderSprite = undefined,
+    render_sprites: [3]world_api.RenderSprite = undefined,
     render_count: usize = 0,
     quit_requested: bool = false,
     last_time_seconds: f64 = 0.0,
@@ -87,6 +99,7 @@ pub const Host = struct {
         });
         const sprite_entity = try runtime_world.spawnSprite(playerSpawnDesc());
         const goal_entity = try runtime_world.spawnSprite(goalSpawnDesc());
+        const hazard_entity = try runtime_world.spawnSprite(hazardSpawnDesc());
 
         var self = Host{
             .platform = platform,
@@ -96,13 +109,14 @@ pub const Host = struct {
             .world = runtime_world,
             .sprite_entity = sprite_entity,
             .goal_entity = goal_entity,
+            .hazard_entity = hazard_entity,
             .world_extent = extent,
             .session = .{},
         };
         const now = self.platform.nowSeconds();
         self.last_time_seconds = now;
         self.last_heartbeat_seconds = now;
-        std.log.info("Runtime host initialized with Vulkan RHI entities: player={d}, goal={d}", .{ sprite_entity, goal_entity });
+        std.log.info("Runtime host initialized with Vulkan RHI entities: player={d}, goal={d}, hazard={d}", .{ sprite_entity, goal_entity, hazard_entity });
         return self;
     }
 
@@ -112,6 +126,9 @@ pub const Host = struct {
         };
         self.world.despawn(self.goal_entity) catch |err| {
             std.log.err("World goal despawn failed: {s}", .{@errorName(err)});
+        };
+        self.world.despawn(self.hazard_entity) catch |err| {
+            std.log.err("World hazard despawn failed: {s}", .{@errorName(err)});
         };
         self.world.deinit();
         self.rhi.destroyTexture(self.texture);
@@ -156,15 +173,22 @@ pub const Host = struct {
         if (self.render_count == 0) return error.WorldProducedNoRenderSprite;
         const extent: PlatformExtent = self.platform.clientExtent();
         const goal = self.renderSprite(self.goal_entity) orelse return error.WorldProducedNoGoalSprite;
+        const hazard = self.renderSprite(self.hazard_entity) orelse return error.WorldProducedNoHazardSprite;
         const player = self.renderSprite(self.sprite_entity) orelse return error.WorldProducedNoPlayerSprite;
         _ = try self.resolveTexture(goal.texture_id);
+        _ = try self.resolveTexture(hazard.texture_id);
         _ = try self.resolveTexture(player.texture_id);
-        // 固定目标先画、玩家后画，避免重开后的 slot 顺序改变可见层级。
+        // 固定目标、Hazard 先画，玩家后画，避免重开后的 slot 顺序改变可见层级。
         const instances = [_]SpriteInstance{
             .{
                 .position = goal.position,
                 .size = goal.size,
                 .color = goal.color,
+            },
+            .{
+                .position = hazard.position,
+                .size = hazard.size,
+                .color = hazard.color,
             },
             .{
                 .position = player.position,
@@ -250,15 +274,30 @@ pub const Host = struct {
         // World 只写入稳定 POD 快照；渲染提交阶段不读取 World 内部存储。
         const sprites = try self.world.extractSprites(&self.render_sprites);
         self.render_count = sprites.len;
+        // 失败判定优先，避免同帧同时接触 Hazard/Goal 时被误判为成功。
         if (self.renderSprite(self.sprite_entity)) |player_sprite| {
-            if (self.renderSprite(self.goal_entity)) |goal_sprite| {
-                if (self.session.observeGoal(
+            if (self.renderSprite(self.hazard_entity)) |hazard_sprite| {
+                if (self.session.observeHazard(
                     player_sprite.position,
                     player_sprite.size,
-                    goal_sprite.position,
-                    goal_sprite.size,
+                    hazard_sprite.position,
+                    hazard_sprite.size,
                 )) {
-                    std.log.info("Game session won: player={d} overlapped goal={d}", .{ self.sprite_entity, self.goal_entity });
+                    std.log.info("Game session lost: player={d} hit hazard={d}", .{ self.sprite_entity, self.hazard_entity });
+                }
+            }
+        }
+        if (self.session.phase == .playing) {
+            if (self.renderSprite(self.sprite_entity)) |player_sprite| {
+                if (self.renderSprite(self.goal_entity)) |goal_sprite| {
+                    if (self.session.observeGoal(
+                        player_sprite.position,
+                        player_sprite.size,
+                        goal_sprite.position,
+                        goal_sprite.size,
+                    )) {
+                        std.log.info("Game session won: player={d} overlapped goal={d}", .{ self.sprite_entity, self.goal_entity });
+                    }
                 }
             }
         }
