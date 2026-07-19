@@ -2,6 +2,7 @@ const std = @import("std");
 const audio_api = @import("audio");
 const collision = @import("collision.zig");
 const game = @import("game.zig");
+const scene_api = @import("scene.zig");
 const Platform = @import("platform").Platform;
 const PlatformExtent = @import("platform").WindowExtent;
 const InputSnapshot = @import("platform").InputSnapshot;
@@ -12,48 +13,69 @@ const world_api = @import("world");
 const World = world_api.World;
 const Renderer2D = @import("renderer2d").Renderer2D;
 const SpriteInstance = @import("renderer2d").SpriteInstance;
+const SpawnedScene = struct {
+    world: World,
+    player_entity: world_api.EntityId,
+    goal_entity: world_api.EntityId,
+    hazard_entity: world_api.EntityId,
+};
+
+fn spawnSceneWorld(scene: *const scene_api.Scene, extent: PlatformExtent) !SpawnedScene {
+    var runtime_world = try World.init();
+    errdefer runtime_world.deinit();
+    try runtime_world.setBounds(.{
+        .min = .{ 0.0, 0.0 },
+        .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
+    });
+    const player_entity = try runtime_world.spawnSprite(playerSpawnDesc(scene));
+    const goal_entity = try runtime_world.spawnSprite(goalSpawnDesc(scene));
+    const hazard_entity = try runtime_world.spawnSprite(hazardSpawnDesc(scene));
+    return .{
+        .world = runtime_world,
+        .player_entity = player_entity,
+        .goal_entity = goal_entity,
+        .hazard_entity = hazard_entity,
+    };
+}
 
 const test_texture_id: world_api.TextureId = 1;
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
-const player_start_position = [2]f32{ 312.0, 130.0 };
-const goal_position = [2]f32{ 700.0, 200.0 };
-const hazard_position = [2]f32{ 650.0, 280.0 };
-const hazard_min_y: f32 = 245.0;
-const hazard_max_y: f32 = 330.0;
-const hazard_speed: f32 = 80.0;
 
-fn playerSpawnDesc() world_api.SpriteSpawnDesc {
+fn playerSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
     return .{
-        .position = player_start_position,
-        .size = .{ 320.0, 240.0 },
-        .color = .{ 1.0, 1.0, 1.0, 1.0 },
+        .position = scene.player.position,
+        .size = scene.player.size,
+        .color = scene.player.color,
         .texture_id = test_texture_id,
-        .move_speed = 180.0,
+        .move_speed = scene.player.moveSpeed,
     };
 }
 
-fn goalSpawnDesc() world_api.SpriteSpawnDesc {
+fn goalSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
     return .{
-        .position = goal_position,
-        .size = .{ 96.0, 96.0 },
-        .color = .{ 1.0, 0.75, 0.10, 1.0 },
+        .position = scene.goal.position,
+        .size = scene.goal.size,
+        .color = scene.goal.color,
         .texture_id = test_texture_id,
         .move_speed = 0.0,
     };
 }
 
-fn hazardSpawnDesc() world_api.SpriteSpawnDesc {
+fn hazardSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
     return .{
-        .position = hazard_position,
-        .size = .{ 96.0, 96.0 },
-        .color = .{ 0.95, 0.20, 0.20, 1.0 },
+        .position = scene.hazard.position,
+        .size = scene.hazard.size,
+        .color = scene.hazard.color,
         .texture_id = test_texture_id,
         .move_speed = 0.0,
     };
 }
 
 pub const Host = struct {
+    io: std.Io,
+    scene: scene_api.Scene,
+    scene_path: ?[]const u8,
     platform: Platform,
     rhi: Rhi,
     renderer2d: Renderer2D,
@@ -75,7 +97,16 @@ pub const Host = struct {
     frame_count: u64 = 0,
     last_heartbeat_seconds: f64 = 0.0,
 
-    pub fn init(io: std.Io) !Host {
+    pub fn init(io: std.Io, scene_path: ?[]const u8) !Host {
+        const scene = if (scene_path) |path| blk: {
+            const loaded = try scene_api.load(io, std.heap.page_allocator, path);
+            std.log.info("Loaded preview scene: {s}", .{path});
+            break :blk loaded;
+        } else blk: {
+            std.log.info("Using built-in preview scene", .{});
+            break :blk scene_api.default_scene;
+        };
+
         var platform = try Platform.init();
         errdefer platform.deinit();
 
@@ -99,27 +130,24 @@ pub const Host = struct {
         });
         errdefer backend.destroyTexture(texture);
 
-        var runtime_world = try World.init();
+        const spawned = try spawnSceneWorld(&scene, extent);
+        var runtime_world = spawned.world;
         errdefer runtime_world.deinit();
-        try runtime_world.setBounds(.{
-            .min = .{ 0.0, 0.0 },
-            .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
-        });
-        const sprite_entity = try runtime_world.spawnSprite(playerSpawnDesc());
-        const goal_entity = try runtime_world.spawnSprite(goalSpawnDesc());
-        const hazard_entity = try runtime_world.spawnSprite(hazardSpawnDesc());
 
         var self = Host{
+            .io = io,
+            .scene = scene,
+            .scene_path = scene_path,
             .platform = platform,
             .rhi = backend,
             .renderer2d = renderer2d,
             .audio = audio_api.Audio.init(),
             .texture = texture,
             .world = runtime_world,
-            .sprite_entity = sprite_entity,
-            .goal_entity = goal_entity,
-            .hazard_entity = hazard_entity,
-            .hazard_y = hazard_position[1],
+            .sprite_entity = spawned.player_entity,
+            .goal_entity = spawned.goal_entity,
+            .hazard_entity = spawned.hazard_entity,
+            .hazard_y = scene.hazard.position[1],
             .hazard_direction = 1.0,
             .world_extent = extent,
             .session = .{},
@@ -127,10 +155,13 @@ pub const Host = struct {
         const now = self.platform.nowSeconds();
         self.last_time_seconds = now;
         self.last_heartbeat_seconds = now;
-        std.log.info("Runtime host initialized with Vulkan RHI entities: player={d}, goal={d}, hazard={d}", .{ sprite_entity, goal_entity, hazard_entity });
+        std.log.info("Runtime host initialized with Vulkan RHI entities: player={d}, goal={d}, hazard={d}", .{
+            spawned.player_entity,
+            spawned.goal_entity,
+            spawned.hazard_entity,
+        });
         return self;
     }
-
     pub fn deinit(self: *Host) void {
         self.audio.deinit();
         self.world.despawn(self.sprite_entity) catch |err| {
@@ -159,6 +190,12 @@ pub const Host = struct {
                 self.quit_requested = true;
                 std.log.info("Runtime exit requested", .{});
                 break;
+            }
+            if (events.input.reload_pressed != 0) {
+                self.reloadScene() catch |err| {
+                    // reload 失败不终止当前 Runtime；旧 World 仍是可运行的事务提交结果。
+                    std.log.err("Scene reload rejected; keeping current scene: {s}", .{@errorName(err)});
+                };
             }
             if (events.input.restart_pressed != 0) try self.restartGame();
 
@@ -227,26 +264,53 @@ pub const Host = struct {
         _ = self;
     }
 
+    fn reloadScene(self: *Host) !void {
+        const path = self.scene_path orelse {
+            std.log.warn("Scene reload requested but no --scene path was supplied", .{});
+            return;
+        };
+        const candidate = try scene_api.load(self.io, std.heap.page_allocator, path);
+        // 关键事务边界：完整新 World 成功后才替换旧 World，解析/创建失败不会破坏当前运行场景。
+        const replacement = try spawnSceneWorld(&candidate, self.world_extent);
+        var previous_world = self.world;
+        self.world = replacement.world;
+        self.scene = candidate;
+        self.sprite_entity = replacement.player_entity;
+        self.goal_entity = replacement.goal_entity;
+        self.hazard_entity = replacement.hazard_entity;
+        self.hazard_y = candidate.hazard.position[1];
+        self.hazard_direction = 1.0;
+        self.session = .{};
+        self.accumulator_seconds = 0.0;
+        self.render_count = 0;
+        previous_world.deinit();
+        std.log.info("Scene reloaded explicitly: player={d}, goal={d}, hazard={d}", .{
+            self.sprite_entity,
+            self.goal_entity,
+            self.hazard_entity,
+        });
+    }
+
     fn restartGame(self: *Host) !void {
         if (self.session.phase == .playing) return;
 
         // 先创建替代实体；spawn 失败时旧玩家仍完整保留，不会留下空世界。
         const previous_entity = self.sprite_entity;
-        const replacement_entity = try self.world.spawnSprite(playerSpawnDesc());
+        const replacement_entity = try self.world.spawnSprite(playerSpawnDesc(&self.scene));
         errdefer self.world.despawn(replacement_entity) catch {};
         try self.world.despawn(previous_entity);
 
         self.sprite_entity = replacement_entity;
-        self.hazard_y = hazard_position[1];
+        self.hazard_y = self.scene.hazard.position[1];
         self.hazard_direction = 1.0;
-        try self.world.setSpritePosition(self.hazard_entity, hazard_position);
+        try self.world.setSpritePosition(self.hazard_entity, self.scene.hazard.position);
         std.debug.assert(self.session.restart());
         self.accumulator_seconds = 0.0;
         self.render_count = 0;
         std.log.info("Game session restarted: entity={d}, position=({d:.2},{d:.2})", .{
             replacement_entity,
-            player_start_position[0],
-            player_start_position[1],
+            self.scene.player.position[0],
+            self.scene.player.position[1],
         });
     }
 
@@ -288,16 +352,16 @@ pub const Host = struct {
     }
 
     fn stepHazard(self: *Host, dt_seconds: f32) !void {
-        self.hazard_y += self.hazard_direction * hazard_speed * dt_seconds;
-        if (self.hazard_y > hazard_max_y) {
-            self.hazard_y = hazard_max_y - (self.hazard_y - hazard_max_y);
+        self.hazard_y += self.hazard_direction * self.scene.hazard.patrolSpeed * dt_seconds;
+        if (self.hazard_y > self.scene.hazard.patrolMaxY) {
+            self.hazard_y = self.scene.hazard.patrolMaxY - (self.hazard_y - self.scene.hazard.patrolMaxY);
             self.hazard_direction = -1.0;
-        } else if (self.hazard_y < hazard_min_y) {
-            self.hazard_y = hazard_min_y + (hazard_min_y - self.hazard_y);
+        } else if (self.hazard_y < self.scene.hazard.patrolMinY) {
+            self.hazard_y = self.scene.hazard.patrolMinY + (self.scene.hazard.patrolMinY - self.hazard_y);
             self.hazard_direction = 1.0;
         }
         // 巡逻状态由 Host 驱动，最终位置仍通过 World 受控 setter 提交。
-        try self.world.setSpritePosition(self.hazard_entity, .{ hazard_position[0], self.hazard_y });
+        try self.world.setSpritePosition(self.hazard_entity, .{ self.scene.hazard.position[0], self.hazard_y });
     }
 
     fn extractRender(self: *Host) !void {

@@ -39,6 +39,7 @@ $requiredFiles = @(
     'bin/assets/renderer2d/test.ppm',
     'bin/assets/audio/won.wav',
     'bin/assets/audio/lost.wav',
+    'bin/assets/scenes/preview.scene.json',
     'README.txt'
 )
 foreach ($relative in $requiredFiles) {

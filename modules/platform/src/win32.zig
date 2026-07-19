@@ -24,6 +24,8 @@ pub const Platform = struct {
     down_down: bool = false,
     restart_down: bool = false,
     restart_pressed: bool = false,
+    reload_down: bool = false,
+    reload_pressed: bool = false,
 
     pub fn init() !Platform {
         var self = Platform{};
@@ -134,6 +136,11 @@ pub const Platform = struct {
                 if (is_down and !self.restart_down) self.restart_pressed = true;
                 self.restart_down = is_down;
             },
+            c.VK_F5 => {
+                // F5 只产生一次显式 reload 请求；文件监听和自动热重载留到后续增量。
+                if (is_down and !self.reload_down) self.reload_pressed = true;
+                self.reload_down = is_down;
+            },
             else => {},
         }
     }
@@ -145,15 +152,20 @@ pub const Platform = struct {
         self.down_down = false;
         self.restart_down = false;
         self.restart_pressed = false;
+        self.reload_down = false;
+        self.reload_pressed = false;
     }
 
     fn sampleInput(self: *Platform) InputSnapshot {
         const restart_pressed: u8 = @intFromBool(self.restart_pressed);
         self.restart_pressed = false;
+        const reload_pressed: u8 = @intFromBool(self.reload_pressed);
+        self.reload_pressed = false;
         return .{
             .move_x = if (self.right_down and !self.left_down) 1 else if (self.left_down and !self.right_down) -1 else 0,
             .move_y = if (self.down_down and !self.up_down) 1 else if (self.up_down and !self.down_down) -1 else 0,
             .restart_pressed = restart_pressed,
+            .reload_pressed = reload_pressed,
         };
     }
     pub fn nowSeconds(self: *Platform) f64 {

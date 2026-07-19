@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "player": {
+    "position": [312.0, 130.0],
+    "size": [320.0, 240.0],
+    "color": [1.0, 1.0, 1.0, 1.0],
+    "moveSpeed": 180.0
+  },
+  "goal": {
+    "position": [700.0, 200.0],
+    "size": [96.0, 96.0],
+    "color": [1.0, 0.75, 0.1, 1.0]
+  },
+  "hazard": {
+    "position": [650.0, 280.0],
+    "size": [96.0, 96.0],
+    "color": [0.95, 0.2, 0.2, 1.0],
+    "patrolMinY": 245.0,
+    "patrolMaxY": 330.0,
+    "patrolSpeed": 80.0
+  }
+}
