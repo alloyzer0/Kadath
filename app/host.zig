@@ -3,6 +3,7 @@ const audio_api = @import("audio");
 const collision = @import("collision.zig");
 const game = @import("game.zig");
 const scene_api = @import("scene.zig");
+const script_api = @import("script.zig");
 const Platform = @import("platform").Platform;
 const PlatformExtent = @import("platform").WindowExtent;
 const InputSnapshot = @import("platform").InputSnapshot;
@@ -19,6 +20,15 @@ const SpawnedScene = struct {
     goal_entity: world_api.EntityId,
     hazard_entity: world_api.EntityId,
 };
+
+fn clampPosition(position: [2]f32, size: [2]f32, extent: PlatformExtent) [2]f32 {
+    const max_x = @max(0.0, @as(f32, @floatFromInt(extent.width)) - size[0]);
+    const max_y = @max(0.0, @as(f32, @floatFromInt(extent.height)) - size[1]);
+    return .{
+        @min(@max(position[0], 0.0), max_x),
+        @min(@max(position[1], 0.0), max_y),
+    };
+}
 
 fn spawnSceneWorld(scene: *const scene_api.Scene, extent: PlatformExtent) !SpawnedScene {
     var runtime_world = try World.init();
@@ -76,6 +86,10 @@ pub const Host = struct {
     io: std.Io,
     scene: scene_api.Scene,
     scene_path: ?[]const u8,
+    script_program: script_api.Program,
+    script_enabled: bool,
+    script_tick: u64,
+    goal_position: [2]f32,
     platform: Platform,
     rhi: Rhi,
     renderer2d: Renderer2D,
@@ -97,7 +111,7 @@ pub const Host = struct {
     frame_count: u64 = 0,
     last_heartbeat_seconds: f64 = 0.0,
 
-    pub fn init(io: std.Io, scene_path: ?[]const u8) !Host {
+    pub fn init(io: std.Io, scene_path: ?[]const u8, script_path: ?[]const u8) !Host {
         const scene = if (scene_path) |path| blk: {
             const loaded = try scene_api.load(io, std.heap.page_allocator, path);
             std.log.info("Loaded preview scene: {s}", .{path});
@@ -106,6 +120,11 @@ pub const Host = struct {
             std.log.info("Using built-in preview scene", .{});
             break :blk scene_api.default_scene;
         };
+        const script_program = if (script_path) |path| blk: {
+            const loaded = try script_api.load(io, std.heap.page_allocator, path);
+            std.log.info("Loaded script hook program: {s}, instructions={d}", .{ path, loaded.count });
+            break :blk loaded;
+        } else script_api.Program{};
 
         var platform = try Platform.init();
         errdefer platform.deinit();
@@ -138,6 +157,10 @@ pub const Host = struct {
             .io = io,
             .scene = scene,
             .scene_path = scene_path,
+            .script_program = script_program,
+            .script_enabled = script_program.hasInstructions(),
+            .script_tick = 0,
+            .goal_position = clampPosition(scene.goal.position, scene.goal.size, extent),
             .platform = platform,
             .rhi = backend,
             .renderer2d = renderer2d,
@@ -155,6 +178,7 @@ pub const Host = struct {
         const now = self.platform.nowSeconds();
         self.last_time_seconds = now;
         self.last_heartbeat_seconds = now;
+        try self.resetScript();
         std.log.info("Runtime host initialized with Vulkan RHI entities: player={d}, goal={d}, hazard={d}", .{
             spawned.player_entity,
             spawned.goal_entity,
@@ -264,6 +288,57 @@ pub const Host = struct {
         _ = self;
     }
 
+    fn resetScript(self: *Host) !void {
+        self.script_tick = 0;
+        self.script_enabled = self.script_program.hasInstructions();
+        try self.setGoalPosition(self.scene.goal.position);
+        if (!self.script_enabled) return;
+
+        var command_buffer: script_api.CommandBuffer = undefined;
+        const commands = try self.script_program.emit(.on_start, 0.0, &command_buffer);
+        try self.applyScriptCommands(commands);
+        std.log.info("Script on_start hook applied: commands={d}", .{commands.len});
+    }
+
+    fn runScriptFixed(self: *Host, dt_seconds: f32) void {
+        if (!self.script_enabled) return;
+        var command_buffer: script_api.CommandBuffer = undefined;
+        const commands = self.script_program.emit(.fixed_update, dt_seconds, &command_buffer) catch |err| {
+            self.disableScript(err);
+            return;
+        };
+        self.applyScriptCommands(commands) catch |err| {
+            self.disableScript(err);
+            return;
+        };
+        if (self.script_tick == 0) {
+            std.log.info("Script fixed_update hook entered: commands={d}", .{commands.len});
+        }
+        self.script_tick +|= 1;
+    }
+
+    fn disableScript(self: *Host, err: anyerror) void {
+        self.script_enabled = false;
+        std.log.err("Script hook disabled; Runtime continues: {s}", .{@errorName(err)});
+    }
+
+    fn applyScriptCommands(self: *Host, commands: []const script_api.Command) !void {
+        for (commands) |command| {
+            switch (command) {
+                .set_goal_position => |position| try self.setGoalPosition(position),
+                .translate_goal => |delta| try self.setGoalPosition(.{
+                    self.goal_position[0] + delta[0],
+                    self.goal_position[1] + delta[1],
+                }),
+            }
+        }
+    }
+
+    fn setGoalPosition(self: *Host, position: [2]f32) !void {
+        self.goal_position = clampPosition(position, self.scene.goal.size, self.world_extent);
+        try self.world.setSpritePosition(self.goal_entity, self.goal_position);
+    }
+
     fn reloadScene(self: *Host) !void {
         const path = self.scene_path orelse {
             std.log.warn("Scene reload requested but no --scene path was supplied", .{});
@@ -278,12 +353,14 @@ pub const Host = struct {
         self.sprite_entity = replacement.player_entity;
         self.goal_entity = replacement.goal_entity;
         self.hazard_entity = replacement.hazard_entity;
+        self.goal_position = clampPosition(candidate.goal.position, candidate.goal.size, self.world_extent);
         self.hazard_y = candidate.hazard.position[1];
         self.hazard_direction = 1.0;
         self.session = .{};
         self.accumulator_seconds = 0.0;
         self.render_count = 0;
         previous_world.deinit();
+        self.resetScript() catch |err| self.disableScript(err);
         std.log.info("Scene reloaded explicitly: player={d}, goal={d}, hazard={d}", .{
             self.sprite_entity,
             self.goal_entity,
@@ -307,6 +384,7 @@ pub const Host = struct {
         std.debug.assert(self.session.restart());
         self.accumulator_seconds = 0.0;
         self.render_count = 0;
+        self.resetScript() catch |err| self.disableScript(err);
         std.log.info("Game session restarted: entity={d}, position=({d:.2},{d:.2})", .{
             replacement_entity,
             self.scene.player.position[0],
@@ -327,6 +405,7 @@ pub const Host = struct {
             .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
         });
         self.world_extent = extent;
+        try self.setGoalPosition(self.goal_position);
     }
 
     fn runFixedUpdates(self: *Host, delta_seconds: f64, input: InputSnapshot) !void {
@@ -344,6 +423,7 @@ pub const Host = struct {
                 .move_x = step_input.move_x,
                 .move_y = step_input.move_y,
             });
+            if (self.session.acceptsInput()) self.runScriptFixed(@floatCast(fixed_dt_seconds));
             self.accumulator_seconds -= fixed_dt_seconds;
         }
         if (steps == max_fixed_steps_per_frame and self.accumulator_seconds >= fixed_dt_seconds) {

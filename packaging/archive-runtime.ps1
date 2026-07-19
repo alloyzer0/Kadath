@@ -40,6 +40,7 @@ $requiredFiles = @(
     'bin/assets/audio/won.wav',
     'bin/assets/audio/lost.wav',
     'bin/assets/scenes/preview.scene.json',
+    'bin/assets/scripts/preview.script.json',
     'README.txt'
 )
 foreach ($relative in $requiredFiles) {
