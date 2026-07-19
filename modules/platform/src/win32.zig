@@ -26,6 +26,8 @@ pub const Platform = struct {
     restart_pressed: bool = false,
     reload_down: bool = false,
     reload_pressed: bool = false,
+    script_reload_down: bool = false,
+    script_reload_pressed: bool = false,
 
     pub fn init() !Platform {
         var self = Platform{};
@@ -137,9 +139,14 @@ pub const Platform = struct {
                 self.restart_down = is_down;
             },
             c.VK_F5 => {
-                // F5 只产生一次显式 reload 请求；文件监听和自动热重载留到后续增量。
+                // F5 只产生一次显式 Scene reload 请求；文件监听和自动热重载留到后续增量。
                 if (is_down and !self.reload_down) self.reload_pressed = true;
                 self.reload_down = is_down;
+            },
+            c.VK_F6 => {
+                // F6 是当前粗粒度 ScriptReload 命令，按下沿保证一次请求只提交一次。
+                if (is_down and !self.script_reload_down) self.script_reload_pressed = true;
+                self.script_reload_down = is_down;
             },
             else => {},
         }
@@ -154,6 +161,8 @@ pub const Platform = struct {
         self.restart_pressed = false;
         self.reload_down = false;
         self.reload_pressed = false;
+        self.script_reload_down = false;
+        self.script_reload_pressed = false;
     }
 
     fn sampleInput(self: *Platform) InputSnapshot {
@@ -161,11 +170,14 @@ pub const Platform = struct {
         self.restart_pressed = false;
         const reload_pressed: u8 = @intFromBool(self.reload_pressed);
         self.reload_pressed = false;
+        const script_reload_pressed: u8 = @intFromBool(self.script_reload_pressed);
+        self.script_reload_pressed = false;
         return .{
             .move_x = if (self.right_down and !self.left_down) 1 else if (self.left_down and !self.right_down) -1 else 0,
             .move_y = if (self.down_down and !self.up_down) 1 else if (self.up_down and !self.down_down) -1 else 0,
             .restart_pressed = restart_pressed,
             .reload_pressed = reload_pressed,
+            .script_reload_pressed = script_reload_pressed,
         };
     }
     pub fn nowSeconds(self: *Platform) f64 {

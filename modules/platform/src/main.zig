@@ -10,6 +10,7 @@ pub const InputSnapshot = extern struct {
     move_y: i8 = 0,
     restart_pressed: u8 = 0,
     reload_pressed: u8 = 0,
+    script_reload_pressed: u8 = 0,
 };
 
 pub const PumpResult = struct {

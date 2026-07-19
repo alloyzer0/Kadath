@@ -86,6 +86,7 @@ pub const Host = struct {
     io: std.Io,
     scene: scene_api.Scene,
     scene_path: ?[]const u8,
+    script_path: ?[]const u8,
     script_program: script_api.Program,
     script_enabled: bool,
     script_tick: u64,
@@ -157,6 +158,7 @@ pub const Host = struct {
             .io = io,
             .scene = scene,
             .scene_path = scene_path,
+            .script_path = script_path,
             .script_program = script_program,
             .script_enabled = script_program.hasInstructions(),
             .script_tick = 0,
@@ -219,6 +221,12 @@ pub const Host = struct {
                 self.reloadScene() catch |err| {
                     // reload 失败不终止当前 Runtime；旧 World 仍是可运行的事务提交结果。
                     std.log.err("Scene reload rejected; keeping current scene: {s}", .{@errorName(err)});
+                };
+            }
+            if (events.input.script_reload_pressed != 0) {
+                self.reloadScript() catch |err| {
+                    // 新 Program 解析/激活失败时，旧 Program 与 Goal 状态继续有效。
+                    std.log.err("Script reload rejected; keeping current program: {s}", .{@errorName(err)});
                 };
             }
             if (events.input.restart_pressed != 0) try self.restartGame();
@@ -335,8 +343,35 @@ pub const Host = struct {
     }
 
     fn setGoalPosition(self: *Host, position: [2]f32) !void {
-        self.goal_position = clampPosition(position, self.scene.goal.size, self.world_extent);
-        try self.world.setSpritePosition(self.goal_entity, self.goal_position);
+        const clamped = clampPosition(position, self.scene.goal.size, self.world_extent);
+        try self.world.setSpritePosition(self.goal_entity, clamped);
+        self.goal_position = clamped;
+    }
+
+    fn reloadScript(self: *Host) !void {
+        const path = self.script_path orelse {
+            std.log.warn("Script reload requested but no --script path was supplied", .{});
+            return;
+        };
+        const candidate = try script_api.load(self.io, std.heap.page_allocator, path);
+        const previous_program = self.script_program;
+        const previous_enabled = self.script_enabled;
+        const previous_tick = self.script_tick;
+        const previous_goal_position = self.goal_position;
+
+        // 关键事务边界：候选 Program 解析成功后再激活；激活失败恢复旧 Program 与 Goal 状态。
+        self.script_program = candidate;
+        self.resetScript() catch |err| {
+            self.script_program = previous_program;
+            self.script_enabled = previous_enabled;
+            self.script_tick = previous_tick;
+            self.setGoalPosition(previous_goal_position) catch |restore_err| {
+                self.disableScript(restore_err);
+                return restore_err;
+            };
+            return err;
+        };
+        std.log.info("Script reloaded explicitly: instructions={d}", .{candidate.count});
     }
 
     fn reloadScene(self: *Host) !void {

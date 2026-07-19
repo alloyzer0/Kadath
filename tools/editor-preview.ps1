@@ -7,11 +7,23 @@ param(
     [string]$PackageRoot,
 
     [ValidateRange(0, 300000)]
-    [int]$StopAfterMilliseconds = 0
+    [int]$StopAfterMilliseconds = 0,
+
+    [ValidateRange(0, 300000)]
+    [int]$ReloadScriptAfterMilliseconds = 0
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class KadathPreviewNative {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+}
+"@
 
 function Resolve-ExistingDirectory([string]$Path, [string]$Name) {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
@@ -53,36 +65,40 @@ function Resolve-PackagePath(
     return $fullPath
 }
 
-function Request-RuntimeClose([Diagnostics.Process]$Process) {
-    if ($Process.HasExited) { return }
-
-    Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public static class KadathPreviewNative {
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-}
-"@
-
+function Get-RuntimeWindow([Diagnostics.Process]$Process, [string]$Operation) {
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
-    $windowHandle = [IntPtr]::Zero
     while ([DateTime]::UtcNow -lt $deadline -and -not $Process.HasExited) {
         $Process.Refresh()
-        $windowHandle = $Process.MainWindowHandle
-        if ($windowHandle -ne [IntPtr]::Zero) { break }
+        if ($Process.MainWindowHandle -ne [IntPtr]::Zero) { return $Process.MainWindowHandle }
         Start-Sleep -Milliseconds 100
     }
+    if ($Process.HasExited) { return [IntPtr]::Zero }
+    throw "Runtime window was not ready before the $Operation timeout"
+}
 
+function Request-RuntimeClose([Diagnostics.Process]$Process) {
     if ($Process.HasExited) { return }
-    if ($windowHandle -eq [IntPtr]::Zero) {
-        throw "Runtime window was not ready before the close timeout"
-    }
+    $windowHandle = Get-RuntimeWindow $Process "close"
+    if ($windowHandle -eq [IntPtr]::Zero) { return }
 
     # 关键生命周期约束：优先请求宿主正常关闭，让 Runtime 自己完成 GPU/音频资源清理。
     if (-not [KadathPreviewNative]::PostMessage($windowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) {
         throw "Failed to post WM_CLOSE to Runtime process"
+    }
+}
+
+function Request-RuntimeScriptReload([Diagnostics.Process]$Process) {
+    if ($Process.HasExited) { return }
+    $windowHandle = Get-RuntimeWindow $Process "script reload"
+    if ($windowHandle -eq [IntPtr]::Zero) { return }
+
+    # F6 是当前 Preview Launcher 到 Runtime 的粗粒度 ScriptReload 命令。
+    if (-not [KadathPreviewNative]::PostMessage($windowHandle, 0x0100, [IntPtr]0x75, [IntPtr]::Zero)) {
+        throw "Failed to post F6 key-down to Runtime process"
+    }
+    Start-Sleep -Milliseconds 50
+    if (-not [KadathPreviewNative]::PostMessage($windowHandle, 0x0101, [IntPtr]0x75, [IntPtr]::Zero)) {
+        throw "Failed to post F6 key-up to Runtime process"
     }
 }
 
@@ -117,6 +133,12 @@ if ($null -ne $argumentsProperty -and $null -ne $argumentsProperty.Value) {
     }
 }
 
+if ($StopAfterMilliseconds -gt 0 -and
+    $ReloadScriptAfterMilliseconds -ge $StopAfterMilliseconds)
+{
+    throw "ReloadScriptAfterMilliseconds must be less than StopAfterMilliseconds"
+}
+
 Write-Output "preview_contract=1"
 Write-Output "runtime_executable=$executable"
 Write-Output "runtime_working_directory=$workingDirectory"
@@ -126,8 +148,18 @@ try {
     $process = Start-Process -FilePath $executable -WorkingDirectory $workingDirectory -ArgumentList $arguments -PassThru
     Write-Output "runtime_pid=$($process.Id)"
 
+    $elapsedMilliseconds = 0
+    if ($ReloadScriptAfterMilliseconds -gt 0 -and
+        -not $process.WaitForExit($ReloadScriptAfterMilliseconds))
+    {
+        Request-RuntimeScriptReload $process
+        $elapsedMilliseconds = $ReloadScriptAfterMilliseconds
+        Write-Output "script_reload_requested=1"
+    }
+
     if ($StopAfterMilliseconds -gt 0) {
-        if (-not $process.WaitForExit($StopAfterMilliseconds)) {
+        $remainingMilliseconds = $StopAfterMilliseconds - $elapsedMilliseconds
+        if (-not $process.WaitForExit($remainingMilliseconds)) {
             Request-RuntimeClose $process
         }
         if (-not $process.WaitForExit(10000)) {
