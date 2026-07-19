@@ -65,7 +65,23 @@ $manifestLines = foreach ($file in $files) {
 $manifestLines = @($manifestLines | Sort-Object { ($_ -split '  ', 2)[1] })
 Set-Content -LiteralPath $manifestPath -Value $manifestLines -Encoding utf8NoBOM
 
-Compress-Archive -Path (Join-Path $package '*') -DestinationPath $archivePath -CompressionLevel Optimal
+# 固定条目顺序和时间戳，避免 Compress-Archive 的文件时间元数据造成归档哈希漂移。
+Add-Type -AssemblyName System.IO.Compression
+$archiveStream = [IO.File]::Open($archivePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+$zip = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+try {
+    foreach ($file in $files) {
+        $relative = Normalize-RelativePath $package $file.FullName
+        $entry = $zip.CreateEntry($relative, [IO.Compression.CompressionLevel]::Optimal)
+        $entry.LastWriteTime = [DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+        $input = [IO.File]::OpenRead($file.FullName)
+        $output = $entry.Open()
+        try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+    }
+} finally {
+    $zip.Dispose()
+    $archiveStream.Dispose()
+}
 if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
     throw "Archive was not created: $archivePath"
 }
