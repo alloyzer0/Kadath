@@ -37,9 +37,14 @@ if (Test-Path -LiteralPath $extract) {
 $requiredFiles = @(
     'bin/kadath.exe',
     'bin/assets/renderer2d/test.ppm',
+    'bin/assets/renderer2d/test.texture',
     'bin/assets/audio/won.wav',
     'bin/assets/audio/lost.wav',
+    'bin/assets/audio/won.audio.wav',
+    'bin/assets/audio/lost.audio.wav',
+    'bin/assets/scenes/preview.scene',
     'bin/assets/scenes/preview.scene.json',
+    'bin/assets/scripts/preview.script',
     'bin/assets/scripts/preview.script.json',
     'README.txt'
 )

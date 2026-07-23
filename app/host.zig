@@ -4,6 +4,7 @@ const collision = @import("collision.zig");
 const game = @import("game.zig");
 const scene_api = @import("scene.zig");
 const script_api = @import("script.zig");
+const preview_status_api = @import("preview_status");
 const Platform = @import("platform").Platform;
 const PlatformExtent = @import("platform").WindowExtent;
 const InputSnapshot = @import("platform").InputSnapshot;
@@ -84,6 +85,7 @@ fn hazardSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
 
 pub const Host = struct {
     io: std.Io,
+    preview_status: *preview_status_api.PreviewStatus,
     scene: scene_api.Scene,
     scene_path: ?[]const u8,
     script_path: ?[]const u8,
@@ -112,10 +114,16 @@ pub const Host = struct {
     frame_count: u64 = 0,
     last_heartbeat_seconds: f64 = 0.0,
 
-    pub fn init(io: std.Io, scene_path: ?[]const u8, script_path: ?[]const u8) !Host {
+    pub fn init(io: std.Io, scene_path: ?[]const u8, script_path: ?[]const u8, preview_status: *preview_status_api.PreviewStatus) !Host {
         const scene = if (scene_path) |path| blk: {
             const loaded = try scene_api.load(io, std.heap.page_allocator, path);
-            std.log.info("Loaded preview scene: {s}", .{path});
+            // `.scene` 是运行时消费的 KSCN v1 二进制；JSON 仍保留原日志和兼容路径，
+            // 让作者态热重载可以继续直接读取 source document。
+            if (std.ascii.endsWithIgnoreCase(path, ".scene")) {
+                std.log.info("Loaded preview scene artifact: {s}, artifact_version={d}", .{ path, scene_api.scene_artifact_version });
+            } else {
+                std.log.info("Loaded preview scene: {s}", .{path});
+            }
             break :blk loaded;
         } else blk: {
             std.log.info("Using built-in preview scene", .{});
@@ -123,7 +131,12 @@ pub const Host = struct {
         };
         const script_program = if (script_path) |path| blk: {
             const loaded = try script_api.load(io, std.heap.page_allocator, path);
-            std.log.info("Loaded script hook program: {s}, instructions={d}", .{ path, loaded.count });
+            // Script artifact 是运行时消费的 KSCP v1；JSON 仍用于 Editor authoring 和事务式 reload。
+            if (std.ascii.endsWithIgnoreCase(path, ".script")) {
+                std.log.info("Loaded script artifact: {s}, artifact_version={d}, instructions={d}", .{ path, script_api.script_artifact_version, loaded.count });
+            } else {
+                std.log.info("Loaded script hook program: {s}, instructions={d}", .{ path, loaded.count });
+            }
             break :blk loaded;
         } else script_api.Program{};
 
@@ -141,13 +154,20 @@ pub const Host = struct {
         var renderer2d = try Renderer2D.init(&backend);
         errdefer renderer2d.deinit(&backend);
 
-        var texture_data = try resource.loadPpm3(io, std.heap.page_allocator, "assets/renderer2d/test.ppm");
+        var texture_data = try resource.loadTextureArtifact(io, std.heap.page_allocator, "assets/renderer2d/test.texture");
         defer texture_data.deinit(std.heap.page_allocator);
-        const texture = try backend.createTexture(.{
+        const upload_mips = try std.heap.page_allocator.alloc(rhi.TextureMipUpload, texture_data.mip_levels.len);
+        defer std.heap.page_allocator.free(upload_mips);
+        for (texture_data.mip_levels, 0..) |level, index| {
+            upload_mips[index] = .{ .width = level.width, .height = level.height, .rgba8 = level.pixels_rgba8 };
+        }
+        // 资源层保留所有 mip bytes，Renderer2D/RHI 负责把完整链上传到 Vulkan image。
+        const texture = try renderer2d.createTexture(&backend, .{
             .width = texture_data.width,
             .height = texture_data.height,
             .rgba8 = texture_data.pixels_rgba8,
-        });
+            .mip_levels = upload_mips,
+        }, .smooth_mipmap_anisotropic);
         errdefer backend.destroyTexture(texture);
 
         const spawned = try spawnSceneWorld(&scene, extent);
@@ -156,6 +176,7 @@ pub const Host = struct {
 
         var self = Host{
             .io = io,
+            .preview_status = preview_status,
             .scene = scene,
             .scene_path = scene_path,
             .script_path = script_path,
@@ -207,6 +228,25 @@ pub const Host = struct {
         std.log.info("Kadath runtime shutdown complete", .{});
     }
 
+    fn processReloadCommand(self: *Host, command: preview_status_api.Command, request_id: ?u64) void {
+        self.preview_status.commandReceived(command, request_id);
+        switch (command) {
+            .reload_scene => self.reloadScene() catch |err| {
+                // 结构化响应只包住事务边界；旧 World 保持为 Runtime 的权威状态。
+                self.preview_status.commandRejected(command, request_id, err);
+                std.log.err("Scene reload rejected; keeping current scene: {s}", .{@errorName(err)});
+                return;
+            },
+            .reload_script => self.reloadScript() catch |err| {
+                // 非法 Program 不会替换当前脚本；响应携带稳定 errorCode 供 Launcher 消费。
+                self.preview_status.commandRejected(command, request_id, err);
+                std.log.err("Script reload rejected; keeping current program: {s}", .{@errorName(err)});
+                return;
+            },
+        }
+        self.preview_status.commandSucceeded(command, request_id);
+    }
+
     pub fn run(self: *Host) !void {
         std.log.info("Runtime main loop entered", .{});
 
@@ -217,17 +257,15 @@ pub const Host = struct {
                 std.log.info("Runtime exit requested", .{});
                 break;
             }
-            if (events.input.reload_pressed != 0) {
-                self.reloadScene() catch |err| {
-                    // reload 失败不终止当前 Runtime；旧 World 仍是可运行的事务提交结果。
-                    std.log.err("Scene reload rejected; keeping current scene: {s}", .{@errorName(err)});
-                };
+            if (events.scene_reload_request_id) |request_id| {
+                self.processReloadCommand(.reload_scene, request_id);
+            } else if (events.input.reload_pressed != 0) {
+                self.processReloadCommand(.reload_scene, null);
             }
-            if (events.input.script_reload_pressed != 0) {
-                self.reloadScript() catch |err| {
-                    // 新 Program 解析/激活失败时，旧 Program 与 Goal 状态继续有效。
-                    std.log.err("Script reload rejected; keeping current program: {s}", .{@errorName(err)});
-                };
+            if (events.script_reload_request_id) |request_id| {
+                self.processReloadCommand(.reload_script, request_id);
+            } else if (events.input.script_reload_pressed != 0) {
+                self.processReloadCommand(.reload_script, null);
             }
             if (events.input.restart_pressed != 0) try self.restartGame();
 
@@ -351,7 +389,7 @@ pub const Host = struct {
     fn reloadScript(self: *Host) !void {
         const path = self.script_path orelse {
             std.log.warn("Script reload requested but no --script path was supplied", .{});
-            return;
+            return error.MissingScriptPath;
         };
         const candidate = try script_api.load(self.io, std.heap.page_allocator, path);
         const previous_program = self.script_program;
@@ -377,7 +415,7 @@ pub const Host = struct {
     fn reloadScene(self: *Host) !void {
         const path = self.scene_path orelse {
             std.log.warn("Scene reload requested but no --scene path was supplied", .{});
-            return;
+            return error.MissingScenePath;
         };
         const candidate = try scene_api.load(self.io, std.heap.page_allocator, path);
         // 关键事务边界：完整新 World 成功后才替换旧 World，解析/创建失败不会破坏当前运行场景。

@@ -2,6 +2,8 @@ const std = @import("std");
 const WindowExtent = @import("main.zig").WindowExtent;
 const PumpResult = @import("main.zig").PumpResult;
 const InputSnapshot = @import("main.zig").InputSnapshot;
+const preview_reload_scene_message = @import("main.zig").preview_reload_scene_message;
+const preview_reload_script_message = @import("main.zig").preview_reload_script_message;
 
 const c = @cImport({
     @cDefine("UNICODE", "1");
@@ -28,6 +30,8 @@ pub const Platform = struct {
     reload_pressed: bool = false,
     script_reload_down: bool = false,
     script_reload_pressed: bool = false,
+    scene_reload_request_id: ?u64 = null,
+    script_reload_request_id: ?u64 = null,
 
     pub fn init() !Platform {
         var self = Platform{};
@@ -115,6 +119,10 @@ pub const Platform = struct {
             _ = c.DispatchMessageW(&message);
         }
         result.input = self.sampleInput();
+        result.scene_reload_request_id = self.scene_reload_request_id;
+        result.script_reload_request_id = self.script_reload_request_id;
+        self.scene_reload_request_id = null;
+        self.script_reload_request_id = null;
         return result;
     }
 
@@ -122,8 +130,25 @@ pub const Platform = struct {
         switch (message.message) {
             c.WM_KEYDOWN, c.WM_SYSKEYDOWN => self.setKeyState(message.wParam, true),
             c.WM_KEYUP, c.WM_SYSKEYUP => self.setKeyState(message.wParam, false),
+            preview_reload_scene_message => self.setPreviewReloadRequest(.scene, message.wParam),
+            preview_reload_script_message => self.setPreviewReloadRequest(.script, message.wParam),
             c.WM_KILLFOCUS => self.clearInput(),
             else => {},
+        }
+    }
+
+    const PreviewReloadKind = enum { scene, script };
+
+    fn setPreviewReloadRequest(self: *Platform, kind: PreviewReloadKind, raw_request_id: c.WPARAM) void {
+        const request_id: u64 = @intCast(raw_request_id);
+        if (request_id == 0) {
+            std.log.warn("Preview reload command ignored because requestId was zero", .{});
+            return;
+        }
+        // 每种命令每帧只保留一个结构化请求；Launcher 在收到终态响应前不会重发同种命令。
+        switch (kind) {
+            .scene => self.scene_reload_request_id = request_id,
+            .script => self.script_reload_request_id = request_id,
         }
     }
 
@@ -139,12 +164,12 @@ pub const Platform = struct {
                 self.restart_down = is_down;
             },
             c.VK_F5 => {
-                // F5 只产生一次显式 Scene reload 请求；文件监听和自动热重载留到后续增量。
+                // F5 仍是手动 Scene reload；自动 watcher 使用独立 WM_APP requestId 命令，不与按键状态混淆。
                 if (is_down and !self.reload_down) self.reload_pressed = true;
                 self.reload_down = is_down;
             },
             c.VK_F6 => {
-                // F6 是当前粗粒度 ScriptReload 命令，按下沿保证一次请求只提交一次。
+                // F6 仍是手动 ScriptReload；结构化 Launcher 命令通过 WM_APP 携带 requestId。
                 if (is_down and !self.script_reload_down) self.script_reload_pressed = true;
                 self.script_reload_down = is_down;
             },

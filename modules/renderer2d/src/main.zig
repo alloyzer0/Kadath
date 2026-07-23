@@ -28,6 +28,13 @@ pub const SpriteInstance = struct {
     color: [4]f32,
 };
 
+pub const TextureSamplingProfile = enum {
+    pixel_art,
+    smooth_linear,
+    smooth_mipmap,
+    smooth_mipmap_anisotropic,
+};
+
 pub const Renderer2D = struct {
     pipeline: rhi.PipelineHandle = rhi.invalid_pipeline,
 
@@ -58,6 +65,25 @@ pub const Renderer2D = struct {
         std.log.info("Renderer2D shutdown complete", .{});
     }
 
+    pub fn createTexture(
+        self: *Renderer2D,
+        backend: *rhi.Rhi,
+        desc: rhi.TextureUploadDesc,
+        sampling_profile: TextureSamplingProfile,
+    ) !rhi.TextureHandle {
+        if (self.pipeline == rhi.invalid_pipeline) return error.RendererNotInitialized;
+        // Renderer2D 选择高层采样意图；尺寸/完整链和 Vulkan sampler 映射由 RHI 统一校验。
+        var upload = desc;
+        upload.sampler_profile = switch (sampling_profile) {
+            .pixel_art => .pixel_nearest,
+            .smooth_linear => .smooth_linear,
+            .smooth_mipmap => .smooth_mipmap,
+            .smooth_mipmap_anisotropic => .smooth_mipmap_anisotropic,
+        };
+        const texture = try backend.createTexture(upload);
+        std.log.info("Renderer2D texture upload complete: mip_levels={d}, sampler={s}", .{ 1 + desc.mip_levels.len, @tagName(upload.sampler_profile) });
+        return texture;
+    }
     pub fn render(
         self: *Renderer2D,
         backend: *rhi.Rhi,

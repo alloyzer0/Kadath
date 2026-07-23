@@ -1,7 +1,11 @@
 const std = @import("std");
 
 pub const current_schema_version: u32 = 1;
+pub const scene_artifact_version: u32 = 1;
+const scene_artifact_header_bytes: usize = 16;
+const scene_artifact_payload_bytes: usize = 28 * @sizeOf(f32);
 const max_document_bytes: usize = 64 * 1024;
+const max_artifact_bytes: usize = 1 * 1024 * 1024;
 
 pub const Sprite = struct {
     position: [2]f32,
@@ -56,11 +60,63 @@ pub const default_scene = Scene{
 };
 
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Scene {
+    if (std.ascii.endsWithIgnoreCase(path, ".scene")) return loadArtifact(io, allocator, path);
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_document_bytes));
     defer allocator.free(contents);
     return parse(allocator, contents);
 }
 
+pub fn loadArtifact(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Scene {
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_artifact_bytes));
+    defer allocator.free(contents);
+    return parseArtifact(contents);
+}
+
+fn readLittleU32(bytes: []const u8) u32 {
+    return @as(u32, bytes[0]) |
+        (@as(u32, bytes[1]) << 8) |
+        (@as(u32, bytes[2]) << 16) |
+        (@as(u32, bytes[3]) << 24);
+}
+
+fn readLittleF32(bytes: []const u8) f32 {
+    return @bitCast(readLittleU32(bytes));
+}
+
+fn parseArtifact(source: []const u8) !Scene {
+    if (source.len != scene_artifact_header_bytes + scene_artifact_payload_bytes) return error.InvalidSceneArtifact;
+    if (!std.mem.eql(u8, source[0..4], "KSCN")) return error.InvalidSceneArtifact;
+    if (readLittleU32(source[4..8]) != scene_artifact_version) return error.UnsupportedSceneArtifactVersion;
+    if (readLittleU32(source[8..12]) != current_schema_version) return error.UnsupportedSceneSchema;
+    if (readLittleU32(source[12..16]) != scene_artifact_payload_bytes) return error.InvalidSceneArtifact;
+
+    // KSCN v1 的字段顺序就是磁盘 ABI；变更顺序必须提升 artifact version。
+    const offset: usize = scene_artifact_header_bytes;
+    const scene = Scene{
+        .schemaVersion = current_schema_version,
+        .player = .{
+            .position = .{ readLittleF32(source[offset..][0..4]), readLittleF32(source[offset + 4 ..][0..4]) },
+            .size = .{ readLittleF32(source[offset + 8 ..][0..4]), readLittleF32(source[offset + 12 ..][0..4]) },
+            .color = .{ readLittleF32(source[offset + 16 ..][0..4]), readLittleF32(source[offset + 20 ..][0..4]), readLittleF32(source[offset + 24 ..][0..4]), readLittleF32(source[offset + 28 ..][0..4]) },
+            .moveSpeed = readLittleF32(source[offset + 32 ..][0..4]),
+        },
+        .goal = .{
+            .position = .{ readLittleF32(source[offset + 36 ..][0..4]), readLittleF32(source[offset + 40 ..][0..4]) },
+            .size = .{ readLittleF32(source[offset + 44 ..][0..4]), readLittleF32(source[offset + 48 ..][0..4]) },
+            .color = .{ readLittleF32(source[offset + 52 ..][0..4]), readLittleF32(source[offset + 56 ..][0..4]), readLittleF32(source[offset + 60 ..][0..4]), readLittleF32(source[offset + 64 ..][0..4]) },
+        },
+        .hazard = .{
+            .position = .{ readLittleF32(source[offset + 68 ..][0..4]), readLittleF32(source[offset + 72 ..][0..4]) },
+            .size = .{ readLittleF32(source[offset + 76 ..][0..4]), readLittleF32(source[offset + 80 ..][0..4]) },
+            .color = .{ readLittleF32(source[offset + 84 ..][0..4]), readLittleF32(source[offset + 88 ..][0..4]), readLittleF32(source[offset + 92 ..][0..4]), readLittleF32(source[offset + 96 ..][0..4]) },
+            .patrolMinY = readLittleF32(source[offset + 100 ..][0..4]),
+            .patrolMaxY = readLittleF32(source[offset + 104 ..][0..4]),
+            .patrolSpeed = readLittleF32(source[offset + 108 ..][0..4]),
+        },
+    };
+    try validate(scene);
+    return scene;
+}
 pub fn parse(allocator: std.mem.Allocator, contents: []const u8) !Scene {
     // 关键契约：严格解析拒绝未知/重复字段，避免 Editor 与 Runtime 静默使用不同语义。
     const parsed = try std.json.parseFromSlice(Scene, allocator, contents, .{});
@@ -132,4 +188,78 @@ test "scene v1 rejects an invalid patrol range" {
     var scene = default_scene;
     scene.hazard.patrolMinY = scene.hazard.patrolMaxY;
     try std.testing.expectError(error.InvalidHazardPatrol, validate(scene));
+}
+fn writeLittleU32(bytes: []u8, value: u32) void {
+    bytes[0] = @truncate(value);
+    bytes[1] = @truncate(value >> 8);
+    bytes[2] = @truncate(value >> 16);
+    bytes[3] = @truncate(value >> 24);
+}
+
+fn writeLittleF32(bytes: []u8, value: f32) void {
+    writeLittleU32(bytes, @bitCast(value));
+}
+
+fn makeDefaultSceneArtifact() [scene_artifact_header_bytes + scene_artifact_payload_bytes]u8 {
+    var artifact = [_]u8{0} ** (scene_artifact_header_bytes + scene_artifact_payload_bytes);
+    artifact[0] = 'K';
+    artifact[1] = 'S';
+    artifact[2] = 'C';
+    artifact[3] = 'N';
+    writeLittleU32(artifact[4..8], scene_artifact_version);
+    writeLittleU32(artifact[8..12], current_schema_version);
+    writeLittleU32(artifact[12..16], scene_artifact_payload_bytes);
+
+    // 测试数据显式列出全部 28 个字段，防止 importer 与 Runtime 的布局悄然漂移。
+    const payload = [_]f32{
+        default_scene.player.position[0],
+        default_scene.player.position[1],
+        default_scene.player.size[0],
+        default_scene.player.size[1],
+        default_scene.player.color[0],
+        default_scene.player.color[1],
+        default_scene.player.color[2],
+        default_scene.player.color[3],
+        default_scene.player.moveSpeed,
+        default_scene.goal.position[0],
+        default_scene.goal.position[1],
+        default_scene.goal.size[0],
+        default_scene.goal.size[1],
+        default_scene.goal.color[0],
+        default_scene.goal.color[1],
+        default_scene.goal.color[2],
+        default_scene.goal.color[3],
+        default_scene.hazard.position[0],
+        default_scene.hazard.position[1],
+        default_scene.hazard.size[0],
+        default_scene.hazard.size[1],
+        default_scene.hazard.color[0],
+        default_scene.hazard.color[1],
+        default_scene.hazard.color[2],
+        default_scene.hazard.color[3],
+        default_scene.hazard.patrolMinY,
+        default_scene.hazard.patrolMaxY,
+        default_scene.hazard.patrolSpeed,
+    };
+    for (payload, 0..) |value, index| {
+        const start = scene_artifact_header_bytes + index * @sizeOf(f32);
+        writeLittleF32(artifact[start .. start + @sizeOf(f32)], value);
+    }
+    return artifact;
+}
+
+test "KSCN v1 parses the fixed scene payload" {
+    const artifact = makeDefaultSceneArtifact();
+    const scene = try parseArtifact(artifact[0..]);
+    try std.testing.expectEqual(default_scene.player.moveSpeed, scene.player.moveSpeed);
+    try std.testing.expectEqual(default_scene.goal.position[0], scene.goal.position[0]);
+    try std.testing.expectEqual(default_scene.hazard.patrolSpeed, scene.hazard.patrolSpeed);
+}
+
+test "KSCN v1 rejects truncated and unsupported artifacts" {
+    var artifact = makeDefaultSceneArtifact();
+    try std.testing.expectError(error.InvalidSceneArtifact, parseArtifact(artifact[0 .. artifact.len - 1]));
+
+    writeLittleU32(artifact[4..8], scene_artifact_version + 1);
+    try std.testing.expectError(error.UnsupportedSceneArtifactVersion, parseArtifact(artifact[0..]));
 }

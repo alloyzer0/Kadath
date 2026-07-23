@@ -25,6 +25,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const preview_status_mod = b.createModule(.{
+        .root_source_file = b.path("app/preview_status.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const world_mod = b.createModule(.{
         .root_source_file = b.path("modules/world/src/main.zig"),
         .target = target,
@@ -50,6 +56,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("audio", audio_mod);
     exe_mod.addImport("renderer2d", renderer2d_mod);
     exe_mod.addImport("world", world_mod);
+    exe_mod.addImport("preview_status", preview_status_mod);
 
     if (target.result.os.tag == .windows) {
         platform_mod.linkSystemLibrary("user32", .{});
@@ -135,6 +142,12 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("ws2_32", .{});
     }
     b.installArtifact(exe);
+    const preview_status_tests = b.addTest(.{
+        .root_module = preview_status_mod,
+    });
+    const preview_status_test_run = b.addRunArtifact(preview_status_tests);
+    const test_step = b.step("test", "Run Preview protocol unit tests");
+    test_step.dependOn(&preview_status_test_run.step);
 
     // 分发目录以 bin 为运行工作目录，资产必须与 exe 保持稳定的相对位置。
     const install_assets = b.addInstallDirectory(.{
@@ -143,6 +156,54 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "assets",
     });
     b.getInstallStep().dependOn(&install_assets.step);
+    // Importer/Baker 在安装阶段从 PPM 源生成确定性的 KDAT Texture Artifact。
+    const texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
+    texture_import.addArg("-SourcePath");
+    texture_import.addFileArg(b.path("assets/renderer2d/test.ppm"));
+    texture_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
+    const texture_artifact = texture_import.addOutputFileArg("test.texture");
+    const install_texture_artifact = b.addInstallFile(texture_artifact, "bin/assets/renderer2d/test.texture");
+    b.getInstallStep().dependOn(&install_texture_artifact.step);
+    // 两个音频 artifact 独立构建，任一失败都会阻止 install/package 完成。
+    const audio_import_won = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    audio_import_won.addFileArg(b.path("tools/editor-audio-importer.ps1"));
+    audio_import_won.addArg("-SourcePath");
+    audio_import_won.addFileArg(b.path("assets/audio/won.wav"));
+    audio_import_won.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
+    const won_audio_artifact = audio_import_won.addOutputFileArg("won.audio.wav");
+    const install_won_audio_artifact = b.addInstallFile(won_audio_artifact, "bin/assets/audio/won.audio.wav");
+    b.getInstallStep().dependOn(&install_won_audio_artifact.step);
+
+    const audio_import_lost = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    audio_import_lost.addFileArg(b.path("tools/editor-audio-importer.ps1"));
+    audio_import_lost.addArg("-SourcePath");
+    audio_import_lost.addFileArg(b.path("assets/audio/lost.wav"));
+    audio_import_lost.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
+    const lost_audio_artifact = audio_import_lost.addOutputFileArg("lost.audio.wav");
+    const install_lost_audio_artifact = b.addInstallFile(lost_audio_artifact, "bin/assets/audio/lost.audio.wav");
+    b.getInstallStep().dependOn(&install_lost_audio_artifact.step);
+
+    // Scene 源 JSON 只保留给 Editor authoring；安装包同时生成 Runtime 消费的 KSCN v1 artifact。
+    const scene_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    scene_import.addFileArg(b.path("tools/editor-scene-importer.ps1"));
+    scene_import.addArg("-SourcePath");
+    scene_import.addFileArg(b.path("assets/scenes/preview.scene.json"));
+    scene_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
+    const scene_artifact = scene_import.addOutputFileArg("preview.scene");
+    const install_scene_artifact = b.addInstallFile(scene_artifact, "bin/assets/scenes/preview.scene");
+    b.getInstallStep().dependOn(&install_scene_artifact.step);
+
+    // Script 源 JSON 只保留给 Editor authoring；安装包同时生成 Runtime 消费的 KSCP v1 artifact。
+    const script_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    script_import.addFileArg(b.path("tools/editor-script-importer.ps1"));
+    script_import.addArg("-SourcePath");
+    script_import.addFileArg(b.path("assets/scripts/preview.script.json"));
+    script_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
+    const script_artifact = script_import.addOutputFileArg("preview.script");
+    const install_script_artifact = b.addInstallFile(script_artifact, "bin/assets/scripts/preview.script");
+    b.getInstallStep().dependOn(&install_script_artifact.step);
+
     const install_package_readme = b.addInstallFile(
         b.path("packaging/README.txt"),
         "README.txt",

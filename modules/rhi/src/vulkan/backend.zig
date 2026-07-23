@@ -8,6 +8,7 @@ const api_version: u32 = 1 << 22;
 
 const max_pipelines: usize = 8;
 const max_textures: usize = 8;
+const max_texture_mip_levels: usize = 32;
 
 const TextureSlot = struct {
     image: c.VkImage = null,
@@ -15,6 +16,10 @@ const TextureSlot = struct {
     view: c.VkImageView = null,
     sampler: c.VkSampler = null,
     descriptor_set: c.VkDescriptorSet = null,
+    mip_levels: u32 = 1,
+    sampler_profile: types.TextureSamplerProfile = .smooth_mipmap,
+    anisotropy_enabled: bool = false,
+    anisotropy_level: f32 = 1.0,
 };
 
 const BufferAllocation = struct {
@@ -22,6 +27,45 @@ const BufferAllocation = struct {
     memory: c.VkDeviceMemory = null,
 };
 
+fn textureLevelBytes(width: u32, height: u32) !usize {
+    const pixels = try std.math.mul(usize, @intCast(width), @intCast(height));
+    return try std.math.mul(usize, pixels, 4);
+}
+
+fn nextMipDimension(value: u32) u32 {
+    return if (value > 1) value / 2 else 1;
+}
+
+fn textureUploadBytes(desc: types.TextureUploadDesc) !usize {
+    if (desc.width == 0 or desc.height == 0) return error.InvalidTextureExtent;
+    if (desc.mip_levels.len + 1 > max_texture_mip_levels) return error.InvalidTextureMipCount;
+    const base_bytes = try textureLevelBytes(desc.width, desc.height);
+    if (desc.rgba8.len != base_bytes) return error.InvalidTextureByteCount;
+
+    var expected_additional: usize = 0;
+    var width = desc.width;
+    var height = desc.height;
+    while (width > 1 or height > 1) {
+        width = nextMipDimension(width);
+        height = nextMipDimension(height);
+        expected_additional += 1;
+    }
+    // 空 slice 保持 KDAT v1/base-only 兼容；提供 mip 时必须是完整链。
+    if (desc.mip_levels.len != 0 and desc.mip_levels.len != expected_additional) return error.InvalidTextureMipCount;
+
+    var total = base_bytes;
+    width = desc.width;
+    height = desc.height;
+    for (desc.mip_levels) |level| {
+        width = nextMipDimension(width);
+        height = nextMipDimension(height);
+        if (level.width != width or level.height != height) return error.InvalidTextureMipExtent;
+        const level_bytes = try textureLevelBytes(width, height);
+        if (level.rgba8.len != level_bytes) return error.InvalidTextureByteCount;
+        total = try std.math.add(usize, total, level_bytes);
+    }
+    return total;
+}
 const PipelineSlot = struct {
     desc: ?types.GraphicsPipelineDesc = null,
     layout: c.VkPipelineLayout = null,
@@ -142,6 +186,8 @@ pub const Rhi = struct {
     texture_slots: [max_textures]TextureSlot = [_]TextureSlot{.{}} ** max_textures,
     descriptor_pool: c.VkDescriptorPool = null,
     texture_descriptor_set_layout: c.VkDescriptorSetLayout = null,
+    sampler_anisotropy_supported: bool = false,
+    max_sampler_anisotropy: f32 = 1.0,
 
     pub fn init(window_handle: usize, instance_handle: usize, requested_extent: types.Extent2D) !Rhi {
         var self = Rhi{};
@@ -249,31 +295,41 @@ pub const Rhi = struct {
     pub fn createTexture(self: *Rhi, desc: types.TextureUploadDesc) !types.TextureHandle {
         if (self.active_frame_token != null) return error.TextureCreationDuringFrame;
         try check(c.vkDeviceWaitIdle(self.device), "vkDeviceWaitIdle(texture upload)");
-        if (desc.width == 0 or desc.height == 0) return error.InvalidTextureExtent;
-        const pixel_count = try std.math.mul(usize, @intCast(desc.width), @intCast(desc.height));
-        const expected_size = try std.math.mul(usize, pixel_count, 4);
-        if (desc.rgba8.len != expected_size) return error.InvalidTextureByteCount;
+        const requested_profile = desc.sampler_profile;
+        var upload_desc = desc;
+        const anisotropy_fallback = requested_profile == .smooth_mipmap_anisotropic and !self.sampler_anisotropy_supported;
+        if (anisotropy_fallback) upload_desc.sampler_profile = .smooth_mipmap;
+        const upload_bytes = try textureUploadBytes(upload_desc);
 
         for (&self.texture_slots, 0..) |*destination, index| {
             if (destination.image != null) continue;
 
             var texture = TextureSlot{};
             errdefer self.destroyTextureSlot(&texture);
-            try self.createTextureImage(&texture, desc);
+            try self.createTextureImage(&texture, upload_desc);
             try self.createTextureViewSamplerDescriptor(&texture);
             destination.* = texture;
 
             const handle: types.TextureHandle = @intCast(index + 1);
-            std.log.info("RHI texture created: handle={d}, extent={d}x{d}", .{
+            std.log.info("RHI texture created: handle={d}, extent={d}x{d}, mip_levels={d}, upload_bytes={d}, sampler_requested={s}, sampler={s}, anisotropy={s}, anisotropy_level={d}, lod=0..{d}", .{
                 handle,
                 desc.width,
                 desc.height,
+                1 + desc.mip_levels.len,
+                upload_bytes,
+                @tagName(requested_profile),
+                @tagName(texture.sampler_profile),
+                if (texture.anisotropy_enabled) "on" else "off",
+                texture.anisotropy_level,
+                if (texture.sampler_profile == .smooth_linear) 0 else desc.mip_levels.len,
             });
+            if (anisotropy_fallback) {
+                std.log.warn("Texture sampler anisotropy unsupported; falling back to smooth_mipmap", .{});
+            }
             return handle;
         }
         return error.TextureLimitReached;
     }
-
     pub fn destroyTexture(self: *Rhi, handle: types.TextureHandle) void {
         const slot = self.textureSlot(handle) orelse return;
         if (self.device != null) {
@@ -539,10 +595,16 @@ pub const Rhi = struct {
                     self.queue_family_index = @intCast(index);
                     var device_properties: c.VkPhysicalDeviceProperties = undefined;
                     c.vkGetPhysicalDeviceProperties(device, &device_properties);
+                    var device_features: c.VkPhysicalDeviceFeatures = undefined;
+                    c.vkGetPhysicalDeviceFeatures(device, &device_features);
+                    self.sampler_anisotropy_supported = device_features.samplerAnisotropy == c.VK_TRUE;
+                    self.max_sampler_anisotropy = if (self.sampler_anisotropy_supported) device_properties.limits.maxSamplerAnisotropy else 1.0;
                     const name = std.mem.sliceTo(&device_properties.deviceName, 0);
-                    std.log.info("Vulkan GPU selected: {s}, queue_family={d}", .{
+                    std.log.info("Vulkan GPU selected: {s}, queue_family={d}, sampler_anisotropy={any}, max={d}", .{
                         name,
                         self.queue_family_index,
+                        self.sampler_anisotropy_supported,
+                        self.max_sampler_anisotropy,
                     });
                     return;
                 }
@@ -581,8 +643,11 @@ pub const Rhi = struct {
         queue_info.pQueuePriorities = &priority;
 
         const extensions = [_][*:0]const u8{"VK_KHR_swapchain"};
+        var enabled_features = std.mem.zeroes(c.VkPhysicalDeviceFeatures);
+        if (self.sampler_anisotropy_supported) enabled_features.samplerAnisotropy = c.VK_TRUE;
         var device_info = std.mem.zeroes(c.VkDeviceCreateInfo);
         device_info.sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        device_info.pEnabledFeatures = &enabled_features;
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.enabledExtensionCount = extensions.len;
@@ -763,12 +828,14 @@ pub const Rhi = struct {
     }
 
     fn createTextureImage(self: *Rhi, destination: *TextureSlot, desc: types.TextureUploadDesc) !void {
+        const upload_bytes = try textureUploadBytes(desc);
+        const mip_level_count: u32 = @intCast(1 + desc.mip_levels.len);
         var image_info = std.mem.zeroes(c.VkImageCreateInfo);
         image_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         image_info.imageType = c.VK_IMAGE_TYPE_2D;
         image_info.format = c.VK_FORMAT_R8G8B8A8_SRGB;
         image_info.extent = .{ .width = desc.width, .height = desc.height, .depth = 1 };
-        image_info.mipLevels = 1;
+        image_info.mipLevels = mip_level_count;
         image_info.arrayLayers = 1;
         image_info.samples = c.VK_SAMPLE_COUNT_1_BIT;
         image_info.tiling = c.VK_IMAGE_TILING_OPTIMAL;
@@ -787,18 +854,26 @@ pub const Rhi = struct {
         try check(c.vkBindImageMemory(self.device, destination.image, destination.memory, 0), "vkBindImageMemory(texture)");
 
         const staging = try self.createBuffer(
-            @intCast(desc.rgba8.len),
+            @intCast(upload_bytes),
             c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
         );
         defer self.destroyBuffer(staging);
 
         var mapped: ?*anyopaque = null;
-        try check(c.vkMapMemory(self.device, staging.memory, 0, @intCast(desc.rgba8.len), 0, &mapped), "vkMapMemory(texture)");
+        try check(c.vkMapMemory(self.device, staging.memory, 0, @intCast(upload_bytes), 0, &mapped), "vkMapMemory(texture)");
         const mapped_bytes: [*]u8 = @ptrCast(mapped.?);
-        @memcpy(mapped_bytes[0..desc.rgba8.len], desc.rgba8);
+        var upload_offset: usize = 0;
+        @memcpy(mapped_bytes[upload_offset .. upload_offset + desc.rgba8.len], desc.rgba8);
+        upload_offset += desc.rgba8.len;
+        for (desc.mip_levels) |level| {
+            @memcpy(mapped_bytes[upload_offset .. upload_offset + level.rgba8.len], level.rgba8);
+            upload_offset += level.rgba8.len;
+        }
         c.vkUnmapMemory(self.device, staging.memory);
-        try self.uploadTexture(staging.buffer, destination.image, desc.width, desc.height);
+        destination.mip_levels = mip_level_count;
+        destination.sampler_profile = desc.sampler_profile;
+        try self.uploadTexture(staging.buffer, destination.image, desc);
     }
 
     fn createTextureViewSamplerDescriptor(self: *Rhi, destination: *TextureSlot) !void {
@@ -808,19 +883,47 @@ pub const Rhi = struct {
         view_info.viewType = c.VK_IMAGE_VIEW_TYPE_2D;
         view_info.format = c.VK_FORMAT_R8G8B8A8_SRGB;
         view_info.subresourceRange.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
-        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.levelCount = destination.mip_levels;
         view_info.subresourceRange.layerCount = 1;
         try check(c.vkCreateImageView(self.device, &view_info, null, &destination.view), "vkCreateImageView(texture)");
 
         var sampler_info = std.mem.zeroes(c.VkSamplerCreateInfo);
         sampler_info.sType = c.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        sampler_info.magFilter = c.VK_FILTER_LINEAR;
-        sampler_info.minFilter = c.VK_FILTER_LINEAR;
-        sampler_info.mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_LINEAR;
         sampler_info.addressModeU = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sampler_info.addressModeV = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sampler_info.addressModeW = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sampler_info.maxLod = 1.0;
+        switch (destination.sampler_profile) {
+            .pixel_nearest => {
+                sampler_info.magFilter = c.VK_FILTER_NEAREST;
+                sampler_info.minFilter = c.VK_FILTER_NEAREST;
+                sampler_info.mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                sampler_info.maxLod = @floatFromInt(destination.mip_levels - 1);
+            },
+            .smooth_linear => {
+                sampler_info.magFilter = c.VK_FILTER_LINEAR;
+                sampler_info.minFilter = c.VK_FILTER_LINEAR;
+                sampler_info.mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                sampler_info.maxLod = 0.0;
+            },
+            .smooth_mipmap => {
+                sampler_info.magFilter = c.VK_FILTER_LINEAR;
+                sampler_info.minFilter = c.VK_FILTER_LINEAR;
+                sampler_info.mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_LINEAR;
+                sampler_info.maxLod = @floatFromInt(destination.mip_levels - 1);
+            },
+            .smooth_mipmap_anisotropic => {
+                sampler_info.magFilter = c.VK_FILTER_LINEAR;
+                sampler_info.minFilter = c.VK_FILTER_LINEAR;
+                sampler_info.mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_LINEAR;
+                sampler_info.maxLod = @floatFromInt(destination.mip_levels - 1);
+            },
+        }
+        if (destination.sampler_profile == .smooth_mipmap_anisotropic and self.sampler_anisotropy_supported) {
+            destination.anisotropy_enabled = true;
+            destination.anisotropy_level = @min(4.0, self.max_sampler_anisotropy);
+            sampler_info.anisotropyEnable = c.VK_TRUE;
+            sampler_info.maxAnisotropy = destination.anisotropy_level;
+        }
         try check(c.vkCreateSampler(self.device, &sampler_info, null, &destination.sampler), "vkCreateSampler(texture)");
 
         var allocate_info = std.mem.zeroes(c.VkDescriptorSetAllocateInfo);
@@ -845,7 +948,8 @@ pub const Rhi = struct {
         c.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
     }
 
-    fn uploadTexture(self: *Rhi, staging: c.VkBuffer, image: c.VkImage, width: u32, height: u32) !void {
+    fn uploadTexture(self: *Rhi, staging: c.VkBuffer, image: c.VkImage, desc: types.TextureUploadDesc) !void {
+        const mip_level_count: u32 = @intCast(1 + desc.mip_levels.len);
         try check(c.vkResetCommandBuffer(self.command_buffer, 0), "vkResetCommandBuffer(texture)");
         var begin_info = std.mem.zeroes(c.VkCommandBufferBeginInfo);
         begin_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -861,15 +965,36 @@ pub const Rhi = struct {
         barrier.dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
         barrier.image = image;
         barrier.subresourceRange.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.levelCount = mip_level_count;
         barrier.subresourceRange.layerCount = 1;
         c.vkCmdPipelineBarrier(self.command_buffer, c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &barrier);
 
-        var copy = std.mem.zeroes(c.VkBufferImageCopy);
-        copy.imageSubresource.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
-        copy.imageSubresource.layerCount = 1;
-        copy.imageExtent = .{ .width = width, .height = height, .depth = 1 };
-        c.vkCmdCopyBufferToImage(self.command_buffer, staging, image, c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        // 一个 staging buffer 连续存放所有 levels；每个 copy region 指向对应 Vulkan mipLevel。
+        var copies: [max_texture_mip_levels]c.VkBufferImageCopy = undefined;
+        copies[0] = std.mem.zeroes(c.VkBufferImageCopy);
+        copies[0].imageSubresource.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
+        copies[0].imageSubresource.mipLevel = 0;
+        copies[0].imageSubresource.layerCount = 1;
+        copies[0].imageExtent = .{ .width = desc.width, .height = desc.height, .depth = 1 };
+        var upload_offset = desc.rgba8.len;
+        for (desc.mip_levels, 0..) |level, index| {
+            const copy_index = index + 1;
+            copies[copy_index] = std.mem.zeroes(c.VkBufferImageCopy);
+            copies[copy_index].bufferOffset = @intCast(upload_offset);
+            copies[copy_index].imageSubresource.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
+            copies[copy_index].imageSubresource.mipLevel = @intCast(copy_index);
+            copies[copy_index].imageSubresource.layerCount = 1;
+            copies[copy_index].imageExtent = .{ .width = level.width, .height = level.height, .depth = 1 };
+            upload_offset += level.rgba8.len;
+        }
+        c.vkCmdCopyBufferToImage(
+            self.command_buffer,
+            staging,
+            image,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            mip_level_count,
+            &copies[0],
+        );
 
         barrier.srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT;
@@ -886,7 +1011,6 @@ pub const Rhi = struct {
         try check(c.vkQueueSubmit(self.queue, 1, &submit, self.in_flight), "vkQueueSubmit(texture)");
         try check(c.vkWaitForFences(self.device, 1, &self.in_flight, c.VK_TRUE, std.math.maxInt(u64)), "vkWaitForFences(texture)");
     }
-
     fn createBuffer(self: *Rhi, size: c.VkDeviceSize, usage: u32, properties: u32) !BufferAllocation {
         var info = std.mem.zeroes(c.VkBufferCreateInfo);
         info.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;

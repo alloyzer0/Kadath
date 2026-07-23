@@ -10,8 +10,9 @@ const sound_async: u32 = 0x0001;
 const sound_nodefault: u32 = 0x0002;
 const sound_filename: u32 = 0x0002_0000;
 
-const won_path = std.unicode.utf8ToUtf16LeStringLiteral("assets/audio/won.wav");
-const lost_path = std.unicode.utf8ToUtf16LeStringLiteral("assets/audio/lost.wav");
+// Runtime 只消费 importer/baker 生成的规范化 artifact，源 WAV 保留给 Editor 重新导入。
+const won_path = std.unicode.utf8ToUtf16LeStringLiteral("assets/audio/won.audio.wav");
+const lost_path = std.unicode.utf8ToUtf16LeStringLiteral("assets/audio/lost.audio.wav");
 
 extern "winmm" fn PlaySoundW(
     sound: ?[*:0]const u16,

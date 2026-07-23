@@ -5,6 +5,8 @@ pub const PipelineHandle = types.PipelineHandle;
 pub const invalid_pipeline = types.invalid_pipeline;
 pub const TextureHandle = types.TextureHandle;
 pub const invalid_texture = types.invalid_texture;
+pub const TextureSamplerProfile = types.TextureSamplerProfile;
+pub const TextureMipUpload = types.TextureMipUpload;
 pub const TextureUploadDesc = types.TextureUploadDesc;
 pub const GraphicsPipelineDesc = types.GraphicsPipelineDesc;
 
