@@ -766,7 +766,7 @@ if ($Headless) {
     # Headless contract 只验证 GUI 依赖的路径/命令入口；内容事务仍由 editor-author verifier 覆盖。
     Add-Type -AssemblyName System.Windows.Forms
     # 覆盖非 Live JSON watcher 与首次失败：artifact/retained 字段均允许缺失，StrictMode 下也不能中断事件流。
-    Handle-PreviewLine '{"event":"runtime_initial_loaded","loadVersion":1,"state":"loaded","scene":{"target":"Scene","kind":"built_in","correlation":"runtime_only"},"script":{"target":"Script","kind":"built_in","correlation":"runtime_only"}}'
+    Handle-PreviewLine '{"event":"runtime_initial_loaded","loadVersion":1,"state":"loaded","scene":{"target":"Scene","kind":"built_in","correlation":"built_in"},"script":{"target":"Script","kind":"built_in","correlation":"built_in"}}'
     Handle-PreviewLine '{"event":"runtime_reload_acknowledged","target":"Scene","requestId":1,"source":"file_change","sourceRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","result":"succeeded"}'
     Handle-PreviewLine '{"event":"runtime_reload_failed","target":"Script","requestId":2,"source":"file_change","sourceRevision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","result":"rejected","errorCode":"UnsupportedScriptSchema"}'
     Write-Output 'gui_contract=ok'

@@ -9,7 +9,11 @@ internal sealed class PreviewProcessController : IAsyncDisposable
 {
     private readonly string _kadathRoot;
     private readonly object _gate = new();
+    private readonly SemaphoreSlim _lifecycleBoundary = new(1, 1);
     private Process? _launcher;
+    private Task _stdoutPump = Task.CompletedTask;
+    private Task _stderrPump = Task.CompletedTask;
+    private Task _exitObserver = Task.CompletedTask;
     private int? _runtimeProcessId;
     private bool _stopRequested;
 
@@ -19,11 +23,17 @@ internal sealed class PreviewProcessController : IAsyncDisposable
 
     public async Task<PreviewStartResult> StartAsync(PreviewStartParameters parameters)
     {
-        lock (_gate)
+        await _lifecycleBoundary.WaitAsync().ConfigureAwait(false);
+        try
         {
-            if (_launcher is { HasExited: false }) { throw new InvalidOperationException("Preview is already running."); }
+            await RetireExitedLauncherAsync().ConfigureAwait(false);
+            return await StartCoreAsync(parameters).ConfigureAwait(false);
         }
+        finally { _lifecycleBoundary.Release(); }
+    }
 
+    private async Task<PreviewStartResult> StartCoreAsync(PreviewStartParameters parameters)
+    {
         if (string.IsNullOrWhiteSpace(parameters.ConfigPath)) { throw new InvalidOperationException("Preview config path was not resolved."); }
         if (string.IsNullOrWhiteSpace(parameters.PackageRoot)) { throw new InvalidOperationException("Package root was not resolved."); }
         var configPath = parameters.ConfigPath;
@@ -55,9 +65,10 @@ internal sealed class PreviewProcessController : IAsyncDisposable
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         if (!process.Start()) { throw new InvalidOperationException("Failed to start editor-preview.ps1."); }
         lock (_gate) { _launcher = process; _runtimeProcessId = null; _stopRequested = false; }
-        _ = PumpOutputAsync(process, process.StandardOutput, false);
-        _ = PumpOutputAsync(process, process.StandardError, true);
-        _ = ObserveExitAsync(process);
+        var stdoutPump = PumpOutputAsync(process, process.StandardOutput, false);
+        var stderrPump = PumpOutputAsync(process, process.StandardError, true);
+        var exitObserver = ObserveExitAsync(process, stdoutPump, stderrPump);
+        lock (_gate) { _stdoutPump = stdoutPump; _stderrPump = stderrPump; _exitObserver = exitObserver; }
         await Task.Yield();
         // surface 元数据可先于 runtime_pid 公布；客户端随后从 preview_status 获取实际进程状态。
         var surface = new PreviewSurfaceDescriptor(PreviewSurfaceModes.ExternalWindow, "native-window", null, "KadathRuntimeWindow", null, null, null, null);
@@ -67,16 +78,50 @@ internal sealed class PreviewProcessController : IAsyncDisposable
 
     public async Task<PreviewStopResult> StopAsync()
     {
+        await _lifecycleBoundary.WaitAsync().ConfigureAwait(false);
+        try { return await StopCoreAsync().ConfigureAwait(false); }
+        finally { _lifecycleBoundary.Release(); }
+    }
+
+    private async Task<PreviewStopResult> StopCoreAsync()
+    {
         Process? process; int? runtimePid;
         lock (_gate) { process = _launcher; runtimePid = _runtimeProcessId; _stopRequested = true; }
-        if (process is null || process.HasExited) { return new PreviewStopResult("stopped"); }
-        if (runtimePid.HasValue && NativePreviewWindow.TryClose(runtimePid.Value))
+        if (process is not null && !process.HasExited && runtimePid.HasValue && NativePreviewWindow.TryClose(runtimePid.Value))
         {
             try { using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10)); await process.WaitForExitAsync(timeout.Token); }
             catch (OperationCanceledException) { }
         }
-        if (!process.HasExited) { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(); }
+        if (process is not null && !process.HasExited) { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(); }
+        if (process is not null) { await CompleteLifecycleAsync(process).ConfigureAwait(false); }
         return new PreviewStopResult("stopped");
+    }
+
+    private async Task RetireExitedLauncherAsync()
+    {
+        Process? process;
+        lock (_gate) { process = _launcher; }
+        if (process is null) { return; }
+        if (!process.HasExited) { throw new InvalidOperationException("Preview is already running."); }
+        await CompleteLifecycleAsync(process).ConfigureAwait(false);
+    }
+
+    private async Task CompleteLifecycleAsync(Process process)
+    {
+        Task stdoutPump; Task stderrPump; Task exitObserver;
+        lock (_gate) { stdoutPump = _stdoutPump; stderrPump = _stderrPump; exitObserver = _exitObserver; }
+        // 生命周期屏障：Stop/下一次 Start 返回前，旧进程的所有输出与 exit 终态必须已经串行排空。
+        await Task.WhenAll(stdoutPump, stderrPump, exitObserver).ConfigureAwait(false);
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_launcher, process)) { return; }
+            _launcher = null;
+            _runtimeProcessId = null;
+            _stdoutPump = Task.CompletedTask;
+            _stderrPump = Task.CompletedTask;
+            _exitObserver = Task.CompletedTask;
+        }
+        process.Dispose();
     }
 
     private static void Add(ProcessStartInfo info, string value) => info.ArgumentList.Add(value);
@@ -268,9 +313,11 @@ internal sealed class PreviewProcessController : IAsyncDisposable
     private static bool IsLowerHex64(string? revision) =>
         revision is { Length: 64 } && revision.All(value => value is >= '0' and <= '9' or >= 'a' and <= 'f');
 
-    private async Task ObserveExitAsync(Process process)
+    private async Task ObserveExitAsync(Process process, Task stdoutPump, Task stderrPump)
     {
         await process.WaitForExitAsync();
+        // preview_stopped 必须排在 Launcher stdout/stderr 的最后一个终态之后。
+        await Task.WhenAll(stdoutPump, stderrPump).ConfigureAwait(false);
         if (!IsCurrentLauncher(process)) { return; }
         bool requested; lock (_gate) { requested = _stopRequested; }
         await EmitAsync("preview_stopped", JsonSerializer.SerializeToElement(new { exitCode = process.ExitCode, requested }, EditorProtocol.JsonOptions));

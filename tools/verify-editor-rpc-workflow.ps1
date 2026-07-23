@@ -153,6 +153,31 @@ try {
     if (-not $reloadAckValid) { throw 'Preview reload acknowledgement contract mismatch' }
     [void](Read-Event $process 'preview_stopped')
 
+    # 显式 Stop 返回后立即 restart；新的 initial 前不得混入旧 Launcher 的 reload/initial 终态。
+    $script:stage = 'preview_restart_stop_boundary'
+    Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'preview-2'; method = 'preview_start'; params = [ordered]@{ projectName = $ProjectName; liveBake = $true; watchChanges = $true; stopAfterMilliseconds = 0 } })
+    [void](Read-Event $process 'preview_surface_created')
+    $preview2 = Read-Response $process 'preview-2'
+    [void](Read-Event $process 'preview_initial_loaded')
+    if (-not [bool]$preview2.ok) { throw 'Second Preview start failed before lifecycle boundary verification' }
+    Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'preview-stop-2'; method = 'preview_stop'; params = $null })
+    [void](Read-Event $process 'preview_stopped')
+    $previewStop2 = Read-Response $process 'preview-stop-2'
+    if (-not [bool]$previewStop2.ok -or [string]$previewStop2.result.state -ne 'stopped') { throw 'Explicit Preview stop boundary failed' }
+
+    $restartBoundary = $messages.Count
+    Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'preview-3'; method = 'preview_start'; params = [ordered]@{ projectName = $ProjectName; liveBake = $true; watchChanges = $true; stopAfterMilliseconds = 1200 } })
+    [void](Read-Event $process 'preview_surface_created')
+    $preview3 = Read-Response $process 'preview-3'
+    [void](Read-Event $process 'preview_initial_loaded')
+    if (-not [bool]$preview3.ok) { throw 'Preview restart failed after explicit stop boundary' }
+    $restartEvents = @($messages | Select-Object -Skip $restartBoundary | Where-Object { $_.type -eq 'event' })
+    if (@($restartEvents | Where-Object { $_.event -eq 'preview_initial_loaded' }).Count -ne 1 -or
+        @($restartEvents | Where-Object { $_.event -like 'preview_reload_*' }).Count -ne 0) {
+        throw 'Old Launcher terminal event crossed the Preview restart lifecycle boundary'
+    }
+    [void](Read-Event $process 'preview_stopped')
+
     $script:stage = 'shutdown'
     Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'shutdown-1'; method = 'shutdown'; params = $null })
     [void](Read-Response $process 'shutdown-1')
@@ -168,6 +193,7 @@ try {
     Write-Output 'preview_external_window=ok'
     Write-Output 'preview_initial_loaded=ok'
     Write-Output 'preview_reload_ack=ok'
+    Write-Output 'preview_restart_boundary=ok'
     Write-Output 'verification=ok'
 }
 finally {

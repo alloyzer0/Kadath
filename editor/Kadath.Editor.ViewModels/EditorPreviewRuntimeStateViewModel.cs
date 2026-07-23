@@ -144,7 +144,7 @@ public sealed class EditorPreviewRuntimeStateViewModel : ObservableObject
     internal void Reset()
     {
         _initialTerminalApplied = false;
-        _publication = null;
+        // Publication 属于 workspace/project 生命周期；Preview restart 只清空 Runtime identity，保留对账基准。
         State = EditorPreviewRuntimeState.Unknown;
         LastTarget = null;
         ErrorCode = null;

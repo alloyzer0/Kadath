@@ -279,7 +279,7 @@ internal static class Program
         await transport.EmitEventAsync("preview_initial_loaded", new PreviewInitialLoadedNotification(
             1, "loaded",
             new PreviewLoadedTargetIdentity("Scene", "artifact", "artifact_mismatch", null, new string('f', 64), 128),
-            new PreviewLoadedTargetIdentity("Script", "built_in", "runtime_only"))).ConfigureAwait(false);
+            new PreviewLoadedTargetIdentity("Script", "built_in", "built_in"))).ConfigureAwait(false);
         await Task.Delay(20).ConfigureAwait(false);
         Assert(workspace.Preview.Runtime.Scene.ArtifactRevision == initialSceneArtifact
             && workspace.Preview.Runtime.Script.ArtifactRevision == initialScriptArtifact,
@@ -396,7 +396,18 @@ internal static class Program
             "Preview ownership was not released after confirmed stop");
 
         _ = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: "demo"));
-        await transport.EmitEventAsync("publication_snapshot_created", initialPublication).ConfigureAwait(false);
+        await transport.EmitEventAsync("preview_initial_loaded", new PreviewInitialLoadedNotification(
+            1, "loaded",
+            new PreviewLoadedTargetIdentity("Scene", "artifact", "manifest_matched", initialSceneSource, initialSceneArtifact, 128),
+            new PreviewLoadedTargetIdentity("Script", "artifact", "manifest_matched", initialScriptSource, initialScriptArtifact, 48),
+            "debug")).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded);
+        Assert(workspace.Preview.Runtime.Scene.Consistency == EditorPreviewRuntimeConsistency.Current
+            && workspace.Preview.Runtime.Script.Consistency == EditorPreviewRuntimeConsistency.Current,
+            "Preview restart lost the existing Publication snapshot before initial reconciliation");
+        await workspace.StopPreviewAsync();
+
+        _ = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: "demo"));
         var mismatchedArtifact = new string('9', 64);
         await transport.EmitEventAsync("preview_initial_loaded", new PreviewInitialLoadedNotification(
             1, "loaded",
