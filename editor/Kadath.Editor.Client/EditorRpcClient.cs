@@ -55,6 +55,7 @@ public interface IEditorRpcClient : IAsyncDisposable
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
+    Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, CancellationToken cancellationToken = default);
     Task<EditorBakeResult> StartBakeAsync(BakeStartParameters parameters, CancellationToken cancellationToken = default);
@@ -131,6 +132,9 @@ public sealed class EditorRpcClient : IEditorRpcClient
 
     public Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<SnapshotQueryParameters, AssetCatalogSnapshot>("asset_catalog_snapshot", parameters, cancellationToken);
+
+    public Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<PublicationSnapshotQueryParameters, PublicationSnapshot>("publication_snapshot", parameters, cancellationToken);
 
     public Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<AuthoringApplyParameters, AuthoringMutationResult>("authoring_apply", parameters, cancellationToken);

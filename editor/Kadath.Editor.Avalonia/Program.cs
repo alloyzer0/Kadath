@@ -64,6 +64,8 @@ internal static class Program
         Require(avaloniaViewModel.HierarchyItems.Count == 8 && avaloniaViewModel.AssetItems.Count == 10, "Avalonia should project real snapshot collections.");
         Require(avaloniaViewModel.InspectorText.Contains("scene.goal", StringComparison.Ordinal), "Avalonia hierarchy inspector did not use snapshot data");
         Console.WriteLine("workflow_snapshot_projection=ok");
+        Require(workspace.Publication.State == EditorPublicationState.Missing, "fresh project should expose missing publication artifacts");
+        Console.WriteLine("workflow_publication_missing=ok");
 
         // 工作流 smoke 覆盖真实 authoring transaction：Apply 更新文件并建立撤销记录，Undo 恢复原值。
         var originalSceneGoalX = avaloniaViewModel.SceneGoalX;
@@ -88,6 +90,14 @@ internal static class Program
         var baked = await workspace.BakeAsync(new BakeStartParameters("Both", "debug"), cancellationToken);
         Require(string.Equals(baked.State, "succeeded", StringComparison.OrdinalIgnoreCase), "bake did not succeed");
         Console.WriteLine("workflow_bake=ok");
+        Require(workspace.Publication.State == EditorPublicationState.Current, "full bake did not publish a current snapshot");
+        avaloniaViewModel.SceneGoalX = (double.Parse(avaloniaViewModel.SceneGoalX, CultureInfo.InvariantCulture) + 5d).ToString("R", CultureInfo.InvariantCulture);
+        var changedAfterPublish = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+        Require(string.Equals(changedAfterPublish.State, "succeeded", StringComparison.OrdinalIgnoreCase) && workspace.Publication.State == EditorPublicationState.SourceDirty, "published source edit did not become dirty");
+        Console.WriteLine("workflow_publication_dirty=ok");
+        var incremental = await workspace.BakeChangesAsync("debug", cancellationToken);
+        Require(incremental?.Target == "Scene" && workspace.Publication.State == EditorPublicationState.Current, "Bake Changes did not choose Scene after source edit");
+        Console.WriteLine("workflow_bake_changes=ok");
 
         var watched = await workspace.StartWatchAsync(new WatchStartParameters("Scene", "debug", 50, 100), cancellationToken);
         Require(string.Equals(watched.State, "watching", StringComparison.OrdinalIgnoreCase), "watch did not start");
@@ -99,16 +109,30 @@ internal static class Program
         await WaitUntilAsync(() => workspace.Watch.State == EditorWatchState.Stopped, cancellationToken, "watch stopped state");
         Console.WriteLine("workflow_watch_stop=ok");
 
-        // Preview 仍使用独立 native window；smoke 只验证 surface/event 生命周期，不读取像素帧。
+        // Preview 仍使用独立 native window；27A 额外跨越 live bake/watch 验证 Runtime 实际确认 revision。
         var preview = await workspace.StartPreviewAsync(new PreviewStartParameters(
             ProjectName: projectName,
-            StopAfterMilliseconds: 1800,
-            WatchChanges: false,
+            WatchChanges: true,
+            PollIntervalMilliseconds: 50,
+            DebounceMilliseconds: 100,
             LiveBake: true,
             BakeProfile: "debug"), cancellationToken);
         Require(string.Equals(preview.SurfaceMode, PreviewSurfaceModes.ExternalWindow, StringComparison.Ordinal), "preview surface mode mismatch");
-        await WaitUntilAsync(() => workspace.Preview.Surface is not null, cancellationToken, "preview surface");
+        await WaitUntilAsync(() => workspace.Preview.Surface is not null && workspace.Preview.RuntimeProcessId is not null, cancellationToken, "preview surface/runtime pid");
         Console.WriteLine("workflow_preview_start=ok");
+
+        avaloniaViewModel.SceneGoalX = (double.Parse(avaloniaViewModel.SceneGoalX, CultureInfo.InvariantCulture) + 3d).ToString("R", CultureInfo.InvariantCulture);
+        var liveEdited = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+        Require(string.Equals(liveEdited.State, "succeeded", StringComparison.OrdinalIgnoreCase), "live Preview authoring update failed");
+        await WaitUntilAsync(() => workspace.Preview.Reload.Scene.State == EditorPreviewReloadState.Acknowledged, cancellationToken, "Scene Runtime reload acknowledgement");
+        Require(workspace.Preview.Reload.Scene.AcknowledgedSourceRevision is { Length: 64 }
+            && workspace.Preview.Reload.Scene.AcknowledgedArtifactRevision is { Length: 64 }
+            && avaloniaViewModel.RuntimeSyncStatus.Contains("Scene loaded", StringComparison.Ordinal),
+            "Avalonia did not project the acknowledged Scene revision");
+        Console.WriteLine("workflow_preview_reload_ack=ok");
+
+        var stoppedPreview = await workspace.StopPreviewAsync(cancellationToken);
+        Require(string.Equals(stoppedPreview.State, "stopped", StringComparison.OrdinalIgnoreCase), "preview_stop response mismatch");
         await WaitUntilAsync(() => workspace.Preview.State == EditorPreviewState.Stopped, cancellationToken, "preview stopped event");
         Console.WriteLine("workflow_preview_stop=ok");
 

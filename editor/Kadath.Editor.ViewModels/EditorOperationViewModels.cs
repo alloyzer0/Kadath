@@ -207,6 +207,10 @@ public sealed class EditorWatchViewModel : ObservableObject
 
 public sealed class EditorPreviewViewModel : ObservableObject
 {
+    public EditorPreviewViewModel() =>
+        Reload.PropertyChanged += (_, _) => RaisePropertyChanged(nameof(Reload));
+
+    public EditorPreviewReloadViewModel Reload { get; } = new();
     private EditorPreviewState _state;
     private string? _surfaceMode;
     private PreviewSurfaceDescriptor? _surface;
@@ -216,6 +220,10 @@ public sealed class EditorPreviewViewModel : ObservableObject
     private int? _exitCode;
     private string? _errorCode;
     private string? _errorMessage;
+    private bool _liveBakeEnabled;
+    private bool _watchChanges;
+    private string _bakeProfile = "debug";
+    private bool _ownsPublicationSync;
 
     public EditorPreviewState State { get => _state; private set => SetProperty(ref _state, value); }
     public string? SurfaceMode { get => _surfaceMode; private set => SetProperty(ref _surfaceMode, value); }
@@ -226,9 +234,19 @@ public sealed class EditorPreviewViewModel : ObservableObject
     public int? ExitCode { get => _exitCode; private set => SetProperty(ref _exitCode, value); }
     public string? ErrorCode { get => _errorCode; private set => SetProperty(ref _errorCode, value); }
     public string? ErrorMessage { get => _errorMessage; private set => SetProperty(ref _errorMessage, value); }
+    public bool LiveBakeEnabled { get => _liveBakeEnabled; private set => SetProperty(ref _liveBakeEnabled, value); }
+    public bool WatchChanges { get => _watchChanges; private set => SetProperty(ref _watchChanges, value); }
+    public string BakeProfile { get => _bakeProfile; private set => SetProperty(ref _bakeProfile, value); }
+    public bool OwnsPublicationSync { get => _ownsPublicationSync; private set => SetProperty(ref _ownsPublicationSync, value); }
 
-    internal void BeginStart()
+    internal void BeginStart(PreviewStartParameters parameters)
     {
+        LiveBakeEnabled = parameters.LiveBake;
+        WatchChanges = parameters.WatchChanges;
+        OwnsPublicationSync = parameters.LiveBake && parameters.WatchChanges;
+        Reload.Reset();
+        BakeProfile = parameters.BakeProfile;
+        // Preview live-bake/watch 运行时拥有派生文件写入权，UI 据此禁用手动 Bake/Service Watch。
         ErrorCode = null;
         ErrorMessage = null;
         ExitCode = null;
@@ -257,12 +275,16 @@ public sealed class EditorPreviewViewModel : ObservableObject
         if (State == EditorPreviewState.Starting && runtimeProcessId is not null) { State = EditorPreviewState.Running; }
     }
 
+    internal void ApplyReload(PreviewReloadNotification notification) => Reload.Apply(notification);
+
     internal void BeginStop() => State = EditorPreviewState.Stopping;
 
     internal void ApplyStopped(int? exitCode)
     {
         ExitCode = exitCode;
         RuntimeProcessId = null;
+        // 只有确认 preview_stopped/stop response 后才释放 derived writer，失败或超时保持保守占用。
+        OwnsPublicationSync = false;
         State = EditorPreviewState.Stopped;
     }
 
@@ -270,6 +292,7 @@ public sealed class EditorPreviewViewModel : ObservableObject
     {
         ErrorCode = code;
         ErrorMessage = message;
+        // 不在未知失败路径释放 ownership；Runtime/Launcher 可能仍存活并继续写 derived。
         State = EditorPreviewState.Failed;
     }
 }

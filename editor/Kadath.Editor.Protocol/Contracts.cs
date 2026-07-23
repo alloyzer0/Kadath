@@ -112,6 +112,8 @@ public static class EditorSnapshotVersions
     public const int ProjectModel = 1;
     public const int Hierarchy = 1;
     public const int AssetCatalog = 1;
+    // Publication 快照使用独立版本，避免与其它只读 snapshot 的演进互相耦合。
+    public const int Publication = 1;
 }
 
 public sealed record ProjectModelFiles(
@@ -139,6 +141,38 @@ public sealed record ProjectModelSnapshot(
     ProjectModelScene Scene,
     ProjectModelScript Script,
     ProjectModelPreview Preview);
+
+/// <summary>
+/// Publication Snapshot 把 source/derived 状态收敛在只读边界后。
+/// 前端只消费该 DTO，不直接读取 manifest 或 artifact。
+/// </summary>
+public sealed record PublicationSnapshotQueryParameters(
+    string? ProjectName = null,
+    string Profile = "debug");
+
+public sealed record PublicationTargetSnapshot(
+    string Target,
+    string State,
+    string? SourceRevision,
+    string? BakedSourceRevision,
+    string? ArtifactRevision,
+    string? ManifestArtifactRevision,
+    long? ArtifactBytes,
+    long? ManifestArtifactBytes);
+
+public sealed record PublicationSnapshot(
+    int SnapshotVersion,
+    string ProjectName,
+    string Profile,
+    string? ManifestProfile,
+    string DerivedDirectory,
+    string ManifestPath,
+    string State,
+    bool ManifestPresent,
+    PublicationTargetSnapshot Scene,
+    PublicationTargetSnapshot Script,
+    string? DiagnosticCode = null,
+    string? DiagnosticMessage = null);
 
 public sealed record HierarchyNode(
     string Id,
@@ -244,4 +278,25 @@ public sealed record PreviewStartParameters(
 
 public sealed record PreviewStartResult(string State, string SurfaceMode);
 public sealed record PreviewStopResult(string State);
+
+/// <summary>
+/// Service 归一化后的 Runtime reload 确认。它携带内容身份，不暴露 Launcher sequence 或 WM_APP。
+/// </summary>
+public sealed record PreviewReloadNotification(
+    int ReloadVersion,
+    string State,
+    string Target,
+    ulong RequestId,
+    string Source,
+    string? SourceRevision = null,
+    string? ArtifactRevision = null,
+    long? ArtifactBytes = null,
+    string? LatestRequestedSourceRevision = null,
+    string? AcknowledgedSourceRevision = null,
+    string? AcknowledgedArtifactRevision = null,
+    string? FailedSourceRevision = null,
+    string? Result = null,
+    string? ErrorCode = null,
+    string? Message = null,
+    bool Ignored = false);
 

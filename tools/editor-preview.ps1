@@ -76,6 +76,23 @@ $script:structuredStatus = [bool]$StructuredStatus
 $script:runtimeStdoutTask = $null
 $script:runtimeStderrTask = $null
 $script:pendingRequests = @{}
+# 每个 target 独立维护 latest/acknowledged，避免 Scene 与 Script 的响应互相污染。
+$script:reloadTargets = @{
+    Scene = [pscustomobject]@{
+        LatestRequestId = [uint64]0
+        LatestRequestedSourceRevision = $null
+        AcknowledgedSourceRevision = $null
+        AcknowledgedArtifactRevision = $null
+        FailedSourceRevision = $null
+    }
+    Script = [pscustomobject]@{
+        LatestRequestId = [uint64]0
+        LatestRequestedSourceRevision = $null
+        AcknowledgedSourceRevision = $null
+        AcknowledgedArtifactRevision = $null
+        FailedSourceRevision = $null
+    }
+}
 $script:nextRequestId = [uint64]1
 $script:launcherSequence = [uint64]0
 $script:liveBakeEnabled = [bool]$LiveBake
@@ -129,6 +146,70 @@ function Start-RuntimeProcess([string]$Executable, [string]$WorkingDirectory, [s
     return $process
 }
 
+function Get-RuntimeReloadTarget([string]$Command) {
+    if ($Command -eq 'reload_scene') { return 'Scene' }
+    if ($Command -eq 'reload_script') { return 'Script' }
+    return $null
+}
+
+function New-RuntimeReloadEvent(
+    [string]$EventName,
+    [string]$State,
+    [object]$Pending,
+    [uint64]$RequestId,
+    [object]$TargetState,
+    [string]$Result,
+    [string]$ErrorCode,
+    [bool]$Ignored
+) {
+    $event = [ordered]@{
+        event = $EventName
+        reloadVersion = 1
+        state = $State
+        target = [string]$Pending.target
+        requestId = $RequestId
+        source = [string]$Pending.source
+    }
+    if ($null -ne $Pending.revision) { $event['sourceRevision'] = [string]$Pending.revision }
+    if ($null -ne $Pending.artifactRevision) { $event['artifactRevision'] = [string]$Pending.artifactRevision }
+    if ($null -ne $Pending.artifactBytes -and [int64]$Pending.artifactBytes -gt 0) { $event['artifactBytes'] = [int64]$Pending.artifactBytes }
+    if ($null -ne $TargetState.LatestRequestedSourceRevision) { $event['latestRequestedSourceRevision'] = [string]$TargetState.LatestRequestedSourceRevision }
+    if ($null -ne $TargetState.AcknowledgedSourceRevision) { $event['acknowledgedSourceRevision'] = [string]$TargetState.AcknowledgedSourceRevision }
+    if ($null -ne $TargetState.AcknowledgedArtifactRevision) { $event['acknowledgedArtifactRevision'] = [string]$TargetState.AcknowledgedArtifactRevision }
+    # failedSourceRevision 只描述当前失败候选；stale/ack/requested 不得泄漏另一个 request 的失败身份。
+    if ($State -eq 'failed' -and $null -ne $TargetState.FailedSourceRevision) { $event['failedSourceRevision'] = [string]$TargetState.FailedSourceRevision }
+    if (-not [string]::IsNullOrWhiteSpace($Result)) { $event['result'] = $Result }
+    if (-not [string]::IsNullOrWhiteSpace($ErrorCode)) { $event['errorCode'] = $ErrorCode }
+    if ($Ignored) { $event['ignored'] = $true }
+    return $event
+}
+
+function Write-RuntimeReloadRequested([object]$Pending, [uint64]$RequestId) {
+    $targetState = $script:reloadTargets[[string]$Pending.target]
+    $targetState.LatestRequestId = $RequestId
+    $targetState.LatestRequestedSourceRevision = $Pending.revision
+    $targetState.FailedSourceRevision = $null
+    Write-StructuredEvent (New-RuntimeReloadEvent 'runtime_reload_requested' 'requested' $Pending $RequestId $targetState '' '' $false)
+}
+
+function Complete-RuntimeReload([object]$Pending, [uint64]$RequestId, [string]$Result, [string]$ErrorCode) {
+    if ($null -eq $Pending -or $null -eq $Pending.target) { return }
+    $targetState = $script:reloadTargets[[string]$Pending.target]
+    # 关键过期保护：同一 target 的旧 request completion 只能生成 stale 证据，不能覆盖新 revision。
+    if ([uint64]$targetState.LatestRequestId -ne $RequestId) {
+        Write-StructuredEvent (New-RuntimeReloadEvent 'runtime_reload_stale' 'stale' $Pending $RequestId $targetState $Result $ErrorCode $true)
+        return
+    }
+    if ($Result -eq 'succeeded') {
+        if ($null -ne $Pending.revision) { $targetState.AcknowledgedSourceRevision = $Pending.revision }
+        if ($null -ne $Pending.artifactRevision) { $targetState.AcknowledgedArtifactRevision = $Pending.artifactRevision }
+        $targetState.FailedSourceRevision = $null
+        Write-StructuredEvent (New-RuntimeReloadEvent 'runtime_reload_acknowledged' 'acknowledged' $Pending $RequestId $targetState $Result '' $false)
+        return
+    }
+    $targetState.FailedSourceRevision = $Pending.revision
+    Write-StructuredEvent (New-RuntimeReloadEvent 'runtime_reload_failed' 'failed' $Pending $RequestId $targetState $Result $ErrorCode $false)
+}
 function Handle-RuntimeOutputLine([object]$Item) {
     if ($Item.stream -eq 'stderr') {
         Write-StructuredEvent ([ordered]@{ event = 'runtime_log'; stream = 'stderr'; message = $Item.line })
@@ -146,10 +227,18 @@ function Handle-RuntimeOutputLine([object]$Item) {
     if ($null -ne $pending) {
         $response['source'] = $pending.source
         if ($null -ne $pending.revision) { $response['revision'] = $pending.revision }
+        if ($null -ne $pending.artifactRevision) { $response['artifactRevision'] = $pending.artifactRevision }
+        if ($null -ne $pending.artifactBytes -and [int64]$pending.artifactBytes -gt 0) { $response['artifactBytes'] = [int64]$pending.artifactBytes }
         $script:pendingRequests.Remove([string]$requestId)
     }
-    if ($null -ne $runtimeEvent.PSObject.Properties['errorCode']) { $response['errorCode'] = [string]$runtimeEvent.errorCode }
+    $errorCode = ''
+    if ($null -ne $runtimeEvent.PSObject.Properties['errorCode']) {
+        $errorCode = [string]$runtimeEvent.errorCode
+        $response['errorCode'] = $errorCode
+    }
+    # 先发旧 command_response，再发新 reload 终态，保持旧 CLI/GUI 的事件消费顺序兼容。
     Write-StructuredEvent $response
+    Complete-RuntimeReload $pending $requestId ([string]$runtimeEvent.result) $errorCode
 }
 
 function Drain-RuntimeOutput([switch]$WaitForEnd) {
@@ -179,8 +268,14 @@ function Expire-PendingRequests {
     foreach ($key in @($script:pendingRequests.Keys)) {
         $pending = $script:pendingRequests[$key]
         if (([DateTime]::UtcNow - $pending.sentAt).TotalSeconds -ge 10) {
-            Write-StructuredEvent ([ordered]@{ event = 'command_response'; requestId = [uint64]$key; command = $pending.command; result = 'timeout'; source = $pending.source })
+            $requestId = [uint64]$key
+            $response = [ordered]@{ event = 'command_response'; requestId = $requestId; command = $pending.command; result = 'timeout'; source = $pending.source }
+            if ($null -ne $pending.revision) { $response['revision'] = $pending.revision }
+            if ($null -ne $pending.artifactRevision) { $response['artifactRevision'] = $pending.artifactRevision }
+            if ($null -ne $pending.artifactBytes -and [int64]$pending.artifactBytes -gt 0) { $response['artifactBytes'] = [int64]$pending.artifactBytes }
+            Write-StructuredEvent $response
             $script:pendingRequests.Remove($key)
+            Complete-RuntimeReload $pending $requestId 'timeout' 'runtime_reload_timeout'
         }
     }
 }
@@ -246,16 +341,28 @@ function Request-RuntimeClose([Diagnostics.Process]$Process) {
     }
 }
 
-function Request-RuntimeStructuredReload([Diagnostics.Process]$Process, [string]$Command, [string]$Source, [string]$Revision) {
+function Request-RuntimeStructuredReload(
+    [Diagnostics.Process]$Process,
+    [string]$Command,
+    [string]$Source,
+    [string]$Revision,
+    [string]$ArtifactRevision = '',
+    [int64]$ArtifactBytes = 0
+) {
     if ($Process.HasExited) { return }
+    $target = Get-RuntimeReloadTarget $Command
+    if ($null -eq $target) { throw "Unsupported structured reload command: $Command" }
     $windowHandle = Get-RuntimeWindow $Process "$Command command"
     if ($windowHandle -eq [IntPtr]::Zero) { return }
     $requestId = Get-NextRequestId
     $message = if ($Command -eq 'reload_scene') { 0x84D0 } else { 0x84D1 }
     $script:pendingRequests[[string]$requestId] = [pscustomobject]@{
         command = $Command
+        target = $target
         source = $Source
         revision = if ([string]::IsNullOrWhiteSpace($Revision)) { $null } else { $Revision }
+        artifactRevision = if ([string]::IsNullOrWhiteSpace($ArtifactRevision)) { $null } else { $ArtifactRevision }
+        artifactBytes = if ($ArtifactBytes -gt 0) { $ArtifactBytes } else { $null }
         sentAt = [DateTime]::UtcNow
     }
     # 关键关联边界：requestId 通过 WM_APP 进入 Runtime，并在 JSONL 终态响应中原样返回。
@@ -265,20 +372,35 @@ function Request-RuntimeStructuredReload([Diagnostics.Process]$Process, [string]
     }
     $event = [ordered]@{ event = 'command_requested'; requestId = $requestId; command = $Command; source = $Source }
     if (-not [string]::IsNullOrWhiteSpace($Revision)) { $event['revision'] = $Revision }
+    if (-not [string]::IsNullOrWhiteSpace($ArtifactRevision)) { $event['artifactRevision'] = $ArtifactRevision }
+    if ($ArtifactBytes -gt 0) { $event['artifactBytes'] = $ArtifactBytes }
     Write-StructuredEvent $event
+    Write-RuntimeReloadRequested $script:pendingRequests[[string]$requestId] $requestId
 }
 
-function Request-RuntimeSceneReload([Diagnostics.Process]$Process, [string]$Source = 'explicit', [string]$Revision = '') {
+function Request-RuntimeSceneReload(
+    [Diagnostics.Process]$Process,
+    [string]$Source = 'explicit',
+    [string]$Revision = '',
+    [string]$ArtifactRevision = '',
+    [int64]$ArtifactBytes = 0
+) {
     if ($script:structuredStatus) {
-        Request-RuntimeStructuredReload $Process 'reload_scene' $Source $Revision
+        Request-RuntimeStructuredReload $Process 'reload_scene' $Source $Revision $ArtifactRevision $ArtifactBytes
         return
     }
     Request-RuntimeKey $Process 0x74 'scene reload'
 }
 
-function Request-RuntimeScriptReload([Diagnostics.Process]$Process, [string]$Source = 'explicit', [string]$Revision = '') {
+function Request-RuntimeScriptReload(
+    [Diagnostics.Process]$Process,
+    [string]$Source = 'explicit',
+    [string]$Revision = '',
+    [string]$ArtifactRevision = '',
+    [int64]$ArtifactBytes = 0
+) {
     if ($script:structuredStatus) {
-        Request-RuntimeStructuredReload $Process 'reload_script' $Source $Revision
+        Request-RuntimeStructuredReload $Process 'reload_script' $Source $Revision $ArtifactRevision $ArtifactBytes
         return
     }
     if ($Process.HasExited) { return }
@@ -465,7 +587,12 @@ function Update-WatchTarget([object]$Target, [Diagnostics.Process]$Process, [Dat
         }
         $Target.LastSuccessfulRevision = $revision
         $Target.FailedRevision = $null
-        if ($Target.Name -eq 'scene') { Request-RuntimeSceneReload $Process 'live_bake' $revision } else { Request-RuntimeScriptReload $Process 'live_bake' $revision }
+        # 将 bake result 的 artifact hash/bytes 随 reload request 传入确认事件，区分 source 与实际派生文件。
+        $expectedKind = if ($Target.Name -eq 'scene') { 'Scene' } else { 'Script' }
+        $bakedEntry = @($result.entries | Where-Object { [string]$_.kind -ieq $expectedKind })[0]
+        $artifactRevision = if ($null -ne $bakedEntry) { [string]$bakedEntry.artifactSha256 } else { '' }
+        $artifactBytes = if ($null -ne $bakedEntry) { [int64]$bakedEntry.artifactBytes } else { 0 }
+        if ($Target.Name -eq 'scene') { Request-RuntimeSceneReload $Process 'live_bake' $revision $artifactRevision $artifactBytes } else { Request-RuntimeScriptReload $Process 'live_bake' $revision $artifactRevision $artifactBytes }
         $Target.PendingRevision = $null; $Target.PendingSince = $null
         Write-PreviewOutput "$($Target.Name)_reload_requested=auto"
         return

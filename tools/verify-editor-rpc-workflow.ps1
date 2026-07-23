@@ -49,6 +49,7 @@ function Read-Response([Diagnostics.Process]$Process, [string]$Id) {
     }
 }
 
+
 function Read-Event([Diagnostics.Process]$Process, [string]$Name) {
     while ($true) {
         $message = Read-Message $Process
@@ -134,10 +135,17 @@ try {
     if (-not [bool]$watchStopped.ok -or [string]$watchStopped.result.state -ne 'stopped') { throw 'watch_stop contract mismatch' }
 
     $script:stage = 'preview_start'
-    Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'preview-1'; method = 'preview_start'; params = [ordered]@{ projectName = $ProjectName; liveBake = $true; stopAfterMilliseconds = 2500 } })
+    Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'preview-1'; method = 'preview_start'; params = [ordered]@{ projectName = $ProjectName; liveBake = $true; watchChanges = $true; pollIntervalMilliseconds = 50; debounceMilliseconds = 100; stopAfterMilliseconds = 9000 } })
     $surface = Read-Event $process 'preview_surface_created'
     $preview = Read-Response $process 'preview-1'
     if (-not [bool]$preview.ok -or [string]$surface.data.mode -ne 'external-window' -or [string]$surface.data.windowClass -ne 'KadathRuntimeWindow') { throw 'preview external-window contract mismatch' }
+    Start-Sleep -Milliseconds 500
+    & pwsh -NoProfile -File $author -Action Update -PackageRoot $root -ProjectName $ProjectName -SceneGoalX 651 -SceneGoalY 251 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to update Scene source for Preview live-bake verification' }
+    $reloadRequested = Read-Event $process 'preview_reload_requested'
+    $reloadAcknowledged = Read-Event $process 'preview_reload_acknowledged'
+    $reloadAckValid = ([string]$reloadRequested.data.target -eq 'Scene') -and ([string]$reloadRequested.data.state -eq 'requested') -and (([string]$reloadRequested.data.sourceRevision).Length -eq 64) -and (([string]$reloadRequested.data.artifactRevision).Length -eq 64) -and ([int]$reloadRequested.data.artifactBytes -eq 128) -and ([uint64]$reloadAcknowledged.data.requestId -eq [uint64]$reloadRequested.data.requestId) -and ([string]$reloadAcknowledged.data.state -eq 'acknowledged') -and ([string]$reloadAcknowledged.data.acknowledgedSourceRevision -ieq [string]$reloadRequested.data.sourceRevision) -and ([string]$reloadAcknowledged.data.acknowledgedArtifactRevision -ieq [string]$reloadRequested.data.artifactRevision)
+    if (-not $reloadAckValid) { throw 'Preview reload acknowledgement contract mismatch' }
     [void](Read-Event $process 'preview_stopped')
 
     $script:stage = 'shutdown'
@@ -153,6 +161,7 @@ try {
     Write-Output 'watch_incremental_bake=ok'
     Write-Output 'watch_failure_retention=ok'
     Write-Output 'preview_external_window=ok'
+    Write-Output 'preview_reload_ack=ok'
     Write-Output 'verification=ok'
 }
 finally {

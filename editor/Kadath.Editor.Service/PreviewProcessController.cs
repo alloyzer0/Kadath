@@ -94,6 +94,11 @@ internal sealed class PreviewProcessController : IAsyncDisposable
             try { payload = JsonSerializer.Deserialize<JsonElement>(line, EditorProtocol.JsonOptions); }
             catch (JsonException) { payload = JsonSerializer.SerializeToElement(new { stream = "stdout", message = line }, EditorProtocol.JsonOptions); }
             await EmitAsync("preview_status", payload);
+            // 旧 preview_status 保持透传；新事件只暴露经过验证的 reload contract，不泄漏 Launcher 私有结构。
+            if (TryNormalizeReloadNotification(payload, out var reloadEvent, out var reloadData))
+            {
+                await EmitAsync(reloadEvent, reloadData);
+            }
             if (line.Contains("runtime_pid", StringComparison.Ordinal))
             {
                 // PowerShell 可能把 value 序列化为 JSON number 或 string；两种形态都必须兼容。
@@ -119,6 +124,56 @@ internal sealed class PreviewProcessController : IAsyncDisposable
         return false;
     }
 
+    private static bool TryNormalizeReloadNotification(JsonElement payload, out string eventName, out JsonElement normalized)
+    {
+        eventName = string.Empty;
+        normalized = default;
+        if (payload.ValueKind != JsonValueKind.Object
+            || !payload.TryGetProperty("origin", out var origin)
+            || !string.Equals(origin.GetString(), "launcher", StringComparison.Ordinal)
+            || !payload.TryGetProperty("event", out var launcherEvent))
+        {
+            return false;
+        }
+
+        var expectedState = launcherEvent.GetString() switch
+        {
+            "runtime_reload_requested" => "requested",
+            "runtime_reload_acknowledged" => "acknowledged",
+            "runtime_reload_failed" => "failed",
+            "runtime_reload_stale" => "stale",
+            _ => null
+        };
+        if (expectedState is null) { return false; }
+
+        PreviewReloadNotification? notification;
+        try { notification = JsonSerializer.Deserialize<PreviewReloadNotification>(payload.GetRawText(), EditorProtocol.JsonOptions); }
+        catch (JsonException) { return false; }
+        if (notification is null
+            || notification.ReloadVersion != 1
+            || notification.RequestId == 0
+            || !string.Equals(notification.State, expectedState, StringComparison.Ordinal)
+            || notification.Target is not ("Scene" or "Script")
+            || string.IsNullOrWhiteSpace(notification.Source)
+            || !IsOptionalRevision(notification.SourceRevision)
+            || !IsOptionalRevision(notification.ArtifactRevision)
+            || !IsOptionalRevision(notification.LatestRequestedSourceRevision)
+            || !IsOptionalRevision(notification.AcknowledgedSourceRevision)
+            || !IsOptionalRevision(notification.AcknowledgedArtifactRevision)
+            || !IsOptionalRevision(notification.FailedSourceRevision)
+            || (notification.ArtifactBytes is <= 0)
+            || (expectedState == "stale" && !notification.Ignored))
+        {
+            return false;
+        }
+
+        eventName = $"preview_reload_{expectedState}";
+        normalized = JsonSerializer.SerializeToElement(notification, EditorProtocol.JsonOptions);
+        return true;
+    }
+
+    private static bool IsOptionalRevision(string? revision) =>
+        revision is null || (revision.Length == 64 && revision.All(Uri.IsHexDigit));
     private async Task ObserveExitAsync(Process process)
     {
         await process.WaitForExitAsync();

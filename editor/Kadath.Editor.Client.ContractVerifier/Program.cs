@@ -28,6 +28,9 @@ internal static class Program
             Console.WriteLine("cancellation_late_response=ok");
             Console.WriteLine("connection_closed_projection=ok");
             Console.WriteLine("snapshot_state=ok");
+            Console.WriteLine("publication_state=ok");
+            Console.WriteLine("preview_reload_ack_state=ok");
+            Console.WriteLine("bake_changes=ok");
             Console.WriteLine("capability_gating=ok");
             Console.WriteLine("viewmodel_state=ok");
             Console.WriteLine("verification=ok");
@@ -63,10 +66,14 @@ internal static class Program
         var projectSnapshot = await client.GetProjectSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var hierarchySnapshot = await client.GetHierarchySnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var assetSnapshot = await client.GetAssetCatalogSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
+        var publicationSnapshot = await client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, "debug")).ConfigureAwait(false);
         Assert(projectSnapshot.ModelVersion == 1 && hierarchySnapshot.SnapshotVersion == 1, "real service snapshot version mismatch");
         Assert(hierarchySnapshot.Nodes.Length == 8, "real service hierarchy snapshot count mismatch");
         Assert(assetSnapshot.CatalogVersion == 1 && assetSnapshot.ItemCount == assetSnapshot.Items.Length, "real service asset snapshot mismatch");
         Assert(projectSnapshot.AuthoringRevision.Length == 64, "real service authoring revision mismatch");
+        Assert(publicationSnapshot.SnapshotVersion == EditorSnapshotVersions.Publication, "real service publication snapshot version mismatch");
+        Assert(capabilities.Commands.Contains("publication_snapshot"), "real service did not advertise publication_snapshot");
+        Console.WriteLine("publication_service_smoke=ok");
         Console.WriteLine("snapshot_service_smoke=ok");
         Assert(capabilities.Commands.Contains("authoring_apply") && capabilities.Commands.Contains("authoring_undo"), "real service did not advertise authoring commands");
 
@@ -129,9 +136,35 @@ internal static class Program
         Assert(workspace.ProjectSnapshot.State == EditorSnapshotState.Ready && workspace.ProjectSnapshot.Value?.ModelVersion == 1, "project snapshot state mismatch");
         Assert(workspace.HierarchySnapshot.Value?.Nodes.Length == 8, "hierarchy snapshot count mismatch");
         Assert(workspace.AssetCatalogSnapshot.Value?.ItemCount == 10, "asset catalog snapshot count mismatch");
+        Assert(workspace.Publication.State == EditorPublicationState.Current && workspace.Publication.RecommendedBakeTarget is null, "publication snapshot current state mismatch");
+
+        // 任一侧缺失都代表 pair 不完整，前端必须选择 Both，避免只修复表面上 dirty 的一侧。
+        var currentPublication = workspace.Publication.Snapshot ?? throw new InvalidOperationException("publication snapshot missing");
+        var oneTargetMissing = currentPublication with
+        {
+            State = "missing",
+            Script = currentPublication.Script with
+            {
+                State = "missing",
+                BakedSourceRevision = null,
+                ArtifactRevision = null,
+                ManifestArtifactRevision = null,
+                ArtifactBytes = null,
+                ManifestArtifactBytes = null
+            }
+        };
+        await transport.EmitEventAsync("publication_snapshot_created", oneTargetMissing).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Publication.State == EditorPublicationState.Missing);
+        Assert(workspace.Publication.RecommendedBakeTarget == "Both", "one missing publication target did not require Both bake");
+        await transport.EmitEventAsync("publication_snapshot_created", currentPublication).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Publication.State == EditorPublicationState.Current);
+
         var scriptedRevision = workspace.ProjectSnapshot.Value?.AuthoringRevision ?? throw new InvalidOperationException("scripted revision missing");
         var scriptedApplied = await workspace.ApplyAuthoringAsync(new AuthoringApplyParameters("demo", scriptedRevision, new AuthoringPatch(SceneGoalPosition: [8d, 9d])));
         Assert(workspace.Authoring.State == EditorAuthoringState.Succeeded && scriptedApplied.UndoDepth == 1, "authoring apply state mismatch");
+        Assert(workspace.Publication.State == EditorPublicationState.SourceDirty && workspace.Publication.RecommendedBakeTarget == "Scene", "authoring apply did not expose Scene publication dirtiness");
+        var incrementalBake = await workspace.BakeChangesAsync("debug");
+        Assert(incrementalBake?.Target == "Scene" && workspace.Publication.State == EditorPublicationState.Current, "Bake Changes did not select the minimum Scene target");
         var scriptedUndone = await workspace.UndoAuthoringAsync(new AuthoringUndoParameters("demo", scriptedApplied.Revision));
         Assert(workspace.Authoring.State == EditorAuthoringState.Succeeded && scriptedUndone.Operation == "undo", "authoring undo state mismatch");
         Assert(workspace.Project.State == EditorProjectState.Opened, "project state was not opened");
@@ -164,11 +197,21 @@ internal static class Program
         Assert(watched.State == "watching" && workspace.Watch.State == EditorWatchState.Watching, "watch state mismatch");
         await transport.EmitEventAsync("source_change_detected", new { target = "scene", revision = "ABC" });
         await WaitUntilAsync(() => workspace.Watch.LastSourceRevision == "ABC");
+        try
+        {
+            _ = await workspace.BakeChangesAsync("debug");
+            throw new InvalidOperationException("manual Bake Changes unexpectedly bypassed watch ownership");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "publication_watch_owns_bake") { }
 
         await transport.EmitEventAsync("bake_failed", new { target = "scene", errorCode = "bake_validation_failed", message = "invalid json", retainedArtifact = true });
         await WaitUntilAsync(() => workspace.Bake.State == EditorBakeState.Failed);
         Assert(workspace.Bake.RetainedPreviousArtifact, "failed bake did not advertise retained artifact");
         Assert(workspace.Bake.LastSuccessfulResult?.SceneArtifactRevision == lastSuccessfulRevision, "failed bake discarded last successful artifact");
+
+        // 先释放 Service watch，再验证 Preview live-bake/watch 成为唯一 derived writer。
+        await workspace.StopWatchAsync();
+        Assert(workspace.Watch.State == EditorWatchState.Stopped, "watch did not stop before live Preview ownership test");
 
         var preview = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: "demo"));
         Assert(preview.SurfaceMode == PreviewSurfaceModes.ExternalWindow, "preview result surface mode mismatch");
@@ -176,10 +219,83 @@ internal static class Program
         Assert(workspace.Preview.Surface?.WindowClass == "KadathRuntimeWindow", "preview surface descriptor mismatch");
         Assert(workspace.Preview.RuntimeProcessId == 1234, "runtime PID status was not parsed");
 
+        var sceneSourceA = new string('A', 64);
+        var sceneArtifactA = new string('B', 64);
+        var sceneSourceB = new string('C', 64);
+        var sceneArtifactB = new string('D', 64);
+        await transport.EmitEventAsync("preview_reload_requested", new PreviewReloadNotification(
+            1, "requested", "Scene", 41, "live_bake",
+            SourceRevision: sceneSourceA, ArtifactRevision: sceneArtifactA, ArtifactBytes: 128,
+            LatestRequestedSourceRevision: sceneSourceA));
+        await transport.EmitEventAsync("preview_reload_requested", new PreviewReloadNotification(
+            1, "requested", "Scene", 42, "live_bake",
+            SourceRevision: sceneSourceB, ArtifactRevision: sceneArtifactB, ArtifactBytes: 128,
+            LatestRequestedSourceRevision: sceneSourceB));
+        await transport.EmitEventAsync("preview_reload_stale", new PreviewReloadNotification(
+            1, "stale", "Scene", 41, "live_bake",
+            SourceRevision: sceneSourceA, ArtifactRevision: sceneArtifactA, ArtifactBytes: 128,
+            LatestRequestedSourceRevision: sceneSourceB, Result: "succeeded", Ignored: true));
+        await transport.EmitEventAsync("preview_reload_acknowledged", new PreviewReloadNotification(
+            1, "acknowledged", "Scene", 42, "live_bake",
+            SourceRevision: sceneSourceB, ArtifactRevision: sceneArtifactB, ArtifactBytes: 128,
+            LatestRequestedSourceRevision: sceneSourceB,
+            AcknowledgedSourceRevision: sceneSourceB,
+            AcknowledgedArtifactRevision: sceneArtifactB,
+            Result: "succeeded"));
+
+        var retainedScriptSource = new string('E', 64);
+        var failedScriptSource = new string('F', 64);
+        await transport.EmitEventAsync("preview_reload_requested", new PreviewReloadNotification(
+            1, "requested", "Script", 43, "file_change",
+            SourceRevision: failedScriptSource,
+            LatestRequestedSourceRevision: failedScriptSource,
+            AcknowledgedSourceRevision: retainedScriptSource));
+        await transport.EmitEventAsync("preview_reload_failed", new PreviewReloadNotification(
+            1, "failed", "Script", 43, "file_change",
+            SourceRevision: failedScriptSource,
+            LatestRequestedSourceRevision: failedScriptSource,
+            AcknowledgedSourceRevision: retainedScriptSource,
+            FailedSourceRevision: failedScriptSource,
+            Result: "rejected",
+            ErrorCode: "UnsupportedScriptSchema"));
+        await WaitUntilAsync(() => workspace.Preview.Reload.Scene.State == EditorPreviewReloadState.Acknowledged
+            && workspace.Preview.Reload.Script.State == EditorPreviewReloadState.Failed);
+        Assert(workspace.Preview.Reload.Scene.LatestRequestId == 42
+            && workspace.Preview.Reload.Scene.AcknowledgedSourceRevision == sceneSourceB
+            && workspace.Preview.Reload.Scene.AcknowledgedArtifactRevision == sceneArtifactB,
+            "latest Scene reload acknowledgement was not retained.");
+        Assert(workspace.Preview.Reload.Scene.StaleResponseCount == 1
+            && workspace.Preview.Reload.Scene.LastStaleRequestId == 41,
+            "stale Scene completion was not ignored.");
+        Assert(workspace.Preview.Reload.Script.AcknowledgedSourceRevision == retainedScriptSource
+            && workspace.Preview.Reload.Script.FailedSourceRevision == failedScriptSource
+            && workspace.Preview.Reload.Script.ErrorCode == "UnsupportedScriptSchema",
+            "failed Script reload did not retain the last acknowledged revision.");
+
         await workspace.StopPreviewAsync();
         Assert(workspace.Preview.State == EditorPreviewState.Stopped, "preview did not stop");
-        await workspace.StopWatchAsync();
-        Assert(workspace.Watch.State == EditorWatchState.Stopped, "watch did not stop");
+
+        var livePreview = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: "demo", LiveBake: true, WatchChanges: true));
+        Assert(livePreview.SurfaceMode == PreviewSurfaceModes.ExternalWindow && workspace.Preview.OwnsPublicationSync,
+            "live Preview did not claim publication ownership");
+        transport.FailNextPreviewStop();
+        try
+        {
+            _ = await workspace.StopPreviewAsync();
+            throw new InvalidOperationException("injected Preview stop failure unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "preview_stop_failed") { }
+        Assert(workspace.Preview.State == EditorPreviewState.Failed && workspace.Preview.OwnsPublicationSync,
+            "Preview publication ownership was released after an unconfirmed stop");
+        try
+        {
+            _ = await workspace.BakeChangesAsync("debug");
+            throw new InvalidOperationException("manual bake bypassed failed Preview ownership");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "publication_preview_owns_bake") { }
+        await workspace.StopPreviewAsync();
+        Assert(workspace.Preview.State == EditorPreviewState.Stopped && !workspace.Preview.OwnsPublicationSync,
+            "Preview ownership was not released after confirmed stop");
 
         // 故意注入重复 sequence，验证客户端在协议破坏时停止接受事件，而不是静默重排。
         var lastSequence = client.LastEventSequence;
@@ -248,6 +364,8 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private bool _started;
     private int _disposed;
     private bool _delayNextValidation;
+    private bool _publicationDirty;
+    private bool _failNextPreviewStop;
     private TaskCompletionSource<bool>? _delayedValidationRelease;
     private TaskCompletionSource<bool>? _delayedValidationCompleted;
 
@@ -296,7 +414,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         {
             case "get_capabilities":
                 await SendResponseAsync(id, new EditorCapabilities(
-                    ["project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"],
+                    ["project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot", "publication_snapshot", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"],
                     [EditorProtocol.TransportName],
                     [
                         new PreviewSurfaceCapability(PreviewSurfaceModes.ExternalWindow, "native-window", true),
@@ -338,6 +456,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 await SendResponseAsync(id, assetSnapshot).ConfigureAwait(false);
                 break;
             case "authoring_apply":
+                _publicationDirty = true;
                 var applied = NewAuthoringMutationResult("apply", "0000000000000000000000000000000000000000000000000000000000000002", 1);
                 await EmitEventAsync("authoring_apply_started", new { projectName = "demo" }, id).ConfigureAwait(false);
                 await EmitEventAsync("authoring_apply_completed", applied, id).ConfigureAwait(false);
@@ -348,9 +467,19 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 await EmitEventAsync("authoring_undo_started", new { projectName = "demo" }, id).ConfigureAwait(false);
                 await EmitEventAsync("authoring_undo_completed", undone, id).ConfigureAwait(false);
                 await SendResponseAsync(id, undone).ConfigureAwait(false);
-                break;            case "bake_start":
-                await EmitEventAsync("bake_started", new { target = "Both", profile = "debug" }, id).ConfigureAwait(false);
-                var bake = NewBakeResult();
+                break;
+            case "publication_snapshot":
+                var publication = NewPublicationSnapshot(_publicationDirty);
+                await EmitEventAsync("publication_snapshot_created", publication, id).ConfigureAwait(false);
+                await SendResponseAsync(id, publication).ConfigureAwait(false);
+                break;
+            case "bake_start":
+                var bakeParameters = request.GetProperty("params");
+                var bakeTarget = bakeParameters.GetProperty("target").GetString() ?? "Both";
+                var bakeProfile = bakeParameters.GetProperty("profile").GetString() ?? "debug";
+                await EmitEventAsync("bake_started", new { target = bakeTarget, profile = bakeProfile }, id).ConfigureAwait(false);
+                _publicationDirty = false;
+                var bake = NewBakeResult(bakeTarget, bakeProfile);
                 await EmitEventAsync("bake_completed", bake, id).ConfigureAwait(false);
                 await SendResponseAsync(id, bake).ConfigureAwait(false);
                 break;
@@ -371,6 +500,12 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 await SendResponseAsync(id, new PreviewStartResult("starting", PreviewSurfaceModes.ExternalWindow)).ConfigureAwait(false);
                 break;
             case "preview_stop":
+                if (_failNextPreviewStop)
+                {
+                    _failNextPreviewStop = false;
+                    await SendErrorAsync(id, "preview_stop_failed", "injected preview stop failure").ConfigureAwait(false);
+                    break;
+                }
                 await EmitEventAsync("preview_stopped", new { exitCode = 0, requested = true }).ConfigureAwait(false);
                 await SendResponseAsync(id, new PreviewStopResult("stopped")).ConfigureAwait(false);
                 break;
@@ -385,6 +520,8 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     }
 
     public void DelayNextValidationResponse() => _delayNextValidation = true;
+
+    public void FailNextPreviewStop() => _failNextPreviewStop = true;
 
     public async Task ReleaseDelayedValidationAsync()
     {
@@ -463,10 +600,19 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         return new AssetCatalogSnapshot(1, "bin/assets", items.Length, items);
     }
 
+    private static PublicationSnapshot NewPublicationSnapshot(bool sourceDirty)
+    {
+        const string source = "0000000000000000000000000000000000000000000000000000000000000001";
+        const string artifact = "0000000000000000000000000000000000000000000000000000000000000002";
+        var scene = new PublicationTargetSnapshot("Scene", sourceDirty ? "source_dirty" : "current", sourceDirty ? new string('3', 64) : source, source, artifact, artifact, 128, 128);
+        var script = new PublicationTargetSnapshot("Script", "current", source, source, artifact, artifact, 96, 96);
+        return new PublicationSnapshot(EditorSnapshotVersions.Publication, "demo", "debug", "debug", "C:/package/bin/projects/demo/.kadath/derived", "C:/package/bin/projects/demo/.kadath/derived/.live-bake.manifest.json", sourceDirty ? "source_dirty" : "current", true, scene, script);
+    }
+
     private static Dictionary<string, JsonElement> Props(params (string Key, object Value)[] values) =>
         values.ToDictionary(value => value.Key, value => JsonSerializer.SerializeToElement(value.Value, EditorProtocol.JsonOptions), StringComparer.Ordinal);
-    private static EditorBakeResult NewBakeResult() => new(
-        "succeeded", "Both", "debug", "C:/package/bin/projects/demo/.kadath/derived", "C:/package/bin/projects/demo/.kadath/derived/.live-bake.manifest.json",
+    private static EditorBakeResult NewBakeResult(string target = "Both", string profile = "debug") => new(
+        "succeeded", target, profile, "C:/package/bin/projects/demo/.kadath/derived", "C:/package/bin/projects/demo/.kadath/derived/.live-bake.manifest.json",
         "SCENE-SOURCE", "SCRIPT-SOURCE", "SCENE-ARTIFACT", "SCRIPT-ARTIFACT", 128, 96);
 
     public Task EmitEventAsync(string eventName, object data, string? requestId = null) =>

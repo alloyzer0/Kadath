@@ -18,6 +18,7 @@ public interface IEditorSessionBackend : IAsyncDisposable
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
+    Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> UndoAuthoringAsync(ProjectSessionInfo project, AuthoringUndoParameters parameters, CancellationToken cancellationToken);
     Task<EditorBakeResult> BakeAsync(ProjectSessionInfo project, BakeStartParameters parameters, CancellationToken cancellationToken);
@@ -39,6 +40,7 @@ public interface IEditorSession : IAsyncDisposable
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<EditorBakeResult> BakeAsync(BakeStartParameters parameters, string? requestId, CancellationToken cancellationToken = default);
@@ -57,6 +59,7 @@ public sealed class EditorSession : IEditorSession
         "project_snapshot",
         "hierarchy_snapshot",
         "asset_catalog_snapshot",
+        "publication_snapshot",
         "authoring_apply",
         "authoring_undo",
         "bake_start",
@@ -126,6 +129,14 @@ public sealed class EditorSession : IEditorSession
         var project = RequireProject(parameters.ProjectName);
         var result = await _backend.GetAssetCatalogSnapshotAsync(project, cancellationToken);
         await EmitAsync("asset_catalog_snapshot_created", result, requestId);
+        return result;
+    }
+
+    public async Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default)
+    {
+        var project = RequireProject(parameters.ProjectName);
+        var result = await _backend.GetPublicationSnapshotAsync(project, parameters, cancellationToken);
+        await EmitAsync("publication_snapshot_created", result, requestId);
         return result;
     }
 
@@ -244,4 +255,3 @@ public sealed class EditorSession : IEditorSession
         finally { _stateGate.Release(); _stateGate.Dispose(); }
     }
 }
-

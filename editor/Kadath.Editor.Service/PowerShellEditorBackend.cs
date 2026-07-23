@@ -76,6 +76,35 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     public Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
         ReadSnapshotAsync<AssetCatalogSnapshot>(project, "Assets", cancellationToken);
 
+    public async Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken)
+    {
+        var profile = NormalizeProfile(parameters.Profile);
+        var output = await RunPowerShellAsync(
+            Path.Combine(_kadathRoot, "tools", "editor-publication-snapshot.ps1"),
+            ["-PackageRoot", project.PackageRoot, "-ProjectName", project.ProjectName, "-Profile", profile],
+            cancellationToken);
+        if (output.ExitCode != 0)
+        {
+            throw new EditorOperationException("publication_snapshot_failed", JoinDiagnostics(output));
+        }
+
+        var line = output.Stdout.LastOrDefault(value => !string.IsNullOrWhiteSpace(value));
+        if (line is null)
+        {
+            throw new EditorOperationException("publication_snapshot_protocol_error", "Publication snapshot adapter emitted no JSON result.");
+        }
+        try
+        {
+            var snapshot = JsonSerializer.Deserialize<PublicationSnapshot>(line, EditorProtocol.JsonOptions)
+                ?? throw new EditorOperationException("publication_snapshot_protocol_error", "Publication snapshot adapter emitted an empty result.");
+            ValidateSnapshot(project, snapshot);
+            return snapshot;
+        }
+        catch (JsonException exception)
+        {
+            throw new EditorOperationException("publication_snapshot_protocol_error", $"Publication snapshot JSON is invalid: {exception.Message}");
+        }
+    }
     public async Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken)
     {
         await _authoringGate.WaitAsync(cancellationToken);
@@ -317,8 +346,79 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
                     }
                 }
                 break;
+            case PublicationSnapshot publication:
+                if (publication is null
+                    || publication.SnapshotVersion != EditorSnapshotVersions.Publication
+                    || !string.Equals(publication.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
+                    || publication.Profile is not ("debug" or "release")
+                    || (publication.ManifestProfile is not null && publication.ManifestProfile is not ("debug" or "release")))
+                {
+                    throw new EditorOperationException("publication_snapshot_protocol_error", "Publication snapshot identity or profile is invalid.");
+                }
+                ValidatePublicationPath(project.ProjectDirectory, publication.DerivedDirectory, "derived directory");
+                ValidatePublicationPath(project.ProjectDirectory, publication.ManifestPath, "manifest path");
+                ValidatePublicationTarget(publication.Scene, "Scene");
+                ValidatePublicationTarget(publication.Script, "Script");
+                var publicationStates = new[] { publication.Scene.State, publication.Script.State };
+                var expectedPublicationState = publicationStates.Contains("artifact_invalid", StringComparer.Ordinal) ? "artifact_invalid"
+                    : publicationStates.Contains("missing", StringComparer.Ordinal) ? "missing"
+                    : publicationStates.Contains("profile_mismatch", StringComparer.Ordinal) ? "profile_mismatch"
+                    : publicationStates.Contains("source_dirty", StringComparer.Ordinal) ? "source_dirty"
+                    : "current";
+                if (!string.Equals(publication.State, expectedPublicationState, StringComparison.Ordinal))
+                {
+                    throw new EditorOperationException("publication_snapshot_protocol_error", "Publication aggregate state does not match target states.");
+                }
+                break;
             default:
                 throw new EditorOperationException("snapshot_protocol_error", "Unknown snapshot DTO.");
+        }
+    }
+    private static void ValidatePublicationTarget(PublicationTargetSnapshot target, string expectedTarget)
+    {
+        if (target is null || !string.Equals(target.Target, expectedTarget, StringComparison.Ordinal)
+            || target.State is not ("current" or "source_dirty" or "missing" or "artifact_invalid" or "profile_mismatch"))
+        {
+            throw new EditorOperationException("publication_snapshot_protocol_error", $"{expectedTarget} publication target is invalid.");
+        }
+        foreach (var revision in new[] { target.SourceRevision, target.BakedSourceRevision, target.ArtifactRevision, target.ManifestArtifactRevision })
+        {
+            if (revision is not null && (revision.Length != 64 || revision.Any(value => !Uri.IsHexDigit(value))))
+            {
+                throw new EditorOperationException("publication_snapshot_protocol_error", $"{expectedTarget} publication revision is invalid.");
+            }
+        }
+        foreach (var bytes in new[] { target.ArtifactBytes, target.ManifestArtifactBytes })
+        {
+            if (bytes is < 0)
+            {
+                throw new EditorOperationException("publication_snapshot_protocol_error", $"{expectedTarget} publication byte count is invalid.");
+            }
+        }
+        if (target.State == "current"
+            && (target.SourceRevision is null || target.BakedSourceRevision is null
+                || target.ArtifactRevision is null || target.ManifestArtifactRevision is null
+                || target.ArtifactBytes is null || target.ManifestArtifactBytes is null
+                || !string.Equals(target.SourceRevision, target.BakedSourceRevision, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(target.ArtifactRevision, target.ManifestArtifactRevision, StringComparison.OrdinalIgnoreCase)
+                || target.ArtifactBytes != target.ManifestArtifactBytes))
+        {
+            throw new EditorOperationException("publication_snapshot_protocol_error", $"{expectedTarget} current state lacks matching revision evidence.");
+        }
+    }
+
+    private static void ValidatePublicationPath(string projectDirectory, string path, string label)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new EditorOperationException("publication_snapshot_protocol_error", $"{label} is empty.");
+        }
+        var full = Path.GetFullPath(path);
+        var prefix = projectDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            || full.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}assets{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new EditorOperationException("publication_snapshot_protocol_error", $"{label} escapes the project derived directory.");
         }
     }
     private async Task InvokeAuthoringAdapterAsync(ProjectSessionInfo project, string expectedRevision, AuthoringPatch patch, CancellationToken cancellationToken)

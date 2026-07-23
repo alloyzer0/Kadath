@@ -83,9 +83,35 @@ try {
     $received = @($runtimeEvents | Where-Object { $_.event -eq 'command_received' })
     $completed = @($runtimeEvents | Where-Object { $_.event -eq 'command_completed' })
     $responses = @($events | Where-Object { $_.event -eq 'command_response' })
+    $reloadRequested = @($events | Where-Object { $_.event -eq 'runtime_reload_requested' })
+    $reloadAcknowledged = @($events | Where-Object { $_.event -eq 'runtime_reload_acknowledged' })
+    $reloadFailed = @($events | Where-Object { $_.event -eq 'runtime_reload_failed' })
+    $reloadStale = @($events | Where-Object { $_.event -eq 'runtime_reload_stale' })
     if ($runtimeReady.Count -ne 1) { throw "Expected one runtime_ready, got $($runtimeReady.Count)" }
     if ($runtimeStopping.Count -ne 1) { throw "Expected one runtime_stopping, got $($runtimeStopping.Count)" }
     if ($received.Count -ne 4 -or $completed.Count -ne 4 -or $responses.Count -ne 4) { throw "Expected 4 received/completed/responses, got $($received.Count)/$($completed.Count)/$($responses.Count)" }
+    if ($reloadRequested.Count -ne 4 -or $reloadAcknowledged.Count -ne 2 -or $reloadFailed.Count -ne 2 -or $reloadStale.Count -ne 0) {
+        throw "Expected reload requested/ack/failed/stale=4/2/2/0, got $($reloadRequested.Count)/$($reloadAcknowledged.Count)/$($reloadFailed.Count)/$($reloadStale.Count)"
+    }
+    foreach ($requestedReload in $reloadRequested) {
+        if ([int]$requestedReload.reloadVersion -ne 1 -or [string]$requestedReload.state -ne 'requested') { throw 'Reload request contract mismatch' }
+        $terminal = @($reloadAcknowledged | Where-Object { [uint64]$_.requestId -eq [uint64]$requestedReload.requestId }) + @($reloadFailed | Where-Object { [uint64]$_.requestId -eq [uint64]$requestedReload.requestId })
+        if ($terminal.Count -ne 1) { throw "Reload request must have exactly one terminal event: $($requestedReload.requestId)" }
+    }
+    foreach ($ack in $reloadAcknowledged) {
+        $ackValid = ([string]$ack.state -eq 'acknowledged') -and ([string]$ack.result -eq 'succeeded') -and ([string]$ack.acknowledgedSourceRevision -ieq [string]$ack.sourceRevision)
+        if (-not $ackValid) { throw "Reload acknowledgement identity mismatch: $($ack.requestId)" }
+    }
+    foreach ($failedReload in $reloadFailed) {
+        $failedValid = ([string]$failedReload.state -eq 'failed') -and ([string]$failedReload.result -eq 'rejected') -and (-not [string]::IsNullOrWhiteSpace([string]$failedReload.errorCode)) -and (-not [string]::IsNullOrWhiteSpace([string]$failedReload.acknowledgedSourceRevision)) -and ([string]$failedReload.failedSourceRevision -ieq [string]$failedReload.sourceRevision)
+        if (-not $failedValid) { throw "Reload failure retention mismatch: $($failedReload.requestId)" }
+    }
+    foreach ($staleReload in $reloadStale) {
+        # stale 只携带被忽略 request 的候选身份，不能泄漏当前 target 的失败 revision。
+        if ($null -ne $staleReload.PSObject.Properties['failedSourceRevision']) {
+            throw "Stale reload leaked failedSourceRevision: $($staleReload.requestId)"
+        }
+    }
 
     $lastSequence = [uint64]0
     foreach ($event in $runtimeEvents) {
@@ -132,6 +158,7 @@ try {
     Write-Output 'sequence=strictly_increasing'
     Write-Output 'lifecycle=exactly_once'
     Write-Output 'mutation_rejection=ok'
+    Write-Output 'runtime_reload_ack=ok'
     Write-Output 'verification=ok'
 } finally {
     [IO.File]::WriteAllText($scene, $originalScene, [Text.UTF8Encoding]::new($false))

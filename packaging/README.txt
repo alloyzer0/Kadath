@@ -29,21 +29,21 @@ Live Bake / Watch（Editor 工具）
 
 `-LiveBake` 会在 Runtime 启动前把项目 `scene.json` / `script.json` bake 到 `bin\projects\<name>\.kadath\derived\scene.scene` 与 `script.script`，并将 Runtime 参数只在内存中切换到派生 artifact。`-WatchChanges` 继续控制是否持续监听；不传时只执行启动 bake。默认 profile 为 debug，可用 `-BakeProfile release` 显式选择。
 
-`.live-bake.manifest.json` 记录 source/artifact SHA-256、相对路径、格式和工具版本。source hash 与 manifest 匹配时复用 artifact；运行中 bake 失败会输出 `live_bake_failed`，保留最近成功 artifact/manifest，且不发送 reload。成功时依次输出 `live_bake_completed`、`command_requested(source=live_bake)` 和 `command_response`。live 派生目录不进入 Asset Catalog、promotion、archive，也不得写入 `bin\assets`。
+`.live-bake.manifest.json` 记录 source/artifact SHA-256、相对路径、格式和工具版本。source hash 与 manifest 匹配时复用 artifact；运行中 bake 失败会输出 `live_bake_failed`，保留最近成功 artifact/manifest，且不发送 reload。成功时依次输出 `live_bake_completed`、`command_requested(source=live_bake)` 和 `command_response`。live 派生目录不进入 Asset Catalog、promotion、archive，也不得写入 `bin\assets`。 P2-M4-27A 继续输出 runtime_reload_requested，随后按 Runtime 终态输出 runtime_reload_acknowledged、runtime_reload_failed 或 runtime_reload_stale；旧 command_response 保持兼容。
 
 GUI 的 `Live Bake` 复选框默认关闭；与默认开启的“自动监听”同时选中即可启用 live bake/watch。独立 adapter verifier：
   pwsh -NoProfile -File tools\verify-editor-live-bake.ps1 -PackageRoot <package>
 
-Editor Service / Avalonia Client（P2-M4-26A/26B）
+Editor Service / Avalonia Client（P2-M4-26A—P2-M4-27A）
 -------------------------------------------------
 Editor Service 是 Avalonia/CLI/兼容 WinForms 共用的本地编排层，使用 stdio JSONL，不监听网络端口：
   dotnet editor\Kadath.Editor.Service\bin\Debug\net8.0\Kadath.Editor.Service.dll --kadath-root <KadathRoot>
 
 客户端先接收 `hello` 并发送 `hello_ack`，再使用 `get_capabilities`、`project_open`、`project_validate`、`bake_start`、`watch_start` / `watch_stop`、`preview_start` / `preview_stop` 和 `shutdown`。Service 内部复用现有 importer/live-bake/Preview adapter，前端不需要知道 staging、manifest、WM_APP 或 Runtime 参数。
 
-P2-M4-26B/26C 的共享组件：
+P2-M4-26B—P2-M4-27A 的共享组件：
 - `editor\Kadath.Editor.Client`：stdio transport、typed request correlation、迟到 response 丢弃、严格 event sequence、EOF/shutdown/dispose 关闭通知；
-- `editor\Kadath.Editor.ViewModels`：Project/Bake/Watch/Preview 状态、artifact retention、capability gating 和 UI dispatcher；
+- `editor\Kadath.Editor.ViewModels`：Project/Authoring/Publication/Bake/Watch/Preview 状态、最小 Bake Changes target、artifact retention、capability gating 和 UI dispatcher；
 - `editor\Kadath.Editor.Avalonia`：Desktop 壳、Live Bake/Watch、external-window Preview 状态和事件日志；Live Bake/Watch 默认关闭并保持 opt-in，View 不直接读取 JSON、artifact 或 PowerShell。
 
 构建整个 Editor solution：
@@ -57,13 +57,13 @@ P2-M4-26B/26C 的共享组件：
   pwsh -NoProfile -File tools\verify-editor-avalonia-workflow.ps1 -PackageRoot <package>
   pwsh -NoProfile -File editor\verify-editor-client-service.ps1 -PackageRoot <package>
 
-真实 Avalonia workflow smoke 跨越共享 Client/Workspace 和 Editor Service，验证 open、validate、bake、watch start/stop、带 Live Bake 的 Preview external-window 生命周期和 shutdown。26A wire workflow 仍可独立验证：
+真实 Avalonia workflow smoke 跨越共享 Client/Workspace 和 Editor Service，验证 open、snapshot/publication、authoring、Bake Changes、watch start/stop、带 Live Bake/Watch 的 Preview external-window、Runtime source/artifact revision acknowledgement 和 shutdown。26A wire workflow 仍可独立验证：
   pwsh -NoProfile -File tools\verify-editor-rpc-workflow.ps1 -PackageRoot <package>
 
-各命令/事件的外部 wire contract 与 `IEditorRpcTransport` / `IEditorRpcClient` / `EditorWorkspaceViewModel` module seam 独立记录在工作区 `docs\superpowers\contracts\p2-m4-26\README.md`。变更字段、事件、错误码、关闭语义或兼容策略时必须同步对应契约和 verifier。
+各命令/事件的外部 wire contract 与共享 module seam 独立记录在工作区 docs\superpowers\contracts\p2-m4-26\README.md；Runtime reload acknowledgement 扩展单独记录在 docs\superpowers\contracts\p2-m4-27\README.md。变更字段、事件、错误码、关闭/retention/stale 语义或兼容策略时必须同步对应契约和 verifier。
 
-Preview v1 只公布 `external-window` surface 元数据，不通过 RPC 传送像素。`shared-texture` / `frame-stream` 尚未实现。26C 已通过 `project_snapshot`、`hierarchy_snapshot`、`asset_catalog_snapshot` 将真实 project model、8 节点 hierarchy 和当前 fixture 的 10 项 asset catalog 投影到 Avalonia；查询为只读，失败保留 Workspace 最近成功快照。现有 PowerShell/WinForms 入口继续可用，正式 package、`bin\assets`、Asset Catalog、promotion 和 archive 不因 Service、Avalonia 或 live bake 改变。
-P2-M4-26C/26D Editor Snapshot 与 Authoring Transaction 验证：在仓库根 Kadath 下执行 dotnet build editor\Kadath.Editor.sln --no-restore -m:1 -p:NuGetAudit=false、dotnet run --project editor\Kadath.Editor.Client.ContractVerifier --no-build、pwsh -NoProfile -File tools\verify-editor-snapshot.ps1 -PackageRoot (Resolve-Path zig-out).Path、pwsh -NoProfile -File tools\verify-editor-authoring-transaction.ps1 -PackageRoot (Resolve-Path zig-out).Path、pwsh -NoProfile -File editor\verify-editor-client-service.ps1 -PackageRoot (Resolve-Path zig-out).Path 和 pwsh -NoProfile -File tools\verify-editor-avalonia-workflow.ps1 -PackageRoot (Resolve-Path zig-out).Path。外部字段、版本、事件、错误码和路径边界见 ..\docs\superpowers\contracts\p2-m4-26\snapshot-queries-v1.md 与 authoring-transactions-v1.md；下一步 26E 评估 Apply 后 bake/reload 编排、redo 或持久化 history。
+Preview v1 只公布 `external-window` surface 元数据，不通过 RPC 传送像素。`shared-texture` / `frame-stream` 尚未实现。26C 已通过 `project_snapshot`、`hierarchy_snapshot`、`asset_catalog_snapshot`、`publication_snapshot` 将真实 project model、8 节点 hierarchy 和当前 fixture 的 10 项 asset catalog 投影到 Avalonia；查询为只读，失败保留 Workspace 最近成功快照。现有 PowerShell/WinForms 入口继续可用，正式 package、`bin\assets`、Asset Catalog、promotion 和 archive 不因 Service、Avalonia 或 live bake 改变。
+P2-M4-26C/26D/26E Snapshot、Authoring Transaction 与 Publication State 验证：在仓库根 Kadath 下执行 dotnet build editor\Kadath.Editor.sln --no-restore -m:1 -p:NuGetAudit=false、dotnet run --project editor\Kadath.Editor.Client.ContractVerifier --no-build、pwsh -NoProfile -File tools\verify-editor-snapshot.ps1 -PackageRoot (Resolve-Path zig-out).Path、pwsh -NoProfile -File tools\verify-editor-authoring-transaction.ps1 -PackageRoot (Resolve-Path zig-out).Path、pwsh -NoProfile -File tools\verify-editor-publication-snapshot.ps1 -PackageRoot (Resolve-Path zig-out).Path、pwsh -NoProfile -File editor\verify-editor-client-service.ps1 -PackageRoot (Resolve-Path zig-out).Path 和 pwsh -NoProfile -File tools\verify-editor-avalonia-workflow.ps1 -PackageRoot (Resolve-Path zig-out).Path。外部字段、版本、事件、错误码和路径边界见 ..\docs\superpowers\contracts\p2-m4-26\snapshot-queries-v1.md、authoring-transactions-v1.md、publication-snapshot-v1.md 与 publication-state-seam-v1.md。
 P2-M4-26D Authoring Transactions
 --------------------------------
 Editor Service 的 authoring 写入只允许通过独立的 `authoring_apply` / `authoring_undo` RPC；Avalonia 不直接编辑 JSON。Apply/Undo 必须携带 Project Snapshot 的 `authoringRevision`（64-hex SHA-256），stale revision 返回 `authoring_revision_conflict`，非法 vector patch 返回 `invalid_authoring_patch`。Service 在 Scene/Script source pair 上执行原子写入、提交后重新生成 Project/Hierarchy Snapshot，并在当前 session 保留最多 32 条 undo；失败、冲突或空 undo 不覆盖最近成功内容。
@@ -71,4 +71,26 @@ Editor Service 的 authoring 写入只允许通过独立的 `authoring_apply` / 
 Authoring mutation 只作用于 `bin\projects\<name>\scene.json` / `script.json`，不写 `.kadath\derived`、`bin\assets`、Asset Catalog、promotion candidate 或 package archive；Apply 成功也不会隐式 bake/reload。正式 package 构建和 archive 仍沿用既有 release 流程。独立外部契约见 `..\docs\superpowers\contracts\p2-m4-26\authoring-transactions-v1.md`、`authoring-apply-v1.md` 与 `authoring-undo-v1.md`；独立 verifier：
   pwsh -NoProfile -File tools\verify-editor-authoring-transaction.ps1 -PackageRoot <package>
 
-真实 Avalonia workflow smoke 现在额外覆盖 `workflow_authoring_apply=ok` 与 `workflow_authoring_undo=ok`。下一步 P2-M4-26E 只在产品确认后评估 Apply 后 bake/reload 编排、redo 或持久化 history，不改变 26D 稳定契约。
+真实 Avalonia workflow smoke 额外覆盖 `workflow_authoring_apply=ok` 与 `workflow_authoring_undo=ok`。26D 稳定事务契约不因 26E 改变。
+
+P2-M4-26E Publication State / Bake Changes
+------------------------------------------
+`publication_snapshot` 只读比较 source JSON、`.kadath\derived` manifest 和 KSCN/KSCP artifact，返回 Scene/Script 的 `current`、`source_dirty`、`missing`、`artifact_invalid` 或 `profile_mismatch`。Avalonia 的 `Bake Changes` 使用共享 Workspace 选择最小 Scene/Script/Both target；Service Watch 或 Preview Live Bake + Watch 运行时，手动 bake 被禁用/拒绝，避免交错提交。
+
+Bake Changes 只执行 source → derived，不隐式 Runtime reload；失败保留最近成功 artifact。正式 `bin\assets`、catalog、promotion 和 archive 保持不变。独立 verifier：
+  pwsh -NoProfile -File tools\verify-editor-publication-snapshot.ps1 -PackageRoot <package>
+
+真实 Avalonia workflow 额外覆盖 `workflow_publication_missing=ok`、`workflow_publication_dirty=ok` 与 `workflow_bake_changes=ok`。外部 wire/module 契约见 `..\docs\superpowers\contracts\p2-m4-26\publication-snapshot-v1.md` 和 `publication-state-seam-v1.md`。
+P2-M4-27A Preview Runtime Reload Acknowledgement
+------------------------------------------------
+Preview Launcher 为 Scene/Script 独立关联 Runtime requestId、source SHA-256、live-bake artifact SHA-256/bytes 与 completion。Editor Service 在保留 preview_status 的同时，对外发布 preview_reload_requested、preview_reload_acknowledged、preview_reload_failed、preview_reload_stale。只有 acknowledged 推进 Runtime loaded revision；rejected/timeout 保留最近 acknowledged identity；旧 requestId 的迟到响应只记 stale。
+
+Avalonia 的 Runtime sync 状态与兼容 WinForms 日志消费同一语义。该扩展不新增 Runtime IPC，继续使用 reload_scene / reload_script；不改变正式 bin\assets、catalog、promotion、archive 或 Bake Changes 的 source → derived 边界。验证：
+
+  dotnet run --project editor\Kadath.Editor.Client.ContractVerifier --no-build
+  pwsh -NoProfile -File tools\verify-preview-protocol-quality.ps1 -PackageRoot <package>
+  pwsh -NoProfile -File tools\verify-editor-rpc-workflow.ps1 -PackageRoot <package>
+  pwsh -NoProfile -File tools\verify-editor-avalonia-workflow.ps1 -PackageRoot <package>
+  pwsh -NoProfile -File tools\verify-editor-gui-workflow.ps1 -PackageRoot <package>
+
+关键输出为 preview_reload_ack_state=ok、runtime_reload_ack=ok、preview_reload_ack=ok、workflow_preview_reload_ack=ok 与 workflow_reload_acknowledged=2。外部 wire/module 契约见 ..\docs\superpowers\contracts\p2-m4-27\README.md。

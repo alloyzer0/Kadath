@@ -34,6 +34,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public EditorSnapshotViewModel<ProjectModelSnapshot> ProjectSnapshot { get; } = new();
     public EditorSnapshotViewModel<HierarchySnapshot> HierarchySnapshot { get; } = new();
     public EditorSnapshotViewModel<AssetCatalogSnapshot> AssetCatalogSnapshot { get; } = new();
+    public EditorPublicationViewModel Publication { get; } = new();
     public EditorAuthoringViewModel Authoring { get; } = new();
     public EditorBakeViewModel Bake { get; } = new();
     public EditorWatchViewModel Watch { get; } = new();
@@ -111,6 +112,10 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         await RefreshProjectSnapshotAsync(projectName, cancellationToken).ConfigureAwait(false);
         await RefreshHierarchySnapshotAsync(projectName, cancellationToken).ConfigureAwait(false);
         await RefreshAssetCatalogSnapshotAsync(projectName, cancellationToken).ConfigureAwait(false);
+        if (Capabilities.CanReadPublicationSnapshot)
+        {
+            await RefreshPublicationAsync(projectName, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task<ProjectModelSnapshot> RefreshProjectSnapshotAsync(string? projectName = null, CancellationToken cancellationToken = default)
@@ -163,6 +168,35 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             throw;
         }
     }
+    public async Task<PublicationSnapshot> RefreshPublicationAsync(string? projectName = null, string profile = "debug", CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanReadPublicationSnapshot, "publication_snapshot");
+        await _dispatcher.InvokeAsync(() => Publication.Begin(profile)).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, profile), cancellationToken).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() => Publication.Apply(result)).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyPublicationExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<EditorBakeResult?> BakeChangesAsync(string profile = "debug", CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanBake, "bake_start");
+        EnsureCommand(Capabilities.CanReadPublicationSnapshot, "publication_snapshot");
+        EnsureManualBakeAllowed();
+        var projectName = Project.Session?.ProjectName;
+        await RefreshPublicationAsync(projectName, profile, cancellationToken).ConfigureAwait(false);
+        var target = Publication.RecommendedBakeTarget;
+        if (target is null) { return null; }
+        return await BakeAsync(new BakeStartParameters(target, profile), cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default)
     {
         EnsureCommand(Capabilities.CanApplyAuthoring, "authoring_apply");
@@ -171,6 +205,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             var result = await Client.ApplyAuthoringAsync(parameters, cancellationToken).ConfigureAwait(false);
             await _dispatcher.InvokeAsync(() => ApplyAuthoringResult(result)).ConfigureAwait(false);
+            await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
             return result;
         }
         catch (Exception exception)
@@ -188,6 +223,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             var result = await Client.UndoAuthoringAsync(parameters, cancellationToken).ConfigureAwait(false);
             await _dispatcher.InvokeAsync(() => ApplyAuthoringResult(result)).ConfigureAwait(false);
+            await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
             return result;
         }
         catch (Exception exception)
@@ -206,11 +242,14 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public async Task<EditorBakeResult> BakeAsync(BakeStartParameters parameters, CancellationToken cancellationToken = default)
     {
         EnsureCommand(Capabilities.CanBake, "bake_start");
+        EnsureManualBakeAllowed();
         await _dispatcher.InvokeAsync(() => Bake.Begin(parameters.Target, parameters.Profile)).ConfigureAwait(false);
         try
         {
             var result = await Client.StartBakeAsync(parameters, cancellationToken).ConfigureAwait(false);
             await _dispatcher.InvokeAsync(() => Bake.ApplyCompleted(result)).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() => Publication.ApplyBakeResult(result)).ConfigureAwait(false);
+            await RefreshPublicationAfterOperationAsync(Project.Session?.ProjectName, parameters.Profile, cancellationToken).ConfigureAwait(false);
             return result;
         }
         catch (Exception exception)
@@ -223,6 +262,10 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public async Task<EditorWatchResult> StartWatchAsync(WatchStartParameters parameters, CancellationToken cancellationToken = default)
     {
         EnsureCommand(Capabilities.CanStartWatch, "watch_start");
+        if (Preview.OwnsPublicationSync)
+        {
+            throw new EditorRpcException("publication_preview_owns_bake", "Preview live-bake/watch is already responsible for derived artifacts.");
+        }
         await _dispatcher.InvokeAsync(() => Watch.BeginStart(parameters.Target, parameters.Profile)).ConfigureAwait(false);
         try
         {
@@ -230,8 +273,13 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             await _dispatcher.InvokeAsync(() =>
             {
                 Watch.ApplyStarted(result);
-                if (result.InitialBake is not null) { Bake.ApplyCompleted(result.InitialBake); }
+                if (result.InitialBake is not null)
+                {
+                    Bake.ApplyCompleted(result.InitialBake);
+                    Publication.ApplyBakeResult(result.InitialBake);
+                }
             }).ConfigureAwait(false);
+            await RefreshPublicationAfterOperationAsync(result.ProjectName, parameters.Profile, cancellationToken).ConfigureAwait(false);
             return result;
         }
         catch (Exception exception)
@@ -261,7 +309,15 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public async Task<PreviewStartResult> StartPreviewAsync(PreviewStartParameters parameters, CancellationToken cancellationToken = default)
     {
         EnsureCommand(Capabilities.CanStartPreview, "preview_start");
-        await _dispatcher.InvokeAsync(Preview.BeginStart).ConfigureAwait(false);
+        if (Preview.OwnsPublicationSync)
+        {
+            throw new EditorRpcException("publication_preview_owns_bake", "Confirm the previous Preview has stopped before starting another publication writer.");
+        }
+        if (parameters.LiveBake && parameters.WatchChanges && Watch.State is EditorWatchState.Starting or EditorWatchState.Watching or EditorWatchState.Stopping)
+        {
+            throw new EditorRpcException("publication_watch_owns_bake", "Stop the Service watch before starting Preview live-bake/watch.");
+        }
+        await _dispatcher.InvokeAsync(() => Preview.BeginStart(parameters)).ConfigureAwait(false);
         try
         {
             var result = await Client.StartPreviewAsync(parameters, cancellationToken).ConfigureAwait(false);
@@ -341,7 +397,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         switch (notification.Event)
         {
             case "project_opened":
-                if (TryRead(notification.Data, out ProjectSessionInfo? session) && session is not null) { Project.ApplyOpened(session); Authoring.Reset(); }
+                if (TryRead(notification.Data, out ProjectSessionInfo? session) && session is not null) { Project.ApplyOpened(session); Authoring.Reset(); Publication.Reset(); }
                 break;
             case "project_validated":
                 if (TryRead(notification.Data, out ProjectValidateResult? validation) && validation is not null) { Project.ApplyValidation(validation); }
@@ -354,6 +410,9 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
                 break;
             case "asset_catalog_snapshot_created":
                 if (TryRead(notification.Data, out AssetCatalogSnapshot? assetSnapshot) && assetSnapshot is not null) { AssetCatalogSnapshot.Apply(assetSnapshot); }
+                break;
+            case "publication_snapshot_created":
+                if (TryRead(notification.Data, out PublicationSnapshot? publicationSnapshot) && publicationSnapshot is not null) { Publication.Apply(publicationSnapshot); }
                 break;
             case "authoring_apply_started":
                 Authoring.Begin("apply");
@@ -377,7 +436,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
                     ReadString(notification.Data, "revision"));
                 break;
             case "bake_completed":
-                if (TryRead(notification.Data, out EditorBakeResult? baked) && baked is not null) { Bake.ApplyCompleted(baked); }
+                if (TryRead(notification.Data, out EditorBakeResult? baked) && baked is not null) { Bake.ApplyCompleted(baked); Publication.ApplyBakeResult(baked); }
                 break;
             case "bake_failed":
                 Bake.ApplyFailed(
@@ -399,6 +458,15 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
                 break;
             case "preview_status":
                 ApplyPreviewStatus(notification.Data);
+                break;
+            case "preview_reload_requested":
+            case "preview_reload_acknowledged":
+            case "preview_reload_failed":
+            case "preview_reload_stale":
+                if (TryRead(notification.Data, out PreviewReloadNotification? reload) && reload is not null)
+                {
+                    Preview.ApplyReload(reload);
+                }
                 break;
             case "preview_stopped":
                 Preview.ApplyStopped(ReadInt(notification.Data, "exitCode"));
@@ -518,6 +586,35 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             _ => (fallbackCode, exception.Message)
         };
         await _dispatcher.InvokeAsync(() => apply(code, message)).ConfigureAwait(false);
+    }
+
+    private async Task ApplyPublicationExceptionAsync(Exception exception) =>
+        await ApplyExceptionAsync(exception, "publication_snapshot_failed", Publication.ApplyFailure).ConfigureAwait(false);
+
+    private async Task RefreshPublicationAfterOperationAsync(string? projectName, string profile, CancellationToken cancellationToken)
+    {
+        if (!Capabilities.CanReadPublicationSnapshot) { return; }
+        try
+        {
+            await RefreshPublicationAsync(projectName, profile, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Authoring/Bake 已完成；发布快照失败只影响诊断，不伪装成源事务失败。
+        }
+    }
+
+    private void EnsureManualBakeAllowed()
+    {
+        // 派生目录同一时刻只允许一个持续写入者，避免手动 bake 与 watcher 交错提交 manifest/artifact。
+        if (Watch.State is EditorWatchState.Starting or EditorWatchState.Watching or EditorWatchState.Stopping)
+        {
+            throw new EditorRpcException("publication_watch_owns_bake", "Stop the Service watch before running a manual bake.");
+        }
+        if (Preview.OwnsPublicationSync)
+        {
+            throw new EditorRpcException("publication_preview_owns_bake", "Preview live-bake/watch already owns publication synchronization.");
+        }
     }
 
     private void ClearError()

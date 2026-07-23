@@ -5,12 +5,12 @@
         Height="900"
         MinWidth="1100"
         MinHeight="680"
-        Title="Kadath Editor · Avalonia 26D">
+        Title="Kadath Editor · Avalonia 27A">
   <Grid RowDefinitions="Auto,*,220" Background="#15191F">
     <Border Grid.Row="0" Padding="12,8" Background="#20262E" BorderBrush="#3C4652" BorderThickness="0,0,0,1">
       <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="10">
         <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="Kadath Editor" />
-        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#AEBAC8" Text="P2-M4-26D · Avalonia / Authoring Transactions" />
+        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#AEBAC8" Text="P2-M4-27A · Preview Runtime Reload Ack" />
         <TextBlock Grid.Column="2" VerticalAlignment="Center" Foreground="#AEBAC8" Text="{Binding ConnectionStatus}" />
         <Button Grid.Column="3" Padding="14,5" Command="{Binding ConnectCommand}" Content="连接 Service" />
         <Button Grid.Column="4" Padding="14,5" Command="{Binding OpenProjectCommand}" Content="打开项目" />
@@ -60,6 +60,7 @@
             <TextBlock HorizontalAlignment="Center" Foreground="#AEBAC8" Text="v1 external-window · no pixel frames over RPC" />
             <TextBlock HorizontalAlignment="Center" Foreground="#6DD6A0" Text="{Binding PreviewStatus}" />
             <TextBlock HorizontalAlignment="Center" FontSize="11" Foreground="#8F9CAB" Text="{Binding SurfaceDetails}" />
+            <TextBlock HorizontalAlignment="Center" FontSize="11" Foreground="#D7B46A" Text="{Binding RuntimeSyncStatus}" />
           </StackPanel>
           <Border Grid.Row="2" Padding="8" Background="#20262E">
             <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
@@ -125,20 +126,24 @@
 
     <Border Grid.Row="2" Padding="12,8" Background="#20262E" BorderBrush="#3C4652" BorderThickness="0,1,0,0">
       <Grid RowDefinitions="Auto,*" RowSpacing="8">
-        <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,*,Auto" ColumnSpacing="8">
+        <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,*,Auto" ColumnSpacing="8">
           <TextBlock VerticalAlignment="Center" FontWeight="SemiBold" Text="Bake / Watch" />
           <ComboBox Grid.Column="1" Width="105" ItemsSource="{Binding BakeTargets}" SelectedItem="{Binding BakeTarget}" />
           <ComboBox Grid.Column="2" Width="105" ItemsSource="{Binding BakeProfiles}" SelectedItem="{Binding BakeProfile}" />
           <Button Grid.Column="3" Command="{Binding BakeCommand}" Content="Bake once" />
-          <Button Grid.Column="4" Command="{Binding StartWatchCommand}" Content="Start watch" />
-          <Button Grid.Column="5" Command="{Binding StopWatchCommand}" Content="Stop watch" />
-          <StackPanel Grid.Column="6" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="14">
+          <Button Grid.Column="4" Command="{Binding BakeChangesCommand}" Content="Bake Changes" />
+          <Button Grid.Column="5" Command="{Binding StartWatchCommand}" Content="Start watch" />
+          <Button Grid.Column="6" Command="{Binding StopWatchCommand}" Content="Stop watch" />
+          <StackPanel Grid.Column="7" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="14">
             <CheckBox IsChecked="{Binding LiveBakeEnabled}" Content="Live Bake" />
             <CheckBox IsChecked="{Binding WatchChanges}" Content="Preview Watch" />
           </StackPanel>
-          <TextBlock Grid.Column="7" VerticalAlignment="Center" Foreground="#9FE3B1" Text="{Binding BakeStatus}" />
+          <StackPanel Grid.Column="8" VerticalAlignment="Center" Spacing="2">
+            <TextBlock Foreground="#9FE3B1" Text="{Binding BakeStatus}" />
+            <TextBlock Foreground="#AEBAC8" FontSize="11" Text="{Binding PublicationStatus}" />
+          </StackPanel>
         </Grid>
-        <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="8">
+        <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
           <ListBox ItemsSource="{Binding EventLog}" Background="#11151A">
             <ListBox.ItemTemplate>
               <DataTemplate>
@@ -152,7 +157,8 @@
               </DataTemplate>
             </ListBox.ItemTemplate>
           </ListBox>
-          <Button Grid.Column="1" VerticalAlignment="Top" Command="{Binding ClearEventLogCommand}" Content="Clear log" />
+          <TextBlock Grid.Column="1" VerticalAlignment="Top" Foreground="#AEBAC8" FontSize="11" Text="{Binding PublicationStatus}" />
+          <Button Grid.Column="2" VerticalAlignment="Top" Command="{Binding ClearEventLogCommand}" Content="Clear log" />
         </Grid>
       </Grid>
     </Border>

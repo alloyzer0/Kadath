@@ -40,6 +40,7 @@ $script:workflowProjectDirectory = $null
 $script:workflowSmokeError = $null
 $script:workflowProjectCreated = $false
 $script:workflowCompletedCommands = 0
+$script:workflowReloadAcknowledged = 0
 $script:workflowEvidence = @()
 $script:workflowTickActive = $false
 $script:hierarchySnapshot = $null
@@ -122,16 +123,19 @@ function Read-EditableValues {
 }
 
 function Set-Status([string]$Message, [bool]$IsError = $false) {
-    if ($null -eq $script:controls.Status -or $script:controls.Status.IsDisposed) { return }
-    $script:controls.Status.Text = $Message
-    $script:controls.Status.ForeColor = if ($IsError) { [Drawing.Color]::Firebrick } else { [Drawing.Color]::DarkGreen }
+    # Headless/旧协议事件可能在 WinForms 控件尚未创建时到达；Hashtable 缺失键也必须视为“无 UI 投影”。
+    $status = if ($script:controls.ContainsKey('Status')) { $script:controls['Status'] } else { $null }
+    if ($null -eq $status -or $status.IsDisposed) { return }
+    $status.Text = $Message
+    $status.ForeColor = if ($IsError) { [Drawing.Color]::Firebrick } else { [Drawing.Color]::DarkGreen }
 }
 
 function Write-Log([string]$Message) {
-    if ($null -eq $script:controls.Log -or $script:controls.Log.IsDisposed) { return }
-    $script:controls.Log.AppendText("[$([DateTime]::Now.ToString('HH:mm:ss'))] $Message`r`n")
-    $script:controls.Log.SelectionStart = $script:controls.Log.TextLength
-    $script:controls.Log.ScrollToCaret()
+    $log = if ($script:controls.ContainsKey('Log')) { $script:controls['Log'] } else { $null }
+    if ($null -eq $log -or $log.IsDisposed) { return }
+    $log.AppendText("[$([DateTime]::Now.ToString('HH:mm:ss'))] $Message`r`n")
+    $log.SelectionStart = $log.TextLength
+    $log.ScrollToCaret()
 }
 
 function Show-InspectorProperties([object]$Node) {
@@ -246,6 +250,13 @@ function Invoke-UiAction([scriptblock]$Action, [string]$SuccessMessage) {
     }
 }
 
+function Get-PreviewEventValue([object]$Event, [string]$Name, [object]$Default = $null) {
+    # JSONL 可选字段在 StrictMode 下不能直接点访问；缺失时显式返回默认值。
+    $property = $Event.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $Default }
+    return $property.Value
+}
+
 function Handle-PreviewLine([string]$Line, [string]$Stream = 'stdout') {
     if ([string]::IsNullOrWhiteSpace($Line)) { return }
     if ($Stream -eq 'stderr') {
@@ -276,6 +287,25 @@ function Handle-PreviewLine([string]$Line, [string]$Stream = 'stdout') {
             Write-Log "完成：$($event.command) #$($event.requestId) = $result$suffix"
         }
         'command_response' { Write-Log "响应：$($event.command) #$($event.requestId) = $($event.result)" }
+        'runtime_reload_requested' {
+            $sourceRevision = Get-PreviewEventValue $event 'sourceRevision' '—'
+            Write-Log "Runtime reload pending：$($event.target) source=$sourceRevision"
+        }
+        'runtime_reload_acknowledged' {
+            if ($script:runWorkflowSmoke) { $script:workflowReloadAcknowledged++ }
+            $sourceRevision = Get-PreviewEventValue $event 'sourceRevision' '—'
+            $artifactRevision = Get-PreviewEventValue $event 'artifactRevision' '—'
+            $artifactBytes = Get-PreviewEventValue $event 'artifactBytes' '—'
+            Set-Status "Runtime 已加载：$($event.target)"
+            Write-Log "Runtime reload 已确认：target=$($event.target) source=$sourceRevision artifact=$artifactRevision bytes=$artifactBytes"
+        }
+        'runtime_reload_failed' {
+            $errorCode = Get-PreviewEventValue $event 'errorCode' 'runtime_reload_failed'
+            $retainedRevision = Get-PreviewEventValue $event 'acknowledgedSourceRevision' '—'
+            Set-Status "Runtime reload 失败，保留旧内容：$errorCode" $true
+            Write-Log "Runtime reload 失败：target=$($event.target) error=$errorCode retained=$retainedRevision"
+        }
+        'runtime_reload_stale' { Write-Log "Runtime reload 迟到响应已忽略：target=$($event.target) request=$($event.requestId)" }
         'runtime_stopping' { Write-Log "Runtime stopping：$($event.reason)" }
         'runtime_failed' {
             $phase = [string]$event.PSObject.Properties['phase'].Value
@@ -469,8 +499,8 @@ function Invoke-GuiWorkflowSmokeTick(
                 $script:workflowStartedAt = [DateTime]::UtcNow
             }
             4 {
-                if ($script:workflowCompletedCommands -lt 2) {
-                    if (([DateTime]::UtcNow - $script:workflowStartedAt).TotalSeconds -gt 10) { throw "Expected Scene/Script reload completions, got $script:workflowCompletedCommands" }
+                if ($script:workflowCompletedCommands -lt 2 -or $script:workflowReloadAcknowledged -lt 2) {
+                    if (([DateTime]::UtcNow - $script:workflowStartedAt).TotalSeconds -gt 10) { throw "Expected Scene/Script reload completions/ack, got $script:workflowCompletedCommands/$script:workflowReloadAcknowledged" }
                     return
                 }
                 $script:workflowStage = 5
@@ -508,6 +538,7 @@ function Invoke-GuiWorkflowSmokeTick(
                     'workflow_apply=ok',
                     'workflow_preview=ok',
                     "workflow_reload_completions=$script:workflowCompletedCommands",
+                    "workflow_reload_acknowledged=$script:workflowReloadAcknowledged",
                     "project_model_version=$($model.ModelVersion)",
                     "hierarchy_snapshot_version=$($snapshot.SnapshotVersion)",
                     "hierarchy_node_count=$(@($snapshot.Nodes).Count)",
@@ -720,7 +751,11 @@ if ($WorkflowSmoke) {
 if ($Headless) {
     # Headless contract 只验证 GUI 依赖的路径/命令入口；内容事务仍由 editor-author verifier 覆盖。
     Add-Type -AssemblyName System.Windows.Forms
+    # 覆盖非 Live JSON watcher 与首次失败：artifact/retained 字段均允许缺失，StrictMode 下也不能中断事件流。
+    Handle-PreviewLine '{"event":"runtime_reload_acknowledged","target":"Scene","requestId":1,"source":"file_change","sourceRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","result":"succeeded"}'
+    Handle-PreviewLine '{"event":"runtime_reload_failed","target":"Script","requestId":2,"source":"file_change","sourceRevision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","result":"rejected","errorCode":"UnsupportedScriptSchema"}'
     Write-Output 'gui_contract=ok'
+    Write-Output 'gui_optional_reload_fields=ok'
     Write-Output "package_root=$script:resolvedPackageRoot"
     Write-Output "project_name=$script:projectName"
     exit 0

@@ -121,6 +121,9 @@ internal sealed class EditorRpcHost
                 case "asset_catalog_snapshot":
                     await WriteResponseAsync(request.Id, true, await _session.GetAssetCatalogSnapshotAsync(DeserializeParams<SnapshotQueryParameters>(request), request.Id), null);
                     break;
+                case "publication_snapshot":
+                    await WriteResponseAsync(request.Id, true, await _session.GetPublicationSnapshotAsync(DeserializeParams<PublicationSnapshotQueryParameters>(request), request.Id), null);
+                    break;
                 case "authoring_apply":
                     await WriteResponseAsync(request.Id, true, await _session.ApplyAuthoringAsync(DeserializeParams<AuthoringApplyParameters>(request), request.Id), null);
                     break;
