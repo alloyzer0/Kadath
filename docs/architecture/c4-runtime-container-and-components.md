@@ -49,8 +49,8 @@ graph TD
         Memory["Memory<br/>分配策略与生命周期基础设施"]
     end
 
-    subgraph Editor["Future Editor（未来容器）"]
-        EditorUI["Scene / Inspector / Preview UI"]
+    subgraph Editor["Editor Container（Runtime 外部容器）"]
+        EditorUI["Thin Authoring Shell<br/>未来 Scene / Inspector / Preview UI"]
     end
 
     subgraph AssetTool["Future Asset Tool（未来容器）"]
@@ -149,11 +149,11 @@ graph TD
 - 编辑器资产管理 UI
 - 底层 GPU 提交
 
-### 3.5 Future Editor 与 Future Asset Tool 是外部容器
+### 3.5 Editor（当前薄 authoring shell）与 Future Asset Tool 是外部容器
 
 它们都在图上出现，但被明确放在 Runtime 外部：
 
-- `Future Editor` 未来通过粗粒度控制、调试绘制和场景 / 资源引用协作接近 Runtime
+- 当前薄 authoring shell 已通过 Authoring CLI 和 Preview Protocol 以粗粒度方式接近 Runtime；未来完整 Editor 可继续扩展场景 / 资源引用与调试绘制协作
 - `Future Asset Tool` 未来负责导入、烘焙、打包，再把运行时产物交给 `Resource System`
 
 这样既保留了扩展路径，也不会污染当前主路径。
@@ -166,10 +166,10 @@ graph TD
 - `Platform -> RHI` 是图形和窗口的底层桥接路径。
 - `Resource` 是 Runtime 与未来工具链之间最关键的稳定边界之一。
 - `World` 与 `Renderer2D` 协作，但 `Renderer2D` 不反向支配世界更新语义。
-- `Future Editor` 和 `Future Asset Tool` 已有清晰接入位点，但当前不要求先实现它们。
+- 当前薄 authoring shell、未来完整 Editor 和 `Future Asset Tool` 都有清晰接入位点，但 GUI 不改变 Runtime 核心职责。
 
 ---
 
 ## 5. 一句话结论
 
-Kadath 当前的轻量容器 / 组件结构是：**以 `Host` 驱动 Runtime 主循环，以 `World + Resource + Renderer2D + Audio` 组成主路径，以 `Platform + RHI + Memory` 提供底层支撑，并为未来 Editor 与 Asset Tool 预留外部接入边界。**
+Kadath 当前的轻量容器 / 组件结构是：**以 `Host` 驱动 Runtime 主循环，以 `World + Resource + Renderer2D + Audio` 组成主路径，以 `Platform + RHI + Memory` 提供底层支撑，并为当前薄 authoring shell、未来完整 Editor 与 Asset Tool 预留外部接入边界。**

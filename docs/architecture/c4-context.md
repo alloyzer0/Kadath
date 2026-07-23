@@ -32,7 +32,8 @@
 graph TD
     Developer["游戏开发者 / 引擎使用者"]
     Runtime["Kadath Runtime<br/>运行时容器与引擎核心"]
-    Editor["未来 Editor<br/>场景编辑、预览控制、调试视图"]
+    Editor["Editor 容器<br/>当前薄 authoring shell；未来完整编辑器"]
+    EditorService["Editor Service<br/>本地 stdio JSON-RPC host"]
     AssetTool["未来 Asset Tool<br/>导入、转换、烘焙、打包"]
     SourceAssets["源资产<br/>PNG / WAV / TMX / glTF / JSON"]
     RuntimeAssets["运行时资源包 / 资源源<br/>目录、Archive、未来 .kpack"]
@@ -46,8 +47,9 @@ graph TD
     AssetTool -->|"产出运行时可消费资源"| RuntimeAssets
     RuntimeAssets -->|"只读加载与实例化"| Runtime
 
-    Editor -->|"未来读取/写入场景与资源引用<br/>粗粒度控制命令"| Runtime
-    Editor -->|"未来驱动导入、预览与重建"| AssetTool
+    Editor -->|"Avalonia/CLI UI"| EditorService
+    EditorService -->|"stdio JSON-RPC；PreviewSurface 控制"| Runtime
+    EditorService -->|"驱动导入、live bake 与重建"| AssetTool
 
     Runtime -->|"窗口、输入、时钟、文件 I/O"| Platform
     Runtime -->|"渲染、音频、系统资源访问"| Platform
@@ -58,7 +60,7 @@ graph TD
 ## 3. 读图说明
 
 - 当前系统边界的核心对象是 **Kadath Runtime**，也就是 `M0-M3` 主路径上真正需要先跑起来的那部分。
-- **Editor** 和 **Asset Tool** 在当前阶段是未来容器，不属于 Runtime 内核，但其边界已被 `ADR-0006` 和 `ADR-0007` 预留。
+- **Editor** 和 **Asset Tool** 位于 Runtime 外部；当前已落地的是不持有 Runtime 内部状态的薄 authoring shell，完整 Editor 与 Asset Tool 仍是后续容器。
 - **源资产** 与 **运行时资源** 被明确区分：
   - 源资产服务于创作、导入和编辑。
   - 运行时资源服务于 Runtime 的只读加载与实例化。
