@@ -1,0 +1,9 @@
+[package]
+name = "kadath_scheduler"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+# 当前 tracer bullet 必须能在不修改根 workspace 的前提下独立验证。
+[workspace]
