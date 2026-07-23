@@ -28,5 +28,8 @@ if (@($output | Where-Object { $_.ToString() -eq 'gui_workflow_smoke=ok' }).Coun
 if (@($output | Where-Object { $_.ToString() -eq 'workflow_reload_acknowledged=2' }).Count -ne 1) {
     throw 'GUI workflow smoke did not confirm both Runtime reload revisions'
 }
+if (@($output | Where-Object { $_.ToString() -eq 'workflow_initial_loaded=1' }).Count -ne 1) {
+    throw 'GUI workflow smoke did not confirm one atomic Runtime initial identity'
+}
 Write-Output 'gui_optional_reload_fields=ok'
 Write-Output 'verification=ok'

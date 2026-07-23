@@ -44,6 +44,7 @@ try {
         'workflow_watch_start=ok',
         'workflow_watch_stop=ok',
         'workflow_preview_start=ok',
+        'workflow_preview_initial_loaded=ok',
         'workflow_preview_reload_ack=ok',
         'workflow_preview_stop=ok',
         'workflow_shutdown=ok',

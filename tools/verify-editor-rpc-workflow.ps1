@@ -139,6 +139,11 @@ try {
     $surface = Read-Event $process 'preview_surface_created'
     $preview = Read-Response $process 'preview-1'
     if (-not [bool]$preview.ok -or [string]$surface.data.mode -ne 'external-window' -or [string]$surface.data.windowClass -ne 'KadathRuntimeWindow') { throw 'preview external-window contract mismatch' }
+    $initialLoaded = Read-Event $process 'preview_initial_loaded'
+    $initialValid = ([int]$initialLoaded.data.loadVersion -eq 1) -and ([string]$initialLoaded.data.state -eq 'loaded') -and
+        ([string]$initialLoaded.data.scene.kind -eq 'artifact') -and ([string]$initialLoaded.data.scene.correlation -eq 'manifest_matched') -and (([string]$initialLoaded.data.scene.sourceRevision).Length -eq 64) -and (([string]$initialLoaded.data.scene.artifactRevision).Length -eq 64) -and ([uint64]$initialLoaded.data.scene.artifactBytes -eq 128) -and
+        ([string]$initialLoaded.data.script.kind -eq 'artifact') -and ([string]$initialLoaded.data.script.correlation -eq 'manifest_matched') -and (([string]$initialLoaded.data.script.sourceRevision).Length -eq 64) -and (([string]$initialLoaded.data.script.artifactRevision).Length -eq 64) -and ([uint64]$initialLoaded.data.script.artifactBytes -eq 48)
+    if (-not $initialValid) { throw 'Preview initial loaded identity contract mismatch' }
     Start-Sleep -Milliseconds 500
     & pwsh -NoProfile -File $author -Action Update -PackageRoot $root -ProjectName $ProjectName -SceneGoalX 651 -SceneGoalY 251 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to update Scene source for Preview live-bake verification' }
@@ -161,6 +166,7 @@ try {
     Write-Output 'watch_incremental_bake=ok'
     Write-Output 'watch_failure_retention=ok'
     Write-Output 'preview_external_window=ok'
+    Write-Output 'preview_initial_loaded=ok'
     Write-Output 'preview_reload_ack=ok'
     Write-Output 'verification=ok'
 }

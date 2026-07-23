@@ -345,6 +345,12 @@ internal static class Program
             && workspace.Preview.Runtime.Script.SourceRevision == initialScriptSource
             && workspace.Preview.Runtime.Script.ArtifactRevision == initialScriptArtifact,
             "failed Script reload replaced the retained Runtime identity");
+        await transport.EmitEventAsync("preview_initial_load_failed", new PreviewInitialLoadFailedNotification(
+            1, "failed", "late_initial_failure", "must be ignored after reload ack")).ConfigureAwait(false);
+        await Task.Delay(20).ConfigureAwait(false);
+        Assert(workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded
+            && workspace.Preview.Runtime.Scene.Origin == EditorPreviewRuntimeOrigin.Reload,
+            "late initial failure rolled back acknowledged Runtime identity");
 
         await workspace.StopPreviewAsync();
         Assert(workspace.Preview.State == EditorPreviewState.Stopped, "preview did not stop");
@@ -362,6 +368,14 @@ internal static class Program
         Assert(workspace.Preview.Runtime.ErrorCode == "FileNotFound"
             && workspace.Preview.Runtime.Scene.Origin == EditorPreviewRuntimeOrigin.None,
             "initial load failure did not retain the empty restart state");
+        await transport.EmitEventAsync("preview_initial_loaded", new PreviewInitialLoadedNotification(
+            1, "loaded",
+            new PreviewLoadedTargetIdentity("Scene", "built_in", "built_in"),
+            new PreviewLoadedTargetIdentity("Script", "built_in", "built_in"))).ConfigureAwait(false);
+        await Task.Delay(20).ConfigureAwait(false);
+        Assert(workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Failed
+            && workspace.Preview.Runtime.ErrorCode == "FileNotFound",
+            "duplicate initial terminal event replaced the first failure");
         transport.FailNextPreviewStop();
         try
         {
@@ -380,6 +394,24 @@ internal static class Program
         await workspace.StopPreviewAsync();
         Assert(workspace.Preview.State == EditorPreviewState.Stopped && !workspace.Preview.OwnsPublicationSync,
             "Preview ownership was not released after confirmed stop");
+
+        _ = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: "demo"));
+        await transport.EmitEventAsync("publication_snapshot_created", initialPublication).ConfigureAwait(false);
+        var mismatchedArtifact = new string('9', 64);
+        await transport.EmitEventAsync("preview_initial_loaded", new PreviewInitialLoadedNotification(
+            1, "loaded",
+            new PreviewLoadedTargetIdentity("Scene", "artifact", "artifact_mismatch", null, mismatchedArtifact, 128),
+            new PreviewLoadedTargetIdentity("Script", "built_in", "built_in"))).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded);
+        Assert(workspace.Preview.Runtime.Scene.ArtifactRevision == mismatchedArtifact
+            && workspace.Preview.Runtime.Scene.SourceRevision is null
+            && workspace.Preview.Runtime.Scene.Consistency == EditorPreviewRuntimeConsistency.ArtifactMismatch,
+            "manifest mismatch did not retain Runtime artifact facts and mismatch projection");
+        Assert(workspace.Preview.Runtime.Script.Kind == "built_in"
+            && workspace.Preview.Runtime.Script.ArtifactRevision is null
+            && workspace.Preview.Runtime.Script.ArtifactBytes is null,
+            "built-in target fabricated digest or byte identity");
+        await workspace.StopPreviewAsync();
 
         // 故意注入重复 sequence，验证客户端在协议破坏时停止接受事件，而不是静默重排。
         var lastSequence = client.LastEventSequence;

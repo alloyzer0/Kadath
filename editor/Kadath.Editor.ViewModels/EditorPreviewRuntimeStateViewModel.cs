@@ -124,7 +124,7 @@ public sealed class EditorPreviewRuntimeStateViewModel : ObservableObject
     private string? _lastTarget;
     private string? _errorCode;
     private string? _errorMessage;
-    private bool _initialApplied;
+    private bool _initialTerminalApplied;
     private PublicationSnapshot? _publication;
 
     public EditorPreviewRuntimeStateViewModel()
@@ -143,7 +143,7 @@ public sealed class EditorPreviewRuntimeStateViewModel : ObservableObject
 
     internal void Reset()
     {
-        _initialApplied = false;
+        _initialTerminalApplied = false;
         _publication = null;
         State = EditorPreviewRuntimeState.Unknown;
         LastTarget = null;
@@ -157,8 +157,8 @@ public sealed class EditorPreviewRuntimeStateViewModel : ObservableObject
     internal void ApplyInitial(PreviewInitialLoadedNotification notification)
     {
         // 每个 Preview 生命周期只接受一次原子 initial；reload 已推进后迟到 initial 也不能倒退身份。
-        if (_initialApplied || Scene.Origin == EditorPreviewRuntimeOrigin.Reload || Script.Origin == EditorPreviewRuntimeOrigin.Reload) { return; }
-        _initialApplied = true;
+        if (_initialTerminalApplied || Scene.Origin == EditorPreviewRuntimeOrigin.Reload || Script.Origin == EditorPreviewRuntimeOrigin.Reload) { return; }
+        _initialTerminalApplied = true;
         Scene.ApplyInitial(notification.Scene);
         Script.ApplyInitial(notification.Script);
         State = EditorPreviewRuntimeState.Loaded;
@@ -171,7 +171,9 @@ public sealed class EditorPreviewRuntimeStateViewModel : ObservableObject
 
     internal void ApplyFailure(PreviewInitialLoadFailedNotification notification)
     {
-        if (_initialApplied) { return; }
+        // initial 成功/失败共享一次性终态；迟到失败也不能把 reload ack 推进后的 loaded 状态倒退。
+        if (_initialTerminalApplied || Scene.Origin == EditorPreviewRuntimeOrigin.Reload || Script.Origin == EditorPreviewRuntimeOrigin.Reload) { return; }
+        _initialTerminalApplied = true;
         State = EditorPreviewRuntimeState.Failed;
         ErrorCode = notification.ErrorCode;
         ErrorMessage = notification.Message;
