@@ -207,10 +207,14 @@ public sealed class EditorWatchViewModel : ObservableObject
 
 public sealed class EditorPreviewViewModel : ObservableObject
 {
-    public EditorPreviewViewModel() =>
+    public EditorPreviewViewModel()
+    {
         Reload.PropertyChanged += (_, _) => RaisePropertyChanged(nameof(Reload));
+        Runtime.PropertyChanged += (_, _) => RaisePropertyChanged(nameof(Runtime));
+    }
 
     public EditorPreviewReloadViewModel Reload { get; } = new();
+    public EditorPreviewRuntimeStateViewModel Runtime { get; } = new();
     private EditorPreviewState _state;
     private string? _surfaceMode;
     private PreviewSurfaceDescriptor? _surface;
@@ -245,6 +249,7 @@ public sealed class EditorPreviewViewModel : ObservableObject
         WatchChanges = parameters.WatchChanges;
         OwnsPublicationSync = parameters.LiveBake && parameters.WatchChanges;
         Reload.Reset();
+        Runtime.Reset();
         BakeProfile = parameters.BakeProfile;
         // Preview live-bake/watch 运行时拥有派生文件写入权，UI 据此禁用手动 Bake/Service Watch。
         ErrorCode = null;
@@ -275,7 +280,16 @@ public sealed class EditorPreviewViewModel : ObservableObject
         if (State == EditorPreviewState.Starting && runtimeProcessId is not null) { State = EditorPreviewState.Running; }
     }
 
-    internal void ApplyReload(PreviewReloadNotification notification) => Reload.Apply(notification);
+    internal void ApplyInitial(PreviewInitialLoadedNotification notification) => Runtime.ApplyInitial(notification);
+
+    internal void ApplyInitialFailure(PreviewInitialLoadFailedNotification notification) => Runtime.ApplyFailure(notification);
+
+    internal void ApplyReload(PreviewReloadNotification notification)
+    {
+        Reload.Apply(notification);
+        // requested/failed/stale 只影响 reload 诊断；只有 acknowledged 能推进 Runtime loaded identity。
+        Runtime.ApplyReload(notification);
+    }
 
     internal void BeginStop() => State = EditorPreviewState.Stopping;
 

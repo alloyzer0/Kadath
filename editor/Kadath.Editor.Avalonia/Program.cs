@@ -120,6 +120,13 @@ internal static class Program
         Require(string.Equals(preview.SurfaceMode, PreviewSurfaceModes.ExternalWindow, StringComparison.Ordinal), "preview surface mode mismatch");
         await WaitUntilAsync(() => workspace.Preview.Surface is not null && workspace.Preview.RuntimeProcessId is not null, cancellationToken, "preview surface/runtime pid");
         Console.WriteLine("workflow_preview_start=ok");
+        await WaitUntilAsync(() => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded, cancellationToken, "preview initial loaded identity");
+        Require(workspace.Preview.Runtime.Scene.ArtifactRevision is { Length: 64 }
+            && workspace.Preview.Runtime.Scene.ArtifactBytes is > 0
+            && workspace.Preview.Runtime.Script.ArtifactRevision is { Length: 64 }
+            && workspace.Preview.Runtime.Script.ArtifactBytes is > 0,
+            "Avalonia did not project the atomic Runtime initial identity");
+        Console.WriteLine("workflow_preview_initial_loaded=ok");
 
         avaloniaViewModel.SceneGoalX = (double.Parse(avaloniaViewModel.SceneGoalX, CultureInfo.InvariantCulture) + 3d).ToString("R", CultureInfo.InvariantCulture);
         var liveEdited = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);

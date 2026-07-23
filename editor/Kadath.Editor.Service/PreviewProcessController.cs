@@ -55,8 +55,8 @@ internal sealed class PreviewProcessController : IAsyncDisposable
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         if (!process.Start()) { throw new InvalidOperationException("Failed to start editor-preview.ps1."); }
         lock (_gate) { _launcher = process; _runtimeProcessId = null; _stopRequested = false; }
-        _ = PumpOutputAsync(process.StandardOutput, false);
-        _ = PumpOutputAsync(process.StandardError, true);
+        _ = PumpOutputAsync(process, process.StandardOutput, false);
+        _ = PumpOutputAsync(process, process.StandardError, true);
         _ = ObserveExitAsync(process);
         await Task.Yield();
         // surface 元数据可先于 runtime_pid 公布；客户端随后从 preview_status 获取实际进程状态。
@@ -81,10 +81,12 @@ internal sealed class PreviewProcessController : IAsyncDisposable
 
     private static void Add(ProcessStartInfo info, string value) => info.ArgumentList.Add(value);
 
-    private async Task PumpOutputAsync(StreamReader reader, bool isError)
+    private async Task PumpOutputAsync(Process owner, StreamReader reader, bool isError)
     {
         while (await reader.ReadLineAsync() is { } line)
         {
+            // Preview 重启后旧 Launcher 的迟到输出必须在 Service seam 被丢弃，不能污染新生命周期。
+            if (!IsCurrentLauncher(owner)) { return; }
             if (isError)
             {
                 await EmitAsync("preview_log", JsonSerializer.SerializeToElement(new { stream = "stderr", message = line }, EditorProtocol.JsonOptions));
@@ -98,6 +100,10 @@ internal sealed class PreviewProcessController : IAsyncDisposable
             if (TryNormalizeReloadNotification(payload, out var reloadEvent, out var reloadData))
             {
                 await EmitAsync(reloadEvent, reloadData);
+            }
+            if (TryNormalizeInitialLoadNotification(payload, out var initialEvent, out var initialData))
+            {
+                await EmitAsync(initialEvent, initialData);
             }
             if (line.Contains("runtime_pid", StringComparison.Ordinal))
             {
@@ -114,6 +120,11 @@ internal sealed class PreviewProcessController : IAsyncDisposable
                 lock (_gate) { _runtimeProcessId = runtimePid; }
             }
         }
+    }
+
+    private bool IsCurrentLauncher(Process process)
+    {
+        lock (_gate) { return ReferenceEquals(_launcher, process); }
     }
 
     private static bool TryReadRuntimeProcessId(JsonElement value, out int processId)
@@ -174,9 +185,93 @@ internal sealed class PreviewProcessController : IAsyncDisposable
 
     private static bool IsOptionalRevision(string? revision) =>
         revision is null || (revision.Length == 64 && revision.All(Uri.IsHexDigit));
+
+    private static bool TryNormalizeInitialLoadNotification(JsonElement payload, out string eventName, out JsonElement normalized)
+    {
+        eventName = string.Empty;
+        normalized = default;
+        if (payload.ValueKind != JsonValueKind.Object
+            || !payload.TryGetProperty("origin", out var origin)
+            || !string.Equals(origin.GetString(), "launcher", StringComparison.Ordinal)
+            || !payload.TryGetProperty("event", out var launcherEvent))
+        {
+            return false;
+        }
+
+        switch (launcherEvent.GetString())
+        {
+            case "runtime_initial_loaded":
+            {
+                PreviewInitialLoadedNotification? notification;
+                try { notification = JsonSerializer.Deserialize<PreviewInitialLoadedNotification>(payload.GetRawText(), EditorProtocol.JsonOptions); }
+                catch (JsonException) { return false; }
+                if (notification is null
+                    || notification.LoadVersion != 1
+                    || !string.Equals(notification.State, "loaded", StringComparison.Ordinal)
+                    || !ValidateInitialTarget(notification.Scene, "Scene")
+                    || !ValidateInitialTarget(notification.Script, "Script")
+                    || (notification.Profile is not null && notification.Profile is not ("debug" or "release")))
+                {
+                    return false;
+                }
+                eventName = "preview_initial_loaded";
+                normalized = JsonSerializer.SerializeToElement(notification, EditorProtocol.JsonOptions);
+                return true;
+            }
+            case "runtime_initial_load_failed":
+            {
+                PreviewInitialLoadFailedNotification? notification;
+                try { notification = JsonSerializer.Deserialize<PreviewInitialLoadFailedNotification>(payload.GetRawText(), EditorProtocol.JsonOptions); }
+                catch (JsonException) { return false; }
+                if (notification is null
+                    || notification.LoadVersion != 1
+                    || !string.Equals(notification.State, "failed", StringComparison.Ordinal)
+                    || string.IsNullOrWhiteSpace(notification.ErrorCode))
+                {
+                    return false;
+                }
+                eventName = "preview_initial_load_failed";
+                normalized = JsonSerializer.SerializeToElement(notification, EditorProtocol.JsonOptions);
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    private static bool ValidateInitialTarget(PreviewLoadedTargetIdentity target, string expectedTarget)
+    {
+        if (target is null || !string.Equals(target.Target, expectedTarget, StringComparison.Ordinal)) { return false; }
+        return target.Kind switch
+        {
+            "built_in" => target.Correlation == "built_in"
+                && target.SourceRevision is null && target.ArtifactRevision is null && target.ArtifactBytes is null,
+            "source_document" => target.Correlation == "runtime_source"
+                && IsLowerHex64(target.SourceRevision)
+                && target.ArtifactRevision is null && target.ArtifactBytes is null,
+            "artifact" => ValidateArtifactTarget(target),
+            _ => false
+        };
+    }
+
+    private static bool ValidateArtifactTarget(PreviewLoadedTargetIdentity target)
+    {
+        if (!IsLowerHex64(target.ArtifactRevision) || target.ArtifactBytes is not > 0) { return false; }
+        return target.Correlation switch
+        {
+            "manifest_matched" => IsLowerHex64(target.SourceRevision),
+            "runtime_only" or "artifact_mismatch" or "manifest_missing" => target.SourceRevision is null,
+            _ => false
+        };
+    }
+
+    private static bool IsLowerHex64(string? revision) =>
+        revision is { Length: 64 } && revision.All(value => value is >= '0' and <= '9' or >= 'a' and <= 'f');
+
     private async Task ObserveExitAsync(Process process)
     {
         await process.WaitForExitAsync();
+        if (!IsCurrentLauncher(process)) { return; }
         bool requested; lock (_gate) { requested = _stopRequested; }
         await EmitAsync("preview_stopped", JsonSerializer.SerializeToElement(new { exitCode = process.ExitCode, requested }, EditorProtocol.JsonOptions));
     }

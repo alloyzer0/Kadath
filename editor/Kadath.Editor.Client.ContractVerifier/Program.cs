@@ -29,6 +29,7 @@ internal static class Program
             Console.WriteLine("connection_closed_projection=ok");
             Console.WriteLine("snapshot_state=ok");
             Console.WriteLine("publication_state=ok");
+            Console.WriteLine("preview_initial_loaded_state=ok");
             Console.WriteLine("preview_reload_ack_state=ok");
             Console.WriteLine("bake_changes=ok");
             Console.WriteLine("capability_gating=ok");
@@ -219,6 +220,71 @@ internal static class Program
         Assert(workspace.Preview.Surface?.WindowClass == "KadathRuntimeWindow", "preview surface descriptor mismatch");
         Assert(workspace.Preview.RuntimeProcessId == 1234, "runtime PID status was not parsed");
 
+        var initialSceneSource = new string('a', 64);
+        var initialSceneArtifact = new string('b', 64);
+        var initialScriptSource = new string('c', 64);
+        var initialScriptArtifact = new string('d', 64);
+        var initialPublication = currentPublication with
+        {
+            State = "current",
+            Scene = currentPublication.Scene with
+            {
+                State = "current",
+                SourceRevision = initialSceneSource,
+                BakedSourceRevision = initialSceneSource,
+                ArtifactRevision = initialSceneArtifact,
+                ManifestArtifactRevision = initialSceneArtifact,
+                ArtifactBytes = 128,
+                ManifestArtifactBytes = 128
+            },
+            Script = currentPublication.Script with
+            {
+                State = "current",
+                SourceRevision = initialScriptSource,
+                BakedSourceRevision = initialScriptSource,
+                ArtifactRevision = initialScriptArtifact,
+                ManifestArtifactRevision = initialScriptArtifact,
+                ArtifactBytes = 48,
+                ManifestArtifactBytes = 48
+            }
+        };
+        await transport.EmitEventAsync("publication_snapshot_created", initialPublication).ConfigureAwait(false);
+        await transport.EmitEventAsync("preview_initial_loaded", new PreviewInitialLoadedNotification(
+            1, "loaded",
+            new PreviewLoadedTargetIdentity("Scene", "artifact", "manifest_matched", initialSceneSource, initialSceneArtifact, 128),
+            new PreviewLoadedTargetIdentity("Script", "artifact", "manifest_matched", initialScriptSource, initialScriptArtifact, 48),
+            "debug")).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded);
+        Assert(workspace.Preview.Runtime.Scene.Origin == EditorPreviewRuntimeOrigin.Initial
+            && workspace.Preview.Runtime.Scene.Consistency == EditorPreviewRuntimeConsistency.Current
+            && workspace.Preview.Runtime.Script.Origin == EditorPreviewRuntimeOrigin.Initial
+            && workspace.Preview.Runtime.Script.Consistency == EditorPreviewRuntimeConsistency.Current,
+            "initial Runtime identity was not atomically projected against publication");
+
+        // publication 只能对账，source 变脏不能覆盖 Runtime 已加载的权威身份。
+        var dirtyPublication = initialPublication with
+        {
+            State = "source_dirty",
+            Scene = initialPublication.Scene with { State = "source_dirty", SourceRevision = new string('e', 64) }
+        };
+        await transport.EmitEventAsync("publication_snapshot_created", dirtyPublication).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Preview.Runtime.Scene.Consistency == EditorPreviewRuntimeConsistency.SourceDirty);
+        Assert(workspace.Preview.Runtime.Scene.SourceRevision == initialSceneSource
+            && workspace.Preview.Runtime.Scene.ArtifactRevision == initialSceneArtifact,
+            "publication dirtiness overwrote Runtime loaded identity");
+        await transport.EmitEventAsync("publication_snapshot_created", initialPublication).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Preview.Runtime.Scene.Consistency == EditorPreviewRuntimeConsistency.Current);
+
+        // 同一生命周期的重复 initial 必须忽略，避免迟到事件把 reload 或首次身份倒退。
+        await transport.EmitEventAsync("preview_initial_loaded", new PreviewInitialLoadedNotification(
+            1, "loaded",
+            new PreviewLoadedTargetIdentity("Scene", "artifact", "artifact_mismatch", null, new string('f', 64), 128),
+            new PreviewLoadedTargetIdentity("Script", "built_in", "runtime_only"))).ConfigureAwait(false);
+        await Task.Delay(20).ConfigureAwait(false);
+        Assert(workspace.Preview.Runtime.Scene.ArtifactRevision == initialSceneArtifact
+            && workspace.Preview.Runtime.Script.ArtifactRevision == initialScriptArtifact,
+            "duplicate initial event replaced authoritative Runtime identity");
+
         var sceneSourceA = new string('A', 64);
         var sceneArtifactA = new string('B', 64);
         var sceneSourceB = new string('C', 64);
@@ -271,6 +337,14 @@ internal static class Program
             && workspace.Preview.Reload.Script.FailedSourceRevision == failedScriptSource
             && workspace.Preview.Reload.Script.ErrorCode == "UnsupportedScriptSchema",
             "failed Script reload did not retain the last acknowledged revision.");
+        Assert(workspace.Preview.Runtime.Scene.Origin == EditorPreviewRuntimeOrigin.Reload
+            && workspace.Preview.Runtime.Scene.SourceRevision == sceneSourceB
+            && workspace.Preview.Runtime.Scene.ArtifactRevision == sceneArtifactB,
+            "acknowledged Scene reload did not advance Runtime loaded identity");
+        Assert(workspace.Preview.Runtime.Script.Origin == EditorPreviewRuntimeOrigin.Initial
+            && workspace.Preview.Runtime.Script.SourceRevision == initialScriptSource
+            && workspace.Preview.Runtime.Script.ArtifactRevision == initialScriptArtifact,
+            "failed Script reload replaced the retained Runtime identity");
 
         await workspace.StopPreviewAsync();
         Assert(workspace.Preview.State == EditorPreviewState.Stopped, "preview did not stop");
@@ -278,6 +352,16 @@ internal static class Program
         var livePreview = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: "demo", LiveBake: true, WatchChanges: true));
         Assert(livePreview.SurfaceMode == PreviewSurfaceModes.ExternalWindow && workspace.Preview.OwnsPublicationSync,
             "live Preview did not claim publication ownership");
+        Assert(workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Unknown
+            && workspace.Preview.Runtime.Scene.Origin == EditorPreviewRuntimeOrigin.None
+            && workspace.Preview.Runtime.Script.Origin == EditorPreviewRuntimeOrigin.None,
+            "Preview restart did not reset Runtime loaded identity");
+        await transport.EmitEventAsync("preview_initial_load_failed", new PreviewInitialLoadFailedNotification(
+            1, "failed", "FileNotFound", "scene artifact missing")).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Failed);
+        Assert(workspace.Preview.Runtime.ErrorCode == "FileNotFound"
+            && workspace.Preview.Runtime.Scene.Origin == EditorPreviewRuntimeOrigin.None,
+            "initial load failure did not retain the empty restart state");
         transport.FailNextPreviewStop();
         try
         {

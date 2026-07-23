@@ -280,6 +280,30 @@ public sealed record PreviewStartResult(string State, string SurfaceMode);
 public sealed record PreviewStopResult(string State);
 
 /// <summary>
+/// Runtime 初始内容身份。artifact 的 sourceRevision 只有在 Launcher 验证 manifest hash/bytes 后才存在。
+/// </summary>
+public sealed record PreviewLoadedTargetIdentity(
+    string Target,
+    string Kind,
+    string Correlation,
+    string? SourceRevision = null,
+    string? ArtifactRevision = null,
+    ulong? ArtifactBytes = null);
+
+public sealed record PreviewInitialLoadedNotification(
+    int LoadVersion,
+    string State,
+    PreviewLoadedTargetIdentity Scene,
+    PreviewLoadedTargetIdentity Script,
+    string? Profile = null);
+
+public sealed record PreviewInitialLoadFailedNotification(
+    int LoadVersion,
+    string State,
+    string ErrorCode,
+    string? Message = null);
+
+/// <summary>
 /// Service 归一化后的 Runtime reload 确认。它携带内容身份，不暴露 Launcher sequence 或 WM_APP。
 /// </summary>
 public sealed record PreviewReloadNotification(

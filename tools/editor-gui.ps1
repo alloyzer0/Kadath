@@ -41,6 +41,7 @@ $script:workflowSmokeError = $null
 $script:workflowProjectCreated = $false
 $script:workflowCompletedCommands = 0
 $script:workflowReloadAcknowledged = 0
+$script:workflowInitialLoaded = 0
 $script:workflowEvidence = @()
 $script:workflowTickActive = $false
 $script:hierarchySnapshot = $null
@@ -279,6 +280,18 @@ function Handle-PreviewLine([string]$Line, [string]$Stream = 'stdout') {
         'live_bake_reused' { Write-Log "Live Bake 复用最近成功 artifact：$($event.target)" }
         'live_bake_failed' { Set-Status "Live Bake 失败，保留旧 artifact" $true; Write-Log "Live Bake 失败：$($event.errorCode) $($event.message)" }
         'runtime_ready' { Set-Status 'Runtime 已就绪'; Write-Log 'Runtime ready' }
+        'runtime_initial_loaded' {
+            if ($script:runWorkflowSmoke) { $script:workflowInitialLoaded++ }
+            $sceneArtifact = Get-PreviewEventValue $event.scene 'artifactRevision' 'built-in/source'
+            $scriptArtifact = Get-PreviewEventValue $event.script 'artifactRevision' 'built-in/source'
+            Set-Status 'Runtime 初始内容身份已确认'
+            Write-Log "Runtime initial loaded：scene=$sceneArtifact script=$scriptArtifact"
+        }
+        'runtime_initial_load_failed' {
+            $errorCode = Get-PreviewEventValue $event 'errorCode' 'runtime_initial_load_failed'
+            Set-Status "Runtime 初始身份失败：$errorCode" $true
+            Write-Log "Runtime initial load failed：$errorCode"
+        }
         'command_requested' { Write-Log "请求：$($event.command) #$($event.requestId)" }
         'command_completed' {
             $result = [string]$event.result
@@ -499,8 +512,8 @@ function Invoke-GuiWorkflowSmokeTick(
                 $script:workflowStartedAt = [DateTime]::UtcNow
             }
             4 {
-                if ($script:workflowCompletedCommands -lt 2 -or $script:workflowReloadAcknowledged -lt 2) {
-                    if (([DateTime]::UtcNow - $script:workflowStartedAt).TotalSeconds -gt 10) { throw "Expected Scene/Script reload completions/ack, got $script:workflowCompletedCommands/$script:workflowReloadAcknowledged" }
+                if ($script:workflowInitialLoaded -lt 1 -or $script:workflowCompletedCommands -lt 2 -or $script:workflowReloadAcknowledged -lt 2) {
+                    if (([DateTime]::UtcNow - $script:workflowStartedAt).TotalSeconds -gt 10) { throw "Expected initial identity and Scene/Script reload completions/ack, got $script:workflowInitialLoaded/$script:workflowCompletedCommands/$script:workflowReloadAcknowledged" }
                     return
                 }
                 $script:workflowStage = 5
@@ -537,6 +550,7 @@ function Invoke-GuiWorkflowSmokeTick(
                     'workflow_create=ok',
                     'workflow_apply=ok',
                     'workflow_preview=ok',
+                    "workflow_initial_loaded=$script:workflowInitialLoaded",
                     "workflow_reload_completions=$script:workflowCompletedCommands",
                     "workflow_reload_acknowledged=$script:workflowReloadAcknowledged",
                     "project_model_version=$($model.ModelVersion)",
@@ -752,6 +766,7 @@ if ($Headless) {
     # Headless contract 只验证 GUI 依赖的路径/命令入口；内容事务仍由 editor-author verifier 覆盖。
     Add-Type -AssemblyName System.Windows.Forms
     # 覆盖非 Live JSON watcher 与首次失败：artifact/retained 字段均允许缺失，StrictMode 下也不能中断事件流。
+    Handle-PreviewLine '{"event":"runtime_initial_loaded","loadVersion":1,"state":"loaded","scene":{"target":"Scene","kind":"built_in","correlation":"runtime_only"},"script":{"target":"Script","kind":"built_in","correlation":"runtime_only"}}'
     Handle-PreviewLine '{"event":"runtime_reload_acknowledged","target":"Scene","requestId":1,"source":"file_change","sourceRevision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","result":"succeeded"}'
     Handle-PreviewLine '{"event":"runtime_reload_failed","target":"Script","requestId":2,"source":"file_change","sourceRevision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","result":"rejected","errorCode":"UnsupportedScriptSchema"}'
     Write-Output 'gui_contract=ok'

@@ -25,6 +25,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         _dispatcher = dispatcher ?? new InlineEditorViewDispatcher();
         Client.EventReceived += HandleEventAsync;
         Client.ConnectionClosed += HandleConnectionClosedAsync;
+        Publication.PropertyChanged += (_, _) => Preview.Runtime.Reconcile(Publication.Snapshot);
     }
 
     public IEditorRpcClient Client { get; }
@@ -458,6 +459,18 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
                 break;
             case "preview_status":
                 ApplyPreviewStatus(notification.Data);
+                break;
+            case "preview_initial_loaded":
+                if (TryRead(notification.Data, out PreviewInitialLoadedNotification? initialLoaded) && initialLoaded is not null)
+                {
+                    Preview.ApplyInitial(initialLoaded);
+                }
+                break;
+            case "preview_initial_load_failed":
+                if (TryRead(notification.Data, out PreviewInitialLoadFailedNotification? initialFailed) && initialFailed is not null)
+                {
+                    Preview.ApplyInitialFailure(initialFailed);
+                }
                 break;
             case "preview_reload_requested":
             case "preview_reload_acknowledged":

@@ -143,19 +143,21 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     {
         get
         {
+            var runtime = _workspace.Preview.Runtime;
+            if (runtime.State == EditorPreviewRuntimeState.Failed) { return $"Runtime initial load failed · {runtime.ErrorCode}"; }
+            var loaded = runtime.Last;
             var reload = _workspace.Preview.Reload.Last;
-            if (reload is null) { return "Runtime reload 尚无确认。"; }
-            var stale = reload.StaleResponseCount > 0 ? $" · stale={reload.StaleResponseCount}" : string.Empty;
-            return reload.State switch
+            var stale = reload is { StaleResponseCount: > 0 } ? $" · stale={reload.StaleResponseCount}" : string.Empty;
+            if (reload?.State == EditorPreviewReloadState.Requested)
             {
-                EditorPreviewReloadState.Requested =>
-                    $"{reload.Target} reload pending · source={ShortRevision(reload.RequestedSourceRevision)}{stale}",
-                EditorPreviewReloadState.Acknowledged =>
-                    $"{reload.Target} loaded · source={ShortRevision(reload.AcknowledgedSourceRevision)} · artifact={ShortRevision(reload.AcknowledgedArtifactRevision)}{stale}",
-                EditorPreviewReloadState.Failed =>
-                    $"{reload.Target} reload failed · {reload.ErrorCode} · retained={ShortRevision(reload.AcknowledgedArtifactRevision ?? reload.AcknowledgedSourceRevision)}{stale}",
-                _ => $"Runtime reload idle{stale}"
-            };
+                return $"{reload.Target} reload pending · retained={ShortRevision(loaded?.ArtifactRevision ?? loaded?.SourceRevision)}{stale}";
+            }
+            if (reload?.State == EditorPreviewReloadState.Failed)
+            {
+                return $"{reload.Target} reload failed · {reload.ErrorCode} · retained={ShortRevision(loaded?.ArtifactRevision ?? loaded?.SourceRevision)}{stale}";
+            }
+            if (loaded is null) { return "Runtime loaded identity 尚不可用。"; }
+            return $"{loaded.Target} loaded · source={ShortRevision(loaded.SourceRevision)} · artifact={ShortRevision(loaded.ArtifactRevision)} · sync={loaded.Consistency}{stale}";
         }
     }
     public string SurfaceMode => _workspace.Preview.SurfaceMode ?? "external-window（独立 Runtime 窗口）";

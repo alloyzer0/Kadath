@@ -100,6 +100,7 @@ $script:liveBakeScript = Join-Path $PSScriptRoot 'editor-live-bake.ps1'
 $script:liveBakeSources = @{}
 $script:liveBakeArtifacts = @{}
 $script:liveBakeManifest = $null
+$script:initialLoadTerminalEmitted = $false
 
 function Write-StructuredEvent([object]$Event) {
     $script:launcherSequence++
@@ -210,6 +211,93 @@ function Complete-RuntimeReload([object]$Pending, [uint64]$RequestId, [string]$R
     $targetState.FailedSourceRevision = $Pending.revision
     Write-StructuredEvent (New-RuntimeReloadEvent 'runtime_reload_failed' 'failed' $Pending $RequestId $targetState $Result $ErrorCode $false)
 }
+
+function Test-LowerHex64([object]$Value) {
+    return $null -ne $Value -and [string]$Value -cmatch '^[0-9a-f]{64}$'
+}
+
+function Convert-RuntimeInitialTarget([string]$TargetName, [object]$RuntimeTarget) {
+    if ($null -eq $RuntimeTarget) { throw "Runtime initialLoaded is missing $TargetName" }
+    $kind = [string](Get-RequiredProperty $RuntimeTarget 'kind' "Runtime initialLoaded.$TargetName")
+    $result = [ordered]@{ target = $TargetName; kind = $kind; correlation = 'runtime_only' }
+    if ($kind -eq 'built_in') {
+        $result.correlation = 'built_in'
+        return $result
+    }
+    if ($kind -notin @('source_document', 'artifact')) { throw "Runtime initialLoaded.$TargetName has unsupported kind: $kind" }
+
+    $sha256 = [string](Get-RequiredProperty $RuntimeTarget 'sha256' "Runtime initialLoaded.$TargetName")
+    if (-not (Test-LowerHex64 $sha256)) { throw "Runtime initialLoaded.$TargetName sha256 must be lowercase 64-hex" }
+    try { $bytes = [uint64](Get-RequiredProperty $RuntimeTarget 'bytes' "Runtime initialLoaded.$TargetName") } catch { throw "Runtime initialLoaded.$TargetName bytes must be uint64" }
+    if ($bytes -eq 0) { throw "Runtime initialLoaded.$TargetName bytes must be positive" }
+
+    if ($kind -eq 'source_document') {
+        # Source document digest 直接来自 Runtime 实际解析 buffer；Launcher 不再读取文件猜测身份。
+        $result.sourceRevision = $sha256
+        $result.correlation = 'runtime_source'
+        return $result
+    }
+
+    $result.artifactRevision = $sha256
+    $result.artifactBytes = $bytes
+    if (-not $script:liveBakeEnabled) { return $result }
+
+    $manifest = Read-LiveBakeManifest $script:liveBakeManifest
+    $entryName = $TargetName.ToLowerInvariant()
+    $entryProperty = if ($null -ne $manifest) { $manifest.PSObject.Properties[$entryName] } else { $null }
+    if ($null -eq $entryProperty -or $null -eq $entryProperty.Value) {
+        $result.correlation = 'manifest_missing'
+        return $result
+    }
+    $entry = $entryProperty.Value
+    try { $manifestBytes = [uint64]$entry.artifactBytes } catch { $result.correlation = 'artifact_mismatch'; return $result }
+    # 只有 Runtime 权威 digest 与 manifest hash/bytes 同时匹配，manifest 才能补充 source revision。
+    if ([string]$entry.artifactSha256 -cne $sha256 -or $manifestBytes -ne $bytes) {
+        $result.correlation = 'artifact_mismatch'
+        return $result
+    }
+    if (-not (Test-LowerHex64 $entry.sourceSha256)) {
+        $result.correlation = 'artifact_mismatch'
+        return $result
+    }
+    $result.sourceRevision = [string]$entry.sourceSha256
+    $result.correlation = 'manifest_matched'
+    return $result
+}
+
+function Write-RuntimeInitialLoadFailed([string]$ErrorCode, [string]$Message) {
+    if ($script:initialLoadTerminalEmitted) { return }
+    $script:initialLoadTerminalEmitted = $true
+    $event = [ordered]@{ event = 'runtime_initial_load_failed'; loadVersion = 1; state = 'failed'; errorCode = $ErrorCode }
+    if (-not [string]::IsNullOrWhiteSpace($Message)) { $event.message = $Message }
+    Write-StructuredEvent $event
+}
+
+function Publish-RuntimeInitialLoaded([object]$RuntimeEvent) {
+    if ($script:initialLoadTerminalEmitted) { return }
+    $property = $RuntimeEvent.PSObject.Properties['initialLoaded']
+    if ($null -eq $property -or $null -eq $property.Value) {
+        # 旧 Runtime 的 runtime_ready 没有 data；保持 ready 兼容，但绝不推测 loaded identity。
+        return
+    }
+    try {
+        $scene = Convert-RuntimeInitialTarget 'Scene' $property.Value.scene
+        $scriptTarget = Convert-RuntimeInitialTarget 'Script' $property.Value.script
+        $script:initialLoadTerminalEmitted = $true
+        $event = [ordered]@{
+            event = 'runtime_initial_loaded'
+            loadVersion = 1
+            state = 'loaded'
+            scene = $scene
+            script = $scriptTarget
+        }
+        if ($script:liveBakeEnabled) { $event.profile = $BakeProfile }
+        Write-StructuredEvent $event
+    } catch {
+        Write-RuntimeInitialLoadFailed 'runtime_initial_identity_invalid' $_.Exception.Message
+    }
+}
+
 function Handle-RuntimeOutputLine([object]$Item) {
     if ($Item.stream -eq 'stderr') {
         Write-StructuredEvent ([ordered]@{ event = 'runtime_log'; stream = 'stderr'; message = $Item.line })
@@ -220,6 +308,14 @@ function Handle-RuntimeOutputLine([object]$Item) {
         return
     }
     Write-Output $Item.line
+    if ($runtimeEvent.event -eq 'runtime_ready') {
+        Publish-RuntimeInitialLoaded $runtimeEvent
+        return
+    }
+    if ($runtimeEvent.event -eq 'runtime_failed' -and [string]$runtimeEvent.phase -eq 'startup') {
+        Write-RuntimeInitialLoadFailed ([string]$runtimeEvent.errorCode) 'Runtime startup failed before initial content became ready.'
+        return
+    }
     if ($runtimeEvent.event -ne 'command_completed' -or $null -eq $runtimeEvent.PSObject.Properties['requestId']) { return }
     $requestId = [uint64]$runtimeEvent.requestId
     $pending = $script:pendingRequests[[string]$requestId]
