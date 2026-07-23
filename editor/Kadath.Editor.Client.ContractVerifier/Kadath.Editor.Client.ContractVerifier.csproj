@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Kadath.Editor.Client.ContractVerifier</AssemblyName>
+    <RootNamespace>Kadath.Editor.Client.ContractVerifier</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Kadath.Editor.Client\Kadath.Editor.Client.csproj" />
+    <ProjectReference Include="..\Kadath.Editor.ViewModels\Kadath.Editor.ViewModels.csproj" />
+    <ProjectReference Include="..\Kadath.Editor.Protocol\Kadath.Editor.Protocol.csproj" />
+  </ItemGroup>
+</Project>

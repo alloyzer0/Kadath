@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Kadath.Editor.ViewModels</AssemblyName>
+    <RootNamespace>Kadath.Editor.ViewModels</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Kadath.Editor.Client\Kadath.Editor.Client.csproj" />
+    <ProjectReference Include="..\Kadath.Editor.Protocol\Kadath.Editor.Protocol.csproj" />
+  </ItemGroup>
+</Project>

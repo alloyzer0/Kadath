@@ -17,15 +17,37 @@ param(
     [float]$ScriptVelocityX = [float]::NaN,
     [float]$ScriptVelocityY = [float]::NaN,
 
+    [string]$ExpectedRevision = '',
+
     [ValidateRange(0, 300000)]
     [int]$StopAfterMilliseconds = 0,
 
     [ValidateRange(0, 300000)]
-    [int]$ReloadScriptAfterMilliseconds = 0
+    [int]$ReloadScriptAfterMilliseconds = 0,
+
+    [switch]$WatchChanges,
+
+    [ValidateRange(25, 2000)]
+    [int]$PollIntervalMilliseconds = 100,
+
+    [ValidateRange(50, 5000)]
+    [int]$DebounceMilliseconds = 250,
+
+    [switch]$StructuredStatus,
+
+    # Live Bake 显式开启；未传入时保留原有 JSON Preview 行为。
+    [switch]$LiveBake,
+
+    [ValidateSet('debug', 'release')]
+    [string]$BakeProfile = 'debug',
+
+    [string]$DerivedDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+. (Join-Path $PSScriptRoot 'editor-project-model.ps1')
 
 function Resolve-ExistingDirectory([string]$Path, [string]$Name) {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
@@ -333,6 +355,13 @@ switch ($Action) {
 
         $originalScene = [IO.File]::ReadAllText($files.Scene)
         $originalScript = [IO.File]::ReadAllText($files.Script)
+        $previousRevision = Get-EditorAuthoringRevision $files.Scene $files.Script
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedRevision)) {
+            if ($ExpectedRevision -notmatch '^[0-9a-fA-F]{64}$') { throw '[invalid_expected_revision] ExpectedRevision must be a SHA-256 hex value' }
+            if (-not $previousRevision.Equals($ExpectedRevision, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "[authoring_revision_conflict] Expected $ExpectedRevision but current revision is $previousRevision"
+            }
+        }
         try {
             $scene = Read-JsonDocument $files.Scene 'Scene'
             $script = Read-JsonDocument $files.Script 'Script'
@@ -345,8 +374,11 @@ switch ($Action) {
             Validate-ScriptDocument $script
             if ($hasScene) { Write-JsonAtomic $scene $files.Scene }
             if ($hasScriptGoal -or $hasScriptVelocity) { Write-JsonAtomic $script $files.Script }
+            $authoringRevision = Get-EditorAuthoringRevision $files.Scene $files.Script
             Write-Output 'action=Update'
             Write-Output "project_directory=$projectDirectory"
+            Write-Output "previous_revision=$previousRevision"
+            Write-Output "authoring_revision=$authoringRevision"
             Write-Output 'validation=ok'
         } catch {
             # 关键事务语义：任一文件写入失败时恢复本次 Update 之前的两个输入文件。
@@ -367,7 +399,7 @@ switch ($Action) {
             throw 'ReloadScriptAfterMilliseconds must be less than StopAfterMilliseconds'
         }
         $previewScript = Join-Path $PSScriptRoot 'editor-preview.ps1'
-        & pwsh -NoProfile -File $previewScript -ConfigPath $files.Preview -PackageRoot $package -StopAfterMilliseconds $StopAfterMilliseconds -ReloadScriptAfterMilliseconds $ReloadScriptAfterMilliseconds
+        & pwsh -NoProfile -File $previewScript -ConfigPath $files.Preview -PackageRoot $package -StopAfterMilliseconds $StopAfterMilliseconds -ReloadScriptAfterMilliseconds $ReloadScriptAfterMilliseconds -WatchChanges:$WatchChanges -PollIntervalMilliseconds $PollIntervalMilliseconds -DebounceMilliseconds $DebounceMilliseconds -StructuredStatus:$StructuredStatus -LiveBake:$LiveBake -BakeProfile $BakeProfile -DerivedDirectory $DerivedDirectory
         if ($LASTEXITCODE -ne 0) { throw "Preview launcher failed with exit code $LASTEXITCODE" }
         Write-Output 'action=Preview'
         Write-Output "project_directory=$projectDirectory"

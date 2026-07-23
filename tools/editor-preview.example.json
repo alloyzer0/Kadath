@@ -3,6 +3,6 @@
   "runtime": {
     "executable": "bin/kadath.exe",
     "workingDirectory": "bin",
-    "arguments": ["--scene", "assets/scenes/preview.scene.json", "--script", "assets/scripts/preview.script.json"]
+    "arguments": ["--scene", "assets/scenes/preview.scene", "--script", "assets/scripts/preview.script"]
   }
 }

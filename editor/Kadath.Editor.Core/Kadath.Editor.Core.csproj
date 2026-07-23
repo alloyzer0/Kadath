@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Kadath.Editor.Protocol\Kadath.Editor.Protocol.csproj" />
+  </ItemGroup>
+</Project>

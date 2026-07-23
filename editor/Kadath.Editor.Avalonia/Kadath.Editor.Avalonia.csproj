@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>Kadath.Editor.Avalonia</AssemblyName>
+    <RootNamespace>Kadath.Editor.Avalonia</RootNamespace>
+    <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
+    <NuGetAudit>false</NuGetAudit>
+    <!-- Avalonia BuildServices 默认写用户级 telemetry；受限构建必须保持无外部副作用。 -->
+    <UsedAvaloniaProducts></UsedAvaloniaProducts>
+    <!-- 受限离线环境关闭 NuGet vulnerability feed；联网 CI 可通过命令行属性重新开启。 -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.0" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.0" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Kadath.Editor.Protocol\Kadath.Editor.Protocol.csproj" />
+    <ProjectReference Include="..\Kadath.Editor.Client\Kadath.Editor.Client.csproj" />
+    <ProjectReference Include="..\Kadath.Editor.ViewModels\Kadath.Editor.ViewModels.csproj" />
+  </ItemGroup>
+
+</Project>

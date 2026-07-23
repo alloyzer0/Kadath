@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Kadath.Editor.Service</AssemblyName>
+    <RootNamespace>Kadath.Editor.Service</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Kadath.Editor.Core\Kadath.Editor.Core.csproj" />
+    <ProjectReference Include="..\Kadath.Editor.Protocol\Kadath.Editor.Protocol.csproj" />
+  </ItemGroup>
+</Project>

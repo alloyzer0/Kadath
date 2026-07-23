@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Kadath.Editor.Protocol</AssemblyName>
+    <RootNamespace>Kadath.Editor.Protocol</RootNamespace>
+  </PropertyGroup>
+</Project>
