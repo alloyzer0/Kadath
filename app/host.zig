@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_identity = @import("content_identity.zig");
 const audio_api = @import("audio");
 const collision = @import("collision.zig");
 const game = @import("game.zig");
@@ -83,9 +84,24 @@ fn hazardSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
     };
 }
 
+fn initialLoadedTarget(identity: ?content_identity.ContentIdentity) preview_status_api.InitialLoadedTarget {
+    if (identity) |value| {
+        return .{ .file = .{
+            .kind = switch (value.kind) {
+                .source_document => .source_document,
+                .artifact => .artifact,
+            },
+            .sha256 = value.sha256,
+            .byte_count = value.byte_count,
+        } };
+    }
+    return .built_in;
+}
+
 pub const Host = struct {
     io: std.Io,
     preview_status: *preview_status_api.PreviewStatus,
+    initial_loaded: preview_status_api.InitialLoaded,
     scene: scene_api.Scene,
     scene_path: ?[]const u8,
     script_path: ?[]const u8,
@@ -115,8 +131,10 @@ pub const Host = struct {
     last_heartbeat_seconds: f64 = 0.0,
 
     pub fn init(io: std.Io, scene_path: ?[]const u8, script_path: ?[]const u8, preview_status: *preview_status_api.PreviewStatus) !Host {
+        var scene_identity: ?content_identity.ContentIdentity = null;
         const scene = if (scene_path) |path| blk: {
-            const loaded = try scene_api.load(io, std.heap.page_allocator, path);
+            const loaded = try scene_api.loadWithIdentity(io, std.heap.page_allocator, path);
+            scene_identity = loaded.identity;
             // `.scene` 是运行时消费的 KSCN v1 二进制；JSON 仍保留原日志和兼容路径，
             // 让作者态热重载可以继续直接读取 source document。
             if (std.ascii.endsWithIgnoreCase(path, ".scene")) {
@@ -124,20 +142,22 @@ pub const Host = struct {
             } else {
                 std.log.info("Loaded preview scene: {s}", .{path});
             }
-            break :blk loaded;
+            break :blk loaded.value;
         } else blk: {
             std.log.info("Using built-in preview scene", .{});
             break :blk scene_api.default_scene;
         };
+        var script_identity: ?content_identity.ContentIdentity = null;
         const script_program = if (script_path) |path| blk: {
-            const loaded = try script_api.load(io, std.heap.page_allocator, path);
+            const loaded = try script_api.loadWithIdentity(io, std.heap.page_allocator, path);
+            script_identity = loaded.identity;
             // Script artifact 是运行时消费的 KSCP v1；JSON 仍用于 Editor authoring 和事务式 reload。
             if (std.ascii.endsWithIgnoreCase(path, ".script")) {
-                std.log.info("Loaded script artifact: {s}, artifact_version={d}, instructions={d}", .{ path, script_api.script_artifact_version, loaded.count });
+                std.log.info("Loaded script artifact: {s}, artifact_version={d}, instructions={d}", .{ path, script_api.script_artifact_version, loaded.value.count });
             } else {
-                std.log.info("Loaded script hook program: {s}, instructions={d}", .{ path, loaded.count });
+                std.log.info("Loaded script hook program: {s}, instructions={d}", .{ path, loaded.value.count });
             }
-            break :blk loaded;
+            break :blk loaded.value;
         } else script_api.Program{};
 
         var platform = try Platform.init();
@@ -177,6 +197,10 @@ pub const Host = struct {
         var self = Host{
             .io = io,
             .preview_status = preview_status,
+            .initial_loaded = .{
+                .scene = initialLoadedTarget(scene_identity),
+                .script = initialLoadedTarget(script_identity),
+            },
             .scene = scene,
             .scene_path = scene_path,
             .script_path = script_path,
@@ -208,6 +232,10 @@ pub const Host = struct {
             spawned.hazard_entity,
         });
         return self;
+    }
+
+    pub fn initialLoaded(self: *const Host) preview_status_api.InitialLoaded {
+        return self.initial_loaded;
     }
     pub fn deinit(self: *Host) void {
         self.audio.deinit();

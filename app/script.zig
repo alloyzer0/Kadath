@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_identity = @import("content_identity.zig");
 
 pub const current_schema_version: u32 = 1;
 pub const max_instructions: usize = 16;
@@ -69,17 +70,42 @@ pub const Program = struct {
     }
 };
 
+pub const LoadedScript = struct {
+    value: Program,
+    identity: content_identity.ContentIdentity,
+};
+
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Program {
-    if (std.ascii.endsWithIgnoreCase(path, ".script")) return loadArtifact(io, allocator, path);
+    return (try loadWithIdentity(io, allocator, path)).value;
+}
+
+pub fn loadWithIdentity(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !LoadedScript {
+    // 保留既有 load 的扩展名分派语义；artifact/source 的解析意图不会由魔数猜测。
+    if (std.ascii.endsWithIgnoreCase(path, ".script")) return loadArtifactWithIdentity(io, allocator, path);
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_document_bytes));
     defer allocator.free(contents);
-    return parse(allocator, contents);
+    return parseWithIdentity(allocator, contents, .source_document);
 }
 
 pub fn loadArtifact(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Program {
+    return (try loadArtifactWithIdentity(io, allocator, path)).value;
+}
+
+pub fn loadArtifactWithIdentity(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !LoadedScript {
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_artifact_bytes));
     defer allocator.free(contents);
-    return parseArtifact(contents);
+    return parseArtifactWithIdentity(contents);
+}
+
+fn parseWithIdentity(allocator: std.mem.Allocator, contents: []const u8, kind: content_identity.ContentKind) !LoadedScript {
+    const value = try parse(allocator, contents);
+    // Program 与身份必须共同来自同一 buffer；解析失败不得泄漏候选 digest。
+    return .{ .value = value, .identity = try content_identity.ContentIdentity.fromBytes(kind, contents) };
+}
+
+fn parseArtifactWithIdentity(contents: []const u8) !LoadedScript {
+    const value = try parseArtifact(contents);
+    return .{ .value = value, .identity = try content_identity.ContentIdentity.fromBytes(.artifact, contents) };
 }
 
 fn readLittleU32(bytes: []const u8) u32 {
@@ -193,6 +219,21 @@ test "script program emits deterministic start and fixed commands" {
     try std.testing.expectApproxEqAbs(@as(f32, -0.5), fixed_commands[0].translate_goal[0], 0.0001);
 }
 
+test "script source identity is computed from the parsed buffer" {
+    const contents =
+        \\{
+        \\  "schemaVersion": 1,
+        \\  "instructions": [
+        \\    { "hook": "on_start", "op": "set_goal_position", "value": [680, 200] }
+        \\  ]
+        \\}
+    ;
+    const loaded = try parseWithIdentity(std.testing.allocator, contents, .source_document);
+    const expected = try content_identity.ContentIdentity.fromBytes(.source_document, contents);
+    try std.testing.expectEqual(expected, loaded.identity);
+    try std.testing.expectEqual(@as(usize, 1), loaded.value.count);
+}
+
 test "script program rejects hook operation mismatch" {
     const contents =
         \\{
@@ -262,6 +303,14 @@ test "KSCP v1 parses a fixed instruction artifact" {
     try std.testing.expectEqual(@as(usize, 2), program.count);
     try std.testing.expectEqual(Hook.on_start, program.instructions[0].hook);
     try std.testing.expectEqual(Operation.move_goal_velocity, program.instructions[1].op);
+}
+
+test "KSCP identity is computed from the validated artifact buffer" {
+    const artifact = makeTestScriptArtifact();
+    const loaded = try parseArtifactWithIdentity(artifact[0..]);
+    const expected = try content_identity.ContentIdentity.fromBytes(.artifact, artifact[0..]);
+    try std.testing.expectEqual(expected, loaded.identity);
+    try std.testing.expectEqual(@as(usize, 2), loaded.value.count);
 }
 
 test "KSCP v1 rejects malformed header, trailing bytes, and unknown opcode" {

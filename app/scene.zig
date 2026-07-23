@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_identity = @import("content_identity.zig");
 
 pub const current_schema_version: u32 = 1;
 pub const scene_artifact_version: u32 = 1;
@@ -36,6 +37,11 @@ pub const Scene = struct {
     hazard: Hazard,
 };
 
+pub const LoadedScene = struct {
+    value: Scene,
+    identity: content_identity.ContentIdentity,
+};
+
 pub const default_scene = Scene{
     .schemaVersion = current_schema_version,
     .player = .{
@@ -60,16 +66,36 @@ pub const default_scene = Scene{
 };
 
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Scene {
-    if (std.ascii.endsWithIgnoreCase(path, ".scene")) return loadArtifact(io, allocator, path);
+    return (try loadWithIdentity(io, allocator, path)).value;
+}
+
+pub fn loadWithIdentity(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !LoadedScene {
+    // 保留既有 load 的扩展名分派语义；实际读取函数始终收到显式 content kind。
+    if (std.ascii.endsWithIgnoreCase(path, ".scene")) return loadArtifactWithIdentity(io, allocator, path);
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_document_bytes));
     defer allocator.free(contents);
-    return parse(allocator, contents);
+    return parseWithIdentity(allocator, contents, .source_document);
 }
 
 pub fn loadArtifact(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Scene {
+    return (try loadArtifactWithIdentity(io, allocator, path)).value;
+}
+
+pub fn loadArtifactWithIdentity(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !LoadedScene {
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_artifact_bytes));
     defer allocator.free(contents);
-    return parseArtifact(contents);
+    return parseArtifactWithIdentity(contents);
+}
+
+fn parseWithIdentity(allocator: std.mem.Allocator, contents: []const u8, kind: content_identity.ContentKind) !LoadedScene {
+    const value = try parse(allocator, contents);
+    // 校验成功后才发布身份；value 与 digest/bytes 均来自 contents 这一次读取。
+    return .{ .value = value, .identity = try content_identity.ContentIdentity.fromBytes(kind, contents) };
+}
+
+fn parseArtifactWithIdentity(contents: []const u8) !LoadedScene {
+    const value = try parseArtifact(contents);
+    return .{ .value = value, .identity = try content_identity.ContentIdentity.fromBytes(.artifact, contents) };
 }
 
 fn readLittleU32(bytes: []const u8) u32 {
@@ -172,6 +198,21 @@ test "scene v1 parses a valid preview document" {
     try std.testing.expectEqual(@as(f32, 75.0), scene.hazard.patrolSpeed);
 }
 
+test "scene source identity is computed from the parsed buffer" {
+    const contents =
+        \\{
+        \\  "schemaVersion": 1,
+        \\  "player": { "position": [100, 120], "size": [64, 64], "color": [1, 1, 1, 1], "moveSpeed": 200 },
+        \\  "goal": { "position": [444, 180], "size": [48, 48], "color": [0.2, 0.9, 0.3, 1] },
+        \\  "hazard": { "position": [300, 220], "size": [40, 40], "color": [0.9, 0.2, 0.2, 1], "patrolMinY": 180, "patrolMaxY": 260, "patrolSpeed": 75 }
+        \\}
+    ;
+    const loaded = try parseWithIdentity(std.testing.allocator, contents, .source_document);
+    const expected = try content_identity.ContentIdentity.fromBytes(.source_document, contents);
+    try std.testing.expectEqual(expected, loaded.identity);
+    try std.testing.expectEqual(@as(f32, 444.0), loaded.value.goal.position[0]);
+}
+
 test "scene v1 rejects unsupported schema" {
     const contents =
         \\{
@@ -254,6 +295,14 @@ test "KSCN v1 parses the fixed scene payload" {
     try std.testing.expectEqual(default_scene.player.moveSpeed, scene.player.moveSpeed);
     try std.testing.expectEqual(default_scene.goal.position[0], scene.goal.position[0]);
     try std.testing.expectEqual(default_scene.hazard.patrolSpeed, scene.hazard.patrolSpeed);
+}
+
+test "KSCN identity is computed from the validated artifact buffer" {
+    const artifact = makeDefaultSceneArtifact();
+    const loaded = try parseArtifactWithIdentity(artifact[0..]);
+    const expected = try content_identity.ContentIdentity.fromBytes(.artifact, artifact[0..]);
+    try std.testing.expectEqual(expected, loaded.identity);
+    try std.testing.expectEqual(default_scene.goal.position[0], loaded.value.goal.position[0]);
 }
 
 test "KSCN v1 rejects truncated and unsupported artifacts" {

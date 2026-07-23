@@ -51,7 +51,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer host.deinit();
 
-    preview_status.runtimeReady();
+    // Host 完整初始化成功后才一次性发布两类内容身份；任一加载失败都不会留下半套 ready 数据。
+    preview_status.runtimeReady(host.initialLoaded());
     host.run() catch |err| {
         preview_status.runtimeFailed("runtime_loop", err);
         std.log.err("Runtime loop failed: {s}", .{@errorName(err)});
