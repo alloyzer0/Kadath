@@ -181,7 +181,7 @@ fn parseTextureArtifactV2(allocator: std.mem.Allocator, source: []const u8) !Tex
 
 fn decodeTextureArtifact(allocator: std.mem.Allocator, source: []const u8) !TextureData {
     // decode 只借用 artifact bytes；成功返回的 TextureData 拥有独立副本，失败时不得留下部分分配。
-    if (source.len < 8 or source.len > texture_artifact_max_bytes) return error.InvalidTextureArtifact;
+    if (source.len < 8 or source.len >= texture_artifact_max_bytes) return error.InvalidTextureArtifact;
     if (!std.mem.eql(u8, source[0..4], "KDAT")) return error.InvalidTextureArtifact;
     return switch (readLittleU32(source[4..8])) {
         1 => parseTextureArtifactV1(allocator, source),
@@ -342,9 +342,17 @@ test "public texture loader keeps the cwd directory production path" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "public.texture", .data = &test_kdat_v1 });
 
-    var path_buffer: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/public.texture", .{tmp.sub_path});
-    var texture = try loadTextureArtifact(std.testing.io, std.testing.allocator, path);
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.Io.Dir.cwd().realPath(std.testing.io, &cwd_buffer);
+    const cwd_path = cwd_buffer[0..cwd_len];
+    var fixture_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const fixture_len = try tmp.dir.realPathFile(std.testing.io, "public.texture", &fixture_buffer);
+    const fixture_path = fixture_buffer[0..fixture_len];
+    // 只通过公开路径 API 计算 cwd-relative key，测试不依赖 tmpDir 的缓存布局，也不修改全局 cwd。
+    const relative_path = try std.fs.path.relative(std.testing.allocator, cwd_path, null, cwd_path, fixture_path);
+    defer std.testing.allocator.free(relative_path);
+
+    var texture = try loadTextureArtifact(std.testing.io, std.testing.allocator, relative_path);
     defer texture.deinit(std.testing.allocator);
     try expectV1Texture(&texture);
 }
@@ -360,6 +368,10 @@ fn expectMemoryLoadError(expected_error: anyerror, bytes: []const u8) !void {
 }
 
 test "resource seam rejects malformed KDAT without partial results" {
+    const exact_limit = try std.testing.allocator.alloc(u8, texture_artifact_max_bytes);
+    defer std.testing.allocator.free(exact_limit);
+    try std.testing.expectError(error.InvalidTextureArtifact, decodeTextureArtifact(std.testing.allocator, exact_limit));
+
     try expectMemoryLoadError(error.InvalidTextureArtifact, test_kdat_v2[0..7]);
     try expectMemoryLoadError(error.InvalidTextureArtifact, test_kdat_v2[0 .. test_kdat_v2.len - 1]);
 
