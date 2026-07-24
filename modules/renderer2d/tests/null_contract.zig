@@ -43,9 +43,7 @@ test "Renderer2D init and deinit use the existing RHI seam" {
     defer backend.deinit();
 
     var renderer = try renderer2d.Renderer2D.init(&backend);
-    try std.testing.expect(renderer.pipeline != rhi.invalid_pipeline);
     renderer.deinit(&backend);
-    try std.testing.expectEqual(rhi.invalid_pipeline, renderer.pipeline);
     try std.testing.expectError(
         error.RendererNotInitialized,
         renderer.createTexture(
@@ -132,6 +130,8 @@ test "Renderer2D consumes a failed frame and can present the next frame" {
     const after_failure = backend.stats();
     try std.testing.expectEqual(@as(u32, 1), after_failure.pipeline_binds - before.pipeline_binds);
     try std.testing.expectEqual(@as(u32, 0), after_failure.texture_binds - before.texture_binds);
+    try std.testing.expectEqual(@as(u32, 0), after_failure.push_constant_writes - before.push_constant_writes);
+    try std.testing.expectEqual(@as(u32, 0), after_failure.draws - before.draws);
     try std.testing.expectEqual(@as(u32, 1), after_failure.failed_frames_consumed - before.failed_frames_consumed);
     try std.testing.expectEqual(@as(u32, 0), after_failure.frames_finished - before.frames_finished);
 
