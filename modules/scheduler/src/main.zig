@@ -144,8 +144,31 @@ fn check(result: i32) !void {
 }
 
 comptime {
-    // 关键 ABI 不变量：Resource Adapter 按值接收 completion，布局漂移必须在编译期失败。
-    if (@sizeOf(c.kadath_scheduler_bytes_t) != @sizeOf(usize) * 2) {
+    const ExpectedBytes = extern struct {
+        data: [*c]u8,
+        len: usize,
+    };
+    const ExpectedCompletion = extern struct {
+        job_id: u64,
+        outcome: i32,
+        failure_reason: i32,
+        bytes: ExpectedBytes,
+    };
+    // 关键 ABI 不变量：Resource Adapter 按值接收 completion，任一字段偏移漂移都必须在编译期失败。
+    if (@sizeOf(c.kadath_scheduler_bytes_t) != @sizeOf(ExpectedBytes) or
+        @alignOf(c.kadath_scheduler_bytes_t) != @alignOf(ExpectedBytes) or
+        @offsetOf(c.kadath_scheduler_bytes_t, "data") != @offsetOf(ExpectedBytes, "data") or
+        @offsetOf(c.kadath_scheduler_bytes_t, "len") != @offsetOf(ExpectedBytes, "len"))
+    {
         @compileError("Scheduler bytes descriptor ABI layout changed");
+    }
+    if (@sizeOf(c.kadath_scheduler_completion_t) != @sizeOf(ExpectedCompletion) or
+        @alignOf(c.kadath_scheduler_completion_t) != @alignOf(ExpectedCompletion) or
+        @offsetOf(c.kadath_scheduler_completion_t, "job_id") != @offsetOf(ExpectedCompletion, "job_id") or
+        @offsetOf(c.kadath_scheduler_completion_t, "outcome") != @offsetOf(ExpectedCompletion, "outcome") or
+        @offsetOf(c.kadath_scheduler_completion_t, "failure_reason") != @offsetOf(ExpectedCompletion, "failure_reason") or
+        @offsetOf(c.kadath_scheduler_completion_t, "bytes") != @offsetOf(ExpectedCompletion, "bytes"))
+    {
+        @compileError("Scheduler completion ABI layout changed");
     }
 }

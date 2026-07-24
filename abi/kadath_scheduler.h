@@ -28,6 +28,8 @@ typedef enum kadath_scheduler_completion_reason_t {
 } kadath_scheduler_completion_reason_t;
 
 typedef struct kadath_scheduler_bytes_t {
+    // Callee-allocated owned bytes。data 只在移交后、精确配对的 bytes_free 前可借用；
+    // descriptor 不得复制后分别释放，也不得修改 data/len 后释放。
     uint8_t* data;
     size_t len;
 } kadath_scheduler_bytes_t;
@@ -39,10 +41,11 @@ typedef struct kadath_scheduler_completion_t {
     kadath_scheduler_bytes_t bytes;
 } kadath_scheduler_completion_t;
 
-// Thread-affine：create、submit、poll、close、destroy 必须由同一 owner thread 调用。
+// Single-thread：创建成功后，后续 submit/poll/close/destroy 必须由本调用线程执行。
 // 成功时写出 handle；失败时不修改 out_scheduler。
 int32_t kadath_scheduler_create(kadath_scheduler_t* out_scheduler);
 
+// Single-thread：必须由 create 线程调用。
 // path 在调用期间借用；成功提交前 Rust 会复制它。exclusive_limit 为严格上界。
 // 只有成功提交时写 out_job_id，其他返回值不修改该 out 参数。
 int32_t kadath_scheduler_submit_bounded_read(
@@ -53,6 +56,7 @@ int32_t kadath_scheduler_submit_bounded_read(
     uint64_t* out_job_id
 );
 
+// Single-thread：必须由 create 线程调用。
 // 非阻塞摄取一个完成项。无结果时只写 out_has_completion=0，保持 completion 不变。
 // 成功 bytes descriptor 必须由原对象精确调用一次 kadath_scheduler_bytes_free。
 int32_t kadath_scheduler_poll(
@@ -61,12 +65,15 @@ int32_t kadath_scheduler_poll(
     kadath_scheduler_completion_t* out_completion
 );
 
+// Single-thread：必须由 create 线程调用。
 // 停止接收并等待已接受任务完成。handler 永不返回时，本调用会一直阻塞。
 int32_t kadath_scheduler_close(kadath_scheduler_t scheduler);
 
+// Single-thread：必须由 create 线程调用。
 // 精确消费 handle 并清空原变量；未摄取 completion 在 Rust 侧释放。
 int32_t kadath_scheduler_destroy(kadath_scheduler_t* inout_scheduler);
 
+// Thread-compatible：不同 descriptor 可并发释放；同一 descriptor 不可并发访问或释放。
 // 消费原 descriptor 并在成功后将 data/len 清零。len=0 仍拥有非空 Box 指针，
 // 调用方不得解引用 data，但仍必须释放一次。复制 descriptor、修改字段或重复释放
 // 均属于调用方契约违反。
