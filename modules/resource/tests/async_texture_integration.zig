@@ -1,5 +1,7 @@
 const std = @import("std");
-const async_texture = @import("resource_async_texture");
+const resource = @import("resource");
+
+pub const resource_async_integration = true;
 
 const valid_kdat_v1 = [_]u8{
     'K', 'D', 'A', 'T', 1,   0, 0,  0,
@@ -8,8 +10,8 @@ const valid_kdat_v1 = [_]u8{
     0,   128, 255, 255,
 };
 
-fn loadDeterministically(path: []const u8) !async_texture.AsyncTextureResult {
-    var loader = async_texture.AsyncTextureLoader.init(std.testing.allocator);
+fn loadDeterministically(path: []const u8) !resource.AsyncTextureResult {
+    var loader = resource.AsyncTextureLoader.init(std.testing.allocator);
     defer loader.deinit();
     try loader.request(path);
     // close/join 是确定性同步原语；测试不使用 sleep 或轮询超时猜测。
@@ -18,9 +20,9 @@ fn loadDeterministically(path: []const u8) !async_texture.AsyncTextureResult {
 }
 
 fn expectFailure(
-    result: async_texture.AsyncTextureResult,
-    stage: async_texture.AsyncTextureFailureStage,
-    reason: async_texture.AsyncTextureFailureReason,
+    result: resource.AsyncTextureResult,
+    stage: resource.AsyncTextureFailureStage,
+    reason: resource.AsyncTextureFailureReason,
 ) !void {
     switch (result) {
         .failed => |failure| {
@@ -103,7 +105,7 @@ test "Resource async interface rejects a second request and frees unconsumed com
     const path_len = try tmp.dir.realPathFile(std.testing.io, "unconsumed.texture", &path_buffer);
     const path = path_buffer[0..path_len];
 
-    var loader = async_texture.AsyncTextureLoader.init(std.testing.allocator);
+    var loader = resource.AsyncTextureLoader.init(std.testing.allocator);
     try loader.request(path);
     try std.testing.expectError(error.RequestAlreadyIssued, loader.request(path));
     // 不 poll：deinit 必须 join、decode，并释放尚未转移的 TextureData/raw completion。

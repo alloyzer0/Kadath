@@ -1,4 +1,5 @@
 const std = @import("std");
+// Resource 内部固定接缝；main.zig 只重导出本文件的业务结果类型，不重导出 Scheduler。
 const scheduler_api = @import("scheduler");
 const texture_decode = @import("texture_decode.zig");
 

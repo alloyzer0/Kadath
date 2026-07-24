@@ -1,8 +1,18 @@
 const std = @import("std");
 const texture_decode = @import("texture_decode.zig");
+const root = @import("root");
+
+// 直接 zig test 本文件只验证同步 parser，未注册 scheduler 模块；生产 Host 和 async
+// integration root 都带有对应标记，届时才实例化并重导出真正的 Resource async 接口。
+const async_interface_enabled = @hasDecl(root, "main") or @hasDecl(root, "resource_async_integration");
 
 pub const TextureMipLevel = texture_decode.TextureMipLevel;
 pub const TextureData = texture_decode.TextureData;
+pub const AsyncTextureLoader = if (async_interface_enabled) @import("async_texture.zig").AsyncTextureLoader else void;
+pub const AsyncTextureResult = if (async_interface_enabled) @import("async_texture.zig").AsyncTextureResult else void;
+pub const AsyncTextureFailure = if (async_interface_enabled) @import("async_texture.zig").AsyncTextureFailure else void;
+pub const AsyncTextureFailureStage = if (async_interface_enabled) @import("async_texture.zig").AsyncTextureFailureStage else void;
+pub const AsyncTextureFailureReason = if (async_interface_enabled) @import("async_texture.zig").AsyncTextureFailureReason else void;
 const texture_artifact_max_bytes = texture_decode.texture_artifact_max_bytes;
 
 const DirectoryArtifactSource = struct {

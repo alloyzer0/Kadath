@@ -53,6 +53,7 @@ fn spawnSceneWorld(scene: *const scene_api.Scene, extent: PlatformExtent) !Spawn
 const test_texture_id: world_api.TextureId = 1;
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
+const tracer_texture_key = "assets/renderer2d/test.texture";
 
 fn playerSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
     return .{
@@ -114,6 +115,7 @@ pub const Host = struct {
     renderer2d: Renderer2D,
     audio: audio_api.Audio,
     texture: rhi.TextureHandle,
+    async_texture_loader: resource.AsyncTextureLoader,
     world: World,
     sprite_entity: world_api.EntityId,
     goal_entity: world_api.EntityId,
@@ -174,7 +176,12 @@ pub const Host = struct {
         var renderer2d = try Renderer2D.init(&backend);
         errdefer renderer2d.deinit(&backend);
 
-        var texture_data = try resource.loadTextureArtifact(io, std.heap.page_allocator, "assets/renderer2d/test.texture");
+        var async_texture_loader = resource.AsyncTextureLoader.init(std.heap.page_allocator);
+        errdefer async_texture_loader.deinit();
+        try async_texture_loader.request(tracer_texture_key);
+        std.log.info("Async texture refresh requested: key={s}", .{tracer_texture_key});
+
+        var texture_data = try resource.loadTextureArtifact(io, std.heap.page_allocator, tracer_texture_key);
         defer texture_data.deinit(std.heap.page_allocator);
         const upload_mips = try std.heap.page_allocator.alloc(rhi.TextureMipUpload, texture_data.mip_levels.len);
         defer std.heap.page_allocator.free(upload_mips);
@@ -213,6 +220,7 @@ pub const Host = struct {
             .renderer2d = renderer2d,
             .audio = audio_api.Audio.init(),
             .texture = texture,
+            .async_texture_loader = async_texture_loader,
             .world = runtime_world,
             .sprite_entity = spawned.player_entity,
             .goal_entity = spawned.goal_entity,
@@ -238,6 +246,8 @@ pub const Host = struct {
         return self.initial_loaded;
     }
     pub fn deinit(self: *Host) void {
+        // 关键 shutdown 顺序：先 join/释放 Resource loader，再销毁 GPU、Renderer2D 和 RHI。
+        self.async_texture_loader.deinit();
         self.audio.deinit();
         self.world.despawn(self.sprite_entity) catch |err| {
             std.log.err("World sprite despawn failed: {s}", .{@errorName(err)});
@@ -359,7 +369,43 @@ pub const Host = struct {
     }
 
     fn syncExternalResults(self: *Host) void {
-        _ = self;
+        const result = self.async_texture_loader.poll() orelse return;
+        switch (result) {
+            .loaded => |loaded| {
+                var texture_data = loaded;
+                defer texture_data.deinit(std.heap.page_allocator);
+                const upload_mips = std.heap.page_allocator.alloc(
+                    rhi.TextureMipUpload,
+                    texture_data.mip_levels.len,
+                ) catch |err| {
+                    std.log.err("Async texture refresh failed: upload allocation {s}; keeping old texture", .{@errorName(err)});
+                    return;
+                };
+                defer std.heap.page_allocator.free(upload_mips);
+                for (texture_data.mip_levels, 0..) |level, index| {
+                    upload_mips[index] = .{ .width = level.width, .height = level.height, .rgba8 = level.pixels_rgba8 };
+                }
+                const replacement = self.renderer2d.createTexture(&self.rhi, .{
+                    .width = texture_data.width,
+                    .height = texture_data.height,
+                    .rgba8 = texture_data.pixels_rgba8,
+                    .mip_levels = upload_mips,
+                }, .smooth_mipmap_anisotropic) catch |err| {
+                    std.log.err("Async texture refresh failed: upload {s}; keeping old texture", .{@errorName(err)});
+                    return;
+                };
+                const previous = self.texture;
+                self.texture = replacement;
+                self.rhi.destroyTexture(previous);
+                std.log.info("Async texture refresh applied: key={s}", .{tracer_texture_key});
+            },
+            .failed => |failure| {
+                std.log.err("Async texture refresh failed: stage={s}, reason={s}; keeping old texture", .{
+                    @tagName(failure.stage),
+                    @tagName(failure.reason),
+                });
+            },
+        }
     }
 
     fn resetScript(self: *Host) !void {

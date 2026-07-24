@@ -20,6 +20,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const scheduler_mod = b.createModule(.{
+        .root_source_file = b.path("modules/scheduler/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scheduler_mod.addIncludePath(b.path("abi"));
+    resource_mod.addImport("scheduler", scheduler_mod);
     const audio_mod = b.createModule(.{
         .root_source_file = b.path("modules/audio/src/main.zig"),
         .target = target,
@@ -132,6 +139,7 @@ pub fn build(b: *std.Build) void {
             "C:\\ProgramTools\\mingw64\\lib\\gcc\\x86_64-w64-mingw32\\14.2.0";
         exe.root_module.addLibraryPath(.{ .cwd_relative = gcc_runtime_dir });
         exe.root_module.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+        exe.root_module.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("kernel32", .{});
         exe.root_module.linkSystemLibrary("dbghelp", .{});
@@ -140,6 +148,32 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("ntdll", .{});
         exe.root_module.linkSystemLibrary("userenv", .{});
         exe.root_module.linkSystemLibrary("ws2_32", .{});
+
+        const async_texture_test_mod = b.createModule(.{
+            .root_source_file = b.path("modules/resource/tests/async_texture_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        async_texture_test_mod.addImport("resource", resource_mod);
+        const async_texture_tests = b.addTest(.{ .root_module = async_texture_test_mod });
+        const async_texture_test_run = b.addRunArtifact(async_texture_tests);
+        const async_texture_test_step = b.step("test-resource-async", "Run Resource-owned async texture tests without GPU");
+        async_texture_test_step.dependOn(&async_texture_test_run.step);
+        // 直接约束测试编译节点，确保冷缓存时先生成 Scheduler staticlib，再解析 -l 链接输入。
+        async_texture_tests.step.dependOn(&cargo_build.step);
+        // 该测试与最终 Host 共用同一 Scheduler staticlib，避免“测试拼 bytes”假集成。
+        async_texture_test_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile }) });
+        async_texture_test_mod.addLibraryPath(.{ .cwd_relative = gcc_runtime_dir });
+        async_texture_test_mod.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
+        async_texture_test_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
+        async_texture_test_mod.linkSystemLibrary("kernel32", .{});
+        async_texture_test_mod.linkSystemLibrary("dbghelp", .{});
+        async_texture_test_mod.linkSystemLibrary("advapi32", .{});
+        async_texture_test_mod.linkSystemLibrary("bcrypt", .{});
+        async_texture_test_mod.linkSystemLibrary("ntdll", .{});
+        async_texture_test_mod.linkSystemLibrary("userenv", .{});
+        async_texture_test_mod.linkSystemLibrary("ws2_32", .{});
     }
     b.installArtifact(exe);
     const preview_status_tests = b.addTest(.{

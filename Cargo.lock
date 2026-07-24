@@ -85,6 +85,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kadath_scheduler"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+]
+
+[[package]]
 name = "kadath_world"
 version = "0.1.0"
 dependencies = [
