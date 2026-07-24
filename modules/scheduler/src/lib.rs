@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Kadath 的最小后台任务调度器。
 //!
@@ -13,6 +13,10 @@ use std::{
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
     thread::{self, JoinHandle},
 };
+
+// 只有 C ABI 适配层可以接触 raw pointer；Scheduler core 始终继承 crate-level deny。
+#[allow(unsafe_code)]
+mod ffi;
 
 /// Scheduler 为每个成功接收的任务分配的进程内身份。
 ///
@@ -200,13 +204,19 @@ impl<Input, Output, Error> Scheduler<Input, Output, Error> {
     /// 非阻塞取走调用时已经到达的全部完成项。
     pub fn drain_completed(&mut self) -> Vec<Completion<Output, Error>> {
         let mut completions = Vec::new();
-        while let Ok(completion) = self.completion_receiver.try_recv() {
-            // completion 只有在成功 submit 后才会产生，因此正常路径下 outstanding 必然大于 0。
-            debug_assert!(self.outstanding > 0);
-            self.outstanding = self.outstanding.saturating_sub(1);
+        while let Some(completion) = self.try_next_completed() {
             completions.push(completion);
         }
         completions
+    }
+
+    /// 非阻塞取走一个完成项，供窄 FFI Adapter 保持 FIFO 且避免额外缓存。
+    pub fn try_next_completed(&mut self) -> Option<Completion<Output, Error>> {
+        let completion = self.completion_receiver.try_recv().ok()?;
+        // completion 只有在成功 submit 后才会产生，因此正常路径下 outstanding 必然大于 0。
+        debug_assert!(self.outstanding > 0);
+        self.outstanding = self.outstanding.saturating_sub(1);
+        Some(completion)
     }
 
     /// 停止接收新任务，等待全部已接收任务结束，并返回尚未摄取的完成项。

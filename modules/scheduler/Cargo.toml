@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["staticlib"]
+
+[build-dependencies]
+bindgen = "=0.72.1"
 
 # 当前 tracer bullet 必须能在不修改根 workspace 的前提下独立验证。
 [workspace]
