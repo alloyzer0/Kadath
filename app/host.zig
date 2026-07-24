@@ -518,11 +518,11 @@ pub const Host = struct {
     fn restartGame(self: *Host) !void {
         if (self.session.phase == .playing) return;
 
-        // 先创建替代实体；spawn 失败时旧玩家仍完整保留，不会留下空世界。
-        const previous_entity = self.sprite_entity;
-        const replacement_entity = try self.world.spawnSprite(playerSpawnDesc(&self.scene));
-        errdefer self.world.despawn(replacement_entity) catch {};
-        try self.world.despawn(previous_entity);
+        // World 在一次 ABI 调用内完成实体替换；失败时旧身份和 live 集合保持不变。
+        const replacement_entity = try self.world.replaceSprite(
+            self.sprite_entity,
+            playerSpawnDesc(&self.scene),
+        );
 
         self.sprite_entity = replacement_entity;
         self.hazard_y = self.scene.hazard.position[1];

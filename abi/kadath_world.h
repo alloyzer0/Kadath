@@ -75,6 +75,16 @@ int32_t kadath_world_spawn_sprite(
     kadath_entity_id_t* out_entity
 );
 
+// Thread-compatible. The descriptor is borrowed for this call and out_replacement
+// is caller-owned. Success atomically invalidates old_entity and writes one new ID;
+// every failure leaves the old entity and out_replacement unchanged.
+int32_t kadath_world_replace_sprite(
+    kadath_world_t world,
+    kadath_entity_id_t old_entity,
+    const kadath_world_sprite_spawn_desc_t* replacement_desc,
+    kadath_entity_id_t* out_replacement
+);
+
 // Thread-compatible. The input POD is borrowed for the duration of this call.
 int32_t kadath_world_step_fixed(
     kadath_world_t world,

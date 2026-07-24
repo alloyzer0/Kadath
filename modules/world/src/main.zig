@@ -67,15 +67,17 @@ pub const World = struct {
     }
 
     pub fn spawnSprite(self: *World, desc: SpriteSpawnDesc) !EntityId {
-        var c_desc = std.mem.zeroes(c.kadath_world_sprite_spawn_desc_t);
-        c_desc.position = desc.position;
-        c_desc.size = desc.size;
-        c_desc.color = desc.color;
-        c_desc.texture_id = desc.texture_id;
-        c_desc.move_speed = desc.move_speed;
+        const c_desc = toCSpawnDesc(desc);
         var entity: c.kadath_entity_id_t = c.KADATH_ENTITY_INVALID;
         try check(c.kadath_world_spawn_sprite(self.handle, &c_desc, &entity));
         return entity;
+    }
+
+    pub fn replaceSprite(self: *World, old_entity: EntityId, desc: SpriteSpawnDesc) !EntityId {
+        const c_desc = toCSpawnDesc(desc);
+        var replacement: c.kadath_entity_id_t = c.KADATH_ENTITY_INVALID;
+        try check(c.kadath_world_replace_sprite(self.handle, old_entity, &c_desc, &replacement));
+        return replacement;
     }
 
     pub fn setBounds(self: *World, bounds: WorldBounds) !void {
@@ -111,6 +113,16 @@ pub const World = struct {
         return output[0..count];
     }
 };
+
+fn toCSpawnDesc(desc: SpriteSpawnDesc) c.kadath_world_sprite_spawn_desc_t {
+    return .{
+        .position = desc.position,
+        .size = desc.size,
+        .color = desc.color,
+        .texture_id = desc.texture_id,
+        .move_speed = desc.move_speed,
+    };
+}
 
 fn check(result: i32) !void {
     return switch (result) {

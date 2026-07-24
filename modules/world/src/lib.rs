@@ -1,3 +1,6 @@
+// C ABI 入口在函数体内集中校验 raw pointer；保持 safe extern 以兼容现有 Zig 调用方。
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
@@ -42,6 +45,36 @@ struct WorldState {
 }
 
 impl WorldState {
+    fn sprite_record_from_desc(
+        &self,
+        desc: &abi::kadath_world_sprite_spawn_desc_t,
+    ) -> Result<SpriteRecord, WorldError> {
+        if desc.texture_id == abi::KADATH_RESOURCE_INVALID
+            || !desc.move_speed.is_finite()
+            || desc.move_speed < 0.0
+            || !desc.position.iter().all(|value| value.is_finite())
+            || !desc
+                .size
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0)
+            || !desc.color.iter().all(|value| value.is_finite())
+        {
+            return Err(WorldError::InvalidArgument);
+        }
+
+        let mut record = SpriteRecord {
+            position: desc.position,
+            size: desc.size,
+            color: desc.color,
+            texture_id: desc.texture_id,
+            move_speed: desc.move_speed,
+        };
+        if let Some(bounds) = self.bounds {
+            constrain_sprite(&mut record, bounds);
+        }
+        Ok(record)
+    }
+
     fn set_bounds(&mut self, bounds: &abi::kadath_world_bounds_t) -> Result<(), WorldError> {
         if !bounds
             .min
@@ -93,29 +126,7 @@ impl WorldState {
         &mut self,
         desc: &abi::kadath_world_sprite_spawn_desc_t,
     ) -> Result<abi::kadath_entity_id_t, WorldError> {
-        if desc.texture_id == abi::KADATH_RESOURCE_INVALID
-            || !desc.move_speed.is_finite()
-            || desc.move_speed < 0.0
-            || !desc.position.iter().all(|value| value.is_finite())
-            || !desc
-                .size
-                .iter()
-                .all(|value| value.is_finite() && *value >= 0.0)
-            || !desc.color.iter().all(|value| value.is_finite())
-        {
-            return Err(WorldError::InvalidArgument);
-        }
-
-        let mut record = SpriteRecord {
-            position: desc.position,
-            size: desc.size,
-            color: desc.color,
-            texture_id: desc.texture_id,
-            move_speed: desc.move_speed,
-        };
-        if let Some(bounds) = self.bounds {
-            constrain_sprite(&mut record, bounds);
-        }
+        let record = self.sprite_record_from_desc(desc)?;
 
         if let Some(index) = self.free_indices.pop() {
             let slot = &mut self.slots[index as usize];
@@ -132,6 +143,29 @@ impl WorldState {
             sprite: Some(record),
         });
         Ok(encode_entity(index, 1))
+    }
+
+    fn replace_sprite(
+        &mut self,
+        old_entity: abi::kadath_entity_id_t,
+        replacement_desc: &abi::kadath_world_sprite_spawn_desc_t,
+    ) -> Result<abi::kadath_entity_id_t, WorldError> {
+        // 关键事务边界：descriptor、实体身份和 bounds 全部在 commit 前验证，
+        // 因此任何失败都不会改变旧实体或 live 集合。
+        let record = self.sprite_record_from_desc(replacement_desc)?;
+        let (index, generation) = decode_entity(old_entity).ok_or(WorldError::InvalidEntity)?;
+        let slot = self
+            .slots
+            .get_mut(index as usize)
+            .filter(|slot| slot.generation == generation && slot.sprite.is_some())
+            .ok_or(WorldError::InvalidEntity)?;
+
+        // 当前 replacement 不分配内存：同一 slot 一次提交新值并推进 generation。
+        // ABI 只承诺新旧身份不同，不暴露 slot 复用策略。
+        let replacement_generation = slot.generation.wrapping_add(1).max(1);
+        slot.sprite = Some(record);
+        slot.generation = replacement_generation;
+        Ok(encode_entity(index, replacement_generation))
     }
 
     fn step_fixed(
@@ -331,6 +365,31 @@ pub extern "C" fn kadath_world_spawn_sprite(
 }
 
 #[no_mangle]
+pub extern "C" fn kadath_world_replace_sprite(
+    world: abi::kadath_world_t,
+    old_entity: abi::kadath_entity_id_t,
+    replacement_desc: *const abi::kadath_world_sprite_spawn_desc_t,
+    out_replacement: *mut abi::kadath_entity_id_t,
+) -> i32 {
+    ffi_boundary(|| {
+        let (Some(world), Some(replacement_desc), Some(out_replacement)) = (
+            unsafe { world.cast::<WorldState>().as_mut() },
+            unsafe { replacement_desc.as_ref() },
+            unsafe { out_replacement.as_mut() },
+        ) else {
+            return abi::KADATH_ERR_INVALID_ARGUMENT as i32;
+        };
+        match world.replace_sprite(old_entity, replacement_desc) {
+            Ok(entity) => {
+                *out_replacement = entity;
+                abi::KADATH_OK as i32
+            }
+            Err(error) => error_code(error),
+        }
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn kadath_world_step_fixed(
     world: abi::kadath_world_t,
     dt_seconds: f32,
@@ -415,6 +474,67 @@ mod tests {
 
     fn world_bounds(min: [f32; 2], max: [f32; 2]) -> abi::kadath_world_bounds_t {
         abi::kadath_world_bounds_t { min, max }
+    }
+
+    #[test]
+    fn ffi_replace_sprite_is_atomic_and_preserves_live_count() {
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(kadath_world_create(&mut handle), abi::KADATH_OK as i32);
+
+        let mut original_desc = sprite_desc(1);
+        let mut old_entity = abi::KADATH_ENTITY_INVALID as abi::kadath_entity_id_t;
+        assert_eq!(
+            kadath_world_spawn_sprite(handle, &original_desc, &mut old_entity),
+            abi::KADATH_OK as i32
+        );
+
+        original_desc.position = [90.0, 90.0];
+        original_desc.texture_id = 2;
+        assert_eq!(
+            kadath_world_set_bounds(handle, &world_bounds([0.0, 0.0], [100.0, 100.0])),
+            abi::KADATH_OK as i32
+        );
+        let mut replacement = 0xDEAD_BEEF_DEAD_BEEFu64;
+        assert_eq!(
+            kadath_world_replace_sprite(handle, old_entity, &original_desc, &mut replacement),
+            abi::KADATH_OK as i32
+        );
+        assert_ne!(replacement, old_entity);
+
+        let mut output = [abi::kadath_world_render_sprite_t::default(); 1];
+        let mut count = 0;
+        assert_eq!(
+            kadath_world_extract_sprites(handle, output.as_mut_ptr(), output.len(), &mut count),
+            abi::KADATH_OK as i32
+        );
+        assert_eq!(count, 1);
+        assert_eq!(output[0].entity_id, replacement);
+        assert_eq!(output[0].position, [68.0, 52.0]);
+        assert_eq!(output[0].texture_id, 2);
+
+        let position = abi::kadath_world_position_t { value: [1.0, 1.0] };
+        assert_eq!(
+            kadath_world_set_sprite_position(handle, old_entity, &position),
+            abi::KADATH_ERR_WORLD_INVALID_ENTITY as i32
+        );
+
+        let sentinel = 0x0123_4567_89AB_CDEFu64;
+        let mut failed_output = sentinel;
+        let mut invalid_desc = original_desc;
+        invalid_desc.texture_id = abi::KADATH_RESOURCE_INVALID;
+        assert_eq!(
+            kadath_world_replace_sprite(handle, replacement, &invalid_desc, &mut failed_output),
+            abi::KADATH_ERR_INVALID_ARGUMENT as i32
+        );
+        assert_eq!(failed_output, sentinel);
+
+        let mut stale_output = sentinel;
+        assert_eq!(
+            kadath_world_replace_sprite(handle, old_entity, &original_desc, &mut stale_output),
+            abi::KADATH_ERR_WORLD_INVALID_ENTITY as i32
+        );
+        assert_eq!(stale_output, sentinel);
+        assert_eq!(kadath_world_destroy(handle), abi::KADATH_OK as i32);
     }
 
     #[test]
