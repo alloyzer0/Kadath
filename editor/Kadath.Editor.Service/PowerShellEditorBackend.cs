@@ -16,6 +16,7 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
     private readonly List<AuthoringUndoRecord> _authoringHistory = [];
+    private const int ProjectAlreadyExistsExitCode = 17;
     private const int MaxAuthoringHistory = 32;
     private LiveBakeWatchController? _watch;
     private string _watchProjectName = string.Empty;
@@ -50,6 +51,68 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 
         var project = new ProjectSessionInfo(packageRoot, parameters.ProjectName, projectDirectory, scenePath, scriptPath, previewPath, 1);
         await ValidateProjectAsync(project, cancellationToken);
+        _authoringHistory.Clear();
+        return project;
+    }
+
+    public async Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, CancellationToken cancellationToken)
+    {
+        if (!Regex.IsMatch(parameters.ProjectName, "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$", RegexOptions.CultureInvariant))
+        {
+            throw new EditorOperationException("invalid_project_name", "Project name contains unsupported characters.");
+        }
+
+        var packageRoot = Path.GetFullPath(parameters.PackageRoot);
+        if (!Directory.Exists(packageRoot)) { throw new EditorOperationException("package_not_found", $"Package root does not exist: {packageRoot}"); }
+        var projectsRoot = Path.GetFullPath(Path.Combine(packageRoot, "bin", "projects"));
+        var projectDirectory = Path.GetFullPath(Path.Combine(projectsRoot, parameters.ProjectName));
+        var prefix = projectsRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!projectDirectory.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) { throw new EditorOperationException("project_path_escape", "Project path escapes package/bin/projects."); }
+
+        foreach (var template in new[]
+        {
+            Path.Combine(packageRoot, "bin", "assets", "scenes", "preview.scene.json"),
+            Path.Combine(packageRoot, "bin", "assets", "scripts", "preview.script.json")
+        })
+        {
+            if (!File.Exists(template)) { throw new EditorOperationException("project_template_missing", $"Project template does not exist: {template}"); }
+        }
+
+        var output = await RunPowerShellAsync(
+            Path.Combine(_kadathRoot, "tools", "editor-author.ps1"),
+            ["-Action", "Create", "-PackageRoot", packageRoot, "-ProjectName", parameters.ProjectName],
+            cancellationToken);
+        // 关键错误映射：业务分支只读取精确退出码；Adapter stdout/stderr 永远只是诊断文本。
+        if (output.ExitCode == ProjectAlreadyExistsExitCode)
+        {
+            throw new EditorOperationException("project_already_exists", JoinDiagnostics(output));
+        }
+        if (output.ExitCode != 0)
+        {
+            throw new EditorOperationException("project_create_failed", JoinDiagnostics(output));
+        }
+
+        var project = new ProjectSessionInfo(
+            packageRoot,
+            parameters.ProjectName,
+            projectDirectory,
+            Path.Combine(projectDirectory, "scene.json"),
+            Path.Combine(projectDirectory, "script.json"),
+            Path.Combine(projectDirectory, "preview.json"),
+            1);
+        try
+        {
+            foreach (var path in new[] { project.ScenePath, project.ScriptPath, project.PreviewPath })
+            {
+                if (!File.Exists(path)) { throw new EditorOperationException("project_validation_failed", $"Project file does not exist: {path}"); }
+            }
+            await ValidateProjectAsync(project, cancellationToken);
+        }
+        catch (EditorOperationException exception)
+        {
+            throw new EditorOperationException("project_validation_failed", exception.Message);
+        }
+
         _authoringHistory.Clear();
         return project;
     }

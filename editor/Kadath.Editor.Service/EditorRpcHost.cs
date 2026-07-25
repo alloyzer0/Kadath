@@ -109,6 +109,9 @@ internal sealed class EditorRpcHost
                 case "project_open":
                     await WriteResponseAsync(request.Id, true, await _session.OpenProjectAsync(DeserializeParams<ProjectOpenParameters>(request), request.Id), null);
                     break;
+                case "project_create":
+                    await WriteResponseAsync(request.Id, true, await _session.CreateProjectAsync(DeserializeParams<ProjectCreateParameters>(request), request.Id), null);
+                    break;
                 case "project_validate":
                     await WriteResponseAsync(request.Id, true, await _session.ValidateProjectAsync(DeserializeParams<ProjectValidateParameters>(request), request.Id), null);
                     break;

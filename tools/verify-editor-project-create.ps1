@@ -126,7 +126,55 @@ function Receive-CreateWorker([Diagnostics.Process]$Worker) {
     }
 }
 
+function Send-RpcJson([Diagnostics.Process]$Process, [object]$Value) {
+    $Process.StandardInput.WriteLine(($Value | ConvertTo-Json -Compress -Depth 12))
+    $Process.StandardInput.Flush()
+}
+
+function Read-RpcMessage([Diagnostics.Process]$Process, [int]$TimeoutMs = 15000) {
+    $readTask = $Process.StandardOutput.ReadLineAsync()
+    if (-not $readTask.Wait($TimeoutMs)) {
+        throw "Editor Service JSONL timeout: stage=$($script:rpcStage) exited=$($Process.HasExited)"
+    }
+    $line = $readTask.GetAwaiter().GetResult()
+    if ($null -eq $line) { throw "Editor Service closed stdout: stage=$($script:rpcStage)" }
+    $message = $line | ConvertFrom-Json
+    $script:rpcMessages.Add($message)
+    if ([string]$message.type -eq 'event') {
+        if ([int64]$message.sequence -le $script:rpcSequence) { throw 'Editor Service event sequence is not strictly increasing.' }
+        $script:rpcSequence = [int64]$message.sequence
+    }
+    return $message
+}
+
+function Assert-NormalizedPath([string]$Actual, [string]$Expected, [string]$Name) {
+    $actualFull = [IO.Path]::GetFullPath($Actual)
+    $expectedFull = [IO.Path]::GetFullPath($Expected)
+    if (-not [string]::Equals($actualFull, $expectedFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Name path mismatch: expected=$expectedFull actual=$actualFull"
+    }
+}
+
+function Assert-ProjectSessionInfo([object]$Value, [string]$ExpectedRoot, [string]$ExpectedName) {
+    $expectedProperties = @('modelVersion', 'packageRoot', 'previewPath', 'projectDirectory', 'projectName', 'scenePath', 'scriptPath') | Sort-Object
+    $actualProperties = @($Value.PSObject.Properties.Name | Sort-Object)
+    if (($actualProperties -join '|') -ne ($expectedProperties -join '|')) {
+        throw "ProjectSessionInfo properties mismatch: expected=$($expectedProperties -join ',') actual=$($actualProperties -join ',')"
+    }
+
+    $expectedDirectory = Join-Path $ExpectedRoot "bin/projects/$ExpectedName"
+    if ([string]$Value.projectName -ne $ExpectedName -or [int]$Value.modelVersion -ne 1) {
+        throw "ProjectSessionInfo identity mismatch: expected=$ExpectedName/1 actual=$($Value.projectName)/$($Value.modelVersion)"
+    }
+    Assert-NormalizedPath ([string]$Value.packageRoot) $ExpectedRoot 'packageRoot'
+    Assert-NormalizedPath ([string]$Value.projectDirectory) $expectedDirectory 'projectDirectory'
+    Assert-NormalizedPath ([string]$Value.scenePath) (Join-Path $expectedDirectory 'scene.json') 'scenePath'
+    Assert-NormalizedPath ([string]$Value.scriptPath) (Join-Path $expectedDirectory 'script.json') 'scriptPath'
+    Assert-NormalizedPath ([string]$Value.previewPath) (Join-Path $expectedDirectory 'preview.json') 'previewPath'
+}
+
 $ownsFixture = $false
+$serviceProcess = $null
 try {
     # 关键 ownership 前置：先排他创建 GUID 根，后续所有 fixture 写入和清理都限定在该根内。
     if (Test-Path -LiteralPath $fixtureRoot) { throw "Verifier fixture unexpectedly exists: $fixtureRoot" }
@@ -274,9 +322,132 @@ try {
 
     Write-Output "concurrent_attempts=$ConcurrentAttemptLimit"
     Write-Output 'concurrent_create_atomic=ok'
+
+    $worktreeRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+    $serviceDll = Join-Path $worktreeRoot 'editor/Kadath.Editor.Service/bin/Debug/net8.0/Kadath.Editor.Service.dll'
+    if (-not (Test-Path -LiteralPath $serviceDll -PathType Leaf)) { throw "Editor Service is not built: $serviceDll" }
+
+    $rpcProjectName = "rpc_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $rpcProjectDirectory = Join-Path $projectsRoot $rpcProjectName
+    if (Test-Path -LiteralPath $rpcProjectDirectory) { throw "RPC verifier project unexpectedly exists: $rpcProjectDirectory" }
+
+    $script:rpcMessages = [Collections.Generic.List[object]]::new()
+    $script:rpcSequence = 0L
+    $script:rpcStage = 'startup'
+    $serviceShutdownComplete = $false
+    try {
+        $serviceStart = [Diagnostics.ProcessStartInfo]::new()
+        $serviceStart.FileName = 'dotnet'
+        $serviceStart.WorkingDirectory = Join-Path $worktreeRoot 'editor'
+        $serviceStart.UseShellExecute = $false
+        $serviceStart.CreateNoWindow = $true
+        $serviceStart.RedirectStandardInput = $true
+        $serviceStart.RedirectStandardOutput = $true
+        $serviceStart.RedirectStandardError = $true
+        $serviceStart.ArgumentList.Add($serviceDll)
+        $serviceStart.ArgumentList.Add('--kadath-root')
+        $serviceStart.ArgumentList.Add($worktreeRoot)
+        $serviceProcess = [Diagnostics.Process]::new()
+        $serviceProcess.StartInfo = $serviceStart
+        if (-not $serviceProcess.Start()) { throw 'Failed to start Editor Service.' }
+
+        $hello = Read-RpcMessage $serviceProcess
+        if ([string]$hello.type -ne 'hello' -or [string]$hello.protocol -ne 'kadath-editor-rpc' -or [int]$hello.schemaVersion -ne 1) {
+            throw "Editor Service hello mismatch: $($hello | ConvertTo-Json -Compress -Depth 4)"
+        }
+        Send-RpcJson $serviceProcess ([ordered]@{ schemaVersion = 1; type = 'hello_ack'; client = 'verify-editor-project-create'; clientVersion = '1' })
+
+        $script:rpcStage = 'get_capabilities'
+        Send-RpcJson $serviceProcess ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'create-caps-1'; method = 'get_capabilities'; params = $null })
+        $capabilities = Read-RpcMessage $serviceProcess
+        if ([string]$capabilities.type -ne 'response' -or [string]$capabilities.id -ne 'create-caps-1' -or -not [bool]$capabilities.ok) {
+            throw "get_capabilities response mismatch: $($capabilities | ConvertTo-Json -Compress -Depth 5)"
+        }
+        if (@($capabilities.result.commands) -notcontains 'project_create') {
+            throw "project_create capability missing: commands=$(@($capabilities.result.commands) -join ',')"
+        }
+
+        $script:rpcStage = 'project_create'
+        Send-RpcJson $serviceProcess ([ordered]@{
+            schemaVersion = 1
+            type = 'request'
+            id = 'create-rpc-1'
+            method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $rpcProjectName }
+        })
+
+        # 关键 JSONL 顺序：不得用“读到目标为止”的循环吞掉提前到达的 response。
+        $createdEvent = Read-RpcMessage $serviceProcess
+        if ([string]$createdEvent.type -ne 'event' -or [string]$createdEvent.event -ne 'project_created' -or [string]$createdEvent.requestId -ne 'create-rpc-1') {
+            throw "project_created must precede response: actual=$($createdEvent | ConvertTo-Json -Compress -Depth 6)"
+        }
+        $createdResponse = Read-RpcMessage $serviceProcess
+        if ([string]$createdResponse.type -ne 'response' -or [string]$createdResponse.id -ne 'create-rpc-1' -or -not [bool]$createdResponse.ok) {
+            throw "project_create response mismatch: $($createdResponse | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        Assert-ProjectSessionInfo $createdEvent.data $fixtureRoot $rpcProjectName
+        Assert-ProjectSessionInfo $createdResponse.result $fixtureRoot $rpcProjectName
+        foreach ($property in @('packageRoot', 'projectName', 'projectDirectory', 'scenePath', 'scriptPath', 'previewPath', 'modelVersion')) {
+            if ([string]$createdEvent.data.$property -ne [string]$createdResponse.result.$property) {
+                throw "project_created/result mismatch: property=$property event=$($createdEvent.data.$property) response=$($createdResponse.result.$property)"
+            }
+        }
+
+        # 最终完整性仍从公开 Validate seam 观察，不读取 Service 或 Adapter 内部状态。
+        $rpcValidateDiagnostics = @(& pwsh -NoProfile -File $author -Action Validate -PackageRoot $fixtureRoot -ProjectName $rpcProjectName 2>&1)
+        $rpcValidateExitCode = $LASTEXITCODE
+        if ($rpcValidateExitCode -ne 0) {
+            throw "RPC-created project Validate failed: exit=$rpcValidateExitCode diagnostics=$(@($rpcValidateDiagnostics | ForEach-Object { $_.ToString() }) -join ' | ')"
+        }
+
+        $script:rpcStage = 'shutdown'
+        Send-RpcJson $serviceProcess ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'create-shutdown-1'; method = 'shutdown'; params = $null })
+        $shutdownResponse = Read-RpcMessage $serviceProcess
+        $shutdownEvent = Read-RpcMessage $serviceProcess
+        if ([string]$shutdownResponse.type -ne 'response' -or [string]$shutdownResponse.id -ne 'create-shutdown-1' -or -not [bool]$shutdownResponse.ok -or
+            [string]$shutdownEvent.type -ne 'event' -or [string]$shutdownEvent.event -ne 'service_stopping' -or [string]$shutdownEvent.requestId -ne 'create-shutdown-1') {
+            throw 'Editor Service shutdown envelope mismatch.'
+        }
+        if (-not $serviceProcess.WaitForExit(10000)) { throw 'Editor Service did not exit after shutdown.' }
+        $serviceShutdownComplete = $true
+
+        Write-Output 'rpc_project_create_capability=ok'
+        Write-Output 'rpc_project_created_before_response=ok'
+        Write-Output 'rpc_project_session_info=ok'
+        Write-Output 'rpc_project_create_validate=ok'
+    }
+    finally {
+        if ($null -ne $serviceProcess) {
+            if (-not $serviceProcess.HasExited) {
+                if (-not $serviceShutdownComplete) {
+                    try {
+                        # 失败路径也先请求正常 shutdown；只有有界等待失败时才终止进程树。
+                        Send-RpcJson $serviceProcess ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'create-cleanup-shutdown'; method = 'shutdown'; params = $null })
+                        $serviceProcess.StandardInput.Close()
+                    }
+                    catch { }
+                }
+                if (-not $serviceProcess.WaitForExit(5000)) {
+                    $serviceProcess.Kill($true)
+                    [void]$serviceProcess.WaitForExit(5000)
+                }
+            }
+            $serviceProcess.Dispose()
+            $serviceProcess = $null
+        }
+    }
+
     Write-Output 'verification=ok'
 }
 finally {
+    if ($null -ne $serviceProcess) {
+        if (-not $serviceProcess.HasExited) {
+            $serviceProcess.Kill($true)
+            [void]$serviceProcess.WaitForExit(5000)
+        }
+        $serviceProcess.Dispose()
+    }
     if ($ownsFixture -and (Test-Path -LiteralPath $fixtureRoot)) {
         $resolvedFixture = (Resolve-Path -LiteralPath $fixtureRoot).Path
         $fixtureItem = Get-Item -LiteralPath $resolvedFixture -Force

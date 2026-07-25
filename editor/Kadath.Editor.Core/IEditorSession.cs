@@ -14,6 +14,7 @@ public sealed class EditorOperationException : Exception
 public interface IEditorSessionBackend : IAsyncDisposable
 {
     Task<ProjectSessionInfo> OpenProjectAsync(ProjectOpenParameters parameters, CancellationToken cancellationToken);
+    Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, CancellationToken cancellationToken);
     Task<ProjectValidateResult> ValidateProjectAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
@@ -36,6 +37,7 @@ public interface IEditorSession : IAsyncDisposable
     ProjectSessionInfo? CurrentProject { get; }
     event Func<EditorSessionNotification, Task>? Notification;
     Task<ProjectSessionInfo> OpenProjectAsync(ProjectOpenParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ProjectValidateResult> ValidateProjectAsync(ProjectValidateParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
@@ -55,6 +57,7 @@ public sealed class EditorSession : IEditorSession
     [
         "get_capabilities",
         "project_open",
+        "project_create",
         "project_validate",
         "project_snapshot",
         "hierarchy_snapshot",
@@ -97,6 +100,15 @@ public sealed class EditorSession : IEditorSession
         var project = await _backend.OpenProjectAsync(parameters, cancellationToken);
         _currentProject = project;
         await EmitAsync("project_opened", project, requestId);
+        return project;
+    }
+
+    public async Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, string? requestId, CancellationToken cancellationToken = default)
+    {
+        var project = await _backend.CreateProjectAsync(parameters, cancellationToken);
+        // 关键提交点：Backend 已完成创建与再验证；先提交唯一 current session，再发布唯一成功终态。
+        _currentProject = project;
+        await EmitAsync("project_created", project, requestId);
         return project;
     }
 

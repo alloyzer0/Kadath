@@ -93,6 +93,8 @@ public sealed record PreviewSurfaceDescriptor(
 
 public sealed record ProjectOpenParameters(string PackageRoot, string ProjectName);
 
+public sealed record ProjectCreateParameters(string PackageRoot, string ProjectName);
+
 public sealed record ProjectSessionInfo(
     string PackageRoot,
     string ProjectName,
