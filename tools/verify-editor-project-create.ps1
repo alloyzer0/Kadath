@@ -8,6 +8,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $ProjectAlreadyExistsExitCode = 17
+$ConcurrentAttemptLimit = 12
+$SceneTemplatePaddingBytes = 48 * 1024
 $fixturePrefix = 'verify-editor-project-create-'
 $packageParent = (Resolve-Path -LiteralPath $PackageRoot).Path
 if (-not (Test-Path -LiteralPath $packageParent -PathType Container)) {
@@ -46,6 +48,82 @@ function Get-TreeIdentity([string]$Root) {
         }
     }
     return @($entries)
+}
+
+function Start-SynchronizedCreateWorker(
+    [string]$ReadyPath,
+    [string]$GatePath,
+    [string]$AdapterPath,
+    [string]$FixturePath,
+    [string]$ProjectName
+) {
+    $workerCommand = @'
+$ErrorActionPreference = 'Stop'
+[IO.File]::WriteAllText($env:KADATH_CREATE_READY, 'ready', [Text.UTF8Encoding]::new($false))
+$deadline = [DateTime]::UtcNow.AddSeconds(20)
+while (-not [IO.File]::Exists($env:KADATH_CREATE_GATE)) {
+    if ([DateTime]::UtcNow -ge $deadline) {
+        [Console]::Error.WriteLine('Timed out waiting for the verifier release gate.')
+        exit 98
+    }
+    [Threading.Thread]::Sleep(2)
+}
+try {
+    & $env:KADATH_CREATE_AUTHOR -Action Create -PackageRoot $env:KADATH_CREATE_PACKAGE -ProjectName $env:KADATH_CREATE_PROJECT
+    exit $LASTEXITCODE
+}
+catch {
+    [Console]::Error.WriteLine($_.ToString())
+    exit 1
+}
+'@
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = (Get-Command pwsh -ErrorAction Stop).Source
+    $startInfo.WorkingDirectory = $PSScriptRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.ArgumentList.Add('-NoProfile')
+    $startInfo.ArgumentList.Add('-NonInteractive')
+    $startInfo.ArgumentList.Add('-Command')
+    $startInfo.ArgumentList.Add($workerCommand)
+    $startInfo.Environment['KADATH_CREATE_READY'] = $ReadyPath
+    $startInfo.Environment['KADATH_CREATE_GATE'] = $GatePath
+    $startInfo.Environment['KADATH_CREATE_AUTHOR'] = $AdapterPath
+    $startInfo.Environment['KADATH_CREATE_PACKAGE'] = $FixturePath
+    $startInfo.Environment['KADATH_CREATE_PROJECT'] = $ProjectName
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw 'Failed to start synchronized project_create worker.' }
+    return $process
+}
+
+function Wait-SynchronizedWorkersReady([Diagnostics.Process[]]$Workers, [string[]]$ReadyPaths) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (@($ReadyPaths | Where-Object { -not [IO.File]::Exists($_) }).Count -ne 0) {
+        foreach ($worker in $Workers) {
+            if ($worker.HasExited) { throw "project_create worker exited before release gate: $($worker.ExitCode)" }
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { throw 'Timed out waiting for synchronized project_create workers.' }
+        [Threading.Thread]::Sleep(5)
+    }
+}
+
+function Receive-CreateWorker([Diagnostics.Process]$Worker) {
+    if (-not $Worker.WaitForExit(60000)) {
+        $Worker.Kill($true)
+        [void]$Worker.WaitForExit(5000)
+        throw 'Timed out waiting for project_create worker completion.'
+    }
+    $Worker.WaitForExit()
+    return [pscustomobject]@{
+        ExitCode = $Worker.ExitCode
+        Stdout = $Worker.StandardOutput.ReadToEnd()
+        Stderr = $Worker.StandardError.ReadToEnd()
+    }
 }
 
 $ownsFixture = $false
@@ -94,6 +172,108 @@ try {
 
     Write-Output "preexisting_exit_code=$actualExitCode"
     Write-Output 'preexisting_project_immutable=ok'
+
+    $sceneAssets = Join-Path $fixtureRoot 'bin/assets/scenes'
+    $scriptAssets = Join-Path $fixtureRoot 'bin/assets/scripts'
+    New-Item -ItemType Directory -Path $sceneAssets -Force | Out-Null
+    New-Item -ItemType Directory -Path $scriptAssets -Force | Out-Null
+
+    $sceneTemplate = @'
+{
+  "schemaVersion": 1,
+  "player": { "position": [312.0, 130.0], "size": [320.0, 240.0], "color": [1.0, 1.0, 1.0, 1.0], "moveSpeed": 180.0 },
+  "goal": { "position": [700.0, 200.0], "size": [96.0, 96.0], "color": [1.0, 0.75, 0.1, 1.0] },
+  "hazard": { "position": [650.0, 280.0], "size": [96.0, 96.0], "color": [0.95, 0.2, 0.2, 1.0], "patrolMinY": 245.0, "patrolMaxY": 330.0, "patrolSpeed": 80.0 }
+}
+'@
+    $scriptTemplate = @'
+{
+  "schemaVersion": 1,
+  "instructions": [
+    { "hook": "on_start", "op": "set_goal_position", "value": [680.0, 200.0] },
+    { "hook": "fixed_update", "op": "move_goal_velocity", "value": [-12.0, 0.0] }
+  ]
+}
+'@
+    # 48 KiB whitespace 在放大并发写入窗口的同时，保证完整 Scene 仍低于 Runtime 文档的 64 KiB 预算。
+    [IO.File]::WriteAllText((Join-Path $sceneAssets 'preview.scene.json'), $sceneTemplate + (' ' * $SceneTemplatePaddingBytes), [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $scriptAssets 'preview.script.json'), $scriptTemplate, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $fixtureRoot 'bin/kadath.exe'), 'verifier runtime placeholder', [Text.UTF8Encoding]::new($false))
+
+    $projectsRoot = Join-Path $fixtureRoot 'bin/projects'
+    for ($attempt = 1; $attempt -le $ConcurrentAttemptLimit; $attempt++) {
+        $concurrentProjectName = "concurrent_$($attempt.ToString('00'))_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+        $concurrentProject = Join-Path $projectsRoot $concurrentProjectName
+        if (Test-Path -LiteralPath $concurrentProject) { throw "Concurrent verifier project unexpectedly exists: $concurrentProject" }
+        $projectsBefore = @(Get-ChildItem -LiteralPath $projectsRoot -Force | ForEach-Object { $_.Name } | Sort-Object)
+
+        $coordinationRoot = Join-Path $fixtureRoot "coordination/attempt-$($attempt.ToString('00'))"
+        New-Item -ItemType Directory -Path $coordinationRoot -Force | Out-Null
+        $gatePath = Join-Path $coordinationRoot 'release.gate'
+        $readyPaths = @((Join-Path $coordinationRoot 'worker-a.ready'), (Join-Path $coordinationRoot 'worker-b.ready'))
+        $workerA = $null
+        $workerB = $null
+        try {
+            # 关键同步点：两个独立 pwsh 都写出 ready 后，父进程才以同一个 gate 同步释放。
+            $workerA = Start-SynchronizedCreateWorker $readyPaths[0] $gatePath $author $fixtureRoot $concurrentProjectName
+            $workerB = Start-SynchronizedCreateWorker $readyPaths[1] $gatePath $author $fixtureRoot $concurrentProjectName
+            Wait-SynchronizedWorkersReady @($workerA, $workerB) $readyPaths
+            [IO.File]::WriteAllText($gatePath, 'go', [Text.UTF8Encoding]::new($false))
+            $resultA = Receive-CreateWorker $workerA
+            $resultB = Receive-CreateWorker $workerB
+        }
+        finally {
+            foreach ($worker in @($workerA, $workerB)) {
+                if ($null -eq $worker) { continue }
+                if (-not $worker.HasExited) {
+                    $worker.Kill($true)
+                    [void]$worker.WaitForExit(5000)
+                }
+                $worker.Dispose()
+            }
+        }
+
+        $exitCodes = @($resultA.ExitCode, $resultB.ExitCode) | Sort-Object
+        # Validate 也是公开 Adapter seam；其退出码和最终三文件是完整性的唯一判据。
+        $validateDiagnostics = @(& pwsh -NoProfile -File $author -Action Validate -PackageRoot $fixtureRoot -ProjectName $concurrentProjectName 2>&1)
+        $validateExitCode = $LASTEXITCODE
+
+        $finalFiles = @()
+        $finalDirectories = @()
+        if (Test-Path -LiteralPath $concurrentProject -PathType Container) {
+            $finalFiles = @(Get-ChildItem -LiteralPath $concurrentProject -Force -File -Recurse | ForEach-Object {
+                [IO.Path]::GetRelativePath($concurrentProject, $_.FullName).Replace('\', '/')
+            } | Sort-Object)
+            $finalDirectories = @(Get-ChildItem -LiteralPath $concurrentProject -Force -Directory -Recurse)
+        }
+        $projectsAfter = @(Get-ChildItem -LiteralPath $projectsRoot -Force | ForEach-Object { $_.Name } | Sort-Object)
+        $unexpectedProjectEntries = @($projectsAfter | Where-Object { $_ -notin $projectsBefore -and $_ -ne $concurrentProjectName })
+
+        $raceFailures = [Collections.Generic.List[string]]::new()
+        if ($exitCodes.Count -ne 2 -or $exitCodes[0] -ne 0 -or $exitCodes[1] -ne $ProjectAlreadyExistsExitCode) {
+            $raceFailures.Add("exit_codes expected=0,$ProjectAlreadyExistsExitCode actual=$($exitCodes -join ',')")
+        }
+        if ($validateExitCode -ne 0) { $raceFailures.Add("validate_exit expected=0 actual=$validateExitCode") }
+        if (($finalFiles -join '|') -ne 'preview.json|scene.json|script.json' -or $finalDirectories.Count -ne 0) {
+            $raceFailures.Add("final_project expected=three-files actual=$($finalFiles -join ',') directories=$($finalDirectories.Count)")
+        }
+        if ($unexpectedProjectEntries.Count -ne 0) {
+            $raceFailures.Add("staging_or_half_entries=$($unexpectedProjectEntries -join ',')")
+        }
+
+        Write-Output "concurrent_attempt=$attempt/$ConcurrentAttemptLimit exit_codes=$($exitCodes -join ',') validate_exit=$validateExitCode"
+        if ($raceFailures.Count -ne 0) {
+            $workerDiagnostics = @($resultA.Stderr, $resultB.Stderr, ($validateDiagnostics | ForEach-Object { $_.ToString() })) -join ' | '
+            throw "project_create concurrent contract failed: $($raceFailures -join '; '); diagnostics=$workerDiagnostics"
+        }
+
+        # 每次通过后只删除本 verifier 所有 fixture 内的该项目，再使用新名字继续有限重试。
+        Remove-Item -LiteralPath $concurrentProject -Recurse -Force
+        Remove-Item -LiteralPath $coordinationRoot -Recurse -Force
+    }
+
+    Write-Output "concurrent_attempts=$ConcurrentAttemptLimit"
+    Write-Output 'concurrent_create_atomic=ok'
     Write-Output 'verification=ok'
 }
 finally {
