@@ -47,6 +47,9 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Create 的 duplicate/lost-claim 共享同一稳定业务退出码；stdout/stderr 仍只用于诊断。
+$ProjectAlreadyExistsExitCode = 17
+
 . (Join-Path $PSScriptRoot 'editor-project-model.ps1')
 
 function Resolve-ExistingDirectory([string]$Path, [string]$Name) {
@@ -313,7 +316,8 @@ $files = Get-ProjectFiles $projectDirectory
 switch ($Action) {
     'Create' {
         if (Test-Path -LiteralPath $projectDirectory) {
-            throw "Refusing to overwrite existing project: $ProjectName"
+            [Console]::Error.WriteLine("Refusing to overwrite existing project: $ProjectName")
+            exit $ProjectAlreadyExistsExitCode
         }
         $created = $false
         try {
