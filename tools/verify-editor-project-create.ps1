@@ -438,6 +438,130 @@ try {
         }
     }
 
+    $fakeKadathRoot = Join-Path $fixtureRoot 'fake-kadath-root'
+    $fakeToolsRoot = Join-Path $fakeKadathRoot 'tools'
+    New-Item -ItemType Directory -Path $fakeToolsRoot | Out-Null
+    [IO.File]::WriteAllText((Join-Path $fakeToolsRoot 'editor-preview.ps1'), "param()`r`n", [Text.UTF8Encoding]::new($false))
+    $fakeAuthor = @'
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Create', 'Validate')]
+    [string]$Action,
+
+    [Parameter(Mandatory = $true)]
+    [string]$PackageRoot,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ProjectName,
+
+    [string]$OwnershipToken
+)
+
+$projectDirectory = Join-Path $PackageRoot "bin/projects/$ProjectName"
+if ($Action -eq 'Create') {
+    New-Item -ItemType Directory -Path $projectDirectory -ErrorAction Stop | Out-Null
+    foreach ($name in @('scene.json', 'script.json', 'preview.json')) {
+        [IO.File]::WriteAllText((Join-Path $projectDirectory $name), '{"schemaVersion":1}', [Text.UTF8Encoding]::new($false))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($OwnershipToken)) {
+        [IO.File]::WriteAllText((Join-Path $projectDirectory '.kadath-create-claim'), $OwnershipToken, [Text.UTF8Encoding]::new($false))
+    }
+    exit 0
+}
+
+if ($ProjectName -like 'rollback_*') {
+    [Console]::Error.WriteLine('injected post-create validation failure')
+    exit 1
+}
+Write-Output 'validation=ok'
+exit 0
+'@
+    [IO.File]::WriteAllText((Join-Path $fakeToolsRoot 'editor-author.ps1'), $fakeAuthor, [Text.UTF8Encoding]::new($false))
+
+    $rollbackProjectName = "rollback_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $rollbackProjectDirectory = Join-Path $projectsRoot $rollbackProjectName
+    $rollbackService = $null
+    try {
+        # 关键 boundary fake：Create 成功但后续 Validate 失败，只观察真实 RPC 与最终文件系统回滚。
+        $rollbackStart = [Diagnostics.ProcessStartInfo]::new()
+        $rollbackStart.FileName = 'dotnet'
+        $rollbackStart.WorkingDirectory = Join-Path $worktreeRoot 'editor'
+        $rollbackStart.UseShellExecute = $false
+        $rollbackStart.CreateNoWindow = $true
+        $rollbackStart.RedirectStandardInput = $true
+        $rollbackStart.RedirectStandardOutput = $true
+        $rollbackStart.RedirectStandardError = $true
+        $rollbackStart.ArgumentList.Add($serviceDll)
+        $rollbackStart.ArgumentList.Add('--kadath-root')
+        $rollbackStart.ArgumentList.Add($fakeKadathRoot)
+        $rollbackService = [Diagnostics.Process]::new()
+        $rollbackService.StartInfo = $rollbackStart
+        if (-not $rollbackService.Start()) { throw 'Failed to start rollback Editor Service.' }
+
+        $script:rpcMessages.Clear()
+        $script:rpcSequence = 0L
+        $script:rpcStage = 'rollback_hello'
+        $rollbackHello = Read-RpcMessage $rollbackService
+        if ([string]$rollbackHello.type -ne 'hello') { throw 'Rollback Service hello mismatch.' }
+        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'hello_ack'; client = 'verify-editor-project-create-rollback'; clientVersion = '1' })
+
+        # 先建立已提交 session；失败 Create 后无参 Validate 必须仍指向该 session。
+        $script:rpcStage = 'rollback_baseline_open'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'rollback-open-1'; method = 'project_open'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $rpcProjectName }
+        })
+        $rollbackOpenedEvent = Read-RpcMessage $rollbackService
+        $rollbackOpenedResponse = Read-RpcMessage $rollbackService
+        if ([string]$rollbackOpenedEvent.event -ne 'project_opened' -or -not [bool]$rollbackOpenedResponse.ok) {
+            throw 'Rollback baseline project_open failed.'
+        }
+
+        $script:rpcStage = 'rollback_project_create'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'rollback-create-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $rollbackProjectName }
+        })
+        $rollbackFailure = Read-RpcMessage $rollbackService
+        if ([string]$rollbackFailure.type -ne 'response' -or [string]$rollbackFailure.id -ne 'rollback-create-1' -or
+            [bool]$rollbackFailure.ok -or [string]$rollbackFailure.error.code -ne 'project_validation_failed') {
+            throw "project_validation_failed response mismatch: $($rollbackFailure | ConvertTo-Json -Compress -Depth 6)"
+        }
+        if (Test-Path -LiteralPath $rollbackProjectDirectory) {
+            throw "Service retained a post-validation-failure project directory: $rollbackProjectDirectory"
+        }
+
+        $script:rpcStage = 'rollback_session_validate'
+        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-validate-1'; method = 'project_validate'; params = [ordered]@{} })
+        $rollbackValidatedEvent = Read-RpcMessage $rollbackService
+        $rollbackValidatedResponse = Read-RpcMessage $rollbackService
+        if ([string]$rollbackValidatedEvent.event -ne 'project_validated' -or -not [bool]$rollbackValidatedResponse.ok -or
+            [string]$rollbackValidatedResponse.result.projectName -ne $rpcProjectName) {
+            throw 'Failed Create replaced the previously committed session.'
+        }
+
+        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-shutdown-1'; method = 'shutdown'; params = $null })
+        [void](Read-RpcMessage $rollbackService)
+        [void](Read-RpcMessage $rollbackService)
+        if (-not $rollbackService.WaitForExit(10000)) { throw 'Rollback Service did not exit after shutdown.' }
+
+        Write-Output 'rpc_project_create_validation_rollback=ok'
+        Write-Output 'rpc_project_create_failure_preserves_session=ok'
+    }
+    finally {
+        if ($null -ne $rollbackService) {
+            if (-not $rollbackService.HasExited) {
+                try { Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-cleanup'; method = 'shutdown'; params = $null }) } catch { }
+                if (-not $rollbackService.WaitForExit(5000)) {
+                    $rollbackService.Kill($true)
+                    [void]$rollbackService.WaitForExit(5000)
+                }
+            }
+            $rollbackService.Dispose()
+        }
+    }
+
     Write-Output 'verification=ok'
 }
 finally {

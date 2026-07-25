@@ -17,6 +17,7 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
     private readonly List<AuthoringUndoRecord> _authoringHistory = [];
     private const int ProjectAlreadyExistsExitCode = 17;
+    private const string ProjectCreateClaimFileName = ".kadath-create-claim";
     private const int MaxAuthoringHistory = 32;
     private LiveBakeWatchController? _watch;
     private string _watchProjectName = string.Empty;
@@ -78,9 +79,10 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
             if (!File.Exists(template)) { throw new EditorOperationException("project_template_missing", $"Project template does not exist: {template}"); }
         }
 
+        var ownershipToken = Guid.NewGuid().ToString("N");
         var output = await RunPowerShellAsync(
             Path.Combine(_kadathRoot, "tools", "editor-author.ps1"),
-            ["-Action", "Create", "-PackageRoot", packageRoot, "-ProjectName", parameters.ProjectName],
+            ["-Action", "Create", "-PackageRoot", packageRoot, "-ProjectName", parameters.ProjectName, "-OwnershipToken", ownershipToken],
             cancellationToken);
         // 关键错误映射：业务分支只读取精确退出码；Adapter stdout/stderr 永远只是诊断文本。
         if (output.ExitCode == ProjectAlreadyExistsExitCode)
@@ -102,19 +104,67 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
             1);
         try
         {
+            _ = ValidateProjectCreateOwnership(project, ownershipToken);
             foreach (var path in new[] { project.ScenePath, project.ScriptPath, project.PreviewPath })
             {
                 if (!File.Exists(path)) { throw new EditorOperationException("project_validation_failed", $"Project file does not exist: {path}"); }
             }
             await ValidateProjectAsync(project, cancellationToken);
+
+            // 关键提交前检查：Validate 期间 ownership 可能被替换；只有再次匹配才移除 claim 并移交给 Core。
+            var claimPath = ValidateProjectCreateOwnership(project, ownershipToken);
+            File.Delete(claimPath);
         }
-        catch (EditorOperationException exception)
+        catch (Exception exception)
         {
+            CleanupCreatedProjectIfOwned(project, ownershipToken);
             throw new EditorOperationException("project_validation_failed", exception.Message);
         }
 
         _authoringHistory.Clear();
         return project;
+    }
+
+    private static string ValidateProjectCreateOwnership(ProjectSessionInfo project, string ownershipToken)
+    {
+        var expectedDirectory = Path.GetFullPath(project.ProjectDirectory);
+        var directory = new DirectoryInfo(expectedDirectory);
+        if (!directory.Exists
+            || !Path.GetFullPath(directory.FullName).Equals(expectedDirectory, StringComparison.OrdinalIgnoreCase)
+            || (directory.Attributes & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new EditorOperationException("project_validation_failed", "Created project directory is missing, replaced, or a reparse point.");
+        }
+
+        var claimPath = Path.GetFullPath(Path.Combine(expectedDirectory, ProjectCreateClaimFileName));
+        var directoryPrefix = expectedDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!claimPath.StartsWith(directoryPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(claimPath))
+        {
+            throw new EditorOperationException("project_validation_failed", "Project create ownership claim is missing or outside the expected directory.");
+        }
+
+        var claim = new FileInfo(claimPath);
+        if ((claim.Attributes & FileAttributes.ReparsePoint) != 0
+            || claim.Length != ownershipToken.Length
+            || !File.ReadAllText(claimPath).Equals(ownershipToken, StringComparison.Ordinal))
+        {
+            throw new EditorOperationException("project_validation_failed", "Project create ownership claim does not match this request.");
+        }
+        return claimPath;
+    }
+
+    private static void CleanupCreatedProjectIfOwned(ProjectSessionInfo project, string ownershipToken)
+    {
+        try
+        {
+            // 关键回滚边界：删除前复用完整 ownership 校验；缺失、不匹配或 reparse 时宁可保留也绝不误删。
+            _ = ValidateProjectCreateOwnership(project, ownershipToken);
+            Directory.Delete(project.ProjectDirectory, recursive: true);
+        }
+        catch
+        {
+            // 原始失败仍统一映射为 project_validation_failed；安全拒绝清理不能降级成无 token 的递归删除。
+        }
     }
 
     public async Task<ProjectValidateResult> ValidateProjectAsync(ProjectSessionInfo project, CancellationToken cancellationToken)

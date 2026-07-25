@@ -10,6 +10,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ProjectName,
 
+    [string]$OwnershipToken = '',
+
     [float]$SceneGoalX = [float]::NaN,
     [float]$SceneGoalY = [float]::NaN,
     [float]$ScriptGoalX = [float]::NaN,
@@ -46,6 +48,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if (-not [string]::IsNullOrEmpty($OwnershipToken) -and $OwnershipToken -cnotmatch '^[0-9a-f]{32}$') {
+    throw 'OwnershipToken must be a 32-character lowercase hexadecimal Guid N value'
+}
+if ($Action -ne 'Create' -and -not [string]::IsNullOrEmpty($OwnershipToken)) {
+    throw 'OwnershipToken is only valid for Create'
+}
 
 # Create 的 duplicate/lost-claim 共享同一稳定业务退出码；stdout/stderr 仍只用于诊断。
 $ProjectAlreadyExistsExitCode = 17
@@ -319,7 +328,7 @@ switch ($Action) {
             [Console]::Error.WriteLine("Refusing to overwrite existing project: $ProjectName")
             exit $ProjectAlreadyExistsExitCode
         }
-        $ownershipToken = $null
+        $ownershipClaim = $null
         try {
             $sceneTemplate = Resolve-PackagePath $package 'bin/assets/scenes/preview.scene.json' 'Scene template' 'Leaf'
             $scriptTemplate = Resolve-PackagePath $package 'bin/assets/scripts/preview.script.json' 'Script template' 'Leaf'
@@ -335,7 +344,7 @@ switch ($Action) {
             }
 
             $claimMarker = Join-Path $projectDirectory '.kadath-create-claim'
-            $claimValue = [Guid]::NewGuid().ToString('N')
+            $claimValue = if ([string]::IsNullOrEmpty($OwnershipToken)) { [Guid]::NewGuid().ToString('N') } else { $OwnershipToken }
             $claimStream = $null
             try {
                 # 关键 ownership 边界：Windows pwsh 可让并发 New-Item 同时返回；CreateNew marker 才是最终目录内的原子排他 claim。
@@ -343,7 +352,7 @@ switch ($Action) {
                 $claimBytes = [Text.Encoding]::UTF8.GetBytes($claimValue)
                 $claimStream.Write($claimBytes, 0, $claimBytes.Length)
                 $claimStream.Flush($true)
-                $ownershipToken = [pscustomobject]@{
+                $ownershipClaim = [pscustomobject]@{
                     Directory = $claimedProjectDirectory
                     MarkerPath = $claimMarker
                     Value = $claimValue
@@ -376,27 +385,30 @@ switch ($Action) {
             Write-Output "project_directory=$projectDirectory"
             Write-Output 'validation=ok'
 
-            $ownershipToken.Stream.Dispose()
-            $ownershipToken.Stream = $null
-            if (-not (Test-Path -LiteralPath $ownershipToken.MarkerPath -PathType Leaf) -or
-                [IO.File]::ReadAllText($ownershipToken.MarkerPath) -ne $ownershipToken.Value) {
+            $ownershipClaim.Stream.Dispose()
+            $ownershipClaim.Stream = $null
+            if (-not (Test-Path -LiteralPath $ownershipClaim.MarkerPath -PathType Leaf) -or
+                [IO.File]::ReadAllText($ownershipClaim.MarkerPath) -ne $ownershipClaim.Value) {
                 throw 'Project create ownership marker no longer matches this invocation'
             }
-            Remove-Item -LiteralPath $ownershipToken.MarkerPath -Force
-            $ownershipToken = $null
+            # Service 提供 token 时 ownership 跨进程移交；直接 CLI 则保持原有成功后不残留 claim 的行为。
+            if ([string]::IsNullOrEmpty($OwnershipToken)) {
+                Remove-Item -LiteralPath $ownershipClaim.MarkerPath -Force
+            }
+            $ownershipClaim = $null
         } catch {
             # 关键清理边界：只有仍匹配本次 marker 值与已校验目标路径的 ownership token 才能递归清理。
-            if ($null -ne $ownershipToken) {
-                if ($null -ne $ownershipToken.Stream) {
-                    $ownershipToken.Stream.Dispose()
-                    $ownershipToken.Stream = $null
+            if ($null -ne $ownershipClaim) {
+                if ($null -ne $ownershipClaim.Stream) {
+                    $ownershipClaim.Stream.Dispose()
+                    $ownershipClaim.Stream = $null
                 }
-                $ownedPath = [IO.Path]::GetFullPath($ownershipToken.Directory.FullName)
+                $ownedPath = [IO.Path]::GetFullPath($ownershipClaim.Directory.FullName)
                 $expectedOwnedPath = [IO.Path]::GetFullPath($projectDirectory)
                 if ($ownedPath.Equals($expectedOwnedPath, [StringComparison]::OrdinalIgnoreCase) -and
                     (Test-Path -LiteralPath $ownedPath -PathType Container) -and
-                    (Test-Path -LiteralPath $ownershipToken.MarkerPath -PathType Leaf) -and
-                    [IO.File]::ReadAllText($ownershipToken.MarkerPath) -eq $ownershipToken.Value) {
+                    (Test-Path -LiteralPath $ownershipClaim.MarkerPath -PathType Leaf) -and
+                    [IO.File]::ReadAllText($ownershipClaim.MarkerPath) -eq $ownershipClaim.Value) {
                     $ownedItem = Get-Item -LiteralPath $ownedPath -Force
                     if (($ownedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
                         Remove-Item -LiteralPath $ownedPath -Recurse -Force
