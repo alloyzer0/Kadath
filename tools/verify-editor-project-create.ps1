@@ -470,6 +470,14 @@ if ($Action -eq 'Create') {
     exit 0
 }
 
+if ($ProjectName -like 'foreign_claim_*') {
+    # 关键敌对边界：模拟 Validate 期间 ownership 被另一方接管，并留下必须保留的外部内容。
+    [IO.File]::WriteAllText((Join-Path $projectDirectory '.kadath-create-claim'), 'foreign-owner', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $projectDirectory 'foreign-owner-sentinel.txt'), 'preserve-foreign-owner', [Text.UTF8Encoding]::new($false))
+    [Console]::Error.WriteLine('injected validation failure after ownership transfer')
+    exit 1
+}
+
 if ($ProjectName -like 'rollback_*') {
     [Console]::Error.WriteLine('injected post-create validation failure')
     exit 1
@@ -481,6 +489,10 @@ exit 0
 
     $rollbackProjectName = "rollback_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
     $rollbackProjectDirectory = Join-Path $projectsRoot $rollbackProjectName
+    $foreignProjectName = "foreign_claim_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $foreignProjectDirectory = Join-Path $projectsRoot $foreignProjectName
+    $foreignClaimPath = Join-Path $foreignProjectDirectory '.kadath-create-claim'
+    $foreignSentinelPath = Join-Path $foreignProjectDirectory 'foreign-owner-sentinel.txt'
     $rollbackService = $null
     try {
         # 关键 boundary fake：Create 成功但后续 Validate 失败，只观察真实 RPC 与最终文件系统回滚。
@@ -541,6 +553,41 @@ exit 0
             throw 'Failed Create replaced the previously committed session.'
         }
 
+        # 第二个 Create 模拟 claim 在 Validate 中转移；Service 只能报错，绝不能清理 foreign owner 的目录。
+        $script:rpcStage = 'foreign_claim_project_create'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'foreign-claim-create-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $foreignProjectName }
+        })
+        $foreignFailure = Read-RpcMessage $rollbackService
+        if ([string]$foreignFailure.type -ne 'response' -or [string]$foreignFailure.id -ne 'foreign-claim-create-1' -or
+            [bool]$foreignFailure.ok -or [string]$foreignFailure.error.code -ne 'project_validation_failed') {
+            throw "foreign-claim project_validation_failed response mismatch: $($foreignFailure | ConvertTo-Json -Compress -Depth 6)"
+        }
+        if (-not (Test-Path -LiteralPath $foreignProjectDirectory -PathType Container) -or
+            -not (Test-Path -LiteralPath $foreignClaimPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $foreignSentinelPath -PathType Leaf)) {
+            throw 'Service deleted foreign-owned project content after validation failure.'
+        }
+        $foreignClaim = [IO.File]::ReadAllText($foreignClaimPath, [Text.UTF8Encoding]::new($false))
+        $foreignSentinel = [IO.File]::ReadAllText($foreignSentinelPath, [Text.UTF8Encoding]::new($false))
+        if ($foreignClaim -ne 'foreign-owner' -or $foreignSentinel -ne 'preserve-foreign-owner') {
+            throw "Service changed foreign-owned project content: claim=$foreignClaim sentinel=$foreignSentinel"
+        }
+
+        $script:rpcStage = 'foreign_claim_session_validate'
+        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'foreign-claim-validate-1'; method = 'project_validate'; params = [ordered]@{} })
+        $foreignValidatedEvent = Read-RpcMessage $rollbackService
+        $foreignValidatedResponse = Read-RpcMessage $rollbackService
+        if ([string]$foreignValidatedEvent.event -ne 'project_validated' -or -not [bool]$foreignValidatedResponse.ok -or
+            [string]$foreignValidatedResponse.result.projectName -ne $rpcProjectName) {
+            throw 'Foreign-claim Create failure replaced the previously committed session.'
+        }
+        $foreignCreatedEvents = @($script:rpcMessages | Where-Object {
+            [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'foreign-claim-create-1'
+        })
+        if ($foreignCreatedEvents.Count -ne 0) { throw 'Foreign-claim Create failure emitted project_created.' }
+
         Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-shutdown-1'; method = 'shutdown'; params = $null })
         [void](Read-RpcMessage $rollbackService)
         [void](Read-RpcMessage $rollbackService)
@@ -548,6 +595,7 @@ exit 0
 
         Write-Output 'rpc_project_create_validation_rollback=ok'
         Write-Output 'rpc_project_create_failure_preserves_session=ok'
+        Write-Output 'rpc_project_create_foreign_claim_preserved=ok'
     }
     finally {
         if ($null -ne $rollbackService) {
