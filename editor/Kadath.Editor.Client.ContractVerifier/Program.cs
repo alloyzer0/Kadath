@@ -15,6 +15,7 @@ internal static class Program
         {
             await VerifyProjectCreateClientContractAsync();
             await VerifyProjectCreateCapabilityProjectionAsync();
+            await VerifyProjectCreateWorkspaceProjectionAsync();
             await VerifyClientAndViewModelsAsync();
             await VerifyUnexpectedEofProjectionAsync();
             await VerifyExpectedShutdownProjectionAsync();
@@ -37,6 +38,7 @@ internal static class Program
             Console.WriteLine("capability_gating=ok");
             Console.WriteLine("project_create_client=ok");
             Console.WriteLine("project_create_capability=ok");
+            Console.WriteLine("project_create_workspace=ok");
             Console.WriteLine("viewmodel_state=ok");
             Console.WriteLine("verification=ok");
             return 0;
@@ -95,6 +97,244 @@ internal static class Program
             $"project_create capability projection mismatch: advertised={advertiseProjectCreate}");
         Assert(changedProperties.Contains(nameof(EditorCapabilitiesViewModel.CanCreateProject), StringComparer.Ordinal),
             "CanCreateProject did not publish a property-change notification");
+    }
+
+    private static async Task VerifyProjectCreateWorkspaceProjectionAsync()
+    {
+        await VerifyProjectCreateCapabilityGateAsync().ConfigureAwait(false);
+        await VerifyProjectCreateIdentityProjectionAsync().ConfigureAwait(false);
+        await VerifyProjectCreateBusinessFailureAsync().ConfigureAwait(false);
+        await VerifyProjectCreateCancellationAsync().ConfigureAwait(false);
+        await VerifyProjectCreateSnapshotRecoveryAsync().ConfigureAwait(false);
+    }
+
+    private static async Task VerifyProjectCreateCapabilityGateAsync()
+    {
+        var transport = new ScriptedTransport(advertiseProjectCreate: false);
+        var client = new EditorRpcClient(transport, "project-create-gate-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await workspace.ConnectAsync().ConfigureAwait(false);
+
+        try
+        {
+            _ = await workspace.CreateProjectAsync(new ProjectCreateParameters("C:/package", "fresh_project")).ConfigureAwait(false);
+            throw new InvalidOperationException("Workspace project_create unexpectedly bypassed the capability gate");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "unsupported_command") { }
+
+        Assert(transport.LastProjectCreateRequest is null,
+            "unsupported Workspace project_create crossed the transport boundary");
+    }
+
+    private static async Task VerifyProjectCreateIdentityProjectionAsync()
+    {
+        var transport = new ScriptedTransport();
+        var client = new EditorRpcClient(transport, "project-create-identity-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+
+        var observedSessionSwitch = false;
+        var snapshotsWereEmptyBeforeSession = false;
+        workspace.Project.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName != nameof(EditorProjectViewModel.Session)
+                || workspace.Project.Session?.ProjectName != "fresh_project") { return; }
+            observedSessionSwitch = true;
+            // Session 通知是同步的；观察者必须先看到旧项目的三组 snapshot 已失效。
+            snapshotsWereEmptyBeforeSession = workspace.ProjectSnapshot.Value is null
+                && workspace.HierarchySnapshot.Value is null
+                && workspace.AssetCatalogSnapshot.Value is null;
+        };
+
+        var invalidationCount = 0;
+        void CountInvalidation(object? sender, System.ComponentModel.PropertyChangedEventArgs args)
+        {
+            if (args.PropertyName != nameof(EditorSnapshotViewModel<ProjectModelSnapshot>.Value)) { return; }
+            var valueIsNull = sender switch
+            {
+                EditorSnapshotViewModel<ProjectModelSnapshot> snapshot => snapshot.Value is null,
+                EditorSnapshotViewModel<HierarchySnapshot> snapshot => snapshot.Value is null,
+                EditorSnapshotViewModel<AssetCatalogSnapshot> snapshot => snapshot.Value is null,
+                _ => false
+            };
+            if (valueIsNull) { invalidationCount++; }
+        }
+        workspace.ProjectSnapshot.PropertyChanged += CountInvalidation;
+        workspace.HierarchySnapshot.PropertyChanged += CountInvalidation;
+        workspace.AssetCatalogSnapshot.PropertyChanged += CountInvalidation;
+
+        transport.DelayNextCreateResponse(emitEventBeforeRelease: true);
+        var createTask = workspace.CreateProjectAsync(new ProjectCreateParameters("C:/package", "fresh_project"));
+        await WaitUntilAsync(() => transport.DelayedCreatePending).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Project.Session?.ProjectName == "fresh_project").ConfigureAwait(false);
+
+        Assert(observedSessionSwitch && snapshotsWereEmptyBeforeSession,
+            "project_created did not invalidate all old snapshots before switching Session in one dispatcher action");
+        Assert(invalidationCount == 3, "different project identity did not invalidate each snapshot exactly once");
+
+        // 在迟到的成功 response 前放入新 identity 的事件值；response 重放不得再次清空它们。
+        await transport.EmitActiveSnapshotEventsAsync().ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.ProjectSnapshot.Value?.ProjectName == "fresh_project"
+            && workspace.HierarchySnapshot.Value?.ProjectName == "fresh_project"
+            && workspace.AssetCatalogSnapshot.Value is not null).ConfigureAwait(false);
+        var invalidationsBeforeResponse = invalidationCount;
+
+        await transport.ReleaseDelayedCreateAsync().ConfigureAwait(false);
+        var created = await createTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        Assert(created.ProjectName == "fresh_project", "Workspace project_create returned the wrong Session");
+        Assert(invalidationCount == invalidationsBeforeResponse,
+            "same-identity success response invalidated snapshots a second time");
+
+        await transport.EmitEventAsync("project_created", created with
+        {
+            PackageRoot = "c:\\package\\.",
+            ProjectName = "FRESH_PROJECT"
+        }).ConfigureAwait(false);
+        // 后继事件是 read-loop barrier，确保重放 handler 已完整返回后再断言无副作用。
+        await transport.EmitEventAsync("project_create_replay_barrier", new { }).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.LastEventName == "project_create_replay_barrier").ConfigureAwait(false);
+        Assert(invalidationCount == invalidationsBeforeResponse
+            && workspace.ProjectSnapshot.Value is not null
+            && workspace.HierarchySnapshot.Value is not null
+            && workspace.AssetCatalogSnapshot.Value is not null,
+            "normalized same-identity project_created replay discarded current snapshots");
+    }
+
+    private static async Task VerifyProjectCreateBusinessFailureAsync()
+    {
+        var transport = new ScriptedTransport();
+        var client = new EditorRpcClient(transport, "project-create-failure-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+
+        var oldSession = workspace.Project.Session;
+        var oldProjectSnapshot = workspace.ProjectSnapshot.Value;
+        var oldHierarchySnapshot = workspace.HierarchySnapshot.Value;
+        var oldAssetSnapshot = workspace.AssetCatalogSnapshot.Value;
+        transport.FailNextCreate("invalid_project_name", "injected create validation failure");
+
+        try
+        {
+            _ = await workspace.CreateProjectAsync(new ProjectCreateParameters("C:/package", "bad/project")).ConfigureAwait(false);
+            throw new InvalidOperationException("injected project_create business failure unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "invalid_project_name") { }
+
+        Assert(ReferenceEquals(workspace.Project.Session, oldSession)
+            && ReferenceEquals(workspace.ProjectSnapshot.Value, oldProjectSnapshot)
+            && ReferenceEquals(workspace.HierarchySnapshot.Value, oldHierarchySnapshot)
+            && ReferenceEquals(workspace.AssetCatalogSnapshot.Value, oldAssetSnapshot),
+            "pre-commit project_create failure discarded the previous confirmed Session or snapshots");
+        Assert(workspace.Project.State == EditorProjectState.Failed
+            && workspace.Project.ErrorCode == "invalid_project_name",
+            "project_create business failure was not projected structurally");
+    }
+
+    private static async Task VerifyProjectCreateCancellationAsync()
+    {
+        var transport = new ScriptedTransport();
+        var client = new EditorRpcClient(transport, "project-create-cancellation-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+
+        var oldSession = workspace.Project.Session;
+        var oldProjectSnapshot = workspace.ProjectSnapshot.Value;
+        var oldHierarchySnapshot = workspace.HierarchySnapshot.Value;
+        var oldAssetSnapshot = workspace.AssetCatalogSnapshot.Value;
+        transport.DelayNextCreateResponse(emitEventBeforeRelease: false);
+        using var cancellation = new CancellationTokenSource();
+        var createTask = workspace.CreateProjectAsync(
+            new ProjectCreateParameters("C:/package", "fresh_project"), cancellation.Token);
+        await WaitUntilAsync(() => transport.DelayedCreatePending).ConfigureAwait(false);
+        cancellation.Cancel();
+
+        try
+        {
+            _ = await createTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            throw new InvalidOperationException("locally cancelled project_create unexpectedly completed");
+        }
+        catch (OperationCanceledException) { }
+
+        Assert(workspace.Project.State == EditorProjectState.OutcomeUnknown
+            && workspace.Project.ErrorCode == "project_create_outcome_unknown"
+            && workspace.Project.ErrorCode != "cancelled",
+            "local project_create cancellation was projected as a remote business failure");
+        Assert(ReferenceEquals(workspace.Project.Session, oldSession)
+            && ReferenceEquals(workspace.ProjectSnapshot.Value, oldProjectSnapshot)
+            && ReferenceEquals(workspace.HierarchySnapshot.Value, oldHierarchySnapshot)
+            && ReferenceEquals(workspace.AssetCatalogSnapshot.Value, oldAssetSnapshot),
+            "outcome-unknown cancellation fabricated a remote Session conclusion");
+
+        await transport.ReleaseDelayedCreateAsync().ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Project.Session?.ProjectName == "fresh_project"
+            && workspace.Project.State == EditorProjectState.Opened).ConfigureAwait(false);
+        Assert(workspace.Project.ErrorCode is null
+            && workspace.ProjectSnapshot.Value is null
+            && workspace.HierarchySnapshot.Value is null
+            && workspace.AssetCatalogSnapshot.Value is null,
+            "late project_created did not reconcile an outcome-unknown Create");
+        _ = await client.GetCapabilitiesAsync().ConfigureAwait(false);
+
+        // 反向竞态：事件先确认成功、随后本地取消 response 等待，不得把 Opened 倒退为 unknown。
+        transport.DelayNextCreateResponse(emitEventBeforeRelease: true);
+        using var cancellationAfterEvent = new CancellationTokenSource();
+        var eventFirstTask = workspace.CreateProjectAsync(
+            new ProjectCreateParameters("C:/package", "event_first_project"), cancellationAfterEvent.Token);
+        await WaitUntilAsync(() => transport.DelayedCreatePending
+            && workspace.Project.Session?.ProjectName == "event_first_project").ConfigureAwait(false);
+        cancellationAfterEvent.Cancel();
+        try
+        {
+            _ = await eventFirstTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            throw new InvalidOperationException("event-first project_create cancellation unexpectedly completed");
+        }
+        catch (OperationCanceledException) { }
+        Assert(workspace.Project.State == EditorProjectState.Opened
+            && workspace.Project.ErrorCode is null,
+            "local cancellation overwrote an already confirmed project_created event");
+        await transport.ReleaseDelayedCreateAsync().ConfigureAwait(false);
+    }
+
+    private static async Task VerifyProjectCreateSnapshotRecoveryAsync()
+    {
+        var transport = new ScriptedTransport();
+        var client = new EditorRpcClient(transport, "project-create-snapshot-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+        transport.FailNextHierarchySnapshot("snapshot_injected", "injected hierarchy refresh failure");
+
+        var created = await workspace.CreateProjectAsync(
+            new ProjectCreateParameters("C:/package", "fresh_project")).ConfigureAwait(false);
+
+        Assert(created.ProjectName == "fresh_project"
+            && workspace.Project.Session?.ProjectName == "fresh_project"
+            && workspace.Project.State == EditorProjectState.Opened,
+            "post-commit snapshot failure rolled back the confirmed created Session");
+        Assert(workspace.Project.ErrorCode is null
+            && workspace.Project.ErrorCode != "project_create_failed",
+            "post-commit snapshot failure was projected as project_create failure");
+        Assert(workspace.ProjectSnapshot.Value is null
+            && workspace.HierarchySnapshot.Value is null
+            && workspace.AssetCatalogSnapshot.Value is null,
+            "snapshot-group refresh failure retained a mixed-project snapshot set");
+        Assert(workspace.ProjectSnapshot.State == EditorSnapshotState.Empty
+            && workspace.HierarchySnapshot.State == EditorSnapshotState.Failed
+            && workspace.HierarchySnapshot.ErrorCode == "snapshot_injected"
+            && workspace.AssetCatalogSnapshot.State == EditorSnapshotState.Empty,
+            "snapshot-group refresh failure did not retain one structured failure marker");
+
+        await workspace.RefreshSnapshotsAsync("fresh_project").ConfigureAwait(false);
+        Assert(workspace.ProjectSnapshot is { State: EditorSnapshotState.Ready, Value.ProjectName: "fresh_project" }
+            && workspace.HierarchySnapshot is { State: EditorSnapshotState.Ready, Value.ProjectName: "fresh_project" }
+            && workspace.AssetCatalogSnapshot is { State: EditorSnapshotState.Ready, Value: not null },
+            "a later snapshot retry did not recover the created Session projection");
+    }
+
+    private static async Task PrepareOpenedWorkspaceAsync(EditorWorkspaceViewModel workspace)
+    {
+        await workspace.ConnectAsync().ConfigureAwait(false);
+        _ = await workspace.OpenProjectAsync(new ProjectOpenParameters("C:/package", "demo")).ConfigureAwait(false);
+        await workspace.RefreshSnapshotsAsync("demo").ConfigureAwait(false);
     }
 
     private static async Task VerifyRealServiceAsync(string serviceDll, string kadathRoot, string packageRoot, string projectName)
@@ -544,16 +784,29 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private bool _started;
     private int _disposed;
     private bool _delayNextValidation;
+    private bool _delayNextCreate;
+    private bool _emitCreateEventBeforeRelease;
+    private bool _failNextCreate;
+    private bool _failNextHierarchySnapshot;
+    private string _nextCreateErrorCode = "project_create_failed";
+    private string _nextCreateErrorMessage = "injected project create failure";
+    private string _nextHierarchyErrorCode = "snapshot_failed";
+    private string _nextHierarchyErrorMessage = "injected hierarchy snapshot failure";
+    private string _activePackageRoot = "C:/package";
+    private string _activeProjectName = "demo";
     private bool _publicationDirty;
     private bool _failNextPreviewStop;
     private readonly bool _advertiseProjectCreate;
     private TaskCompletionSource<bool>? _delayedValidationRelease;
     private TaskCompletionSource<bool>? _delayedValidationCompleted;
+    private TaskCompletionSource<bool>? _delayedCreateRelease;
+    private TaskCompletionSource<bool>? _delayedCreateCompleted;
 
     public ScriptedTransport(bool advertiseProjectCreate = true) => _advertiseProjectCreate = advertiseProjectCreate;
 
     public bool IsOpen => _started && !_stop.IsCancellationRequested;
     public bool DelayedValidationPending => _delayedValidationRelease is not null;
+    public bool DelayedCreatePending => _delayedCreateRelease is not null;
     public JsonElement? LastProjectCreateRequest { get; private set; }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
@@ -609,18 +862,33 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
             case "project_create":
                 // 记录跨 transport seam 的原始 envelope，验证 typed Client 没有夹带额外参数。
                 LastProjectCreateRequest = request.Clone();
-                var created = new ProjectSessionInfo(
-                    "C:/package",
-                    "fresh_project",
-                    "C:/package/bin/projects/fresh_project",
-                    "C:/package/bin/projects/fresh_project/scene.json",
-                    "C:/package/bin/projects/fresh_project/script.json",
-                    "C:/package/bin/projects/fresh_project/preview.json",
-                    1);
+                if (_failNextCreate)
+                {
+                    _failNextCreate = false;
+                    await SendErrorAsync(id, _nextCreateErrorCode, _nextCreateErrorMessage).ConfigureAwait(false);
+                    break;
+                }
+                var created = NewCreatedSession(request);
+                if (_delayNextCreate)
+                {
+                    _delayNextCreate = false;
+                    _delayedCreateRelease = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _delayedCreateCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _ = CompleteDelayedCreateAsync(
+                        id,
+                        created,
+                        _emitCreateEventBeforeRelease,
+                        _delayedCreateRelease.Task,
+                        _delayedCreateCompleted);
+                    break;
+                }
+                await CommitCreatedSessionAsync(created, id).ConfigureAwait(false);
                 await SendResponseAsync(id, created).ConfigureAwait(false);
                 break;
             case "project_open":
                 var opened = new ProjectSessionInfo("C:/package", "demo", "C:/package/bin/projects/demo", "C:/package/bin/projects/demo/scene.json", "C:/package/bin/projects/demo/script.json", "C:/package/bin/projects/demo/preview.json", 1);
+                _activePackageRoot = opened.PackageRoot;
+                _activeProjectName = opened.ProjectName;
                 await EmitEventAsync("project_opened", opened, id).ConfigureAwait(false);
                 await SendResponseAsync(id, opened).ConfigureAwait(false);
                 break;
@@ -638,12 +906,18 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 await SendResponseAsync(id, validation).ConfigureAwait(false);
                 break;
             case "project_snapshot":
-                var projectSnapshot = NewProjectSnapshot();
+                var projectSnapshot = NewProjectSnapshot(_activeProjectName, _activePackageRoot);
                 await EmitEventAsync("project_snapshot_created", projectSnapshot, id).ConfigureAwait(false);
                 await SendResponseAsync(id, projectSnapshot).ConfigureAwait(false);
                 break;
             case "hierarchy_snapshot":
-                var hierarchySnapshot = NewHierarchySnapshot();
+                if (_failNextHierarchySnapshot)
+                {
+                    _failNextHierarchySnapshot = false;
+                    await SendErrorAsync(id, _nextHierarchyErrorCode, _nextHierarchyErrorMessage).ConfigureAwait(false);
+                    break;
+                }
+                var hierarchySnapshot = NewHierarchySnapshot(_activeProjectName);
                 await EmitEventAsync("hierarchy_snapshot_created", hierarchySnapshot, id).ConfigureAwait(false);
                 await SendResponseAsync(id, hierarchySnapshot).ConfigureAwait(false);
                 break;
@@ -666,7 +940,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 await SendResponseAsync(id, undone).ConfigureAwait(false);
                 break;
             case "publication_snapshot":
-                var publication = NewPublicationSnapshot(_publicationDirty);
+                var publication = NewPublicationSnapshot(_publicationDirty, _activeProjectName, _activePackageRoot);
                 await EmitEventAsync("publication_snapshot_created", publication, id).ConfigureAwait(false);
                 await SendResponseAsync(id, publication).ConfigureAwait(false);
                 break;
@@ -718,6 +992,26 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
 
     public void DelayNextValidationResponse() => _delayNextValidation = true;
 
+    public void DelayNextCreateResponse(bool emitEventBeforeRelease)
+    {
+        _delayNextCreate = true;
+        _emitCreateEventBeforeRelease = emitEventBeforeRelease;
+    }
+
+    public void FailNextCreate(string code, string message)
+    {
+        _failNextCreate = true;
+        _nextCreateErrorCode = code;
+        _nextCreateErrorMessage = message;
+    }
+
+    public void FailNextHierarchySnapshot(string code, string message)
+    {
+        _failNextHierarchySnapshot = true;
+        _nextHierarchyErrorCode = code;
+        _nextHierarchyErrorMessage = message;
+    }
+
     public void FailNextPreviewStop() => _failNextPreviewStop = true;
 
     private string[] CreateCommands()
@@ -742,6 +1036,24 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         _delayedValidationCompleted = null;
     }
 
+    public async Task ReleaseDelayedCreateAsync()
+    {
+        var release = _delayedCreateRelease ?? throw new InvalidOperationException("No delayed project_create is pending.");
+        var completed = _delayedCreateCompleted ?? throw new InvalidOperationException("Delayed project_create completion is missing.");
+        release.TrySetResult(true);
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        _delayedCreateRelease = null;
+        _delayedCreateCompleted = null;
+    }
+
+    public async Task EmitActiveSnapshotEventsAsync()
+    {
+        // 只经公开 event envelope 注入状态，避免 verifier 依赖 ViewModel 内部方法。
+        await EmitEventAsync("project_snapshot_created", NewProjectSnapshot(_activeProjectName, _activePackageRoot)).ConfigureAwait(false);
+        await EmitEventAsync("hierarchy_snapshot_created", NewHierarchySnapshot(_activeProjectName)).ConfigureAwait(false);
+        await EmitEventAsync("asset_catalog_snapshot_created", NewAssetCatalogSnapshot()).ConfigureAwait(false);
+    }
+
     private async Task CompleteDelayedValidationAsync(string id, Task release, TaskCompletionSource<bool> completed)
     {
         try
@@ -754,11 +1066,61 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         finally { completed.TrySetResult(true); }
     }
 
-    private static ProjectModelSnapshot NewProjectSnapshot() => new(
+    private async Task CompleteDelayedCreateAsync(
+        string id,
+        ProjectSessionInfo session,
+        bool emitEventBeforeRelease,
+        Task release,
+        TaskCompletionSource<bool> completed)
+    {
+        try
+        {
+            if (emitEventBeforeRelease)
+            {
+                await CommitCreatedSessionAsync(session, id).ConfigureAwait(false);
+            }
+            await release.ConfigureAwait(false);
+            if (!emitEventBeforeRelease)
+            {
+                await CommitCreatedSessionAsync(session, id).ConfigureAwait(false);
+            }
+            await SendResponseAsync(id, session).ConfigureAwait(false);
+        }
+        finally { completed.TrySetResult(true); }
+    }
+
+    private async Task CommitCreatedSessionAsync(ProjectSessionInfo session, string? requestId)
+    {
+        _activePackageRoot = session.PackageRoot;
+        _activeProjectName = session.ProjectName;
+        await EmitEventAsync("project_created", session, requestId).ConfigureAwait(false);
+    }
+
+    private static ProjectSessionInfo NewCreatedSession(JsonElement request)
+    {
+        var parameters = request.GetProperty("params");
+        var packageRoot = (parameters.GetProperty("packageRoot").GetString() ?? "C:/package").TrimEnd('/', '\\');
+        var projectName = parameters.GetProperty("projectName").GetString() ?? "fresh_project";
+        var projectDirectory = $"{packageRoot}/bin/projects/{projectName}";
+        return new ProjectSessionInfo(
+            packageRoot,
+            projectName,
+            projectDirectory,
+            $"{projectDirectory}/scene.json",
+            $"{projectDirectory}/script.json",
+            $"{projectDirectory}/preview.json",
+            1);
+    }
+
+    private static ProjectModelSnapshot NewProjectSnapshot(string projectName = "demo", string packageRoot = "C:/package") => new(
         1,
-        "demo",
+        projectName,
         "0000000000000000000000000000000000000000000000000000000000000001",
-        new ProjectModelFiles("C:/package/bin/projects/demo", "C:/package/bin/projects/demo/scene.json", "C:/package/bin/projects/demo/script.json", "C:/package/bin/projects/demo/preview.json"),
+        new ProjectModelFiles(
+            $"{packageRoot}/bin/projects/{projectName}",
+            $"{packageRoot}/bin/projects/{projectName}/scene.json",
+            $"{packageRoot}/bin/projects/{projectName}/script.json",
+            $"{packageRoot}/bin/projects/{projectName}/preview.json"),
         new ProjectModelScene(1, [3d, 4d]),
         new ProjectModelScript(1, [3d, 4d], [1d, 0d]),
         new ProjectModelPreview(1));
@@ -773,10 +1135,10 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         undoDepth,
         NewProjectSnapshot(),
         NewHierarchySnapshot());
-    private static HierarchySnapshot NewHierarchySnapshot() => new(
+    private static HierarchySnapshot NewHierarchySnapshot(string projectName = "demo") => new(
         1,
         1,
-        "demo",
+        projectName,
         [
             new HierarchyNode("scene", null, "Scene", "SceneDocument", Props(("SchemaVersion", 1))),
             new HierarchyNode("scene.player", "scene", "Player", "Sprite", Props(("Position", "0, 0"))),
@@ -809,13 +1171,26 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         return new AssetCatalogSnapshot(1, "bin/assets", items.Length, items);
     }
 
-    private static PublicationSnapshot NewPublicationSnapshot(bool sourceDirty)
+    private static PublicationSnapshot NewPublicationSnapshot(
+        bool sourceDirty,
+        string projectName = "demo",
+        string packageRoot = "C:/package")
     {
         const string source = "0000000000000000000000000000000000000000000000000000000000000001";
         const string artifact = "0000000000000000000000000000000000000000000000000000000000000002";
         var scene = new PublicationTargetSnapshot("Scene", sourceDirty ? "source_dirty" : "current", sourceDirty ? new string('3', 64) : source, source, artifact, artifact, 128, 128);
         var script = new PublicationTargetSnapshot("Script", "current", source, source, artifact, artifact, 96, 96);
-        return new PublicationSnapshot(EditorSnapshotVersions.Publication, "demo", "debug", "debug", "C:/package/bin/projects/demo/.kadath/derived", "C:/package/bin/projects/demo/.kadath/derived/.live-bake.manifest.json", sourceDirty ? "source_dirty" : "current", true, scene, script);
+        return new PublicationSnapshot(
+            EditorSnapshotVersions.Publication,
+            projectName,
+            "debug",
+            "debug",
+            $"{packageRoot}/bin/projects/{projectName}/.kadath/derived",
+            $"{packageRoot}/bin/projects/{projectName}/.kadath/derived/.live-bake.manifest.json",
+            sourceDirty ? "source_dirty" : "current",
+            true,
+            scene,
+            script);
     }
 
     private static Dictionary<string, JsonElement> Props(params (string Key, object Value)[] values) =>

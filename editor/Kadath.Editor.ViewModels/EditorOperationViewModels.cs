@@ -2,7 +2,7 @@ using Kadath.Editor.Protocol;
 
 namespace Kadath.Editor.ViewModels;
 
-public enum EditorProjectState { Closed, Opening, Opened, Validating, Valid, Invalid, Failed }
+public enum EditorProjectState { Closed, Opening, Opened, Validating, Valid, Invalid, Failed, Creating, OutcomeUnknown }
 public enum EditorBakeState { Idle, Running, Succeeded, Failed }
 public enum EditorWatchState { Stopped, Starting, Watching, Stopping, Failed }
 public enum EditorPreviewState { Stopped, Starting, Running, Stopping, Failed }
@@ -26,6 +26,22 @@ public sealed class EditorProjectViewModel : ObservableObject
     public IReadOnlyList<string> Diagnostics { get => _diagnostics; private set => SetProperty(ref _diagnostics, value); }
     public string? ErrorCode { get => _errorCode; private set => SetProperty(ref _errorCode, value); }
     public string? ErrorMessage { get => _errorMessage; private set => SetProperty(ref _errorMessage, value); }
+
+    internal void BeginCreate()
+    {
+        // Create 提交前保留最近确认的 Session；只有成功事件/响应才能替换它。
+        State = EditorProjectState.Creating;
+        ClearError();
+    }
+
+    internal void ApplyCreateOutcomeUnknown()
+    {
+        // project_created 可能先于本地取消 catch 到达，已确认的 Opened 状态不得倒退。
+        if (State != EditorProjectState.Creating) { return; }
+        ErrorCode = "project_create_outcome_unknown";
+        ErrorMessage = "The local project_create wait was cancelled; the remote outcome is still unknown.";
+        State = EditorProjectState.OutcomeUnknown;
+    }
 
     internal void BeginOpen()
     {

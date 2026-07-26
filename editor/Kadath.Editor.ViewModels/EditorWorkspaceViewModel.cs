@@ -87,6 +87,34 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         }
     }
 
+    public async Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanCreateProject, "project_create");
+        await _dispatcher.InvokeAsync(Project.BeginCreate).ConfigureAwait(false);
+
+        ProjectSessionInfo result;
+        try
+        {
+            result = await Client.CreateProjectAsync(parameters, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // 本地停止等待不等于 Service 已拒绝；保留旧 Session，等待迟到事件对账。
+            await _dispatcher.InvokeAsync(Project.ApplyCreateOutcomeUnknown).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            await ApplyProjectExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+
+        await _dispatcher.InvokeAsync(() => ApplyCreatedSession(result)).ConfigureAwait(false);
+        // Create 已由成功 response 确认；后续 snapshot 失败只影响新 Session 的读取状态。
+        await RefreshCreatedSnapshotGroupAsync(result.ProjectName, cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
     public async Task<ProjectValidateResult> ValidateProjectAsync(string? projectName = null, CancellationToken cancellationToken = default)
     {
         EnsureCommand(Capabilities.CanValidateProject, "project_validate");
@@ -400,6 +428,9 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             case "project_opened":
                 if (TryRead(notification.Data, out ProjectSessionInfo? session) && session is not null) { Project.ApplyOpened(session); Authoring.Reset(); Publication.Reset(); }
                 break;
+            case "project_created":
+                if (TryRead(notification.Data, out ProjectSessionInfo? createdSession) && createdSession is not null) { ApplyCreatedSession(createdSession); }
+                break;
             case "project_validated":
                 if (TryRead(notification.Data, out ProjectValidateResult? validation) && validation is not null) { Project.ApplyValidation(validation); }
                 break;
@@ -542,6 +573,89 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         return bool.TryParse(value.ToString(), out var parsed) ? parsed : null;
     }
 
+    private void ApplyCreatedSession(ProjectSessionInfo session)
+    {
+        var sameIdentity = HasSameProjectIdentity(Project.Session, session);
+        if (sameIdentity && Project.State is not (EditorProjectState.Creating or EditorProjectState.OutcomeUnknown))
+        {
+            // event/response 与规范化重放共用此落点；已确认 identity 不重复清空，也不降级 Valid 状态。
+            return;
+        }
+
+        if (!sameIdentity)
+        {
+            // PropertyChanged 同步触发：必须先清旧 snapshot，Session 观察者才不会读到跨项目混合状态。
+            ProjectSnapshot.Invalidate();
+            HierarchySnapshot.Invalidate();
+            AssetCatalogSnapshot.Invalidate();
+            Authoring.Reset();
+            Publication.Reset();
+        }
+        Project.ApplyOpened(session);
+    }
+
+    private static bool HasSameProjectIdentity(ProjectSessionInfo? current, ProjectSessionInfo candidate)
+    {
+        if (current is null) { return false; }
+        return string.Equals(NormalizePackageRoot(current.PackageRoot), NormalizePackageRoot(candidate.PackageRoot), StringComparison.OrdinalIgnoreCase)
+            && string.Equals(current.ProjectName, candidate.ProjectName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizePackageRoot(string packageRoot) =>
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath(packageRoot));
+
+    private async Task RefreshCreatedSnapshotGroupAsync(string projectName, CancellationToken cancellationToken)
+    {
+        try { _ = await RefreshProjectSnapshotAsync(projectName, cancellationToken).ConfigureAwait(false); }
+        catch (Exception exception)
+        {
+            await ApplyCreatedSnapshotGroupFailureAsync(
+                exception,
+                (code, message) => ProjectSnapshot.InvalidateFailure(code, message)).ConfigureAwait(false);
+            return;
+        }
+
+        try { _ = await RefreshHierarchySnapshotAsync(projectName, cancellationToken).ConfigureAwait(false); }
+        catch (Exception exception)
+        {
+            await ApplyCreatedSnapshotGroupFailureAsync(
+                exception,
+                (code, message) => HierarchySnapshot.InvalidateFailure(code, message)).ConfigureAwait(false);
+            return;
+        }
+
+        try { _ = await RefreshAssetCatalogSnapshotAsync(projectName, cancellationToken).ConfigureAwait(false); }
+        catch (Exception exception)
+        {
+            await ApplyCreatedSnapshotGroupFailureAsync(
+                exception,
+                (code, message) => AssetCatalogSnapshot.InvalidateFailure(code, message)).ConfigureAwait(false);
+            return;
+        }
+
+        await RefreshPublicationAfterOperationAsync(projectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task ApplyCreatedSnapshotGroupFailureAsync(Exception exception, Action<string, string> applyFailure)
+    {
+        var (code, message) = ReadSnapshotFailure(exception);
+        await _dispatcher.InvokeAsync(() =>
+        {
+            // 禁止保留“前两项是新项目、后一项失败”的部分快照集合。
+            ProjectSnapshot.Invalidate();
+            HierarchySnapshot.Invalidate();
+            AssetCatalogSnapshot.Invalidate();
+            applyFailure(code, message);
+        }).ConfigureAwait(false);
+    }
+
+    private static (string Code, string Message) ReadSnapshotFailure(Exception exception) => exception switch
+    {
+        EditorRpcException rpc => (rpc.Code, rpc.Message),
+        OperationCanceledException => ("cancelled", "The snapshot request was cancelled."),
+        _ => ("snapshot_failed", exception.Message)
+    };
+
     private void EnsureCommand(bool supported, string command)
     {
         if (!supported) { throw new EditorRpcException("unsupported_command", $"Editor Service capability is not available: {command}"); }
@@ -553,12 +667,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     private async Task ApplySnapshotExceptionAsync<TSnapshot>(EditorSnapshotViewModel<TSnapshot> snapshot, Exception exception)
         where TSnapshot : class
     {
-        var (code, message) = exception switch
-        {
-            EditorRpcException rpc => (rpc.Code, rpc.Message),
-            OperationCanceledException => ("cancelled", "The snapshot request was cancelled."),
-            _ => ("snapshot_failed", exception.Message)
-        };
+        var (code, message) = ReadSnapshotFailure(exception);
         await _dispatcher.InvokeAsync(() => snapshot.ApplyFailure(code, message)).ConfigureAwait(false);
     }
     private async Task ApplyAuthoringExceptionAsync(Exception exception)

@@ -49,5 +49,25 @@ public sealed class EditorSnapshotViewModel<TSnapshot> : ObservableObject
         ErrorMessage = message;
         RaisePropertyChanged(nameof(HasValue));
     }
+
+    internal void Invalidate()
+    {
+        // Session identity 已改变时，旧值不能再作为新项目的可见事实。
+        Value = null;
+        State = EditorSnapshotState.Empty;
+        ErrorCode = null;
+        ErrorMessage = null;
+        RaisePropertyChanged(nameof(HasValue));
+    }
+
+    internal void InvalidateFailure(string code, string message)
+    {
+        // Create 已提交但整组刷新失败：清值，同时保留实际失败位置的结构化诊断。
+        Value = null;
+        State = EditorSnapshotState.Failed;
+        ErrorCode = code;
+        ErrorMessage = message;
+        RaisePropertyChanged(nameof(HasValue));
+    }
 }
 
