@@ -252,6 +252,7 @@ internal static class Program
 
         var observedSessionSwitch = false;
         var snapshotsWereEmptyBeforeSession = false;
+        var sessionSwitchObservation = "not-observed";
         workspace.Project.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName != nameof(EditorProjectViewModel.Session)
@@ -261,9 +262,11 @@ internal static class Program
             snapshotsWereEmptyBeforeSession = workspace.ProjectSnapshot.Value is null
                 && workspace.HierarchySnapshot.Value is null
                 && workspace.AssetCatalogSnapshot.Value is null;
+            sessionSwitchObservation = $"project={workspace.ProjectSnapshot.Value?.ProjectName ?? "null"};hierarchy={workspace.HierarchySnapshot.Value?.ProjectName ?? "null"};assets={(workspace.AssetCatalogSnapshot.Value is null ? "null" : "set")}";
         };
 
         var invalidationCount = 0;
+        var snapshotObserversSawAtomicCommit = true;
         void CountInvalidation(object? sender, System.ComponentModel.PropertyChangedEventArgs args)
         {
             if (args.PropertyName != nameof(EditorSnapshotViewModel<ProjectModelSnapshot>.Value)) { return; }
@@ -274,7 +277,15 @@ internal static class Program
                 EditorSnapshotViewModel<AssetCatalogSnapshot> snapshot => snapshot.Value is null,
                 _ => false
             };
-            if (valueIsNull) { invalidationCount++; }
+            if (valueIsNull)
+            {
+                invalidationCount++;
+                // 任一 holder 的通知到达时，权威 Session 与整组 holder 都必须已完成状态提交。
+                snapshotObserversSawAtomicCommit &= workspace.Project.Session?.ProjectName == "fresh_project"
+                    && workspace.ProjectSnapshot.Value is null
+                    && workspace.HierarchySnapshot.Value is null
+                    && workspace.AssetCatalogSnapshot.Value is null;
+            }
         }
         workspace.ProjectSnapshot.PropertyChanged += CountInvalidation;
         workspace.HierarchySnapshot.PropertyChanged += CountInvalidation;
@@ -283,11 +294,13 @@ internal static class Program
         transport.DelayNextCreateResponse(emitEventBeforeRelease: true);
         var createTask = workspace.CreateProjectAsync(new ProjectCreateParameters("C:/package", "fresh_project"));
         await WaitUntilAsync(() => transport.DelayedCreatePending).ConfigureAwait(false);
-        await WaitUntilAsync(() => workspace.Project.Session?.ProjectName == "fresh_project").ConfigureAwait(false);
+        await WaitUntilAsync(() => observedSessionSwitch && invalidationCount == 3).ConfigureAwait(false);
 
         Assert(observedSessionSwitch && snapshotsWereEmptyBeforeSession,
-            "project_created did not invalidate all old snapshots before switching Session in one dispatcher action");
+            $"project_created did not invalidate all old snapshots before switching Session in one dispatcher action: {sessionSwitchObservation}");
         Assert(invalidationCount == 3, "different project identity did not invalidate each snapshot exactly once");
+        Assert(snapshotObserversSawAtomicCommit,
+            "snapshot observer saw a partial session/snapshot identity transition");
 
         // 在迟到的成功 response 前放入新 identity 的事件值；response 重放不得再次清空它们。
         await transport.EmitActiveSnapshotEventsAsync().ConfigureAwait(false);

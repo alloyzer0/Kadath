@@ -7,6 +7,41 @@ public enum EditorBakeState { Idle, Running, Succeeded, Failed }
 public enum EditorWatchState { Stopped, Starting, Watching, Stopping, Failed }
 public enum EditorPreviewState { Stopped, Starting, Running, Stopping, Failed }
 
+public sealed class EditorProjectIdentity
+{
+    private EditorProjectIdentity(string packageRoot, string projectName)
+    {
+        PackageRoot = packageRoot;
+        ProjectName = projectName;
+    }
+
+    public string PackageRoot { get; }
+    public string ProjectName { get; }
+
+    public static EditorProjectIdentity? From(ProjectSessionInfo? session) => session is null
+        ? null
+        : new EditorProjectIdentity(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(session.PackageRoot)),
+            session.ProjectName);
+
+    public static bool Matches(ProjectSessionInfo? left, ProjectSessionInfo? right) =>
+        Matches(From(left), From(right));
+
+    public static bool Matches(ProjectSessionInfo? left, string packageRoot, string projectName) =>
+        Matches(From(left), new EditorProjectIdentity(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(packageRoot)),
+            projectName));
+
+    public static bool Matches(EditorProjectIdentity? left, EditorProjectIdentity? right)
+    {
+        if (ReferenceEquals(left, right)) { return true; }
+        if (left is null || right is null) { return false; }
+        // Windows package identity 不区分路径大小写；项目名沿用现有 v1 session 的兼容规则。
+        return string.Equals(left.PackageRoot, right.PackageRoot, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(left.ProjectName, right.ProjectName, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
 public sealed class EditorProjectViewModel : ObservableObject
 {
     private EditorProjectState _state = EditorProjectState.Closed;
@@ -51,10 +86,27 @@ public sealed class EditorProjectViewModel : ObservableObject
 
     internal void ApplyOpened(ProjectSessionInfo session)
     {
-        Session = session;
-        State = EditorProjectState.Opened;
-        Diagnostics = Array.Empty<string>();
-        ClearError();
+        StageOpened(session);
+        PublishStagedOpened();
+    }
+
+    internal void StageOpened(ProjectSessionInfo session)
+    {
+        // Workspace 原子 session 切换先直接提交 backing state，再统一发布可观察通知。
+        _session = session;
+        _state = EditorProjectState.Opened;
+        _diagnostics = Array.Empty<string>();
+        _errorCode = null;
+        _errorMessage = null;
+    }
+
+    internal void PublishStagedOpened()
+    {
+        RaisePropertyChanged(nameof(Session));
+        RaisePropertyChanged(nameof(State));
+        RaisePropertyChanged(nameof(Diagnostics));
+        RaisePropertyChanged(nameof(ErrorCode));
+        RaisePropertyChanged(nameof(ErrorMessage));
         RaiseSessionProperties();
     }
 

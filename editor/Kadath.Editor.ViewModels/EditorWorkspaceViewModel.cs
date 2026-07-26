@@ -576,7 +576,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
 
     private void ApplyCreatedSession(ProjectSessionInfo session)
     {
-        var sameIdentity = HasSameProjectIdentity(Project.Session, session);
+        var sameIdentity = EditorProjectIdentity.Matches(Project.Session, session);
         if (sameIdentity && Project.State is not (EditorProjectState.Creating or EditorProjectState.OutcomeUnknown))
         {
             // event/response 与规范化重放共用此落点；已确认 identity 不重复清空，也不降级 Valid 状态。
@@ -585,59 +585,61 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
 
         if (!sameIdentity)
         {
-            // PropertyChanged 同步触发：必须先清旧 snapshot，Session 观察者才不会读到跨项目混合状态。
-            ProjectSnapshot.Invalidate();
-            HierarchySnapshot.Invalidate();
-            AssetCatalogSnapshot.Invalidate();
+            // 先静默提交所有 backing state；任何后续通知观察到的都是新 Session + 全空 snapshot 组。
+            StageCreatedSnapshotGroupInvalidation();
+            Project.StageOpened(session);
             Authoring.Reset();
             Publication.Reset();
+            Project.PublishStagedOpened();
+            PublishCreatedSnapshotGroupInvalidation();
+            return;
         }
         Project.ApplyOpened(session);
     }
 
-    private static bool HasSameProjectIdentity(ProjectSessionInfo? current, ProjectSessionInfo candidate)
-        => HasSameProjectIdentity(current, candidate.PackageRoot, candidate.ProjectName);
-
-    private static bool HasSameProjectIdentity(ProjectSessionInfo? current, string packageRoot, string projectName)
+    private void StageCreatedSnapshotGroupInvalidation()
     {
-        if (current is null) { return false; }
-        return string.Equals(NormalizePackageRoot(current.PackageRoot), NormalizePackageRoot(packageRoot), StringComparison.OrdinalIgnoreCase)
-            && string.Equals(current.ProjectName, projectName, StringComparison.OrdinalIgnoreCase);
+        ProjectSnapshot.StageInvalidation();
+        HierarchySnapshot.StageInvalidation();
+        AssetCatalogSnapshot.StageInvalidation();
     }
 
-    private static string NormalizePackageRoot(string packageRoot) =>
-        Path.TrimEndingDirectorySeparator(Path.GetFullPath(packageRoot));
+    private void PublishCreatedSnapshotGroupInvalidation()
+    {
+        ProjectSnapshot.PublishStagedInvalidation();
+        HierarchySnapshot.PublishStagedInvalidation();
+        AssetCatalogSnapshot.PublishStagedInvalidation();
+    }
 
     private async Task RefreshCreatedSnapshotGroupAsync(string projectName, CancellationToken cancellationToken)
     {
-        try { _ = await RefreshProjectSnapshotAsync(projectName, cancellationToken).ConfigureAwait(false); }
-        catch (Exception exception)
-        {
-            await ApplyCreatedSnapshotGroupFailureAsync(
-                exception,
-                (code, message) => ProjectSnapshot.InvalidateFailure(code, message)).ConfigureAwait(false);
-            return;
-        }
-
-        try { _ = await RefreshHierarchySnapshotAsync(projectName, cancellationToken).ConfigureAwait(false); }
-        catch (Exception exception)
-        {
-            await ApplyCreatedSnapshotGroupFailureAsync(
-                exception,
-                (code, message) => HierarchySnapshot.InvalidateFailure(code, message)).ConfigureAwait(false);
-            return;
-        }
-
-        try { _ = await RefreshAssetCatalogSnapshotAsync(projectName, cancellationToken).ConfigureAwait(false); }
-        catch (Exception exception)
-        {
-            await ApplyCreatedSnapshotGroupFailureAsync(
-                exception,
-                (code, message) => AssetCatalogSnapshot.InvalidateFailure(code, message)).ConfigureAwait(false);
-            return;
-        }
+        if (!await TryRefreshCreatedSnapshotAsync(
+            () => RefreshProjectSnapshotAsync(projectName, cancellationToken),
+            (code, message) => ProjectSnapshot.InvalidateFailure(code, message)).ConfigureAwait(false)) { return; }
+        if (!await TryRefreshCreatedSnapshotAsync(
+            () => RefreshHierarchySnapshotAsync(projectName, cancellationToken),
+            (code, message) => HierarchySnapshot.InvalidateFailure(code, message)).ConfigureAwait(false)) { return; }
+        if (!await TryRefreshCreatedSnapshotAsync(
+            () => RefreshAssetCatalogSnapshotAsync(projectName, cancellationToken),
+            (code, message) => AssetCatalogSnapshot.InvalidateFailure(code, message)).ConfigureAwait(false)) { return; }
 
         await RefreshPublicationAfterOperationAsync(projectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<bool> TryRefreshCreatedSnapshotAsync<TSnapshot>(
+        Func<Task<TSnapshot>> refresh,
+        Action<string, string> applyFailure)
+    {
+        try
+        {
+            _ = await refresh().ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            await ApplyCreatedSnapshotGroupFailureAsync(exception, applyFailure).ConfigureAwait(false);
+            return false;
+        }
     }
 
     private async Task ApplyCreatedSnapshotGroupFailureAsync(Exception exception, Action<string, string> applyFailure)
@@ -646,10 +648,9 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         await _dispatcher.InvokeAsync(() =>
         {
             // 禁止保留“前两项是新项目、后一项失败”的部分快照集合。
-            ProjectSnapshot.Invalidate();
-            HierarchySnapshot.Invalidate();
-            AssetCatalogSnapshot.Invalidate();
+            StageCreatedSnapshotGroupInvalidation();
             applyFailure(code, message);
+            PublishCreatedSnapshotGroupInvalidation();
         }).ConfigureAwait(false);
     }
 
@@ -684,7 +685,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             // BeginCreate 先进入 Creating；只有目标 identity 的 project_created 已落为 Opened 才能抑制伪回滚。
             if (Project.State == EditorProjectState.Opened
-                && HasSameProjectIdentity(Project.Session, parameters.PackageRoot, parameters.ProjectName))
+                && EditorProjectIdentity.Matches(Project.Session, parameters.PackageRoot, parameters.ProjectName))
             {
                 return;
             }

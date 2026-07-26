@@ -52,11 +52,25 @@ public sealed class EditorSnapshotViewModel<TSnapshot> : ObservableObject
 
     internal void Invalidate()
     {
-        // Session identity 已改变时，旧值不能再作为新项目的可见事实。
-        Value = null;
-        State = EditorSnapshotState.Empty;
-        ErrorCode = null;
-        ErrorMessage = null;
+        StageInvalidation();
+        PublishStagedInvalidation();
+    }
+
+    internal void StageInvalidation()
+    {
+        // Session identity 已改变时，先静默提交 backing state，避免观察者看到半组旧 snapshot。
+        _value = null;
+        _state = EditorSnapshotState.Empty;
+        _errorCode = null;
+        _errorMessage = null;
+    }
+
+    internal void PublishStagedInvalidation()
+    {
+        RaisePropertyChanged(nameof(Value));
+        RaisePropertyChanged(nameof(State));
+        RaisePropertyChanged(nameof(ErrorCode));
+        RaisePropertyChanged(nameof(ErrorMessage));
         RaisePropertyChanged(nameof(HasValue));
     }
 

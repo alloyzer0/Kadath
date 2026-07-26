@@ -21,7 +21,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private readonly Dictionary<string, HierarchyNode> _hierarchyItemsByLabel = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AssetCatalogItem> _assetItemsByLabel = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _lifetime = new();
-    private ProjectProjectionIdentity? _projectIdentity;
+    private EditorProjectIdentity? _projectIdentity;
     private int _disposed;
     private readonly TimeSpan _connectionTimeout;
     private string _packageRoot;
@@ -45,7 +45,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace = workspace ?? throw new ArgumentNullException(nameof(workspace));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _packageRoot = defaultPackageRoot;
-        _projectIdentity = ProjectProjectionIdentity.From(_workspace.Project.Session);
+        _projectIdentity = EditorProjectIdentity.From(_workspace.Project.Session);
         _connectionTimeout = connectionTimeout ?? TimeSpan.FromSeconds(10);
         _workspace.PropertyChanged += OnWorkspacePropertyChanged;
         _workspace.Project.PropertyChanged += OnProjectPropertyChanged;
@@ -400,8 +400,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
     private void ReconcileProjectIdentity()
     {
-        var next = ProjectProjectionIdentity.From(_workspace.Project.Session);
-        if (ProjectProjectionIdentity.Equals(_projectIdentity, next)) { return; }
+        var next = EditorProjectIdentity.From(_workspace.Project.Session);
+        if (EditorProjectIdentity.Matches(_projectIdentity, next)) { return; }
         _projectIdentity = next;
         InvalidateProjectProjection();
     }
@@ -512,22 +512,6 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         finally { await _workspace.DisposeAsync(); _lifetime.Dispose(); }
     }
 
-    private sealed record ProjectProjectionIdentity(string PackageRoot, string ProjectName)
-    {
-        public static ProjectProjectionIdentity? From(ProjectSessionInfo? session) => session is null
-            ? null
-            : new ProjectProjectionIdentity(
-                Path.TrimEndingDirectorySeparator(Path.GetFullPath(session.PackageRoot)),
-                session.ProjectName);
-
-        public static bool Equals(ProjectProjectionIdentity? left, ProjectProjectionIdentity? right)
-        {
-            if (ReferenceEquals(left, right)) { return true; }
-            if (left is null || right is null) { return false; }
-            return string.Equals(left.PackageRoot, right.PackageRoot, StringComparison.OrdinalIgnoreCase)
-                && string.Equals(left.ProjectName, right.ProjectName, StringComparison.OrdinalIgnoreCase);
-        }
-    }
 }
 
 public sealed record EditorEventLogItem(long Sequence, string Event, string Summary, string? RequestId, DateTimeOffset Timestamp);
