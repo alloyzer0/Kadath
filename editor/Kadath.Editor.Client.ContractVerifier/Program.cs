@@ -102,10 +102,127 @@ internal static class Program
     private static async Task VerifyProjectCreateWorkspaceProjectionAsync()
     {
         await VerifyProjectCreateCapabilityGateAsync().ConfigureAwait(false);
+        await VerifyProjectCreateActivityGateAsync().ConfigureAwait(false);
         await VerifyProjectCreateIdentityProjectionAsync().ConfigureAwait(false);
         await VerifyProjectCreateBusinessFailureAsync().ConfigureAwait(false);
+        await VerifyProjectCreateConfirmedConnectionFailuresAsync().ConfigureAwait(false);
         await VerifyProjectCreateCancellationAsync().ConfigureAwait(false);
         await VerifyProjectCreateSnapshotRecoveryAsync().ConfigureAwait(false);
+    }
+
+    private static async Task VerifyProjectCreateActivityGateAsync()
+    {
+        await VerifyProjectCreateWatchGateAsync().ConfigureAwait(false);
+        await VerifyProjectCreatePreviewGateAsync().ConfigureAwait(false);
+    }
+
+    private static async Task VerifyProjectCreateWatchGateAsync()
+    {
+        var transport = new ScriptedTransport();
+        var client = new EditorRpcClient(transport, "project-create-watch-gate-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+
+        transport.DelayNextOperationResponse("watch_start");
+        var startTask = workspace.StartWatchAsync(new WatchStartParameters("Scene", "debug", 50, 100));
+        await WaitUntilAsync(() => transport.DelayedOperationPending
+            && workspace.Watch.State == EditorWatchState.Starting).ConfigureAwait(false);
+        await AssertCreateBusyAsync(workspace, transport, "Watch.Starting").ConfigureAwait(false);
+
+        await transport.ReleaseDelayedOperationAsync().ConfigureAwait(false);
+        _ = await startTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        Assert(workspace.Watch.State == EditorWatchState.Watching, "delayed watch_start did not reach Watching");
+        await AssertCreateBusyAsync(workspace, transport, "Watch.Watching").ConfigureAwait(false);
+
+        transport.DelayNextOperationResponse("watch_stop");
+        var stopTask = workspace.StopWatchAsync();
+        await WaitUntilAsync(() => transport.DelayedOperationPending
+            && workspace.Watch.State == EditorWatchState.Stopping).ConfigureAwait(false);
+        await AssertCreateBusyAsync(workspace, transport, "Watch.Stopping").ConfigureAwait(false);
+        await transport.ReleaseDelayedOperationAsync().ConfigureAwait(false);
+        _ = await stopTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+
+        transport.FailNextRequest("watch_start", "watch_start_failed", "injected watch start failure");
+        try
+        {
+            _ = await workspace.StartWatchAsync(new WatchStartParameters("Scene", "debug", 50, 100)).ConfigureAwait(false);
+            throw new InvalidOperationException("injected watch_start failure unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "watch_start_failed") { }
+        Assert(workspace.Watch.State == EditorWatchState.Failed, "watch_start failure did not reach Failed");
+        await AssertCreateBusyAsync(workspace, transport, "Watch.Failed").ConfigureAwait(false);
+
+        // Stop 的成功 response 是重新开放 Create 的唯一 watch 侧证据。
+        _ = await workspace.StopWatchAsync().ConfigureAwait(false);
+        Assert(workspace.Watch.State == EditorWatchState.Stopped, "confirmed watch_stop did not restore Stopped");
+        var created = await workspace.CreateProjectAsync(
+            new ProjectCreateParameters("C:/package", "watch_stopped_project")).ConfigureAwait(false);
+        Assert(created.ProjectName == "watch_stopped_project" && transport.LastProjectCreateRequest is not null,
+            "confirmed watch_stop did not restore project_create");
+    }
+
+    private static async Task VerifyProjectCreatePreviewGateAsync()
+    {
+        var transport = new ScriptedTransport();
+        var client = new EditorRpcClient(transport, "project-create-preview-gate-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+
+        transport.DelayNextOperationResponse("preview_start");
+        var startTask = workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: "demo"));
+        await WaitUntilAsync(() => transport.DelayedOperationPending
+            && workspace.Preview.State == EditorPreviewState.Starting).ConfigureAwait(false);
+        await AssertCreateBusyAsync(workspace, transport, "Preview.Starting").ConfigureAwait(false);
+
+        await transport.ReleaseDelayedOperationAsync().ConfigureAwait(false);
+        _ = await startTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Preview.State == EditorPreviewState.Running).ConfigureAwait(false);
+        await AssertCreateBusyAsync(workspace, transport, "Preview.Running").ConfigureAwait(false);
+
+        transport.DelayNextOperationResponse("preview_stop");
+        var stopTask = workspace.StopPreviewAsync();
+        await WaitUntilAsync(() => transport.DelayedOperationPending
+            && workspace.Preview.State == EditorPreviewState.Stopping).ConfigureAwait(false);
+        await AssertCreateBusyAsync(workspace, transport, "Preview.Stopping").ConfigureAwait(false);
+        await transport.ReleaseDelayedOperationAsync().ConfigureAwait(false);
+        _ = await stopTask.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+
+        _ = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: "demo")).ConfigureAwait(false);
+        await WaitUntilAsync(() => workspace.Preview.State == EditorPreviewState.Running).ConfigureAwait(false);
+        transport.FailNextPreviewStop();
+        try
+        {
+            _ = await workspace.StopPreviewAsync().ConfigureAwait(false);
+            throw new InvalidOperationException("injected preview_stop failure unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "preview_stop_failed") { }
+        Assert(workspace.Preview.State == EditorPreviewState.Failed, "preview_stop failure did not reach Failed");
+        await AssertCreateBusyAsync(workspace, transport, "Preview.Failed").ConfigureAwait(false);
+
+        // Failed 也必须等待明确 Stop 成功，不能把未知 Runtime 状态当作空闲。
+        _ = await workspace.StopPreviewAsync().ConfigureAwait(false);
+        Assert(workspace.Preview.State == EditorPreviewState.Stopped, "confirmed preview_stop did not restore Stopped");
+        var created = await workspace.CreateProjectAsync(
+            new ProjectCreateParameters("C:/package", "preview_stopped_project")).ConfigureAwait(false);
+        Assert(created.ProjectName == "preview_stopped_project" && transport.LastProjectCreateRequest is not null,
+            "confirmed preview_stop did not restore project_create");
+    }
+
+    private static async Task AssertCreateBusyAsync(
+        EditorWorkspaceViewModel workspace,
+        ScriptedTransport transport,
+        string stateName)
+    {
+        try
+        {
+            _ = await workspace.CreateProjectAsync(
+                new ProjectCreateParameters("C:/package", $"blocked_{stateName.Replace('.', '_').ToLowerInvariant()}")).ConfigureAwait(false);
+            throw new InvalidOperationException($"project_create unexpectedly ran while {stateName}");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "project_create_busy") { }
+
+        Assert(transport.LastProjectCreateRequest is null,
+            $"project_create crossed the transport boundary while {stateName}");
     }
 
     private static async Task VerifyProjectCreateCapabilityGateAsync()
@@ -228,6 +345,62 @@ internal static class Program
         Assert(workspace.Project.State == EditorProjectState.Failed
             && workspace.Project.ErrorCode == "invalid_project_name",
             "project_create business failure was not projected structurally");
+    }
+
+    private static async Task VerifyProjectCreateConfirmedConnectionFailuresAsync()
+    {
+        await VerifyProjectCreateConfirmedConnectionFailureAsync(
+            "eof",
+            "created_before_eof",
+            exception => exception is EndOfStreamException).ConfigureAwait(false);
+        await VerifyProjectCreateConfirmedConnectionFailureAsync(
+            "protocol",
+            "created_before_protocol_error",
+            exception => exception is EditorRpcException { Code: "event_sequence_violation" }).ConfigureAwait(false);
+        await VerifyProjectCreateConfirmedConnectionFailureAsync(
+            "transport",
+            "created_before_transport_error",
+            exception => exception is IOException).ConfigureAwait(false);
+    }
+
+    private static async Task VerifyProjectCreateConfirmedConnectionFailureAsync(
+        string failureKind,
+        string projectName,
+        Func<Exception, bool> isExpectedFailure)
+    {
+        var transport = new ScriptedTransport();
+        var client = new EditorRpcClient(transport, $"project-create-{failureKind}-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+
+        var projectedFailure = false;
+        workspace.Project.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(EditorProjectViewModel.State)
+                && workspace.Project.State == EditorProjectState.Failed)
+            {
+                projectedFailure = true;
+            }
+        };
+        transport.FailNextCreateResponseAfterEvent(failureKind);
+
+        Exception? observed = null;
+        try
+        {
+            _ = await workspace.CreateProjectAsync(
+                new ProjectCreateParameters("C:/package", projectName)).WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        }
+        catch (Exception exception) { observed = exception; }
+
+        Assert(observed is not null && isExpectedFailure(observed),
+            $"event-first project_create did not preserve the real {failureKind} exception: {observed?.GetType().Name ?? "none"}");
+        Assert(workspace.Project.Session?.ProjectName == projectName
+            && workspace.Project.State == EditorProjectState.Opened
+            && workspace.Project.ErrorCode is null
+            && !projectedFailure,
+            $"event-first {failureKind} failure claimed the confirmed created Session was rolled back");
+        Assert(transport.LastProjectCreateRequest is not null,
+            $"event-first {failureKind} scenario did not cross the project_create transport seam");
     }
 
     private static async Task VerifyProjectCreateCancellationAsync()
@@ -777,6 +950,7 @@ internal static class Program
 /// </summary>
 internal sealed class ScriptedTransport : IEditorRpcTransport
 {
+    private const string InjectedTransportFailureLine = "\0injected_transport_read_failure";
     private readonly Channel<string> _toClient = Channel.CreateUnbounded<string>();
     private readonly Channel<string> _toServer = Channel.CreateUnbounded<string>();
     private readonly CancellationTokenSource _stop = new();
@@ -785,8 +959,13 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private int _disposed;
     private bool _delayNextValidation;
     private bool _delayNextCreate;
+    private string? _delayNextOperation;
+    private string? _failNextMethod;
+    private string _nextMethodErrorCode = "operation_failed";
+    private string _nextMethodErrorMessage = "injected operation failure";
     private bool _emitCreateEventBeforeRelease;
     private bool _failNextCreate;
+    private string? _nextCreateResponseFailure;
     private bool _failNextHierarchySnapshot;
     private string _nextCreateErrorCode = "project_create_failed";
     private string _nextCreateErrorMessage = "injected project create failure";
@@ -801,12 +980,15 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private TaskCompletionSource<bool>? _delayedValidationCompleted;
     private TaskCompletionSource<bool>? _delayedCreateRelease;
     private TaskCompletionSource<bool>? _delayedCreateCompleted;
+    private TaskCompletionSource<bool>? _delayedOperationRelease;
+    private TaskCompletionSource<bool>? _delayedOperationCompleted;
 
     public ScriptedTransport(bool advertiseProjectCreate = true) => _advertiseProjectCreate = advertiseProjectCreate;
 
     public bool IsOpen => _started && !_stop.IsCancellationRequested;
     public bool DelayedValidationPending => _delayedValidationRelease is not null;
     public bool DelayedCreatePending => _delayedCreateRelease is not null;
+    public bool DelayedOperationPending => _delayedOperationRelease is not null;
     public JsonElement? LastProjectCreateRequest { get; private set; }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
@@ -838,7 +1020,15 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
 
     private async ValueTask<string?> ReadLineCoreAsync(CancellationToken cancellationToken)
     {
-        try { return await _toClient.Reader.ReadAsync(cancellationToken).ConfigureAwait(false); }
+        try
+        {
+            var line = await _toClient.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            if (line == InjectedTransportFailureLine)
+            {
+                throw new IOException("Injected scripted transport read failure.");
+            }
+            return line;
+        }
         catch (ChannelClosedException) { return null; }
         catch (OperationCanceledException) { return null; }
     }
@@ -847,6 +1037,12 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     {
         var id = request.GetProperty("id").GetString() ?? "";
         var method = request.GetProperty("method").GetString() ?? "";
+        if (string.Equals(method, _failNextMethod, StringComparison.Ordinal))
+        {
+            _failNextMethod = null;
+            await SendErrorAsync(id, _nextMethodErrorCode, _nextMethodErrorMessage).ConfigureAwait(false);
+            return;
+        }
         switch (method)
         {
             case "get_capabilities":
@@ -869,6 +1065,14 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                     break;
                 }
                 var created = NewCreatedSession(request);
+                if (_nextCreateResponseFailure is { } responseFailure)
+                {
+                    _nextCreateResponseFailure = null;
+                    await CommitCreatedSessionAsync(created, id).ConfigureAwait(false);
+                    // FIFO 保证 project_created handler 完整返回后，read loop 才观察终止异常。
+                    await FailCreateResponseAsync(responseFailure).ConfigureAwait(false);
+                    break;
+                }
                 if (_delayNextCreate)
                 {
                     _delayNextCreate = false;
@@ -956,16 +1160,32 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 break;
             case "watch_start":
                 var watch = new EditorWatchResult("watching", "demo", "Scene", "debug", NewBakeResult());
+                if (DelayOperationIfRequested(method, async () =>
+                {
+                    await EmitEventAsync("watch_started", watch, id).ConfigureAwait(false);
+                    await SendResponseAsync(id, watch).ConfigureAwait(false);
+                })) { break; }
                 await EmitEventAsync("watch_started", watch, id).ConfigureAwait(false);
                 await SendResponseAsync(id, watch).ConfigureAwait(false);
                 break;
             case "watch_stop":
                 var watchStopped = new EditorWatchResult("stopped", "demo", "Scene", "debug", null);
+                if (DelayOperationIfRequested(method, async () =>
+                {
+                    await EmitEventAsync("watch_stopped", watchStopped, id).ConfigureAwait(false);
+                    await SendResponseAsync(id, watchStopped).ConfigureAwait(false);
+                })) { break; }
                 await EmitEventAsync("watch_stopped", watchStopped, id).ConfigureAwait(false);
                 await SendResponseAsync(id, watchStopped).ConfigureAwait(false);
                 break;
             case "preview_start":
                 var surface = new PreviewSurfaceDescriptor(PreviewSurfaceModes.ExternalWindow, "native-window", 1234, "KadathRuntimeWindow", null, null, null, null);
+                if (DelayOperationIfRequested(method, async () =>
+                {
+                    await EmitEventAsync("preview_surface_created", surface).ConfigureAwait(false);
+                    await EmitEventAsync("preview_status", new { @event = "launcher_status", name = "runtime_pid", value = 1234 }).ConfigureAwait(false);
+                    await SendResponseAsync(id, new PreviewStartResult("starting", PreviewSurfaceModes.ExternalWindow)).ConfigureAwait(false);
+                })) { break; }
                 await EmitEventAsync("preview_surface_created", surface).ConfigureAwait(false);
                 await EmitEventAsync("preview_status", new { @event = "launcher_status", name = "runtime_pid", value = 1234 }).ConfigureAwait(false);
                 await SendResponseAsync(id, new PreviewStartResult("starting", PreviewSurfaceModes.ExternalWindow)).ConfigureAwait(false);
@@ -977,6 +1197,11 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                     await SendErrorAsync(id, "preview_stop_failed", "injected preview stop failure").ConfigureAwait(false);
                     break;
                 }
+                if (DelayOperationIfRequested(method, async () =>
+                {
+                    await EmitEventAsync("preview_stopped", new { exitCode = 0, requested = true }).ConfigureAwait(false);
+                    await SendResponseAsync(id, new PreviewStopResult("stopped")).ConfigureAwait(false);
+                })) { break; }
                 await EmitEventAsync("preview_stopped", new { exitCode = 0, requested = true }).ConfigureAwait(false);
                 await SendResponseAsync(id, new PreviewStopResult("stopped")).ConfigureAwait(false);
                 break;
@@ -992,6 +1217,22 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
 
     public void DelayNextValidationResponse() => _delayNextValidation = true;
 
+    public void DelayNextOperationResponse(string method)
+    {
+        if (_delayNextOperation is not null || _delayedOperationRelease is not null)
+        {
+            throw new InvalidOperationException("A delayed operation is already configured.");
+        }
+        _delayNextOperation = method;
+    }
+
+    public void FailNextRequest(string method, string code, string message)
+    {
+        _failNextMethod = method;
+        _nextMethodErrorCode = code;
+        _nextMethodErrorMessage = message;
+    }
+
     public void DelayNextCreateResponse(bool emitEventBeforeRelease)
     {
         _delayNextCreate = true;
@@ -1003,6 +1244,15 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         _failNextCreate = true;
         _nextCreateErrorCode = code;
         _nextCreateErrorMessage = message;
+    }
+
+    public void FailNextCreateResponseAfterEvent(string failureKind)
+    {
+        if (failureKind is not ("eof" or "protocol" or "transport"))
+        {
+            throw new ArgumentOutOfRangeException(nameof(failureKind), failureKind, "Unknown scripted create response failure.");
+        }
+        _nextCreateResponseFailure = failureKind;
     }
 
     public void FailNextHierarchySnapshot(string code, string message)
@@ -1046,6 +1296,16 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         _delayedCreateCompleted = null;
     }
 
+    public async Task ReleaseDelayedOperationAsync()
+    {
+        var release = _delayedOperationRelease ?? throw new InvalidOperationException("No delayed operation is pending.");
+        var completed = _delayedOperationCompleted ?? throw new InvalidOperationException("Delayed operation completion is missing.");
+        release.TrySetResult(true);
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        _delayedOperationRelease = null;
+        _delayedOperationCompleted = null;
+    }
+
     public async Task EmitActiveSnapshotEventsAsync()
     {
         // 只经公开 event envelope 注入状态，避免 verifier 依赖 ViewModel 内部方法。
@@ -1062,6 +1322,30 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
             var validation = new ProjectValidateResult("valid", "demo", []);
             await EmitEventAsync("project_validated", validation, id).ConfigureAwait(false);
             await SendResponseAsync(id, validation).ConfigureAwait(false);
+        }
+        finally { completed.TrySetResult(true); }
+    }
+
+    private bool DelayOperationIfRequested(string method, Func<Task> complete)
+    {
+        if (!string.Equals(_delayNextOperation, method, StringComparison.Ordinal)) { return false; }
+        _delayNextOperation = null;
+        _delayedOperationRelease = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _delayedOperationCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // SendLineAsync 必须及时返回；真实 Client 才能在 response 未到时观察 Starting/Stopping。
+        _ = CompleteDelayedOperationAsync(complete, _delayedOperationRelease.Task, _delayedOperationCompleted);
+        return true;
+    }
+
+    private static async Task CompleteDelayedOperationAsync(
+        Func<Task> complete,
+        Task release,
+        TaskCompletionSource<bool> completed)
+    {
+        try
+        {
+            await release.ConfigureAwait(false);
+            await complete().ConfigureAwait(false);
         }
         finally { completed.TrySetResult(true); }
     }
@@ -1094,6 +1378,22 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         _activePackageRoot = session.PackageRoot;
         _activeProjectName = session.ProjectName;
         await EmitEventAsync("project_created", session, requestId).ConfigureAwait(false);
+    }
+
+    private async Task FailCreateResponseAsync(string failureKind)
+    {
+        switch (failureKind)
+        {
+            case "eof":
+                CompleteServerOutput();
+                break;
+            case "protocol":
+                await EmitRawEventAsync(Interlocked.Read(ref _sequence)).ConfigureAwait(false);
+                break;
+            case "transport":
+                await _toClient.Writer.WriteAsync(InjectedTransportFailureLine).ConfigureAwait(false);
+                break;
+        }
     }
 
     private static ProjectSessionInfo NewCreatedSession(JsonElement request)

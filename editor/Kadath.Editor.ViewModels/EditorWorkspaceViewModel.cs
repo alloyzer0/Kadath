@@ -90,6 +90,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public async Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, CancellationToken cancellationToken = default)
     {
         EnsureCommand(Capabilities.CanCreateProject, "project_create");
+        EnsureProjectCreateIdle();
         await _dispatcher.InvokeAsync(Project.BeginCreate).ConfigureAwait(false);
 
         ProjectSessionInfo result;
@@ -105,7 +106,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         }
         catch (Exception exception)
         {
-            await ApplyProjectExceptionAsync(exception).ConfigureAwait(false);
+            await ApplyCreateExceptionAsync(exception, parameters).ConfigureAwait(false);
             throw;
         }
 
@@ -595,10 +596,13 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     }
 
     private static bool HasSameProjectIdentity(ProjectSessionInfo? current, ProjectSessionInfo candidate)
+        => HasSameProjectIdentity(current, candidate.PackageRoot, candidate.ProjectName);
+
+    private static bool HasSameProjectIdentity(ProjectSessionInfo? current, string packageRoot, string projectName)
     {
         if (current is null) { return false; }
-        return string.Equals(NormalizePackageRoot(current.PackageRoot), NormalizePackageRoot(candidate.PackageRoot), StringComparison.OrdinalIgnoreCase)
-            && string.Equals(current.ProjectName, candidate.ProjectName, StringComparison.OrdinalIgnoreCase);
+        return string.Equals(NormalizePackageRoot(current.PackageRoot), NormalizePackageRoot(packageRoot), StringComparison.OrdinalIgnoreCase)
+            && string.Equals(current.ProjectName, projectName, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizePackageRoot(string packageRoot) =>
@@ -661,8 +665,31 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         if (!supported) { throw new EditorRpcException("unsupported_command", $"Editor Service capability is not available: {command}"); }
     }
 
+    private void EnsureProjectCreateIdle()
+    {
+        // Create 会替换活动 Session；只有两类持续运行状态都明确停止后才能发出请求。
+        if (Watch.State != EditorWatchState.Stopped || Preview.State != EditorPreviewState.Stopped)
+        {
+            throw new EditorRpcException(
+                "project_create_busy",
+                "Stop Watch and Preview before creating a project.");
+        }
+    }
+
     private async Task ApplyProjectExceptionAsync(Exception exception) =>
         await ApplyExceptionAsync(exception, "project_operation_failed", Project.ApplyFailure).ConfigureAwait(false);
+
+    private async Task ApplyCreateExceptionAsync(Exception exception, ProjectCreateParameters parameters) =>
+        await ApplyExceptionAsync(exception, "project_operation_failed", (code, message) =>
+        {
+            // BeginCreate 先进入 Creating；只有目标 identity 的 project_created 已落为 Opened 才能抑制伪回滚。
+            if (Project.State == EditorProjectState.Opened
+                && HasSameProjectIdentity(Project.Session, parameters.PackageRoot, parameters.ProjectName))
+            {
+                return;
+            }
+            Project.ApplyFailure(code, message);
+        }).ConfigureAwait(false);
 
     private async Task ApplySnapshotExceptionAsync<TSnapshot>(EditorSnapshotViewModel<TSnapshot> snapshot, Exception exception)
         where TSnapshot : class
