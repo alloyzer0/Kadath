@@ -249,6 +249,51 @@ function Read-ProjectCreateSuccessWithPreviewInterleaving(
     throw "Successful Create exceeded $MaxMessages envelopes: requestId=$RequestId"
 }
 
+function Assert-PreviewBlocksProjectCreate(
+    [Diagnostics.Process]$Process,
+    [string]$RequestId,
+    [string]$PackageRoot,
+    [string]$ProjectName,
+    [string]$ProjectDirectory,
+    [string]$Context
+) {
+    Send-RpcJson $Process ([ordered]@{
+        schemaVersion = 1; type = 'request'; id = $RequestId; method = 'project_create'
+        params = [ordered]@{ packageRoot = $PackageRoot; projectName = $ProjectName }
+    })
+    $exchange = Read-RpcResponseWithPreviewInterleaving $Process $RequestId
+    if ([bool]$exchange.Response.ok -or [string]$exchange.Response.error.code -ne 'project_create_busy') {
+        throw "$Context project_create_busy response mismatch: $($exchange.Response | ConvertTo-Json -Compress -Depth 6)"
+    }
+    $createdEvents = @($script:rpcMessages | Where-Object {
+        [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq $RequestId
+    })
+    if ($createdEvents.Count -ne 0 -or (Test-Path -LiteralPath $ProjectDirectory)) {
+        throw "$Context allowed project_created or created its target directory."
+    }
+}
+
+function Assert-PreviewCreateAfterStop(
+    [Diagnostics.Process]$Process,
+    [string]$RequestId,
+    [string]$PackageRoot,
+    [string]$ProjectName,
+    [string]$ProjectDirectory,
+    [string]$Context
+) {
+    # 两个 Preview 终态共用同一成功协议：project_created 必须先于 response，且 DTO identity 完整一致。
+    Send-RpcJson $Process ([ordered]@{
+        schemaVersion = 1; type = 'request'; id = $RequestId; method = 'project_create'
+        params = [ordered]@{ packageRoot = $PackageRoot; projectName = $ProjectName }
+    })
+    $exchange = Read-ProjectCreateSuccessWithPreviewInterleaving $Process $RequestId
+    if (-not [bool]$exchange.Response.ok -or -not (Test-Path -LiteralPath $ProjectDirectory -PathType Container)) {
+        throw "$Context Create-after-stop mismatch: $($exchange.Response | ConvertTo-Json -Compress -Depth 6)"
+    }
+    Assert-ProjectSessionInfo $exchange.Event.data $PackageRoot $ProjectName
+    Assert-ProjectSessionInfo $exchange.Response.result $PackageRoot $ProjectName
+}
+
 function Assert-NormalizedPath([string]$Actual, [string]$Expected, [string]$Name) {
     $actualFull = [IO.Path]::GetFullPath($Actual)
     $expectedFull = [IO.Path]::GetFullPath($Expected)
@@ -1167,21 +1212,7 @@ exit 0
         }
 
         $script:rpcStage = 'failed_preview_project_create_busy'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'failed-preview-create-busy-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $failedPreviewProjectName }
-        })
-        $failedPreviewBusyExchange = Read-RpcResponseWithPreviewInterleaving $rollbackService 'failed-preview-create-busy-1'
-        $failedPreviewBusy = $failedPreviewBusyExchange.Response
-        if ([bool]$failedPreviewBusy.ok -or [string]$failedPreviewBusy.error.code -ne 'project_create_busy') {
-            throw "Failed-preview project_create_busy response mismatch: $($failedPreviewBusy | ConvertTo-Json -Compress -Depth 6)"
-        }
-        $failedPreviewCreatedEvents = @($script:rpcMessages | Where-Object {
-            [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'failed-preview-create-busy-1'
-        })
-        if ($failedPreviewCreatedEvents.Count -ne 0 -or (Test-Path -LiteralPath $failedPreviewProjectDirectory)) {
-            throw 'Failed Preview allowed project_created or created its target directory.'
-        }
+        Assert-PreviewBlocksProjectCreate $rollbackService 'failed-preview-create-busy-1' $fixtureRoot $failedPreviewProjectName $failedPreviewProjectDirectory 'Failed Preview'
 
         $script:rpcStage = 'failed_preview_stop'
         Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'failed-preview-stop-1'; method = 'preview_stop'; params = $null })
@@ -1191,16 +1222,7 @@ exit 0
         }
 
         $script:rpcStage = 'failed_preview_project_create_retry'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'failed-preview-create-retry-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $failedPreviewProjectName }
-        })
-        $failedPreviewRetry = Read-ProjectCreateSuccessWithPreviewInterleaving $rollbackService 'failed-preview-create-retry-1'
-        if (-not [bool]$failedPreviewRetry.Response.ok -or -not (Test-Path -LiteralPath $failedPreviewProjectDirectory -PathType Container)) {
-            throw "Post-failed-preview-stop Create mismatch: $($failedPreviewRetry.Response | ConvertTo-Json -Compress -Depth 6)"
-        }
-        Assert-ProjectSessionInfo $failedPreviewRetry.Event.data $fixtureRoot $failedPreviewProjectName
-        Assert-ProjectSessionInfo $failedPreviewRetry.Response.result $fixtureRoot $failedPreviewProjectName
+        Assert-PreviewCreateAfterStop $rollbackService 'failed-preview-create-retry-1' $fixtureRoot $failedPreviewProjectName $failedPreviewProjectDirectory 'Failed Preview'
 
         # B：marker 让 Launcher 持续运行；Running 同样阻止 Create，Stop 的 requested=true 终态必须先于成功 response。
         if (Test-Path -LiteralPath $previewRunMarker) { throw "Preview run marker unexpectedly exists: $previewRunMarker" }
@@ -1217,21 +1239,7 @@ exit 0
             }
 
             $script:rpcStage = 'running_preview_project_create_busy'
-            Send-RpcJson $rollbackService ([ordered]@{
-                schemaVersion = 1; type = 'request'; id = 'running-preview-create-busy-1'; method = 'project_create'
-                params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $runningPreviewProjectName }
-            })
-            $runningPreviewBusyExchange = Read-RpcResponseWithPreviewInterleaving $rollbackService 'running-preview-create-busy-1'
-            $runningPreviewBusy = $runningPreviewBusyExchange.Response
-            if ([bool]$runningPreviewBusy.ok -or [string]$runningPreviewBusy.error.code -ne 'project_create_busy') {
-                throw "Running-preview project_create_busy response mismatch: $($runningPreviewBusy | ConvertTo-Json -Compress -Depth 6)"
-            }
-            $runningPreviewCreatedEvents = @($script:rpcMessages | Where-Object {
-                [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'running-preview-create-busy-1'
-            })
-            if ($runningPreviewCreatedEvents.Count -ne 0 -or (Test-Path -LiteralPath $runningPreviewProjectDirectory)) {
-                throw 'Running Preview allowed project_created or created its target directory.'
-            }
+            Assert-PreviewBlocksProjectCreate $rollbackService 'running-preview-create-busy-1' $fixtureRoot $runningPreviewProjectName $runningPreviewProjectDirectory 'Running Preview'
 
             $script:rpcStage = 'running_preview_stop'
             Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'running-preview-stop-1'; method = 'preview_stop'; params = $null })
@@ -1242,16 +1250,7 @@ exit 0
             }
 
             $script:rpcStage = 'running_preview_project_create_retry'
-            Send-RpcJson $rollbackService ([ordered]@{
-                schemaVersion = 1; type = 'request'; id = 'running-preview-create-retry-1'; method = 'project_create'
-                params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $runningPreviewProjectName }
-            })
-            $runningPreviewRetry = Read-ProjectCreateSuccessWithPreviewInterleaving $rollbackService 'running-preview-create-retry-1'
-            if (-not [bool]$runningPreviewRetry.Response.ok -or -not (Test-Path -LiteralPath $runningPreviewProjectDirectory -PathType Container)) {
-                throw "Post-running-preview-stop Create mismatch: $($runningPreviewRetry.Response | ConvertTo-Json -Compress -Depth 6)"
-            }
-            Assert-ProjectSessionInfo $runningPreviewRetry.Event.data $fixtureRoot $runningPreviewProjectName
-            Assert-ProjectSessionInfo $runningPreviewRetry.Response.result $fixtureRoot $runningPreviewProjectName
+            Assert-PreviewCreateAfterStop $rollbackService 'running-preview-create-retry-1' $fixtureRoot $runningPreviewProjectName $runningPreviewProjectDirectory 'Running Preview'
         }
         finally {
             if (Test-Path -LiteralPath $previewRunMarker -PathType Leaf) { Remove-Item -LiteralPath $previewRunMarker -Force }
