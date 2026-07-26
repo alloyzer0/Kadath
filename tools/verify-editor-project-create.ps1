@@ -147,6 +147,108 @@ function Read-RpcMessage([Diagnostics.Process]$Process, [int]$TimeoutMs = 15000)
     return $message
 }
 
+function Test-PreviewTelemetryEvent([object]$Message) {
+    return [string]$Message.type -eq 'event' -and [string]$Message.event -in @('preview_log', 'preview_status')
+}
+
+function Read-PreviewStartExchange(
+    [Diagnostics.Process]$Process,
+    [string]$RequestId,
+    [bool]$ExpectUnrequestedStop,
+    [int]$MaxMessages = 16
+) {
+    $response = $null
+    $surface = $null
+    $unrequestedStop = $null
+    for ($index = 0; $index -lt $MaxMessages; $index++) {
+        $message = Read-RpcMessage $Process
+        if (Test-PreviewTelemetryEvent $message) { continue }
+
+        if ([string]$message.type -eq 'response') {
+            if ([string]$message.id -ne $RequestId -or $null -ne $response) {
+                throw "Unexpected Preview start response: $($message | ConvertTo-Json -Compress -Depth 6)"
+            }
+            $response = $message
+        }
+        elseif ([string]$message.type -eq 'event' -and [string]$message.event -eq 'preview_surface_created') {
+            if ($null -ne $surface) { throw 'Preview start emitted duplicate preview_surface_created.' }
+            $surface = $message
+        }
+        elseif ([string]$message.type -eq 'event' -and [string]$message.event -eq 'preview_stopped') {
+            $requestedProperty = $message.data.PSObject.Properties['requested']
+            if ($null -eq $requestedProperty -or [bool]$message.data.requested) {
+                throw "Preview start emitted an unexpected requested stop: $($message | ConvertTo-Json -Compress -Depth 6)"
+            }
+            if ($null -ne $unrequestedStop) { throw 'Preview start emitted duplicate unrequested preview_stopped.' }
+            $unrequestedStop = $message
+        }
+        else {
+            throw "Unexpected envelope during Preview start: $($message | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        $hasExpectedStop = -not $ExpectUnrequestedStop -or $null -ne $unrequestedStop
+        if ($null -ne $response -and $null -ne $surface -and $hasExpectedStop) {
+            if (-not $ExpectUnrequestedStop -and $null -ne $unrequestedStop) {
+                throw 'Running Preview exited before preview_start completed.'
+            }
+            return [pscustomobject]@{ Response = $response; Surface = $surface; UnrequestedStop = $unrequestedStop }
+        }
+    }
+    throw "Preview start exchange exceeded $MaxMessages envelopes: requestId=$RequestId"
+}
+
+function Read-RpcResponseWithPreviewInterleaving(
+    [Diagnostics.Process]$Process,
+    [string]$RequestId,
+    [bool]$AllowRequestedStop = $false,
+    [int]$MaxMessages = 16
+) {
+    $requestedStop = $null
+    for ($index = 0; $index -lt $MaxMessages; $index++) {
+        $message = Read-RpcMessage $Process
+        if (Test-PreviewTelemetryEvent $message) { continue }
+
+        if ([string]$message.type -eq 'event' -and [string]$message.event -eq 'preview_stopped' -and $AllowRequestedStop) {
+            $requestedProperty = $message.data.PSObject.Properties['requested']
+            if ($null -eq $requestedProperty -or -not [bool]$message.data.requested -or $null -ne $requestedStop) {
+                throw "Unexpected preview_stopped while awaiting response: $($message | ConvertTo-Json -Compress -Depth 6)"
+            }
+            $requestedStop = $message
+            continue
+        }
+        if ([string]$message.type -eq 'response' -and [string]$message.id -eq $RequestId) {
+            return [pscustomobject]@{ Response = $message; RequestedStop = $requestedStop }
+        }
+        throw "Unexpected envelope while awaiting response $RequestId`: $($message | ConvertTo-Json -Compress -Depth 6)"
+    }
+    throw "Response exceeded $MaxMessages envelopes: requestId=$RequestId"
+}
+
+function Read-ProjectCreateSuccessWithPreviewInterleaving(
+    [Diagnostics.Process]$Process,
+    [string]$RequestId,
+    [int]$MaxMessages = 16
+) {
+    $created = $null
+    for ($index = 0; $index -lt $MaxMessages; $index++) {
+        $message = Read-RpcMessage $Process
+        if (Test-PreviewTelemetryEvent $message) { continue }
+
+        if ([string]$message.type -eq 'event' -and [string]$message.event -eq 'project_created' -and
+            [string]$message.requestId -eq $RequestId) {
+            if ($null -ne $created) { throw "Create emitted duplicate project_created: requestId=$RequestId" }
+            $created = $message
+            continue
+        }
+        if ([string]$message.type -eq 'response' -and [string]$message.id -eq $RequestId) {
+            if ($null -eq $created) { throw "project_created must precede Create response: requestId=$RequestId" }
+            return [pscustomobject]@{ Event = $created; Response = $message }
+        }
+        throw "Unexpected envelope during successful Create $RequestId`: $($message | ConvertTo-Json -Compress -Depth 6)"
+    }
+    throw "Successful Create exceeded $MaxMessages envelopes: requestId=$RequestId"
+}
+
 function Assert-NormalizedPath([string]$Actual, [string]$Expected, [string]$Name) {
     $actualFull = [IO.Path]::GetFullPath($Actual)
     $expectedFull = [IO.Path]::GetFullPath($Expected)
@@ -706,7 +808,41 @@ namespace Kadath.Editor.Verification
     $fakeKadathRoot = Join-Path $fixtureRoot 'fake-kadath-root'
     $fakeToolsRoot = Join-Path $fakeKadathRoot 'tools'
     New-Item -ItemType Directory -Path $fakeToolsRoot | Out-Null
-    [IO.File]::WriteAllText((Join-Path $fakeToolsRoot 'editor-preview.ps1'), "param()`r`n", [Text.UTF8Encoding]::new($false))
+    $fakePreview = @'
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$ConfigPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$PackageRoot,
+
+    [switch]$StructuredStatus,
+    [int]$StopAfterMilliseconds = 0,
+    [int]$ReloadScriptAfterMilliseconds = 0,
+    [switch]$WatchChanges,
+    [int]$PollIntervalMilliseconds = 100,
+    [int]$DebounceMilliseconds = 250,
+    [switch]$LiveBake,
+    [string]$BakeProfile = 'debug',
+    [string]$DerivedDirectory = ''
+)
+
+$fakeRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$runMarker = Join-Path $fakeRoot 'preview-run.marker'
+if (Test-Path -LiteralPath $runMarker -PathType Leaf) {
+    # 运行模式只在显式 preview_stop 杀死 Launcher 后退出，并产生一条可交错的 preview_status。
+    Write-Output '{"origin":"fake-preview","state":"running"}'
+    while ($true) { Start-Sleep -Milliseconds 50 }
+}
+
+# 失败模式同时产生 stdout/status 与 stderr/log，随后立即以非零退出触发 requested=false。
+Write-Output '{"origin":"fake-preview","state":"exiting"}'
+[Console]::Error.WriteLine('injected unrequested Preview exit')
+exit 23
+'@
+    [IO.File]::WriteAllText((Join-Path $fakeToolsRoot 'editor-preview.ps1'), $fakePreview, [Text.UTF8Encoding]::new($false))
+    $previewRunMarker = Join-Path $fakeKadathRoot 'preview-run.marker'
     $missingLiveBakeAdapter = Join-Path $fakeToolsRoot 'editor-live-bake.ps1'
     if (Test-Path -LiteralPath $missingLiveBakeAdapter) {
         throw "Failed-watch fixture must omit the live-bake Adapter: $missingLiveBakeAdapter"
@@ -764,6 +900,10 @@ exit 0
     $foreignSentinelPath = Join-Path $foreignProjectDirectory 'foreign-owner-sentinel.txt'
     $failedWatchProjectName = "watch_failed_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
     $failedWatchProjectDirectory = Join-Path $projectsRoot $failedWatchProjectName
+    $failedPreviewProjectName = "preview_failed_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $failedPreviewProjectDirectory = Join-Path $projectsRoot $failedPreviewProjectName
+    $runningPreviewProjectName = "preview_running_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $runningPreviewProjectDirectory = Join-Path $projectsRoot $runningPreviewProjectName
     $rollbackService = $null
     try {
         # 关键 boundary fake：Create 成功但后续 Validate 失败，只观察真实 RPC 与最终文件系统回滚。
@@ -929,6 +1069,110 @@ exit 0
         Assert-ProjectSessionInfo $failedWatchRetryEvent.data $fixtureRoot $failedWatchProjectName
         Assert-ProjectSessionInfo $failedWatchRetryResponse.result $fixtureRoot $failedWatchProjectName
 
+        # A：Launcher 非请求退出后 Preview lifecycle 必须保持 Failed，直到显式 Stop 确认收敛为 Stopped。
+        $script:rpcStage = 'failed_preview_start'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'failed-preview-start-1'; method = 'preview_start'
+            params = [ordered]@{ projectName = $failedWatchProjectName; pollIntervalMilliseconds = 50; debounceMilliseconds = 100 }
+        })
+        $failedPreviewStart = Read-PreviewStartExchange $rollbackService 'failed-preview-start-1' $true
+        if ([string]$failedPreviewStart.Response.type -ne 'response' -or -not [bool]$failedPreviewStart.Response.ok -or
+            [string]$failedPreviewStart.Response.result.state -ne 'starting' -or
+            [int]$failedPreviewStart.UnrequestedStop.data.exitCode -eq 0) {
+            throw "Unrequested Preview failure exchange mismatch: $($failedPreviewStart | ConvertTo-Json -Compress -Depth 8)"
+        }
+
+        $script:rpcStage = 'failed_preview_project_create_busy'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'failed-preview-create-busy-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $failedPreviewProjectName }
+        })
+        $failedPreviewBusyExchange = Read-RpcResponseWithPreviewInterleaving $rollbackService 'failed-preview-create-busy-1'
+        $failedPreviewBusy = $failedPreviewBusyExchange.Response
+        if ([bool]$failedPreviewBusy.ok -or [string]$failedPreviewBusy.error.code -ne 'project_create_busy') {
+            throw "Failed-preview project_create_busy response mismatch: $($failedPreviewBusy | ConvertTo-Json -Compress -Depth 6)"
+        }
+        $failedPreviewCreatedEvents = @($script:rpcMessages | Where-Object {
+            [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'failed-preview-create-busy-1'
+        })
+        if ($failedPreviewCreatedEvents.Count -ne 0 -or (Test-Path -LiteralPath $failedPreviewProjectDirectory)) {
+            throw 'Failed Preview allowed project_created or created its target directory.'
+        }
+
+        $script:rpcStage = 'failed_preview_stop'
+        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'failed-preview-stop-1'; method = 'preview_stop'; params = $null })
+        $failedPreviewStop = Read-RpcResponseWithPreviewInterleaving $rollbackService 'failed-preview-stop-1' $true
+        if (-not [bool]$failedPreviewStop.Response.ok -or [string]$failedPreviewStop.Response.result.state -ne 'stopped') {
+            throw "Failed-state preview_stop response mismatch: $($failedPreviewStop.Response | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        $script:rpcStage = 'failed_preview_project_create_retry'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'failed-preview-create-retry-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $failedPreviewProjectName }
+        })
+        $failedPreviewRetry = Read-ProjectCreateSuccessWithPreviewInterleaving $rollbackService 'failed-preview-create-retry-1'
+        if (-not [bool]$failedPreviewRetry.Response.ok -or -not (Test-Path -LiteralPath $failedPreviewProjectDirectory -PathType Container)) {
+            throw "Post-failed-preview-stop Create mismatch: $($failedPreviewRetry.Response | ConvertTo-Json -Compress -Depth 6)"
+        }
+        Assert-ProjectSessionInfo $failedPreviewRetry.Event.data $fixtureRoot $failedPreviewProjectName
+        Assert-ProjectSessionInfo $failedPreviewRetry.Response.result $fixtureRoot $failedPreviewProjectName
+
+        # B：marker 让 Launcher 持续运行；Running 同样阻止 Create，Stop 的 requested=true 终态必须先于成功 response。
+        if (Test-Path -LiteralPath $previewRunMarker) { throw "Preview run marker unexpectedly exists: $previewRunMarker" }
+        [IO.File]::WriteAllText($previewRunMarker, 'run', [Text.UTF8Encoding]::new($false))
+        try {
+            $script:rpcStage = 'running_preview_start'
+            Send-RpcJson $rollbackService ([ordered]@{
+                schemaVersion = 1; type = 'request'; id = 'running-preview-start-1'; method = 'preview_start'
+                params = [ordered]@{ projectName = $failedPreviewProjectName; pollIntervalMilliseconds = 50; debounceMilliseconds = 100 }
+            })
+            $runningPreviewStart = Read-PreviewStartExchange $rollbackService 'running-preview-start-1' $false
+            if (-not [bool]$runningPreviewStart.Response.ok -or [string]$runningPreviewStart.Response.result.state -ne 'starting') {
+                throw "Running Preview start mismatch: $($runningPreviewStart.Response | ConvertTo-Json -Compress -Depth 6)"
+            }
+
+            $script:rpcStage = 'running_preview_project_create_busy'
+            Send-RpcJson $rollbackService ([ordered]@{
+                schemaVersion = 1; type = 'request'; id = 'running-preview-create-busy-1'; method = 'project_create'
+                params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $runningPreviewProjectName }
+            })
+            $runningPreviewBusyExchange = Read-RpcResponseWithPreviewInterleaving $rollbackService 'running-preview-create-busy-1'
+            $runningPreviewBusy = $runningPreviewBusyExchange.Response
+            if ([bool]$runningPreviewBusy.ok -or [string]$runningPreviewBusy.error.code -ne 'project_create_busy') {
+                throw "Running-preview project_create_busy response mismatch: $($runningPreviewBusy | ConvertTo-Json -Compress -Depth 6)"
+            }
+            $runningPreviewCreatedEvents = @($script:rpcMessages | Where-Object {
+                [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'running-preview-create-busy-1'
+            })
+            if ($runningPreviewCreatedEvents.Count -ne 0 -or (Test-Path -LiteralPath $runningPreviewProjectDirectory)) {
+                throw 'Running Preview allowed project_created or created its target directory.'
+            }
+
+            $script:rpcStage = 'running_preview_stop'
+            Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'running-preview-stop-1'; method = 'preview_stop'; params = $null })
+            $runningPreviewStop = Read-RpcResponseWithPreviewInterleaving $rollbackService 'running-preview-stop-1' $true
+            if (-not [bool]$runningPreviewStop.Response.ok -or [string]$runningPreviewStop.Response.result.state -ne 'stopped' -or
+                $null -eq $runningPreviewStop.RequestedStop) {
+                throw "Running preview_stop did not confirm requested stop before response: $($runningPreviewStop | ConvertTo-Json -Compress -Depth 8)"
+            }
+
+            $script:rpcStage = 'running_preview_project_create_retry'
+            Send-RpcJson $rollbackService ([ordered]@{
+                schemaVersion = 1; type = 'request'; id = 'running-preview-create-retry-1'; method = 'project_create'
+                params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $runningPreviewProjectName }
+            })
+            $runningPreviewRetry = Read-ProjectCreateSuccessWithPreviewInterleaving $rollbackService 'running-preview-create-retry-1'
+            if (-not [bool]$runningPreviewRetry.Response.ok -or -not (Test-Path -LiteralPath $runningPreviewProjectDirectory -PathType Container)) {
+                throw "Post-running-preview-stop Create mismatch: $($runningPreviewRetry.Response | ConvertTo-Json -Compress -Depth 6)"
+            }
+            Assert-ProjectSessionInfo $runningPreviewRetry.Event.data $fixtureRoot $runningPreviewProjectName
+            Assert-ProjectSessionInfo $runningPreviewRetry.Response.result $fixtureRoot $runningPreviewProjectName
+        }
+        finally {
+            if (Test-Path -LiteralPath $previewRunMarker -PathType Leaf) { Remove-Item -LiteralPath $previewRunMarker -Force }
+        }
+
         Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-shutdown-1'; method = 'shutdown'; params = $null })
         [void](Read-RpcMessage $rollbackService)
         [void](Read-RpcMessage $rollbackService)
@@ -939,6 +1183,10 @@ exit 0
         Write-Output 'rpc_project_create_foreign_claim_preserved=ok'
         Write-Output 'rpc_project_create_failed_watch_gate=ok'
         Write-Output 'rpc_project_create_after_failed_watch_stop=ok'
+        Write-Output 'rpc_project_create_failed_preview_gate=ok'
+        Write-Output 'rpc_project_create_after_failed_preview_stop=ok'
+        Write-Output 'rpc_project_create_running_preview_gate=ok'
+        Write-Output 'rpc_project_create_after_running_preview_stop=ok'
     }
     finally {
         if ($null -ne $rollbackService) {
