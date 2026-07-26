@@ -327,6 +327,271 @@ try {
     $serviceDll = Join-Path $worktreeRoot 'editor/Kadath.Editor.Service/bin/Debug/net8.0/Kadath.Editor.Service.dll'
     if (-not (Test-Path -LiteralPath $serviceDll -PathType Leaf)) { throw "Editor Service is not built: $serviceDll" }
 
+    # 关键 Core seam tracer：使用 net8 reference pack 编译内存 fake，不新增 csproj 或持久化测试程序集。
+    $serviceBin = [IO.Path]::GetDirectoryName($serviceDll)
+    $coreDll = Join-Path $serviceBin 'Kadath.Editor.Core.dll'
+    $protocolDll = Join-Path $serviceBin 'Kadath.Editor.Protocol.dll'
+    foreach ($assemblyPath in @($coreDll, $protocolDll)) {
+        if (-not (Test-Path -LiteralPath $assemblyPath -PathType Leaf)) {
+            throw "Core mutation-gate dependency is not built: $assemblyPath"
+        }
+    }
+
+    $dotnetRoot = [IO.Path]::GetDirectoryName((Get-Command dotnet -ErrorAction Stop).Source)
+    $net8Pack = Get-ChildItem -LiteralPath (Join-Path $dotnetRoot 'packs/Microsoft.NETCore.App.Ref') -Directory |
+        Where-Object Name -Like '8.*' |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1
+    if ($null -eq $net8Pack) { throw 'Microsoft.NETCore.App.Ref 8.x is required for the Core mutation-gate tracer.' }
+
+    $referenceAssemblies = @(
+        Get-ChildItem -LiteralPath (Join-Path $net8Pack.FullName 'ref/net8.0') -Filter '*.dll' |
+            ForEach-Object { $_.FullName }
+    ) + @($protocolDll, $coreDll)
+    # 先加载 Protocol 再加载 Core，保证运行时解析顺序与项目依赖方向一致。
+    [void][Reflection.Assembly]::LoadFrom($protocolDll)
+    [void][Reflection.Assembly]::LoadFrom($coreDll)
+
+    $projectMutationHarnessSource = @'
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Kadath.Editor.Core;
+using Kadath.Editor.Protocol;
+
+namespace Kadath.Editor.Verification
+{
+    public sealed class BlockingProjectMutationBackend : IEditorSessionBackend
+    {
+        private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
+        private readonly TaskCompletionSource<bool> _applyEntered = NewSignal();
+        private readonly TaskCompletionSource<bool> _createEntered = NewSignal();
+        private readonly TaskCompletionSource<bool> _releaseApply = NewSignal();
+
+        public Task ApplyEntered => _applyEntered.Task;
+        public Task CreateEntered => _createEntered.Task;
+
+        // 此 tracer 不产生 Backend notification；保留公开 Interface 的完整 event surface。
+        public event Func<EditorSessionNotification, Task> Notification
+        {
+            add { }
+            remove { }
+        }
+
+        public void ReleaseApply() => _releaseApply.TrySetResult(true);
+
+        public Task<ProjectSessionInfo> OpenProjectAsync(ProjectOpenParameters parameters, CancellationToken cancellationToken) =>
+            Task.FromResult(NewProject(parameters.PackageRoot, parameters.ProjectName));
+
+        public Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, CancellationToken cancellationToken)
+        {
+            _createEntered.TrySetResult(true);
+            return Task.FromResult(NewProject(parameters.PackageRoot, parameters.ProjectName));
+        }
+
+        public async Task<AuthoringMutationResult> ApplyAuthoringAsync(
+            ProjectSessionInfo project,
+            AuthoringApplyParameters parameters,
+            CancellationToken cancellationToken)
+        {
+            _applyEntered.TrySetResult(true);
+            await _releaseApply.Task.WaitAsync(Timeout, cancellationToken).ConfigureAwait(false);
+            return NewMutation("apply", project);
+        }
+
+        public Task<AuthoringMutationResult> UndoAuthoringAsync(
+            ProjectSessionInfo project,
+            AuthoringUndoParameters parameters,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(NewMutation("undo", project));
+
+        public Task<ProjectValidateResult> ValidateProjectAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
+            Task.FromResult(new ProjectValidateResult("valid", project.ProjectName, Array.Empty<string>()));
+
+        public Task<ProjectModelSnapshot> GetProjectSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
+            Task.FromResult(NewSnapshot(project));
+
+        public Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
+            Task.FromResult(NewHierarchy(project));
+
+        public Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
+            Task.FromResult(new AssetCatalogSnapshot(1, "bin/assets", 0, Array.Empty<AssetCatalogItem>()));
+
+        public Task<PublicationSnapshot> GetPublicationSnapshotAsync(
+            ProjectSessionInfo project,
+            PublicationSnapshotQueryParameters parameters,
+            CancellationToken cancellationToken) =>
+            Task.FromException<PublicationSnapshot>(new NotSupportedException("Publication is outside this mutation-gate tracer."));
+
+        public Task<EditorBakeResult> BakeAsync(
+            ProjectSessionInfo project,
+            BakeStartParameters parameters,
+            CancellationToken cancellationToken) =>
+            Task.FromException<EditorBakeResult>(new NotSupportedException("Bake is outside this mutation-gate tracer."));
+
+        public Task<EditorWatchResult> StartWatchAsync(
+            ProjectSessionInfo project,
+            WatchStartParameters parameters,
+            CancellationToken cancellationToken) =>
+            Task.FromException<EditorWatchResult>(new NotSupportedException("Watch is outside this mutation-gate tracer."));
+
+        public Task<EditorWatchResult> StopWatchAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new EditorWatchResult("stopped", string.Empty, "Both", "debug", null));
+
+        public ValueTask DisposeAsync()
+        {
+            ReleaseApply();
+            return ValueTask.CompletedTask;
+        }
+
+        private static TaskCompletionSource<bool> NewSignal() =>
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private static ProjectSessionInfo NewProject(string packageRoot, string projectName)
+        {
+            var directory = packageRoot.TrimEnd('/', '\\') + "/bin/projects/" + projectName;
+            return new ProjectSessionInfo(
+                packageRoot,
+                projectName,
+                directory,
+                directory + "/scene.json",
+                directory + "/script.json",
+                directory + "/preview.json",
+                1);
+        }
+
+        private static ProjectModelSnapshot NewSnapshot(ProjectSessionInfo project) => new(
+            1,
+            project.ProjectName,
+            new string('1', 64),
+            new ProjectModelFiles(project.ProjectDirectory, project.ScenePath, project.ScriptPath, project.PreviewPath),
+            new ProjectModelScene(1, new[] { 0d, 0d }),
+            new ProjectModelScript(1, new[] { 0d, 0d }, new[] { 0d, 0d }),
+            new ProjectModelPreview(1));
+
+        private static HierarchySnapshot NewHierarchy(ProjectSessionInfo project) =>
+            new(1, 1, project.ProjectName, Array.Empty<HierarchyNode>());
+
+        private static AuthoringMutationResult NewMutation(string operation, ProjectSessionInfo project) => new(
+            operation,
+            "succeeded",
+            project.ProjectName,
+            new string('1', 64),
+            new string('2', 64),
+            new[] { "scene.goal.position" },
+            operation == "apply" ? 1 : 0,
+            NewSnapshot(project),
+            NewHierarchy(project));
+    }
+
+    public static class ProjectMutationGateHarness
+    {
+        private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
+
+        public static async Task VerifyApplyBeforeCreateAsync()
+        {
+            var backend = new BlockingProjectMutationBackend();
+            await using var session = new EditorSession(backend);
+            var opened = await session.OpenProjectAsync(
+                    new ProjectOpenParameters("C:/package", "A"),
+                    "open-A")
+                .WaitAsync(Timeout)
+                .ConfigureAwait(false);
+            Require(
+                opened.ProjectName == "A" &&
+                session.CurrentProject != null &&
+                session.CurrentProject.ProjectName == "A",
+                "baseline session A was not committed");
+
+            var events = new string[8];
+            var eventCount = 0;
+            session.Notification += notification =>
+            {
+                lock (events)
+                {
+                    if (eventCount >= events.Length) { throw new InvalidOperationException("event log overflow"); }
+                    events[eventCount++] = notification.Event + ":" + notification.RequestId;
+                }
+                return Task.CompletedTask;
+            };
+
+            var applyTask = session.ApplyAuthoringAsync(
+                new AuthoringApplyParameters(
+                    "A",
+                    new string('1', 64),
+                    new AuthoringPatch(SceneGoalPosition: new[] { 1d, 2d })),
+                "apply-A");
+            await backend.ApplyEntered.WaitAsync(Timeout).ConfigureAwait(false);
+
+            var createTask = session.CreateProjectAsync(
+                new ProjectCreateParameters("C:/package", "B"),
+                "create-B");
+            var createEnteredTask = backend.CreateEntered;
+            var observation = await Task.WhenAny(
+                    createEnteredTask,
+                    Task.Delay(TimeSpan.FromMilliseconds(250)))
+                .ConfigureAwait(false);
+
+            bool projectCreatedBeforeRelease;
+            lock (events)
+            {
+                projectCreatedBeforeRelease = Contains(events, eventCount, "project_created:create-B");
+            }
+            var createEnteredBeforeRelease = ReferenceEquals(observation, createEnteredTask) && createEnteredTask.IsCompleted;
+            var createCompletedBeforeRelease = createTask.IsCompleted;
+            var currentProjectBeforeRelease = session.CurrentProject == null ? "<null>" : session.CurrentProject.ProjectName;
+
+            // 先记录全部 pre-release 事实，再释放并回收任务；RED 也不能泄漏后台工作。
+            backend.ReleaseApply();
+            await Task.WhenAll(applyTask, createTask).WaitAsync(Timeout).ConfigureAwait(false);
+
+            Require(!createEnteredBeforeRelease, "Create entered Backend while Apply(A) was blocked");
+            Require(!createCompletedBeforeRelease, "Create completed while Apply(A) was blocked");
+            Require(!projectCreatedBeforeRelease, "project_created was emitted while Apply(A) was blocked");
+            Require(currentProjectBeforeRelease == "A", "CurrentProject changed before Apply(A) completed: " + currentProjectBeforeRelease);
+
+            lock (events)
+            {
+                Require(
+                    eventCount == 3 &&
+                    events[0] == "authoring_apply_started:apply-A" &&
+                    events[1] == "authoring_apply_completed:apply-A" &&
+                    events[2] == "project_created:create-B",
+                    "mutation event order mismatch: " + string.Join(",", events));
+            }
+            Require(session.CurrentProject != null && session.CurrentProject.ProjectName == "B", "Create(B) did not become the final session");
+        }
+
+        private static bool Contains(string[] values, int count, string expected)
+        {
+            for (var index = 0; index < count; index++)
+            {
+                if (values[index] == expected) { return true; }
+            }
+            return false;
+        }
+
+        private static void Require(bool condition, string message)
+        {
+            if (!condition) { throw new InvalidOperationException("project_mutation_gate=failed: " + message); }
+        }
+    }
+}
+'@
+
+    $harnessTypes = @(
+        Add-Type `
+            -TypeDefinition $projectMutationHarnessSource `
+            -Language CSharp `
+            -ReferencedAssemblies $referenceAssemblies `
+            -IgnoreWarnings `
+            -WarningAction SilentlyContinue `
+            -PassThru
+    )
+    $projectMutationHarnessType = $harnessTypes |
+        Where-Object FullName -eq 'Kadath.Editor.Verification.ProjectMutationGateHarness'
+    if ($null -eq $projectMutationHarnessType) { throw 'Project mutation-gate harness type was not compiled.' }
+
     $rpcProjectName = "rpc_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
     $rpcProjectDirectory = Join-Path $projectsRoot $rpcProjectName
     if (Test-Path -LiteralPath $rpcProjectDirectory) { throw "RPC verifier project unexpectedly exists: $rpcProjectDirectory" }
@@ -687,6 +952,17 @@ exit 0
             $rollbackService.Dispose()
         }
     }
+
+    # 既有 Adapter/RPC/rollback 全部通过后，最后执行 Core mutation serialization tracer。
+    try {
+        [void]$projectMutationHarnessType::VerifyApplyBeforeCreateAsync().GetAwaiter().GetResult()
+    }
+    catch {
+        $cause = $_.Exception
+        while ($null -ne $cause.InnerException) { $cause = $cause.InnerException }
+        throw $cause.Message
+    }
+    Write-Output 'core_project_mutation_gate=ok'
 
     Write-Output 'verification=ok'
 }

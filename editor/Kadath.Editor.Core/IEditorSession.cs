@@ -74,7 +74,8 @@ public sealed class EditorSession : IEditorSession
     ];
 
     private readonly IEditorSessionBackend _backend;
-    private readonly SemaphoreSlim _stateGate = new(1, 1);
+    // 固定锁序：Core project mutation gate → Backend 内部 gate；仅会改变项目/session 状态的四类命令进入此门。
+    private readonly SemaphoreSlim _projectMutationGate = new(1, 1);
     private ProjectSessionInfo? _currentProject;
 
     public EditorSession(IEditorSessionBackend backend)
@@ -97,19 +98,29 @@ public sealed class EditorSession : IEditorSession
 
     public async Task<ProjectSessionInfo> OpenProjectAsync(ProjectOpenParameters parameters, string? requestId, CancellationToken cancellationToken = default)
     {
-        var project = await _backend.OpenProjectAsync(parameters, cancellationToken);
-        _currentProject = project;
-        await EmitAsync("project_opened", project, requestId);
-        return project;
+        await _projectMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var project = await _backend.OpenProjectAsync(parameters, cancellationToken);
+            _currentProject = project;
+            await EmitAsync("project_opened", project, requestId);
+            return project;
+        }
+        finally { _projectMutationGate.Release(); }
     }
 
     public async Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, string? requestId, CancellationToken cancellationToken = default)
     {
-        var project = await _backend.CreateProjectAsync(parameters, cancellationToken);
-        // 关键提交点：Backend 已完成创建与再验证；先提交唯一 current session，再发布唯一成功终态。
-        _currentProject = project;
-        await EmitAsync("project_created", project, requestId);
-        return project;
+        await _projectMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var project = await _backend.CreateProjectAsync(parameters, cancellationToken);
+            // 关键提交点：Backend→current session→成功事件作为一个有序事务，不能与 Apply/Undo/Open 交错。
+            _currentProject = project;
+            await EmitAsync("project_created", project, requestId);
+            return project;
+        }
+        finally { _projectMutationGate.Release(); }
     }
 
     public async Task<ProjectValidateResult> ValidateProjectAsync(ProjectValidateParameters parameters, string? requestId, CancellationToken cancellationToken = default)
@@ -154,36 +165,47 @@ public sealed class EditorSession : IEditorSession
 
     public async Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default)
     {
-        var project = RequireProject(parameters.ProjectName);
-        await EmitAsync("authoring_apply_started", new { projectName = project.ProjectName, expectedRevision = parameters.ExpectedRevision }, requestId);
+        await _projectMutationGate.WaitAsync(cancellationToken);
         try
         {
-            var result = await _backend.ApplyAuthoringAsync(project, parameters, cancellationToken);
-            await EmitAsync("authoring_apply_completed", result, requestId);
-            return result;
+            // RequireProject 必须在 mutation gate 内读取，保证后续事件与 Backend 都绑定同一个已提交 session。
+            var project = RequireProject(parameters.ProjectName);
+            await EmitAsync("authoring_apply_started", new { projectName = project.ProjectName, expectedRevision = parameters.ExpectedRevision }, requestId);
+            try
+            {
+                var result = await _backend.ApplyAuthoringAsync(project, parameters, cancellationToken);
+                await EmitAsync("authoring_apply_completed", result, requestId);
+                return result;
+            }
+            catch (EditorOperationException exception)
+            {
+                await EmitAsync("authoring_apply_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+                throw;
+            }
         }
-        catch (EditorOperationException exception)
-        {
-            await EmitAsync("authoring_apply_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
-            throw;
-        }
+        finally { _projectMutationGate.Release(); }
     }
 
     public async Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default)
     {
-        var project = RequireProject(parameters.ProjectName);
-        await EmitAsync("authoring_undo_started", new { projectName = project.ProjectName, expectedRevision = parameters.ExpectedRevision }, requestId);
+        await _projectMutationGate.WaitAsync(cancellationToken);
         try
         {
-            var result = await _backend.UndoAuthoringAsync(project, parameters, cancellationToken);
-            await EmitAsync("authoring_undo_completed", result, requestId);
-            return result;
+            var project = RequireProject(parameters.ProjectName);
+            await EmitAsync("authoring_undo_started", new { projectName = project.ProjectName, expectedRevision = parameters.ExpectedRevision }, requestId);
+            try
+            {
+                var result = await _backend.UndoAuthoringAsync(project, parameters, cancellationToken);
+                await EmitAsync("authoring_undo_completed", result, requestId);
+                return result;
+            }
+            catch (EditorOperationException exception)
+            {
+                await EmitAsync("authoring_undo_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+                throw;
+            }
         }
-        catch (EditorOperationException exception)
-        {
-            await EmitAsync("authoring_undo_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
-            throw;
-        }
+        finally { _projectMutationGate.Release(); }
     }
     public async Task<EditorBakeResult> BakeAsync(BakeStartParameters parameters, string? requestId, CancellationToken cancellationToken = default)
     {
@@ -262,8 +284,12 @@ public sealed class EditorSession : IEditorSession
 
     public async ValueTask DisposeAsync()
     {
-        await _stateGate.WaitAsync();
+        await _projectMutationGate.WaitAsync();
         try { await _backend.DisposeAsync(); }
-        finally { _stateGate.Release(); _stateGate.Dispose(); }
+        finally
+        {
+            _projectMutationGate.Release();
+            _projectMutationGate.Dispose();
+        }
     }
 }
