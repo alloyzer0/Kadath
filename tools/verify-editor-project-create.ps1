@@ -865,12 +865,23 @@ param(
 
 $projectDirectory = Join-Path $PackageRoot "bin/projects/$ProjectName"
 if ($Action -eq 'Create') {
+    if ($ProjectName -like 'adapter_duplicate_*') {
+        # 故意输出成功字样，证明 Backend 的 duplicate 分支只认精确退出码 17。
+        Write-Output 'validation=ok'
+        exit 17
+    }
     New-Item -ItemType Directory -Path $projectDirectory -ErrorAction Stop | Out-Null
     foreach ($name in @('scene.json', 'script.json', 'preview.json')) {
         [IO.File]::WriteAllText((Join-Path $projectDirectory $name), '{"schemaVersion":1}', [Text.UTF8Encoding]::new($false))
     }
     if (-not [string]::IsNullOrWhiteSpace($OwnershipToken)) {
         [IO.File]::WriteAllText((Join-Path $projectDirectory '.kadath-create-claim'), $OwnershipToken, [Text.UTF8Encoding]::new($false))
+    }
+    if ($ProjectName -like 'adapter_nonzero_*') {
+        # 模拟 Adapter 在取得 ownership 后异常退出；Service 必须以 token 兜底清理。
+        Write-Output 'validation=ok'
+        [Console]::Error.WriteLine('injected adapter non-zero after ownership claim')
+        exit 23
     }
     exit 0
 }
@@ -898,6 +909,12 @@ exit 0
     $foreignProjectDirectory = Join-Path $projectsRoot $foreignProjectName
     $foreignClaimPath = Join-Path $foreignProjectDirectory '.kadath-create-claim'
     $foreignSentinelPath = Join-Path $foreignProjectDirectory 'foreign-owner-sentinel.txt'
+    $adapterDuplicateProjectName = "adapter_duplicate_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $adapterDuplicateProjectDirectory = Join-Path $projectsRoot $adapterDuplicateProjectName
+    $adapterNonzeroProjectName = "adapter_nonzero_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $adapterNonzeroProjectDirectory = Join-Path $projectsRoot $adapterNonzeroProjectName
+    $adapterMissingProjectName = "adapter_missing_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $adapterMissingProjectDirectory = Join-Path $projectsRoot $adapterMissingProjectName
     $failedWatchProjectName = "watch_failed_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
     $failedWatchProjectDirectory = Join-Path $projectsRoot $failedWatchProjectName
     $failedPreviewProjectName = "preview_failed_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
@@ -998,6 +1015,73 @@ exit 0
             [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'foreign-claim-create-1'
         })
         if ($foreignCreatedEvents.Count -ne 0) { throw 'Foreign-claim Create failure emitted project_created.' }
+
+        $script:rpcStage = 'adapter_duplicate_exit_mapping'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'adapter-duplicate-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $adapterDuplicateProjectName }
+        })
+        $adapterDuplicateFailure = Read-RpcMessage $rollbackService
+        if ([bool]$adapterDuplicateFailure.ok -or [string]$adapterDuplicateFailure.error.code -ne 'project_already_exists' -or
+            (Test-Path -LiteralPath $adapterDuplicateProjectDirectory)) {
+            throw "Adapter exit 17 mapping mismatch: $($adapterDuplicateFailure | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        $script:rpcStage = 'adapter_nonzero_cleanup'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'adapter-nonzero-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $adapterNonzeroProjectName }
+        })
+        $adapterNonzeroFailure = Read-RpcMessage $rollbackService
+        if ([bool]$adapterNonzeroFailure.ok -or [string]$adapterNonzeroFailure.error.code -ne 'project_create_failed') {
+            throw "Adapter non-zero mapping mismatch: $($adapterNonzeroFailure | ConvertTo-Json -Compress -Depth 6)"
+        }
+        if (Test-Path -LiteralPath $adapterNonzeroProjectDirectory) {
+            throw "Service retained an owned Adapter non-zero half-project: $adapterNonzeroProjectDirectory"
+        }
+
+        $missingTemplatePackage = Join-Path $fixtureRoot 'missing-template-package'
+        New-Item -ItemType Directory -Path $missingTemplatePackage | Out-Null
+        $script:rpcStage = 'project_template_missing'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'template-missing-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $missingTemplatePackage; projectName = 'template_missing_project' }
+        })
+        $templateMissingFailure = Read-RpcMessage $rollbackService
+        if ([bool]$templateMissingFailure.ok -or [string]$templateMissingFailure.error.code -ne 'project_template_missing' -or
+            (Test-Path -LiteralPath (Join-Path $missingTemplatePackage 'bin/projects/template_missing_project'))) {
+            throw "Template-missing mapping mismatch: $($templateMissingFailure | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        $script:rpcStage = 'invalid_project_name'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'invalid-name-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = '../escape' }
+        })
+        $invalidNameFailure = Read-RpcMessage $rollbackService
+        if ([bool]$invalidNameFailure.ok -or [string]$invalidNameFailure.error.code -ne 'invalid_project_name' -or
+            (Test-Path -LiteralPath (Join-Path $fixtureRoot 'bin/escape'))) {
+            throw "Invalid-name mapping mismatch: $($invalidNameFailure | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        $fakeAuthorPath = Join-Path $fakeToolsRoot 'editor-author.ps1'
+        $fakeAuthorBackupPath = Join-Path $fakeToolsRoot 'editor-author.ps1.verifier-backup'
+        Move-Item -LiteralPath $fakeAuthorPath -Destination $fakeAuthorBackupPath
+        try {
+            $script:rpcStage = 'adapter_missing'
+            Send-RpcJson $rollbackService ([ordered]@{
+                schemaVersion = 1; type = 'request'; id = 'adapter-missing-1'; method = 'project_create'
+                params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $adapterMissingProjectName }
+            })
+            $adapterMissingFailure = Read-RpcMessage $rollbackService
+            if ([bool]$adapterMissingFailure.ok -or [string]$adapterMissingFailure.error.code -ne 'adapter_missing' -or
+                (Test-Path -LiteralPath $adapterMissingProjectDirectory)) {
+                throw "Adapter-missing mapping mismatch: $($adapterMissingFailure | ConvertTo-Json -Compress -Depth 6)"
+            }
+        }
+        finally {
+            Move-Item -LiteralPath $fakeAuthorBackupPath -Destination $fakeAuthorPath
+        }
 
         # 关键 Failed/unknown 门禁：watch_start 在 Adapter 缺失后必须保持“未知是否仍占用”的忙状态，直到显式 watch_stop。
         $script:rpcStage = 'failed_watch_start'
@@ -1181,6 +1265,8 @@ exit 0
         Write-Output 'rpc_project_create_validation_rollback=ok'
         Write-Output 'rpc_project_create_failure_preserves_session=ok'
         Write-Output 'rpc_project_create_foreign_claim_preserved=ok'
+        Write-Output 'rpc_project_create_error_mapping=ok'
+        Write-Output 'rpc_project_create_adapter_nonzero_cleanup=ok'
         Write-Output 'rpc_project_create_failed_watch_gate=ok'
         Write-Output 'rpc_project_create_after_failed_watch_stop=ok'
         Write-Output 'rpc_project_create_failed_preview_gate=ok'
@@ -1198,6 +1284,64 @@ exit 0
                 }
             }
             $rollbackService.Dispose()
+        }
+    }
+
+    $adapterStartService = $null
+    $adapterStartProjectName = "adapter_start_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $adapterStartProjectDirectory = Join-Path $projectsRoot $adapterStartProjectName
+    try {
+        # 独立 Service 继承一个不含 pwsh 的 PATH，稳定触发 Process.Start 失败而不修改主机环境。
+        $adapterStartInfo = [Diagnostics.ProcessStartInfo]::new()
+        $adapterStartInfo.FileName = (Get-Command dotnet -ErrorAction Stop).Source
+        $adapterStartInfo.WorkingDirectory = Join-Path $worktreeRoot 'editor'
+        $adapterStartInfo.UseShellExecute = $false
+        $adapterStartInfo.CreateNoWindow = $true
+        $adapterStartInfo.RedirectStandardInput = $true
+        $adapterStartInfo.RedirectStandardOutput = $true
+        $adapterStartInfo.RedirectStandardError = $true
+        $adapterStartInfo.Environment['PATH'] = $fakeToolsRoot
+        $adapterStartInfo.ArgumentList.Add($serviceDll)
+        $adapterStartInfo.ArgumentList.Add('--kadath-root')
+        $adapterStartInfo.ArgumentList.Add($fakeKadathRoot)
+        $adapterStartService = [Diagnostics.Process]::new()
+        $adapterStartService.StartInfo = $adapterStartInfo
+        if (-not $adapterStartService.Start()) { throw 'Failed to start adapter-start Editor Service.' }
+
+        $script:rpcMessages.Clear()
+        $script:rpcSequence = 0L
+        $script:rpcStage = 'adapter_start_hello'
+        $adapterStartHello = Read-RpcMessage $adapterStartService
+        if ([string]$adapterStartHello.type -ne 'hello') { throw 'Adapter-start Service hello mismatch.' }
+        Send-RpcJson $adapterStartService ([ordered]@{ schemaVersion = 1; type = 'hello_ack'; client = 'verify-editor-project-create-adapter-start'; clientVersion = '1' })
+
+        $script:rpcStage = 'adapter_start_failed'
+        Send-RpcJson $adapterStartService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'adapter-start-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $adapterStartProjectName }
+        })
+        $adapterStartFailure = Read-RpcMessage $adapterStartService
+        if ([bool]$adapterStartFailure.ok -or [string]$adapterStartFailure.error.code -ne 'adapter_start_failed' -or
+            (Test-Path -LiteralPath $adapterStartProjectDirectory)) {
+            throw "Adapter-start mapping mismatch: $($adapterStartFailure | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        Send-RpcJson $adapterStartService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'adapter-start-shutdown'; method = 'shutdown'; params = $null })
+        [void](Read-RpcMessage $adapterStartService)
+        [void](Read-RpcMessage $adapterStartService)
+        if (-not $adapterStartService.WaitForExit(10000)) { throw 'Adapter-start Service did not exit after shutdown.' }
+        Write-Output 'rpc_project_create_adapter_start_failed=ok'
+    }
+    finally {
+        if ($null -ne $adapterStartService) {
+            if (-not $adapterStartService.HasExited) {
+                try { Send-RpcJson $adapterStartService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'adapter-start-cleanup'; method = 'shutdown'; params = $null }) } catch { }
+                if (-not $adapterStartService.WaitForExit(5000)) {
+                    $adapterStartService.Kill($true)
+                    [void]$adapterStartService.WaitForExit(5000)
+                }
+            }
+            $adapterStartService.Dispose()
         }
     }
 

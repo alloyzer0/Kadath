@@ -80,6 +80,14 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         }
 
         var ownershipToken = Guid.NewGuid().ToString("N");
+        var project = new ProjectSessionInfo(
+            packageRoot,
+            parameters.ProjectName,
+            projectDirectory,
+            Path.Combine(projectDirectory, "scene.json"),
+            Path.Combine(projectDirectory, "script.json"),
+            Path.Combine(projectDirectory, "preview.json"),
+            1);
         var output = await RunPowerShellAsync(
             Path.Combine(_kadathRoot, "tools", "editor-author.ps1"),
             ["-Action", "Create", "-PackageRoot", packageRoot, "-ProjectName", parameters.ProjectName, "-OwnershipToken", ownershipToken],
@@ -91,17 +99,11 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         }
         if (output.ExitCode != 0)
         {
+            // Adapter 已可能取得 ownership 后失败；Service 只凭相同 token 做兜底清理，绝不触碰竞争方目录。
+            CleanupCreatedProjectIfOwned(project, ownershipToken);
             throw new EditorOperationException("project_create_failed", JoinDiagnostics(output));
         }
 
-        var project = new ProjectSessionInfo(
-            packageRoot,
-            parameters.ProjectName,
-            projectDirectory,
-            Path.Combine(projectDirectory, "scene.json"),
-            Path.Combine(projectDirectory, "script.json"),
-            Path.Combine(projectDirectory, "preview.json"),
-            1);
         try
         {
             _ = ValidateProjectCreateOwnership(project, ownershipToken);
@@ -681,7 +683,16 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         foreach (var argument in arguments) { startInfo.ArgumentList.Add(argument); }
 
         using var process = new Process { StartInfo = startInfo };
-        if (!process.Start()) { throw new EditorOperationException("adapter_start_failed", $"Failed to start adapter: {scriptPath}"); }
+        try
+        {
+            if (!process.Start()) { throw new EditorOperationException("adapter_start_failed", $"Failed to start adapter: {scriptPath}"); }
+        }
+        catch (EditorOperationException) { throw; }
+        catch (Exception exception)
+        {
+            // Process.Start 在可执行文件缺失等 Windows 错误上会抛异常；统一收敛为稳定 Adapter 错误码。
+            throw new EditorOperationException("adapter_start_failed", $"Failed to start adapter: {scriptPath}; {exception.Message}");
+        }
         var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
         try { await process.WaitForExitAsync(cancellationToken); }
