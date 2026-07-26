@@ -13,6 +13,8 @@ internal static class Program
     {
         try
         {
+            await VerifyProjectCreateClientContractAsync();
+            await VerifyProjectCreateCapabilityProjectionAsync();
             await VerifyClientAndViewModelsAsync();
             await VerifyUnexpectedEofProjectionAsync();
             await VerifyExpectedShutdownProjectionAsync();
@@ -33,6 +35,8 @@ internal static class Program
             Console.WriteLine("preview_reload_ack_state=ok");
             Console.WriteLine("bake_changes=ok");
             Console.WriteLine("capability_gating=ok");
+            Console.WriteLine("project_create_client=ok");
+            Console.WriteLine("project_create_capability=ok");
             Console.WriteLine("viewmodel_state=ok");
             Console.WriteLine("verification=ok");
             return 0;
@@ -42,6 +46,55 @@ internal static class Program
             Console.Error.WriteLine($"verification=failed: {exception}");
             return 1;
         }
+    }
+
+    private static async Task VerifyProjectCreateClientContractAsync()
+    {
+        var transport = new ScriptedTransport();
+        await using var client = new EditorRpcClient(transport, "project-create-contract-verifier", "1");
+        await client.ConnectAsync().ConfigureAwait(false);
+
+        var created = await client.CreateProjectAsync(new ProjectCreateParameters("C:/package", "fresh_project")).ConfigureAwait(false);
+        var expected = new ProjectSessionInfo(
+            "C:/package",
+            "fresh_project",
+            "C:/package/bin/projects/fresh_project",
+            "C:/package/bin/projects/fresh_project/scene.json",
+            "C:/package/bin/projects/fresh_project/script.json",
+            "C:/package/bin/projects/fresh_project/preview.json",
+            1);
+        Assert(created == expected, "project_create result was not mapped to ProjectSessionInfo");
+
+        var request = transport.LastProjectCreateRequest ?? throw new InvalidOperationException("project_create request was not observed by the transport Adapter");
+        Assert(request.GetProperty("method").GetString() == "project_create", "typed Create used the wrong RPC method");
+        var parameters = request.GetProperty("params");
+        var parameterNames = parameters.EnumerateObject().Select(property => property.Name).OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        Assert(parameterNames.SequenceEqual(["packageRoot", "projectName"]), $"project_create params mismatch: {string.Join(',', parameterNames)}");
+        Assert(parameters.GetProperty("packageRoot").GetString() == "C:/package"
+            && parameters.GetProperty("projectName").GetString() == "fresh_project",
+            "project_create params did not preserve the typed input");
+    }
+
+    private static async Task VerifyProjectCreateCapabilityProjectionAsync()
+    {
+        await VerifyProjectCreateCapabilityProjectionAsync(advertiseProjectCreate: true, expected: true).ConfigureAwait(false);
+        await VerifyProjectCreateCapabilityProjectionAsync(advertiseProjectCreate: false, expected: false).ConfigureAwait(false);
+    }
+
+    private static async Task VerifyProjectCreateCapabilityProjectionAsync(bool advertiseProjectCreate, bool expected)
+    {
+        var transport = new ScriptedTransport(advertiseProjectCreate);
+        var client = new EditorRpcClient(transport, "project-create-capability-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        var changedProperties = new List<string?>();
+        workspace.Capabilities.PropertyChanged += (_, args) => changedProperties.Add(args.PropertyName);
+
+        await workspace.ConnectAsync().ConfigureAwait(false);
+
+        Assert(workspace.Capabilities.CanCreateProject == expected,
+            $"project_create capability projection mismatch: advertised={advertiseProjectCreate}");
+        Assert(changedProperties.Contains(nameof(EditorCapabilitiesViewModel.CanCreateProject), StringComparer.Ordinal),
+            "CanCreateProject did not publish a property-change notification");
     }
 
     private static async Task VerifyRealServiceAsync(string serviceDll, string kadathRoot, string packageRoot, string projectName)
@@ -493,11 +546,15 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private bool _delayNextValidation;
     private bool _publicationDirty;
     private bool _failNextPreviewStop;
+    private readonly bool _advertiseProjectCreate;
     private TaskCompletionSource<bool>? _delayedValidationRelease;
     private TaskCompletionSource<bool>? _delayedValidationCompleted;
 
+    public ScriptedTransport(bool advertiseProjectCreate = true) => _advertiseProjectCreate = advertiseProjectCreate;
+
     public bool IsOpen => _started && !_stop.IsCancellationRequested;
     public bool DelayedValidationPending => _delayedValidationRelease is not null;
+    public JsonElement? LastProjectCreateRequest { get; private set; }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -541,13 +598,26 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         {
             case "get_capabilities":
                 await SendResponseAsync(id, new EditorCapabilities(
-                    ["project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot", "publication_snapshot", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"],
+                    CreateCommands(),
                     [EditorProtocol.TransportName],
                     [
                         new PreviewSurfaceCapability(PreviewSurfaceModes.ExternalWindow, "native-window", true),
                         new PreviewSurfaceCapability(PreviewSurfaceModes.SharedTexture, "gpu-shared-resource", false),
                         new PreviewSurfaceCapability(PreviewSurfaceModes.FrameStream, "encoded-frame-stream", false)
                     ])).ConfigureAwait(false);
+                break;
+            case "project_create":
+                // 记录跨 transport seam 的原始 envelope，验证 typed Client 没有夹带额外参数。
+                LastProjectCreateRequest = request.Clone();
+                var created = new ProjectSessionInfo(
+                    "C:/package",
+                    "fresh_project",
+                    "C:/package/bin/projects/fresh_project",
+                    "C:/package/bin/projects/fresh_project/scene.json",
+                    "C:/package/bin/projects/fresh_project/script.json",
+                    "C:/package/bin/projects/fresh_project/preview.json",
+                    1);
+                await SendResponseAsync(id, created).ConfigureAwait(false);
                 break;
             case "project_open":
                 var opened = new ProjectSessionInfo("C:/package", "demo", "C:/package/bin/projects/demo", "C:/package/bin/projects/demo/scene.json", "C:/package/bin/projects/demo/script.json", "C:/package/bin/projects/demo/preview.json", 1);
@@ -649,6 +719,18 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     public void DelayNextValidationResponse() => _delayNextValidation = true;
 
     public void FailNextPreviewStop() => _failNextPreviewStop = true;
+
+    private string[] CreateCommands()
+    {
+        var commands = new List<string>
+        {
+            "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot",
+            "publication_snapshot", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop",
+            "preview_start", "preview_stop", "shutdown"
+        };
+        if (_advertiseProjectCreate) { commands.Insert(1, "project_create"); }
+        return commands.ToArray();
+    }
 
     public async Task ReleaseDelayedValidationAsync()
     {

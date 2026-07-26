@@ -51,6 +51,7 @@ public interface IEditorRpcClient : IAsyncDisposable
     Task ConnectAsync(CancellationToken cancellationToken = default);
     Task<EditorCapabilities> GetCapabilitiesAsync(CancellationToken cancellationToken = default);
     Task<ProjectSessionInfo> OpenProjectAsync(ProjectOpenParameters parameters, CancellationToken cancellationToken = default);
+    Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, CancellationToken cancellationToken = default);
     Task<ProjectValidateResult> ValidateProjectAsync(ProjectValidateParameters parameters, CancellationToken cancellationToken = default);
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
@@ -120,6 +121,10 @@ public sealed class EditorRpcClient : IEditorRpcClient
 
     public Task<ProjectSessionInfo> OpenProjectAsync(ProjectOpenParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<ProjectOpenParameters, ProjectSessionInfo>("project_open", parameters, cancellationToken);
+
+    // Create 复用稳定的 ProjectSessionInfo，不在 Client 复制第二套会话 DTO。
+    public Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ProjectCreateParameters, ProjectSessionInfo>("project_create", parameters, cancellationToken);
 
     public Task<ProjectValidateResult> ValidateProjectAsync(ProjectValidateParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<ProjectValidateParameters, ProjectValidateResult>("project_validate", parameters, cancellationToken);

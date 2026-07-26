@@ -16,6 +16,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
 
     public IReadOnlyCollection<string> Commands => _commands;
     public bool CanOpenProject => SupportsCommand("project_open");
+    public bool CanCreateProject => SupportsCommand("project_create");
     public bool CanValidateProject => SupportsCommand("project_validate");
     public bool CanReadProjectSnapshot => SupportsCommand("project_snapshot");
     public bool CanReadHierarchySnapshot => SupportsCommand("hierarchy_snapshot");
@@ -44,6 +45,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
         IsLoaded = true;
         RaisePropertyChanged(nameof(Commands));
         RaisePropertyChanged(nameof(CanOpenProject));
+        RaisePropertyChanged(nameof(CanCreateProject));
         RaisePropertyChanged(nameof(CanValidateProject));
         RaisePropertyChanged(nameof(CanReadProjectSnapshot));
         RaisePropertyChanged(nameof(CanReadHierarchySnapshot));
