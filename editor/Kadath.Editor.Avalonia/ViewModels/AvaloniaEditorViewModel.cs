@@ -21,6 +21,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private readonly Dictionary<string, HierarchyNode> _hierarchyItemsByLabel = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AssetCatalogItem> _assetItemsByLabel = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _lifetime = new();
+    private ProjectProjectionIdentity? _projectIdentity;
     private int _disposed;
     private readonly TimeSpan _connectionTimeout;
     private string _packageRoot;
@@ -44,9 +45,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace = workspace ?? throw new ArgumentNullException(nameof(workspace));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _packageRoot = defaultPackageRoot;
+        _projectIdentity = ProjectProjectionIdentity.From(_workspace.Project.Session);
         _connectionTimeout = connectionTimeout ?? TimeSpan.FromSeconds(10);
         _workspace.PropertyChanged += OnWorkspacePropertyChanged;
-        _workspace.Project.PropertyChanged += OnNestedPropertyChanged;
+        _workspace.Project.PropertyChanged += OnProjectPropertyChanged;
         _workspace.ProjectSnapshot.PropertyChanged += OnNestedPropertyChanged;
         _workspace.HierarchySnapshot.PropertyChanged += OnNestedPropertyChanged;
         _workspace.AssetCatalogSnapshot.PropertyChanged += OnNestedPropertyChanged;
@@ -59,6 +61,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
         ConnectCommand = AddCommand(new AsyncUiCommand(InitializeAsync, () => !IsBusy, HandleCommandError));
         OpenProjectCommand = AddCommand(new AsyncUiCommand(OpenProjectAsync, () => CanProjectCommand && !IsBusy, HandleCommandError));
+        CreateProjectCommand = AddCommand(new AsyncUiCommand(CreateProjectAsync, () => CanCreateProject, HandleCommandError));
         ValidateProjectCommand = AddCommand(new AsyncUiCommand(ValidateProjectAsync, () => IsProjectOpen && !IsBusy, HandleCommandError));
         RefreshSnapshotsCommand = AddCommand(new AsyncUiCommand(RefreshSnapshotsAsync, () => CanRefreshSnapshots && !IsBusy, HandleCommandError));
         ApplyAuthoringCommand = AddCommand(new AsyncUiCommand(ApplyAuthoringAsync, () => CanApplyAuthoring && !IsBusy, HandleCommandError));
@@ -66,7 +69,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         BakeCommand = AddCommand(new AsyncUiCommand(BakeAsync, () => IsProjectOpen && CanBake && !IsWatching && !IsPreviewAutoSync && !IsBusy, HandleCommandError));
         BakeChangesCommand = AddCommand(new AsyncUiCommand(BakeChangesAsync, () => CanBakeChanges, HandleCommandError));
         StartWatchCommand = AddCommand(new AsyncUiCommand(StartWatchAsync, () => IsProjectOpen && CanStartWatch && !IsWatching && !IsBusy, HandleCommandError));
-        StopWatchCommand = AddCommand(new AsyncUiCommand(StopWatchAsync, () => IsWatching && !IsBusy, HandleCommandError));
+        StopWatchCommand = AddCommand(new AsyncUiCommand(StopWatchAsync, () => CanRequestWatchStop && !IsBusy, HandleCommandError));
         StartPreviewCommand = AddCommand(new AsyncUiCommand(StartPreviewAsync, () => IsProjectOpen && CanStartPreview && !IsPreviewRunning && !IsBusy, HandleCommandError));
         StopPreviewCommand = AddCommand(new AsyncUiCommand(StopPreviewAsync, () => CanRequestPreviewStop && !IsBusy, HandleCommandError));
         ClearEventLogCommand = new DelegateUiCommand(() => EventLog.Clear());
@@ -81,6 +84,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
     public ICommand ConnectCommand { get; }
     public ICommand OpenProjectCommand { get; }
+    public ICommand CreateProjectCommand { get; }
     public ICommand ValidateProjectCommand { get; }
     public ICommand RefreshSnapshotsCommand { get; }
     public ICommand ApplyAuthoringCommand { get; }
@@ -191,7 +195,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public string CapabilitySummary => _workspace.Capabilities.IsLoaded
         ? $"commands={_workspace.Capabilities.Commands.Count}; transport=stdio-jsonl"
         : "能力尚未协商";
-    public bool IsBusy => _workspace.Project.State is EditorProjectState.Opening or EditorProjectState.Validating
+    public bool IsBusy => _workspace.Project.State is EditorProjectState.Creating or EditorProjectState.Opening or EditorProjectState.Validating
         || _workspace.ProjectSnapshot.State == EditorSnapshotState.Loading
         || _workspace.HierarchySnapshot.State == EditorSnapshotState.Loading
         || _workspace.AssetCatalogSnapshot.State == EditorSnapshotState.Loading
@@ -206,6 +210,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool IsPreviewRunning => _workspace.Preview.State is EditorPreviewState.Starting or EditorPreviewState.Running;
     public bool IsPreviewAutoSync => _workspace.Preview.OwnsPublicationSync;
     public bool CanProjectCommand => _workspace.Capabilities.CanOpenProject && IsConnected;
+    public bool CanCreateProject => IsConnected
+        && _workspace.Capabilities.CanCreateProject
+        && _workspace.Watch.State == EditorWatchState.Stopped
+        && _workspace.Preview.State == EditorPreviewState.Stopped
+        && !IsBusy;
     public bool CanApplyAuthoring => IsProjectOpen && _workspace.Capabilities.CanApplyAuthoring;
     public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0;
     public bool CanRefreshSnapshots => IsProjectOpen
@@ -215,6 +224,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool CanBake => _workspace.Capabilities.CanBake;
     public bool CanBakeChanges => IsProjectOpen && CanBake && _workspace.Capabilities.CanReadPublicationSnapshot && _workspace.Publication.RecommendedBakeTarget is not null && !IsWatching && !IsPreviewAutoSync && !IsBusy;
     public bool CanStartWatch => _workspace.Capabilities.CanStartWatch && !IsPreviewAutoSync;
+    public bool CanStopWatch => _workspace.Capabilities.CanStopWatch;
+    public bool CanRequestWatchStop => CanStopWatch
+        && (_workspace.Watch.State is EditorWatchState.Watching or EditorWatchState.Failed);
     public bool CanStopPreview => _workspace.Capabilities.CanStopPreview;
     public bool CanRequestPreviewStop => CanStopPreview && (IsPreviewRunning || _workspace.Preview.State == EditorPreviewState.Failed);
     public bool CanStartPreview => _workspace.Capabilities.CanStartPreview && !IsPreviewAutoSync && !(LiveBakeEnabled && WatchChanges && IsWatching);
@@ -246,6 +258,29 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             ApplySessionProjection(session);
         }
         RaiseAll();
+    }
+
+    private async Task CreateProjectAsync()
+    {
+        _ = await CreateProjectForCurrentInputAsync(_lifetime.Token);
+    }
+
+    // UI command 与真实 workflow 共用此公开入口，避免出现绕过 typed Workspace Client 的第二条创建路径。
+    public async Task<ProjectSessionInfo> CreateProjectForCurrentInputAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureConnectedAsync();
+        var effectiveToken = cancellationToken == default ? _lifetime.Token : cancellationToken;
+        var session = await _workspace.CreateProjectAsync(
+            new ProjectCreateParameters(PackageRoot, ProjectName),
+            effectiveToken);
+        if (_workspace.ProjectSnapshot.Value is not null
+            && _workspace.HierarchySnapshot.Value is not null
+            && _workspace.AssetCatalogSnapshot.Value is not null)
+        {
+            ApplySnapshotProjection(session);
+        }
+        RaiseAll();
+        return session;
     }
 
     private async Task RefreshSnapshotsAsync()
@@ -345,6 +380,32 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         if (defaultHierarchy is not null) { SelectedHierarchyItem = defaultHierarchy; }
     }
 
+    private void InvalidateProjectProjection()
+    {
+        // Workspace 已先切换权威 Session；Avalonia 必须同步丢弃所有旧 identity 的复制缓存。
+        HierarchyItems.Clear();
+        _hierarchyItemsByLabel.Clear();
+        AssetItems.Clear();
+        _assetItemsByLabel.Clear();
+        SelectedHierarchyItem = null;
+        SelectedAssetItem = null;
+        InspectorText = string.Empty;
+        SceneGoalX = string.Empty;
+        SceneGoalY = string.Empty;
+        ScriptGoalX = string.Empty;
+        ScriptGoalY = string.Empty;
+        ScriptVelocityX = string.Empty;
+        ScriptVelocityY = string.Empty;
+    }
+
+    private void ReconcileProjectIdentity()
+    {
+        var next = ProjectProjectionIdentity.From(_workspace.Project.Session);
+        if (ProjectProjectionIdentity.Equals(_projectIdentity, next)) { return; }
+        _projectIdentity = next;
+        InvalidateProjectProjection();
+    }
+
     private void SetAuthoringFields(ProjectModelSnapshot project)
     {
         SceneGoalX = project.Scene.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
@@ -428,12 +489,17 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     }
 
     private void OnWorkspacePropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
+    private void OnProjectPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(EditorProjectViewModel.Session)) { ReconcileProjectIdentity(); }
+        RaiseAll();
+    }
     private void OnNestedPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
     private void HandleCommandError(Exception exception) => _ = _dispatcher.InvokeAsync(() => AddLog("command_failed", exception.Message, null, 0));
     private void AddLog(string eventName, string summary, string? requestId, long sequence) { EventLog.Add(new EditorEventLogItem(sequence, eventName, summary, requestId, DateTimeOffset.Now)); while (EventLog.Count > 200) { EventLog.RemoveAt(0); } }
     private AsyncUiCommand AddCommand(AsyncUiCommand command) { _commands.Add(command); return command; }
     private void OnPropertyChanged(string propertyName) => RaisePropertyChanged(propertyName);
-    private void RaiseAll() { foreach (var command in _commands) { command.RaiseCanExecuteChanged(); } OnPropertyChanged(nameof(ConnectionStatus)); OnPropertyChanged(nameof(ValidationStatus)); OnPropertyChanged(nameof(ValidationDiagnostics)); OnPropertyChanged(nameof(BakeStatus)); OnPropertyChanged(nameof(PublicationStatus)); OnPropertyChanged(nameof(PreviewStatus)); OnPropertyChanged(nameof(RuntimeSyncStatus)); OnPropertyChanged(nameof(SurfaceMode)); OnPropertyChanged(nameof(SurfaceDetails)); OnPropertyChanged(nameof(SnapshotStatus)); OnPropertyChanged(nameof(AuthoringStatus)); OnPropertyChanged(nameof(AuthoringRevisionStatus)); OnPropertyChanged(nameof(CapabilitySummary)); OnPropertyChanged(nameof(IsBusy)); OnPropertyChanged(nameof(IsConnected)); OnPropertyChanged(nameof(IsProjectOpen)); OnPropertyChanged(nameof(IsWatching)); OnPropertyChanged(nameof(IsPreviewRunning)); OnPropertyChanged(nameof(IsPreviewAutoSync)); OnPropertyChanged(nameof(CanProjectCommand)); OnPropertyChanged(nameof(CanApplyAuthoring)); OnPropertyChanged(nameof(CanUndoAuthoring)); OnPropertyChanged(nameof(CanRefreshSnapshots)); OnPropertyChanged(nameof(CanBake)); OnPropertyChanged(nameof(CanBakeChanges)); OnPropertyChanged(nameof(CanStartWatch)); OnPropertyChanged(nameof(CanStopPreview)); OnPropertyChanged(nameof(CanRequestPreviewStop)); OnPropertyChanged(nameof(CanStartPreview)); OnPropertyChanged(nameof(SupportsExternalWindow)); OnPropertyChanged(nameof(SupportsSharedTexture)); OnPropertyChanged(nameof(SupportsFrameStream)); }
+    private void RaiseAll() { foreach (var command in _commands) { command.RaiseCanExecuteChanged(); } OnPropertyChanged(nameof(ConnectionStatus)); OnPropertyChanged(nameof(ValidationStatus)); OnPropertyChanged(nameof(ValidationDiagnostics)); OnPropertyChanged(nameof(BakeStatus)); OnPropertyChanged(nameof(PublicationStatus)); OnPropertyChanged(nameof(PreviewStatus)); OnPropertyChanged(nameof(RuntimeSyncStatus)); OnPropertyChanged(nameof(SurfaceMode)); OnPropertyChanged(nameof(SurfaceDetails)); OnPropertyChanged(nameof(SnapshotStatus)); OnPropertyChanged(nameof(AuthoringStatus)); OnPropertyChanged(nameof(AuthoringRevisionStatus)); OnPropertyChanged(nameof(CapabilitySummary)); OnPropertyChanged(nameof(IsBusy)); OnPropertyChanged(nameof(IsConnected)); OnPropertyChanged(nameof(IsProjectOpen)); OnPropertyChanged(nameof(IsWatching)); OnPropertyChanged(nameof(IsPreviewRunning)); OnPropertyChanged(nameof(IsPreviewAutoSync)); OnPropertyChanged(nameof(CanProjectCommand)); OnPropertyChanged(nameof(CanCreateProject)); OnPropertyChanged(nameof(CanApplyAuthoring)); OnPropertyChanged(nameof(CanUndoAuthoring)); OnPropertyChanged(nameof(CanRefreshSnapshots)); OnPropertyChanged(nameof(CanBake)); OnPropertyChanged(nameof(CanBakeChanges)); OnPropertyChanged(nameof(CanStartWatch)); OnPropertyChanged(nameof(CanStopWatch)); OnPropertyChanged(nameof(CanRequestWatchStop)); OnPropertyChanged(nameof(CanStopPreview)); OnPropertyChanged(nameof(CanRequestPreviewStop)); OnPropertyChanged(nameof(CanStartPreview)); OnPropertyChanged(nameof(SupportsExternalWindow)); OnPropertyChanged(nameof(SupportsSharedTexture)); OnPropertyChanged(nameof(SupportsFrameStream)); }
 
     public async ValueTask DisposeAsync()
     {
@@ -444,6 +510,23 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             if (IsConnected && _workspace.Capabilities.SupportsCommand("shutdown")) { try { await _workspace.ShutdownAsync(CancellationToken.None); } catch { } }
         }
         finally { await _workspace.DisposeAsync(); _lifetime.Dispose(); }
+    }
+
+    private sealed record ProjectProjectionIdentity(string PackageRoot, string ProjectName)
+    {
+        public static ProjectProjectionIdentity? From(ProjectSessionInfo? session) => session is null
+            ? null
+            : new ProjectProjectionIdentity(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(session.PackageRoot)),
+                session.ProjectName);
+
+        public static bool Equals(ProjectProjectionIdentity? left, ProjectProjectionIdentity? right)
+        {
+            if (ReferenceEquals(left, right)) { return true; }
+            if (left is null || right is null) { return false; }
+            return string.Equals(left.PackageRoot, right.PackageRoot, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(left.ProjectName, right.ProjectName, StringComparison.OrdinalIgnoreCase);
+        }
     }
 }
 
