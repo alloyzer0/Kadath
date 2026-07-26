@@ -442,6 +442,10 @@ try {
     $fakeToolsRoot = Join-Path $fakeKadathRoot 'tools'
     New-Item -ItemType Directory -Path $fakeToolsRoot | Out-Null
     [IO.File]::WriteAllText((Join-Path $fakeToolsRoot 'editor-preview.ps1'), "param()`r`n", [Text.UTF8Encoding]::new($false))
+    $missingLiveBakeAdapter = Join-Path $fakeToolsRoot 'editor-live-bake.ps1'
+    if (Test-Path -LiteralPath $missingLiveBakeAdapter) {
+        throw "Failed-watch fixture must omit the live-bake Adapter: $missingLiveBakeAdapter"
+    }
     $fakeAuthor = @'
 [CmdletBinding()]
 param(
@@ -493,6 +497,8 @@ exit 0
     $foreignProjectDirectory = Join-Path $projectsRoot $foreignProjectName
     $foreignClaimPath = Join-Path $foreignProjectDirectory '.kadath-create-claim'
     $foreignSentinelPath = Join-Path $foreignProjectDirectory 'foreign-owner-sentinel.txt'
+    $failedWatchProjectName = "watch_failed_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $failedWatchProjectDirectory = Join-Path $projectsRoot $failedWatchProjectName
     $rollbackService = $null
     try {
         # 关键 boundary fake：Create 成功但后续 Validate 失败，只观察真实 RPC 与最终文件系统回滚。
@@ -588,6 +594,76 @@ exit 0
         })
         if ($foreignCreatedEvents.Count -ne 0) { throw 'Foreign-claim Create failure emitted project_created.' }
 
+        # 关键 Failed/unknown 门禁：watch_start 在 Adapter 缺失后必须保持“未知是否仍占用”的忙状态，直到显式 watch_stop。
+        $script:rpcStage = 'failed_watch_start'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'failed-watch-start-1'; method = 'watch_start'
+            params = [ordered]@{ target = 'Both'; profile = 'debug'; pollIntervalMilliseconds = 50; debounceMilliseconds = 100 }
+        })
+        $failedWatchStart = Read-RpcMessage $rollbackService
+        if ([string]$failedWatchStart.type -ne 'response' -or [string]$failedWatchStart.id -ne 'failed-watch-start-1' -or
+            [bool]$failedWatchStart.ok -or [string]$failedWatchStart.error.code -ne 'adapter_missing') {
+            throw "Failed watch_start response mismatch: $($failedWatchStart | ConvertTo-Json -Compress -Depth 6)"
+        }
+        $failedWatchStartedEvents = @($script:rpcMessages | Where-Object {
+            [string]$_.type -eq 'event' -and [string]$_.event -eq 'watch_started' -and [string]$_.requestId -eq 'failed-watch-start-1'
+        })
+        if ($failedWatchStartedEvents.Count -ne 0) { throw 'Failed watch_start emitted watch_started.' }
+
+        $script:rpcStage = 'failed_watch_project_create_busy'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'failed-watch-create-busy-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $failedWatchProjectName }
+        })
+        $failedWatchBusy = Read-RpcMessage $rollbackService
+        if ([string]$failedWatchBusy.type -eq 'event' -and [string]$failedWatchBusy.event -eq 'project_created' -and
+            [string]$failedWatchBusy.requestId -eq 'failed-watch-create-busy-1') {
+            # 当前产品缺口的稳定 RED：消费紧随其后的 response，避免把未读 envelope 误报成 verifier 协议错误。
+            $unexpectedCreateResponse = Read-RpcMessage $rollbackService
+            $unexpectedDirectoryExists = Test-Path -LiteralPath $failedWatchProjectDirectory
+            throw "Watch Failed/unknown gate accepted project_create before watch_stop: response_ok=$([bool]$unexpectedCreateResponse.ok) directory_exists=$unexpectedDirectoryExists"
+        }
+        if ([string]$failedWatchBusy.type -ne 'response' -or [string]$failedWatchBusy.id -ne 'failed-watch-create-busy-1' -or
+            [bool]$failedWatchBusy.ok -or [string]$failedWatchBusy.error.code -ne 'project_create_busy') {
+            throw "Failed-watch project_create_busy response mismatch: $($failedWatchBusy | ConvertTo-Json -Compress -Depth 6)"
+        }
+        $failedWatchCreatedEvents = @($script:rpcMessages | Where-Object {
+            [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'failed-watch-create-busy-1'
+        })
+        if ($failedWatchCreatedEvents.Count -ne 0) { throw 'Failed-watch busy Create emitted project_created.' }
+        if (Test-Path -LiteralPath $failedWatchProjectDirectory) { throw 'Failed-watch busy Create created its target directory.' }
+
+        $script:rpcStage = 'failed_watch_stop'
+        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'failed-watch-stop-1'; method = 'watch_stop'; params = $null })
+        $failedWatchStoppedEvent = Read-RpcMessage $rollbackService
+        $failedWatchStoppedResponse = Read-RpcMessage $rollbackService
+        if ([string]$failedWatchStoppedEvent.type -ne 'event' -or [string]$failedWatchStoppedEvent.event -ne 'watch_stopped' -or
+            [string]$failedWatchStoppedEvent.requestId -ne 'failed-watch-stop-1' -or [string]$failedWatchStoppedEvent.data.state -ne 'stopped') {
+            throw "watch_stopped must precede response from Failed state: $($failedWatchStoppedEvent | ConvertTo-Json -Compress -Depth 6)"
+        }
+        if ([string]$failedWatchStoppedResponse.type -ne 'response' -or [string]$failedWatchStoppedResponse.id -ne 'failed-watch-stop-1' -or
+            -not [bool]$failedWatchStoppedResponse.ok -or [string]$failedWatchStoppedResponse.result.state -ne 'stopped') {
+            throw "Failed-state watch_stop response mismatch: $($failedWatchStoppedResponse | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        $script:rpcStage = 'failed_watch_project_create_retry'
+        Send-RpcJson $rollbackService ([ordered]@{
+            schemaVersion = 1; type = 'request'; id = 'failed-watch-create-retry-1'; method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $failedWatchProjectName }
+        })
+        $failedWatchRetryEvent = Read-RpcMessage $rollbackService
+        $failedWatchRetryResponse = Read-RpcMessage $rollbackService
+        if ([string]$failedWatchRetryEvent.type -ne 'event' -or [string]$failedWatchRetryEvent.event -ne 'project_created' -or
+            [string]$failedWatchRetryEvent.requestId -ne 'failed-watch-create-retry-1') {
+            throw "Retry project_created must precede response: $($failedWatchRetryEvent | ConvertTo-Json -Compress -Depth 6)"
+        }
+        if ([string]$failedWatchRetryResponse.type -ne 'response' -or [string]$failedWatchRetryResponse.id -ne 'failed-watch-create-retry-1' -or
+            -not [bool]$failedWatchRetryResponse.ok) {
+            throw "Post-watch_stop project_create retry mismatch: $($failedWatchRetryResponse | ConvertTo-Json -Compress -Depth 6)"
+        }
+        Assert-ProjectSessionInfo $failedWatchRetryEvent.data $fixtureRoot $failedWatchProjectName
+        Assert-ProjectSessionInfo $failedWatchRetryResponse.result $fixtureRoot $failedWatchProjectName
+
         Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-shutdown-1'; method = 'shutdown'; params = $null })
         [void](Read-RpcMessage $rollbackService)
         [void](Read-RpcMessage $rollbackService)
@@ -596,6 +672,8 @@ exit 0
         Write-Output 'rpc_project_create_validation_rollback=ok'
         Write-Output 'rpc_project_create_failure_preserves_session=ok'
         Write-Output 'rpc_project_create_foreign_claim_preserved=ok'
+        Write-Output 'rpc_project_create_failed_watch_gate=ok'
+        Write-Output 'rpc_project_create_after_failed_watch_stop=ok'
     }
     finally {
         if ($null -ne $rollbackService) {

@@ -11,6 +11,10 @@ internal sealed class EditorRpcHost
     private readonly TextReader _input;
     private readonly TextWriter _output;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
+    private readonly object _lifecycleStateGate = new();
+    private LifecycleState _watchState = LifecycleState.Stopped;
+    private LifecycleState _previewState = LifecycleState.Stopped;
     private long _sequence;
     private bool _helloAccepted;
     private bool _shutdownRequested;
@@ -110,8 +114,11 @@ internal sealed class EditorRpcHost
                     await WriteResponseAsync(request.Id, true, await _session.OpenProjectAsync(DeserializeParams<ProjectOpenParameters>(request), request.Id), null);
                     break;
                 case "project_create":
-                    await WriteResponseAsync(request.Id, true, await _session.CreateProjectAsync(DeserializeParams<ProjectCreateParameters>(request), request.Id), null);
+                {
+                    var result = await CreateProjectWithLifecycleAsync(DeserializeParams<ProjectCreateParameters>(request), request.Id);
+                    await WriteResponseAsync(request.Id, true, result, null);
                     break;
+                }
                 case "project_validate":
                     await WriteResponseAsync(request.Id, true, await _session.ValidateProjectAsync(DeserializeParams<ProjectValidateParameters>(request), request.Id), null);
                     break;
@@ -137,18 +144,29 @@ internal sealed class EditorRpcHost
                     await WriteResponseAsync(request.Id, true, await _session.BakeAsync(DeserializeParams<BakeStartParameters>(request), request.Id), null);
                     break;
                 case "watch_start":
-                    await WriteResponseAsync(request.Id, true, await _session.StartWatchAsync(DeserializeParams<WatchStartParameters>(request), request.Id), null);
+                {
+                    var result = await StartWatchWithLifecycleAsync(DeserializeParams<WatchStartParameters>(request), request.Id);
+                    await WriteResponseAsync(request.Id, true, result, null);
                     break;
+                }
                 case "watch_stop":
-                    await WriteResponseAsync(request.Id, true, await _session.StopWatchAsync(request.Id), null);
+                {
+                    var result = await StopWatchWithLifecycleAsync(request.Id);
+                    await WriteResponseAsync(request.Id, true, result, null);
                     break;
+                }
                 case "preview_start":
-                    var start = _session.ResolvePreviewStart(DeserializeParams<PreviewStartParameters>(request));
-                    await WriteResponseAsync(request.Id, true, await _preview.StartAsync(start), null);
+                {
+                    var result = await StartPreviewWithLifecycleAsync(DeserializeParams<PreviewStartParameters>(request));
+                    await WriteResponseAsync(request.Id, true, result, null);
                     break;
+                }
                 case "preview_stop":
-                    await WriteResponseAsync(request.Id, true, await _preview.StopAsync(), null);
+                {
+                    var result = await StopPreviewWithLifecycleAsync();
+                    await WriteResponseAsync(request.Id, true, result, null);
                     break;
+                }
                 case "shutdown":
                     await WriteResponseAsync(request.Id, true, new { state = "stopping" }, null);
                     _shutdownRequested = true;
@@ -169,6 +187,136 @@ internal sealed class EditorRpcHost
         }
     }
 
+    private async Task<ProjectSessionInfo> CreateProjectWithLifecycleAsync(ProjectCreateParameters parameters, string? requestId)
+    {
+        await _lifecycleGate.WaitAsync();
+        try
+        {
+            var (watchState, previewState) = ReadLifecycleStates();
+            if (watchState != LifecycleState.Stopped || previewState != LifecycleState.Stopped)
+            {
+                throw new EditorOperationException(
+                    "project_create_busy",
+                    $"Project creation requires stopped watch and preview lifecycles; watch={watchState}, preview={previewState}.");
+            }
+
+            // 关键提交边界：Session 的 current project 提交与 project_created 发布都在生命周期门内完成；response 由调用方在释放门后写出。
+            return await _session.CreateProjectAsync(parameters, requestId);
+        }
+        finally { _lifecycleGate.Release(); }
+    }
+
+    private async Task<EditorWatchResult> StartWatchWithLifecycleAsync(WatchStartParameters parameters, string? requestId)
+    {
+        await _lifecycleGate.WaitAsync();
+        try
+        {
+            SetWatchState(LifecycleState.Starting);
+            try
+            {
+                var result = await _session.StartWatchAsync(parameters, requestId);
+                SetWatchState(LifecycleState.Running);
+                return result;
+            }
+            catch
+            {
+                SetWatchState(LifecycleState.Failed);
+                throw;
+            }
+        }
+        finally { _lifecycleGate.Release(); }
+    }
+
+    private async Task<EditorWatchResult> StopWatchWithLifecycleAsync(string? requestId)
+    {
+        await _lifecycleGate.WaitAsync();
+        try
+        {
+            // Failed/Starting 等未知状态也必须能经显式 Stop 收敛；只有 Backend 成功返回才可声明 Stopped。
+            SetWatchState(LifecycleState.Stopping);
+            try
+            {
+                var result = await _session.StopWatchAsync(requestId);
+                SetWatchState(LifecycleState.Stopped);
+                return result;
+            }
+            catch
+            {
+                SetWatchState(LifecycleState.Failed);
+                throw;
+            }
+        }
+        finally { _lifecycleGate.Release(); }
+    }
+
+    private async Task<PreviewStartResult> StartPreviewWithLifecycleAsync(PreviewStartParameters parameters)
+    {
+        await _lifecycleGate.WaitAsync();
+        try
+        {
+            SetPreviewState(LifecycleState.Starting);
+            try
+            {
+                var start = _session.ResolvePreviewStart(parameters);
+                var result = await _preview.StartAsync(start);
+                // 异步 preview_stopped(requested=false) 可能已把状态置为 Failed；Start 返回不得覆盖该终态。
+                TransitionPreviewState(LifecycleState.Starting, LifecycleState.Running);
+                return result;
+            }
+            catch
+            {
+                SetPreviewState(LifecycleState.Failed);
+                throw;
+            }
+        }
+        finally { _lifecycleGate.Release(); }
+    }
+
+    private async Task<PreviewStopResult> StopPreviewWithLifecycleAsync()
+    {
+        await _lifecycleGate.WaitAsync();
+        try
+        {
+            SetPreviewState(LifecycleState.Stopping);
+            try
+            {
+                var result = await _preview.StopAsync();
+                SetPreviewState(LifecycleState.Stopped);
+                return result;
+            }
+            catch
+            {
+                SetPreviewState(LifecycleState.Failed);
+                throw;
+            }
+        }
+        finally { _lifecycleGate.Release(); }
+    }
+
+    private (LifecycleState Watch, LifecycleState Preview) ReadLifecycleStates()
+    {
+        lock (_lifecycleStateGate) { return (_watchState, _previewState); }
+    }
+
+    private void SetWatchState(LifecycleState state)
+    {
+        lock (_lifecycleStateGate) { _watchState = state; }
+    }
+
+    private void SetPreviewState(LifecycleState state)
+    {
+        lock (_lifecycleStateGate) { _previewState = state; }
+    }
+
+    private void TransitionPreviewState(LifecycleState expected, LifecycleState next)
+    {
+        // 状态锁只保护一次短读写，绝不跨 await；异步事件因此不会与 lifecycle 操作形成锁反转。
+        lock (_lifecycleStateGate)
+        {
+            if (_previewState == expected) { _previewState = next; }
+        }
+    }
+
     private static T DeserializeParams<T>(EditorRpcRequest request)
     {
         if (request.Params is not { } value) { throw new InvalidOperationException($"Request {request.Method} requires params."); }
@@ -176,7 +324,25 @@ internal sealed class EditorRpcHost
             ?? throw new InvalidOperationException($"Request {request.Method} params were empty.");
     }
 
-    private Task PublishPreviewEventAsync(string eventName, JsonElement? data) => PublishEventAsync(eventName, null, data);
+    private Task PublishPreviewEventAsync(string eventName, JsonElement? data)
+    {
+        if (string.Equals(eventName, "preview_surface_created", StringComparison.Ordinal))
+        {
+            TransitionPreviewState(LifecycleState.Starting, LifecycleState.Running);
+        }
+        else if (string.Equals(eventName, "preview_stopped", StringComparison.Ordinal) && IsUnrequestedPreviewStop(data))
+        {
+            SetPreviewState(LifecycleState.Failed);
+        }
+        return PublishEventAsync(eventName, null, data);
+    }
+
+    private static bool IsUnrequestedPreviewStop(JsonElement? data) =>
+        data is JsonElement payload
+        && payload.ValueKind == JsonValueKind.Object
+        && payload.TryGetProperty("requested", out var requested)
+        && requested.ValueKind == JsonValueKind.False;
+
     private Task PublishSessionEventAsync(EditorSessionNotification notification) => PublishEventAsync(notification.Event, notification.RequestId, notification.Data);
 
     private async Task PublishEventAsync(string eventName, string? requestId, JsonElement? data)
@@ -213,6 +379,15 @@ internal sealed class EditorRpcHost
             await _output.FlushAsync();
         }
         finally { _writeGate.Release(); }
+    }
+
+    private enum LifecycleState
+    {
+        Stopped,
+        Starting,
+        Running,
+        Stopping,
+        Failed
     }
 }
 
