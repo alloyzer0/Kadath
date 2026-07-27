@@ -389,6 +389,14 @@ function Test-DirectoryContains([string]$Parent, [string]$Candidate) {
     return $normalizedCandidate.StartsWith($normalizedParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-ByteSequenceAtOffset([byte[]]$Actual, [int]$Offset, [byte[]]$Expected) {
+    if ($Offset -lt 0 -or $Offset + $Expected.Length -gt $Actual.Length) { return $false }
+    for ($index = 0; $index -lt $Expected.Length; $index++) {
+        if ($Actual[$Offset + $index] -ne $Expected[$index]) { return $false }
+    }
+    return $true
+}
+
 function Assert-DisjointDirectories([string]$Left, [string]$LeftName, [string]$Right, [string]$RightName) {
     if ((Test-DirectoryContains $Left $Right) -or (Test-DirectoryContains $Right $Left)) {
         throw "$LeftName and $RightName must be disjoint directories: $Left <> $Right"
@@ -505,7 +513,99 @@ function Get-SampleCoordinates([int]$ClientWidth, [int]$ClientHeight, [int]$Rend
     }
 }
 
-function Get-SampleEvidence([KadathClientCapture]$Capture, [int]$RenderWidth, [int]$RenderHeight) {
+function Convert-SrgbByteToLinear([byte]$Value) {
+    $encoded = $Value / 255.0
+    if ($encoded -le 0.04045) { return $encoded / 12.92 }
+    return [math]::Pow(($encoded + 0.055) / 1.055, 2.4)
+}
+
+function Convert-LinearToSrgbByte([double]$Value) {
+    $linear = [math]::Min(1.0, [math]::Max(0.0, $Value))
+    $encoded = if ($linear -le 0.0031308) {
+        12.92 * $linear
+    } else {
+        (1.055 * [math]::Pow($linear, 1.0 / 2.4)) - 0.055
+    }
+    return [int][math]::Round(255.0 * $encoded, [MidpointRounding]::AwayFromZero)
+}
+
+function Get-ExpectedLinearCompositeRgb([byte[]]$SourceRgba, [double[]]$ClearLinearRgb) {
+    if ($SourceRgba.Length -ne 4 -or $ClearLinearRgb.Length -ne 3) { throw 'Frozen composite inputs have invalid channel counts' }
+    $alpha = $SourceRgba[3] / 255.0
+    [int[]]$expected = @(0, 0, 0)
+    for ($channel = 0; $channel -lt 3; $channel++) {
+        # Vulkan 在 linear space 使用 source alpha 混合，swapchain 最后编码为 sRGB。
+        $sourceLinear = Convert-SrgbByteToLinear $SourceRgba[$channel]
+        $outLinear = ($sourceLinear * $alpha) + ($ClearLinearRgb[$channel] * (1.0 - $alpha))
+        $expected[$channel] = Convert-LinearToSrgbByte $outLinear
+    }
+    return $expected
+}
+
+function Get-CompositeErrorEvidence([Collections.IDictionary]$Actual, [Collections.IDictionary]$Expected) {
+    if ($Actual.Count -ne $Expected.Count) { throw 'Composite actual/expected sample sets differ' }
+    $perSample = [ordered]@{}
+    $maximum = 0
+    foreach ($name in $Expected.Keys) {
+        if (-not $Actual.Contains($name) -or $Actual[$name].Count -ne 3 -or $Expected[$name].Count -ne 3) {
+            throw "Composite sample is missing or is not RGB: $name"
+        }
+        $sampleMaximum = 0
+        for ($channel = 0; $channel -lt 3; $channel++) {
+            $sampleMaximum = [math]::Max($sampleMaximum, [math]::Abs($Actual[$name][$channel] - $Expected[$name][$channel]))
+        }
+        $perSample[$name] = [int]$sampleMaximum
+        $maximum = [math]::Max($maximum, $sampleMaximum)
+    }
+    return [pscustomobject]@{ PerSample = $perSample; Maximum = [int]$maximum }
+}
+
+function Get-SwapchainFormatGateEvidence([string]$RuntimeLog) {
+    $expectedFormat = 50
+    $creationRecords = @([regex]::Matches($RuntimeLog, '(?im)^.*Vulkan swapchain created:.*$'))
+    $formatTokens = @()
+    $parsedFormat = $null
+    $failureReason = $null
+
+    if ($creationRecords.Count -ne 1) {
+        $failureReason = "expected exactly one swapchain creation record, got $($creationRecords.Count)"
+    } else {
+        $formatTokens = @([regex]::Matches($creationRecords[0].Value, '(?<![A-Za-z0-9_])format=(?<value>[^,\s]+)'))
+        if ($formatTokens.Count -ne 1) {
+            $failureReason = "expected exactly one format token, got $($formatTokens.Count)"
+        } else {
+            [uint32]$formatValue = 0
+            if (-not [uint32]::TryParse($formatTokens[0].Groups['value'].Value, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$formatValue)) {
+                $failureReason = 'swapchain format token is not an unsigned decimal integer'
+            } else {
+                $parsedFormat = [int64]$formatValue
+                if ($parsedFormat -ne $expectedFormat) {
+                    $failureReason = "swapchain format must be VK_FORMAT_B8G8R8A8_SRGB ($expectedFormat)"
+                }
+            }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        ParsedFormat = $parsedFormat
+        GateResult = if ($null -eq $failureReason) { 'passed' } else { 'failed' }
+        ExpectedFormat = $expectedFormat
+        ExpectedFormatName = 'VK_FORMAT_B8G8R8A8_SRGB'
+        CreationRecordCount = $creationRecords.Count
+        FormatTokenCount = $formatTokens.Count
+        FailureReason = $failureReason
+    }
+}
+
+function Get-SampleEvidence(
+    [KadathClientCapture]$Capture,
+    [int]$RenderWidth,
+    [int]$RenderHeight,
+    [byte[]]$TextureBaseRgba8,
+    [double[]]$ClearLinearRgb,
+    [int]$CompositeTolerance
+) {
+    if ($TextureBaseRgba8.Length -ne 16 -or $CompositeTolerance -lt 0) { throw 'Frozen composite oracle configuration is invalid' }
     $mapping = Get-SampleCoordinates $Capture.Width $Capture.Height $RenderWidth $RenderHeight
     $background = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.Background.Physical[0], $mapping.Coordinates.Background.Physical[1])
     $topLeft = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.Alpha0.Physical[0], $mapping.Coordinates.Alpha0.Physical[1])
@@ -514,12 +614,33 @@ function Get-SampleEvidence([KadathClientCapture]$Capture, [int]$RenderWidth, [i
     $bottomRight = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.Alpha255.Physical[0], $mapping.Coordinates.Alpha255.Physical[1])
     $distance64 = [math]::Sqrt([math]::Pow($topRight[0] - $background[0], 2) + [math]::Pow($topRight[1] - $background[1], 2) + [math]::Pow($topRight[2] - $background[2], 2))
     $distance128 = [math]::Sqrt([math]::Pow($bottomLeft[0] - $background[0], 2) + [math]::Pow($bottomLeft[1] - $background[1], 2) + [math]::Pow($bottomLeft[2] - $background[2], 2))
-    $alphaPasses = $true
-    for ($channel = 0; $channel -lt 3; $channel++) {
-        if ([math]::Abs($topLeft[$channel] - $background[$channel]) -gt 24) { $alphaPasses = $false }
-        if ($bottomRight[$channel] -lt 230) { $alphaPasses = $false }
+
+    $actual = [ordered]@{
+        Background = [int[]]$background
+        Alpha0 = [int[]]$topLeft
+        Alpha64 = [int[]]$topRight
+        Alpha128 = [int[]]$bottomLeft
+        Alpha255 = [int[]]$bottomRight
     }
-    if ($distance64 -le 32 -or $distance128 -lt ($distance64 + 16)) { $alphaPasses = $false }
+    $expected = [ordered]@{
+        Background = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]](0, 0, 0, 0)) $ClearLinearRgb)
+        Alpha0 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[0..3])) $ClearLinearRgb)
+        Alpha64 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[4..7])) $ClearLinearRgb)
+        Alpha128 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[8..11])) $ClearLinearRgb)
+        Alpha255 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[12..15])) $ClearLinearRgb)
+    }
+    $errorEvidence = Get-CompositeErrorEvidence $actual $expected
+    $perSampleMaxChannelError = $errorEvidence.PerSample
+    $maxChannelError = $errorEvidence.Maximum
+
+    # 逐通道 sRGB composite 是主 oracle；两项旧门禁只保留透明/不透明端点的粗保护。
+    $compositePasses = $maxChannelError -le $CompositeTolerance
+    $coarseAlphaGatesPass = $true
+    for ($channel = 0; $channel -lt 3; $channel++) {
+        if ([math]::Abs($topLeft[$channel] - $background[$channel]) -gt 24) { $coarseAlphaGatesPass = $false }
+        if ($bottomRight[$channel] -lt 230) { $coarseAlphaGatesPass = $false }
+    }
+    $alphaPasses = $compositePasses -and $coarseAlphaGatesPass
     return [pscustomobject]@{
         Passed = $alphaPasses
         AlphaPassed = $alphaPasses
@@ -528,6 +649,12 @@ function Get-SampleEvidence([KadathClientCapture]$Capture, [int]$RenderWidth, [i
         Alpha64 = @($topRight)
         Alpha128 = @($bottomLeft)
         Alpha255 = @($bottomRight)
+        Expected = $expected
+        PerSampleMaxChannelError = $perSampleMaxChannelError
+        MaxChannelError = [int]$maxChannelError
+        CompositeTolerance = $CompositeTolerance
+        CompositePassed = $compositePasses
+        CoarseAlphaGatesPassed = $coarseAlphaGatesPass
         Distance64 = $distance64
         Distance128 = $distance128
         RenderWidth = $mapping.RenderWidth
@@ -822,6 +949,19 @@ $runtimeExeSha256 = Get-Hash $runtime
 $sourceSha256 = Get-Hash $source
 [byte[]]$textureBytes = [IO.File]::ReadAllBytes($texture)
 if ($textureBytes.Length -ne 44 -or [Text.Encoding]::ASCII.GetString($textureBytes, 0, 4) -cne 'KDAT' -or [BitConverter]::ToUInt32($textureBytes, 4) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 8) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 12) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 16) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 20) -ne 20) { throw 'Package texture is not the frozen KDAT v2 2x2 mip chain' }
+$frozenTextureBaseBytes = [byte[]](
+    255, 0, 0, 0,
+    0, 255, 0, 64,
+    0, 0, 255, 128,
+    255, 255, 255, 255
+)
+$frozenTextureMipBytes = [byte[]](127, 127, 127, 111)
+if (-not (Test-ByteSequenceAtOffset $textureBytes 24 $frozenTextureBaseBytes) -or
+    -not (Test-ByteSequenceAtOffset $textureBytes 40 $frozenTextureMipBytes)) {
+    throw 'Package KDAT payload does not contain the frozen RGBA base texels and 1x1 mip'
+}
+$frozenClearLinearRgb = [double[]](0.035, 0.10, 0.22)
+$compositeTolerance = 8
 $kdatSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($textureBytes)).ToLowerInvariant()
 if ([int]$buildProfile.Version -ne 1 -or [string]$buildProfile.Optimize -cne 'ReleaseSafe' -or
     [string]$buildProfile.TextureProfile -cne 'release' -or
@@ -895,6 +1035,15 @@ $restartSearchStart = -1
 $captureState = 'not_started'
 $captureOverallStartedAt = [DateTimeOffset]::MinValue
 $captureOverallDeadline = [DateTimeOffset]::MinValue
+$swapchainFormatGate = [pscustomobject][ordered]@{
+    ParsedFormat = $null
+    GateResult = 'not_evaluated'
+    ExpectedFormat = 50
+    ExpectedFormatName = 'VK_FORMAT_B8G8R8A8_SRGB'
+    CreationRecordCount = 0
+    FormatTokenCount = 0
+    FailureReason = $null
+}
 
 try {
     $previousDpi = [KadathPngRuntimeNative]::EnterPerMonitorV2DpiAwareness()
@@ -925,6 +1074,12 @@ try {
     if ($windowDpi -le 0) { throw 'Runtime window did not report a valid physical DPI' }
     if (-not $ready) { throw 'Runtime host/texture upload readiness evidence timed out' }
     if ($runtimeLog -match '(?im)\bVUID-|validation\s+error|VulkanCallFailed|error:') { throw 'Runtime log contains Vulkan validation/error evidence' }
+
+    # sRGB composite oracle 只在唯一的 B8G8R8A8_SRGB swapchain 上成立，必须先于任何像素 Green 判定。
+    $swapchainFormatGate = Get-SwapchainFormatGateEvidence $runtimeLog
+    if ($swapchainFormatGate.GateResult -cne 'passed') {
+        throw "Runtime swapchain format gate failed: $($swapchainFormatGate.FailureReason)"
+    }
 
     $extentMatches = [regex]::Matches($runtimeLog, '(?im)^.*Vulkan swapchain created:.*\bextent=(?<width>[1-9]\d*)x(?<height>[1-9]\d*)\b.*$')
     if ($extentMatches.Count -eq 0) { throw 'Runtime log does not contain a valid Vulkan swapchain extent' }
@@ -1008,7 +1163,7 @@ try {
         if (-not [KadathPngRuntimeNative]::IsWindowVisible($window) -or [KadathPngRuntimeNative]::IsIconic($window) -or -not [KadathPngRuntimeNative]::ClientEvidencePointsAreUnobscured($window, [int[]]$sampleCoordinates.PhysicalFlat)) { throw 'Runtime window became hidden, minimized, or obscured during capture' }
         $lastCapture = [KadathPngRuntimeNative]::CaptureClient($window)
         if ($lastCapture.Width -ne $clientSize[0] -or $lastCapture.Height -ne $clientSize[1]) { throw "Runtime client area changed during evidence capture: initial=$($clientSize[0])x$($clientSize[1]) current=$($lastCapture.Width)x$($lastCapture.Height)" }
-        $lastSamples = Get-SampleEvidence $lastCapture $renderWidth $renderHeight
+        $lastSamples = Get-SampleEvidence $lastCapture $renderWidth $renderHeight $frozenTextureBaseBytes $frozenClearLinearRgb $compositeTolerance
         $now = [DateTime]::UtcNow
         if ([DateTimeOffset]::UtcNow -gt $captureDeadline) { break }
         if ($lastSamples.Passed) {
@@ -1033,6 +1188,11 @@ try {
     $runtimeLog = $processCapture.StderrText
     if (-not $runtimeLog.Contains('Kadath runtime shutdown complete')) { throw 'Runtime shutdown evidence is missing' }
     if ($runtimeLog -match '(?im)\bVUID-|validation\s+error|VulkanCallFailed|error:') { throw 'Runtime log contains Vulkan validation/error evidence' }
+    # 关闭后用完整 stderr 再检查一次，拒绝初检之后出现的第二次 swapchain 创建。
+    $swapchainFormatGate = Get-SwapchainFormatGateEvidence $runtimeLog
+    if ($swapchainFormatGate.GateResult -cne 'passed') {
+        throw "Final Runtime swapchain format gate failed: $($swapchainFormatGate.FailureReason)"
+    }
     $finalLossPosition = $runtimeLog.IndexOf($lossMarker, [StringComparison]::Ordinal)
     $finalRestartPosition = if ($restartSearchStart -ge 0) { $runtimeLog.IndexOf($restartMarker, $restartSearchStart, [StringComparison]::Ordinal) } else { -1 }
     if (-not $lossObserved -or -not $restartPosted -or -not $restartObserved -or
@@ -1078,6 +1238,7 @@ try {
         ScaleX = $scaleX
         ScaleY = $scaleY
         ConsecutivePassTimesUtc = @($passTimes)
+        SwapchainFormatGate = $swapchainFormatGate
         CaptureOverallStartedAtUtc = $captureOverallStartedAt.ToString('O')
         CaptureOverallDeadlineUtc = $captureOverallDeadline.ToString('O')
         LossObserved = [ordered]@{ Status = 'observed'; AtUtc = $lossObservedAt.ToString('O'); LogPosition = $lossLogPosition }
@@ -1174,6 +1335,7 @@ try {
                 RenderHeight = $renderHeight
                 ScaleX = $scaleX
                 ScaleY = $scaleY
+                SwapchainFormatGate = $swapchainFormatGate
                 CaptureOverallStartedAtUtc = if ($captureOverallStartedAt -ne [DateTimeOffset]::MinValue) { $captureOverallStartedAt.ToString('O') } else { $null }
                 CaptureOverallDeadlineUtc = if ($captureOverallDeadline -ne [DateTimeOffset]::MinValue) { $captureOverallDeadline.ToString('O') } else { $null }
                 LossObserved = [ordered]@{
