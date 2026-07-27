@@ -185,17 +185,200 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&preview_status_test_run.step);
 
     // 分发目录以 bin 为运行工作目录，资产必须与 exe 保持稳定的相对位置。
+    const texture_source_snapshot_test_barrier = b.option(
+        []const u8,
+        "texture-source-snapshot-test-barrier",
+        "Verifier-only absolute empty directory used to pause after the PNG source snapshot",
+    );
+    const texture_source_snapshot_script =
+        \\$sourcePath, $barrierPath, $destination = $args
+        \\$ErrorActionPreference = 'Stop'
+        \\Set-StrictMode -Version Latest
+        \\function Assert-NoWin32DevicePath([string]$path, [string]$name) {
+        \\    if ([string]::IsNullOrWhiteSpace($path)) { throw "$name cannot be empty" }
+        \\    $windowsSpelling = $path.Replace('/', '\\')
+        \\    if ($windowsSpelling.StartsWith('\\', [StringComparison]::Ordinal) -or $windowsSpelling.StartsWith('\??\', [StringComparison]::Ordinal)) { throw "$name cannot use UNC/device syntax: $path" }
+        \\}
+        \\function Assert-NoReparsePointInExistingPath([string]$path, [string]$name) {
+        \\    Assert-NoWin32DevicePath $path $name
+        \\    $full = [IO.Path]::GetFullPath($path)
+        \\    $root = [IO.Path]::GetPathRoot($full)
+        \\    $relative = [IO.Path]::GetRelativePath($root, $full)
+        \\    $current = $root
+        \\    if (((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$name root cannot be a reparse point: $current" }
+        \\    foreach ($segment in $relative.Split([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar), [StringSplitOptions]::RemoveEmptyEntries)) {
+        \\        $current = Join-Path $current $segment
+        \\        if (-not (Test-Path -LiteralPath $current)) { break }
+        \\        $item = Get-Item -LiteralPath $current -Force
+        \\        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$name cannot traverse a reparse point: $current" }
+        \\    }
+        \\}
+        \\function Get-CanonicalAbsolutePath([string]$path, [string]$name) {
+        \\    Assert-NoWin32DevicePath $path $name
+        \\    if (-not [IO.Path]::IsPathFullyQualified($path)) { throw "$name must be fully qualified: $path" }
+        \\    $full = [IO.Path]::GetFullPath($path)
+        \\    if (-not $path.Equals($full, [StringComparison]::OrdinalIgnoreCase)) { throw "$name must use its canonical absolute spelling: $path" }
+        \\    Assert-NoReparsePointInExistingPath $full $name
+        \\    return $full
+        \\}
+        \\function Resolve-CanonicalDirectory([string]$path, [string]$name) {
+        \\    $full = Get-CanonicalAbsolutePath $path $name
+        \\    if (-not (Test-Path -LiteralPath $full -PathType Container)) { throw "$name must be an existing directory: $full" }
+        \\    $item = Get-Item -LiteralPath $full -Force
+        \\    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$name cannot be a reparse point: $full" }
+        \\    return (Resolve-Path -LiteralPath $full).Path
+        \\}
+        \\function Resolve-CanonicalFile([string]$path, [string]$name) {
+        \\    $full = Get-CanonicalAbsolutePath $path $name
+        \\    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "$name must be an existing regular file: $full" }
+        \\    $item = Get-Item -LiteralPath $full -Force
+        \\    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$name cannot be a reparse point: $full" }
+        \\    return (Resolve-Path -LiteralPath $full).Path
+        \\}
+        \\function Test-DirectoryContains([string]$parent, [string]$candidate) {
+        \\    $normalizedParent = $parent.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        \\    $normalizedCandidate = $candidate.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        \\    if ($normalizedParent.Equals($normalizedCandidate, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        \\    return $normalizedCandidate.StartsWith($normalizedParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+        \\}
+        \\function Get-BytesHash([byte[]]$bytes) { return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant() }
+        \\function Write-OwnedFileDurable([string]$path, [byte[]]$bytes) {
+        \\    $stream = $null
+        \\    try {
+        \\        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        \\        $stream.Write($bytes, 0, $bytes.Length)
+        \\        $stream.Flush($true)
+        \\    } finally {
+        \\        if ($null -ne $stream) { $stream.Dispose() }
+        \\    }
+        \\}
+        \\function Remove-OwnedTemporary([string]$path, [long]$expectedLength, [string]$expectedHash) {
+        \\    if (-not (Test-Path -LiteralPath $path)) { return }
+        \\    Assert-NoReparsePointInExistingPath $path 'Owned snapshot file'
+        \\    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Refusing to delete a non-file snapshot path: $path" }
+        \\    $item = Get-Item -LiteralPath $path -Force
+        \\    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or $item.Length -ne $expectedLength -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedHash) { throw "Refusing to delete an unowned snapshot temporary: $path" }
+        \\    Remove-Item -LiteralPath $path -Force
+        \\}
+        \\$barrier = $null
+        \\if ($barrierPath -cne '-') {
+        \\    Assert-NoWin32DevicePath $barrierPath 'Snapshot test barrier'
+        \\    if (-not [IO.Path]::IsPathFullyQualified($barrierPath)) { throw 'Snapshot test barrier must be fully qualified' }
+        \\    $barrier = [IO.Path]::GetFullPath($barrierPath)
+        \\    if (-not $barrierPath.Equals($barrier, [StringComparison]::OrdinalIgnoreCase)) { throw 'Snapshot test barrier must use its canonical absolute spelling' }
+        \\    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        \\    Assert-NoReparsePointInExistingPath $temporaryRoot 'System temporary root'
+        \\    if (-not (Test-DirectoryContains $temporaryRoot $barrier) -or $temporaryRoot.Equals($barrier, [StringComparison]::OrdinalIgnoreCase)) { throw 'Snapshot test barrier must be below the system temporary root' }
+        \\    Assert-NoReparsePointInExistingPath $barrier 'Snapshot test barrier'
+        \\    if (-not (Test-Path -LiteralPath $barrier -PathType Container)) { throw 'Snapshot test barrier must be an existing directory' }
+        \\    $barrierItem = Get-Item -LiteralPath $barrier -Force
+        \\    if (($barrierItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Snapshot test barrier cannot be a reparse point' }
+        \\    if (@(Get-ChildItem -LiteralPath $barrier -Force).Count -ne 0) { throw 'Snapshot test barrier must start empty' }
+        \\}
+        \\[byte[]]$sourceBytes = $null
+        \\$sourceStream = $null
+        \\try {
+        \\    # 关键快照边界：打开 handle 前先锁定 canonical regular/non-reparse source。
+        \\    $sourcePath = Resolve-CanonicalFile $sourcePath 'Texture source'
+        \\    $sourceStream = [IO.File]::Open($sourcePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        \\    [long]$sourceLength = $sourceStream.Length
+        \\    if ($sourceLength -le 0 -or $sourceLength -ge 8MB) { throw 'Texture source snapshot must contain 1..(8 MiB - 1) bytes' }
+        \\    $sourceBytes = [byte[]]::new([int]$sourceLength)
+        \\    $offset = 0
+        \\    while ($offset -lt $sourceBytes.Length) {
+        \\        $read = $sourceStream.Read($sourceBytes, $offset, $sourceBytes.Length - $offset)
+        \\        if ($read -eq 0) { throw 'Texture source ended during snapshot read' }
+        \\        $offset += $read
+        \\    }
+        \\    if ($sourceStream.ReadByte() -ne -1) { throw 'Texture source grew during snapshot read' }
+        \\} finally {
+        \\    if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+        \\}
+        \\$sourceHash = Get-BytesHash $sourceBytes
+        \\$destination = Get-CanonicalAbsolutePath $destination 'Texture source snapshot destination'
+        \\$destinationParent = Split-Path -Parent $destination
+        \\Assert-NoReparsePointInExistingPath $destinationParent 'Texture source snapshot output parent before create'
+        \\if (-not (Test-Path -LiteralPath $destinationParent)) { New-Item -ItemType Directory -Path $destinationParent | Out-Null }
+        \\$destinationParent = Resolve-CanonicalDirectory $destinationParent 'Texture source snapshot output parent after create'
+        \\if (Test-Path -LiteralPath $destination) { throw "Texture source snapshot destination already exists: $destination" }
+        \\$snapshotTemporary = Join-Path $destinationParent ('.kadath-texture-source-snapshot-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+        \\$readyTemporary = $null
+        \\$readyTemporaryBytes = $null
+        \\$readyTemporaryHash = $null
+        \\$destinationCommitted = $false
+        \\$snapshotSucceeded = $false
+        \\try {
+        \\    Write-OwnedFileDurable $snapshotTemporary $sourceBytes
+        \\    if ((Get-FileHash -LiteralPath $snapshotTemporary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sourceHash) { throw 'Durable texture source snapshot hash mismatch' }
+        \\    $moveParent = Resolve-CanonicalDirectory $destinationParent 'Texture source snapshot output parent before move'
+        \\    if (-not $moveParent.Equals($destinationParent, [StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $destination)) { throw 'Texture source snapshot destination changed before no-replace move' }
+        \\    [IO.File]::Move($snapshotTemporary, $destination, $false)
+        \\    $destinationCommitted = $true
+        \\    $committedDestination = Resolve-CanonicalFile $destination 'Committed texture source snapshot'
+        \\    if ((Get-Item -LiteralPath $committedDestination -Force).Length -ne $sourceBytes.Length -or (Get-FileHash -LiteralPath $committedDestination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sourceHash) { throw 'Committed texture source snapshot identity mismatch' }
+        \\    if ($null -ne $barrier) {
+        \\        Assert-NoReparsePointInExistingPath $barrier 'Snapshot test barrier before ready'
+        \\        $readyPath = Join-Path $barrier 'ready.json'
+        \\        $releasePath = Join-Path $barrier 'release'
+        \\        if ((Test-Path -LiteralPath $readyPath) -or (Test-Path -LiteralPath $releasePath)) { throw 'Snapshot test barrier contains a pre-existing control path' }
+        \\        $readyDocument = [ordered]@{ Version = 1; Length = [long]$sourceBytes.Length; Sha256 = $sourceHash }
+        \\        $readyTemporaryBytes = [Text.UTF8Encoding]::new($false).GetBytes(($readyDocument | ConvertTo-Json -Compress) + "`n")
+        \\        $readyTemporaryHash = Get-BytesHash $readyTemporaryBytes
+        \\        $readyTemporary = Join-Path $barrier ('.ready-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+        \\        Write-OwnedFileDurable $readyTemporary $readyTemporaryBytes
+        \\        [IO.File]::Move($readyTemporary, $readyPath, $false)
+        \\        $wait = [Diagnostics.Stopwatch]::StartNew()
+        \\        while ($true) {
+        \\            if (Test-Path -LiteralPath $releasePath) {
+        \\                Assert-NoReparsePointInExistingPath $barrier 'Snapshot test barrier before release'
+        \\                if (-not (Test-Path -LiteralPath $releasePath -PathType Leaf)) { throw 'Snapshot test barrier release must be a regular file' }
+        \\                $release = Get-Item -LiteralPath $releasePath -Force
+        \\                if (($release.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $release.Length -ne 0) { throw 'Snapshot test barrier release must be zero-length and non-reparse' }
+        \\                break
+        \\            }
+        \\            if ($wait.ElapsedMilliseconds -ge 30000) { throw 'Timed out waiting for snapshot test barrier release' }
+        \\            Start-Sleep -Milliseconds 25
+        \\        }
+        \\    }
+        \\    $snapshotSucceeded = $true
+        \\} finally {
+        \\    # cleanup 必须全部尝试：destination rollback 优先，单项失败不得短路其它 owned temp。
+        \\    $cleanupErrors = [Collections.Generic.List[Exception]]::new()
+        \\    try {
+        \\        if ($destinationCommitted -and -not $snapshotSucceeded) { Remove-OwnedTemporary $destination $sourceBytes.Length $sourceHash }
+        \\    } catch { $cleanupErrors.Add($_.Exception) }
+        \\    try { Remove-OwnedTemporary $snapshotTemporary $sourceBytes.Length $sourceHash } catch { $cleanupErrors.Add($_.Exception) }
+        \\    try {
+        \\        if ($null -ne $readyTemporary -and $null -ne $readyTemporaryBytes) { Remove-OwnedTemporary $readyTemporary $readyTemporaryBytes.Length $readyTemporaryHash }
+        \\    } catch { $cleanupErrors.Add($_.Exception) }
+        \\    if ($cleanupErrors.Count -eq 1) { throw $cleanupErrors[0] }
+        \\    if ($cleanupErrors.Count -gt 1) { throw [AggregateException]::new('Texture source snapshot cleanup failures', $cleanupErrors) }
+        \\}
+    ;
+    const texture_source_snapshot_command = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-CommandWithArgs", texture_source_snapshot_script });
+    texture_source_snapshot_command.addFileArg(b.path("assets/renderer2d/test.png"));
+    if (texture_source_snapshot_test_barrier) |barrier_path| {
+        texture_source_snapshot_command.addArg(barrier_path);
+    } else {
+        texture_source_snapshot_command.addArg("-");
+    }
+    const texture_source_snapshot = texture_source_snapshot_command.addOutputFileArg("test.png");
+
     const install_assets = b.addInstallDirectory(.{
         .source_dir = b.path("assets"),
         .install_dir = .bin,
         .install_subdir = "assets",
     });
     b.getInstallStep().dependOn(&install_assets.step);
+    // install_assets 仍提供完整资产树；snapshot install 是 test.png 的唯一有序 final writer。
+    const install_texture_source_snapshot = b.addInstallFile(texture_source_snapshot, "bin/assets/renderer2d/test.png");
+    install_texture_source_snapshot.step.dependOn(&install_assets.step);
+    b.getInstallStep().dependOn(&install_texture_source_snapshot.step);
     // Importer/Baker 在安装阶段从 PNG 源生成确定性 KDAT；Zig optimize 不改变 release texture profile。
     const texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
     texture_import.addArg("-SourcePath");
-    texture_import.addFileArg(b.path("assets/renderer2d/test.png"));
+    texture_import.addFileArg(texture_source_snapshot);
     texture_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const texture_artifact = texture_import.addOutputFileArg("test.texture");
     const install_texture_artifact = b.addInstallFile(texture_artifact, "bin/assets/renderer2d/test.texture");
@@ -315,7 +498,7 @@ pub fn build(b: *std.Build) void {
     const runtime_build_profile_command = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-CommandWithArgs", runtime_build_profile_script });
     runtime_build_profile_command.step.dependOn(&install_exe.step);
     runtime_build_profile_command.addFileArg(exe.getEmittedBin());
-    runtime_build_profile_command.addFileArg(b.path("assets/renderer2d/test.png"));
+    runtime_build_profile_command.addFileArg(texture_source_snapshot);
     runtime_build_profile_command.addFileArg(texture_artifact);
     runtime_build_profile_command.addFileArg(b.path("shaders/renderer2d/quad.vert.glsl"));
     runtime_build_profile_command.addFileArg(b.path("shaders/renderer2d/quad.frag.glsl"));
