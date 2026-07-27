@@ -883,6 +883,18 @@ $scaleX = 0.0
 $scaleY = 0.0
 $sampleCoordinates = $null
 $occlusionProbeCount = 0
+$lossObserved = $false
+$lossObservedAt = [DateTimeOffset]::MinValue
+$lossLogPosition = -1
+$restartPosted = $false
+$restartPostedAt = [DateTimeOffset]::MinValue
+$restartObserved = $false
+$restartObservedAt = [DateTimeOffset]::MinValue
+$restartLogPosition = -1
+$restartSearchStart = -1
+$captureState = 'not_started'
+$captureOverallStartedAt = [DateTimeOffset]::MinValue
+$captureOverallDeadline = [DateTimeOffset]::MinValue
 
 try {
     $previousDpi = [KadathPngRuntimeNative]::EnterPerMonitorV2DpiAwareness()
@@ -933,15 +945,72 @@ try {
     $scaleY = $sampleCoordinates.ScaleY
     if (-not [KadathPngRuntimeNative]::ClientEvidencePointsAreUnobscured($window, [int[]]$sampleCoordinates.PhysicalFlat)) { throw 'Runtime client grid/sample points are obscured; GDI capture is not trustworthy' }
 
-    $captureDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    # ready、采样坐标与遮挡前置完成后，只允许一个共享的 10 秒 loss/restart/capture 总窗口。
+    $captureOverallStartedAt = [DateTimeOffset]::UtcNow
+    $captureOverallDeadline = $captureOverallStartedAt.AddSeconds(10)
+
+    # GameSession 在 3 秒后进入 lost tint；先确定性观察 loss，再按正式输入路径重启。
+    $captureState = 'waiting_for_loss'
+    $lossMarker = 'Game session lost: timer expired'
+    $lossDeadline = [DateTimeOffset]::UtcNow.AddSeconds(6)
+    if ($lossDeadline -gt $captureOverallDeadline) { $lossDeadline = $captureOverallDeadline }
+    while ([DateTimeOffset]::UtcNow -lt $lossDeadline -and -not $process.HasExited) {
+        $runtimeLog = $processCapture.StderrText
+        $lossLogPosition = $runtimeLog.IndexOf($lossMarker, [StringComparison]::Ordinal)
+        if ($lossLogPosition -ge 0 -and [DateTimeOffset]::UtcNow -le $lossDeadline) {
+            $lossObserved = $true
+            $lossObservedAt = [DateTimeOffset]::UtcNow
+            $captureState = 'loss_observed'
+            break
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    if ($process.HasExited) { throw "Runtime exited before GameSession loss evidence: exit=$($process.ExitCode)" }
+    if (-not $lossObserved) { throw 'Timed out waiting for Game session lost: timer expired' }
+
+    $restartMarker = 'Game session restarted:'
+    $runtimeLog = $processCapture.StderrText
+    $prePostRestartPosition = $runtimeLog.IndexOf($restartMarker, $lossLogPosition + $lossMarker.Length, [StringComparison]::Ordinal)
+    if ($prePostRestartPosition -ge 0) { throw 'GameSession restart appeared after loss before verifier posted R' }
+    # 精确冻结 pre-post 日志尾；跨 boundary 开始的旧前缀不能匹配为本次 restart。
+    $restartSearchStart = $runtimeLog.Length
+
+    # 0x0100/0x0101 与产品窗口输入一致；R 只在已观察到 loss 后投递。
+    if ([DateTimeOffset]::UtcNow -ge $captureOverallDeadline) { throw 'Overall capture deadline elapsed before verifier could post R' }
+    if (-not [KadathPngRuntimeNative]::PostMessage($window, 0x0100, [IntPtr]0x52, [IntPtr]::Zero)) { throw 'WM_KEYDOWN(R) failed for Runtime window' }
+    if (-not [KadathPngRuntimeNative]::PostMessage($window, 0x0101, [IntPtr]0x52, [IntPtr]::Zero)) { throw 'WM_KEYUP(R) failed for Runtime window' }
+    $restartPosted = $true
+    $restartPostedAt = [DateTimeOffset]::UtcNow
+    $captureState = 'restart_posted'
+
+    $restartDeadline = [DateTimeOffset]::UtcNow.AddSeconds(2)
+    if ($restartDeadline -gt $captureOverallDeadline) { $restartDeadline = $captureOverallDeadline }
+    while ([DateTimeOffset]::UtcNow -lt $restartDeadline -and -not $process.HasExited) {
+        $runtimeLog = $processCapture.StderrText
+        $restartLogPosition = $runtimeLog.IndexOf($restartMarker, $restartSearchStart, [StringComparison]::Ordinal)
+        if ($restartLogPosition -ge $restartSearchStart -and [DateTimeOffset]::UtcNow -le $restartDeadline) {
+            $restartObserved = $true
+            $restartObservedAt = [DateTimeOffset]::UtcNow
+            $captureState = 'playing_after_restart'
+            break
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    if ($process.HasExited) { throw "Runtime exited before GameSession restart evidence: exit=$($process.ExitCode)" }
+    if (-not $restartObserved) { throw 'Timed out waiting for a new Game session restarted log after loss' }
+
+    # 捕获窗口严格短于下一次 3 秒 loss；两帧 oracle 与 >=100ms 间隔保持不变。
+    $captureDeadline = [DateTimeOffset]::UtcNow.AddSeconds(2)
+    if ($captureDeadline -gt $captureOverallDeadline) { $captureDeadline = $captureOverallDeadline }
     $previousPassed = $false
     $previousPassAt = [DateTime]::MinValue
-    while ([DateTime]::UtcNow -lt $captureDeadline -and -not $process.HasExited) {
+    while ([DateTimeOffset]::UtcNow -lt $captureDeadline -and -not $process.HasExited) {
         if (-not [KadathPngRuntimeNative]::IsWindowVisible($window) -or [KadathPngRuntimeNative]::IsIconic($window) -or -not [KadathPngRuntimeNative]::ClientEvidencePointsAreUnobscured($window, [int[]]$sampleCoordinates.PhysicalFlat)) { throw 'Runtime window became hidden, minimized, or obscured during capture' }
         $lastCapture = [KadathPngRuntimeNative]::CaptureClient($window)
         if ($lastCapture.Width -ne $clientSize[0] -or $lastCapture.Height -ne $clientSize[1]) { throw "Runtime client area changed during evidence capture: initial=$($clientSize[0])x$($clientSize[1]) current=$($lastCapture.Width)x$($lastCapture.Height)" }
         $lastSamples = Get-SampleEvidence $lastCapture $renderWidth $renderHeight
         $now = [DateTime]::UtcNow
+        if ([DateTimeOffset]::UtcNow -gt $captureDeadline) { break }
         if ($lastSamples.Passed) {
             $passTimes.Add($now.ToString('O'))
             if ($previousPassed -and ($now - $previousPassAt).TotalMilliseconds -ge 100) { break }
@@ -964,6 +1033,14 @@ try {
     $runtimeLog = $processCapture.StderrText
     if (-not $runtimeLog.Contains('Kadath runtime shutdown complete')) { throw 'Runtime shutdown evidence is missing' }
     if ($runtimeLog -match '(?im)\bVUID-|validation\s+error|VulkanCallFailed|error:') { throw 'Runtime log contains Vulkan validation/error evidence' }
+    $finalLossPosition = $runtimeLog.IndexOf($lossMarker, [StringComparison]::Ordinal)
+    $finalRestartPosition = if ($restartSearchStart -ge 0) { $runtimeLog.IndexOf($restartMarker, $restartSearchStart, [StringComparison]::Ordinal) } else { -1 }
+    if (-not $lossObserved -or -not $restartPosted -or -not $restartObserved -or
+        $finalLossPosition -ne $lossLogPosition -or $finalRestartPosition -ne $restartLogPosition -or
+        $finalRestartPosition -lt $restartSearchStart -or $finalRestartPosition -le $finalLossPosition -or
+        $restartPostedAt -lt $lossObservedAt -or $restartObservedAt -lt $restartPostedAt) {
+        throw 'GameSession loss/restart evidence is missing or out of order'
+    }
     $identityAfter = Get-IdentitySnapshot $identityPaths
     Assert-IdentityUnchanged $identityBefore $identityAfter
 
@@ -1001,6 +1078,12 @@ try {
         ScaleX = $scaleX
         ScaleY = $scaleY
         ConsecutivePassTimesUtc = @($passTimes)
+        CaptureOverallStartedAtUtc = $captureOverallStartedAt.ToString('O')
+        CaptureOverallDeadlineUtc = $captureOverallDeadline.ToString('O')
+        LossObserved = [ordered]@{ Status = 'observed'; AtUtc = $lossObservedAt.ToString('O'); LogPosition = $lossLogPosition }
+        RestartPosted = [ordered]@{ Status = 'posted'; AtUtc = $restartPostedAt.ToString('O'); LogSearchStart = $restartSearchStart; Key = 'R'; KeyDownMessage = '0x0100'; KeyUpMessage = '0x0101' }
+        RestartObserved = [ordered]@{ Status = 'observed'; AtUtc = $restartObservedAt.ToString('O'); LogPosition = $restartLogPosition }
+        CaptureState = $captureState
         Samples = $lastSamples
         SourceSha256 = $sourceSha256
         KdatSha256 = $kdatSha256
@@ -1038,6 +1121,7 @@ try {
     Write-Output 'alpha_samples=ok'
     Write-Output 'build_profile=ReleaseSafe'
     Write-Output 'consecutive_frames=2'
+    Write-Output 'capture_state=playing_after_restart'
     Write-Output 'vulkan_validation=ok'
     Write-Output 'runtime_shutdown=ok'
     Write-Output 'verification=ok'
@@ -1090,6 +1174,27 @@ try {
                 RenderHeight = $renderHeight
                 ScaleX = $scaleX
                 ScaleY = $scaleY
+                CaptureOverallStartedAtUtc = if ($captureOverallStartedAt -ne [DateTimeOffset]::MinValue) { $captureOverallStartedAt.ToString('O') } else { $null }
+                CaptureOverallDeadlineUtc = if ($captureOverallDeadline -ne [DateTimeOffset]::MinValue) { $captureOverallDeadline.ToString('O') } else { $null }
+                LossObserved = [ordered]@{
+                    Status = if ($lossObserved) { 'observed' } else { 'not_observed' }
+                    AtUtc = if ($lossObserved) { $lossObservedAt.ToString('O') } else { $null }
+                    LogPosition = $lossLogPosition
+                }
+                RestartPosted = [ordered]@{
+                    Status = if ($restartPosted) { 'posted' } else { 'not_posted' }
+                    AtUtc = if ($restartPosted) { $restartPostedAt.ToString('O') } else { $null }
+                    LogSearchStart = $restartSearchStart
+                    Key = 'R'
+                    KeyDownMessage = '0x0100'
+                    KeyUpMessage = '0x0101'
+                }
+                RestartObserved = [ordered]@{
+                    Status = if ($restartObserved) { 'observed' } else { 'not_observed' }
+                    AtUtc = if ($restartObserved) { $restartObservedAt.ToString('O') } else { $null }
+                    LogPosition = $restartLogPosition
+                }
+                CaptureState = $captureState
                 Samples = $lastSamples
                 SourceSha256 = $sourceSha256
                 KdatSha256 = $kdatSha256
