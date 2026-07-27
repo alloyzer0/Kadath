@@ -339,7 +339,9 @@ $sourceAHash = $null
 $sourceBBytes = $null
 $sourceBHash = $null
 $publishTemporary = $null
+$publishBackupTemporary = $null
 $restoreTemporary = $null
+$restoreBackupTemporary = $null
 $releaseTemporary = $null
 $primaryError = $null
 $restoreError = $null
@@ -442,11 +444,15 @@ try {
     # 关键 race：ready 后才以 owned temp + same-volume replace 发布 B。
     [void](Assert-OwnedRegularFile $sourceTarget 'Tracked PNG source before B publish' $sourceABytes.Length $sourceAHash)
     $publishTemporary = Join-Path $root ('.kadath-texture-source-b-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+    $publishBackupTemporary = Join-Path $root ('.kadath-texture-source-a-backup-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $publishBackupTemporary) { throw 'Verifier-owned A backup path must be fresh' }
     Write-OwnedFileDurable $publishTemporary $sourceBBytes
     [void](Assert-OwnedRegularFile $publishTemporary 'Verifier-owned B temporary' $sourceBBytes.Length $sourceBHash)
-    [IO.File]::Replace($publishTemporary, $sourceTarget, $null, $true)
+    # Windows File.Replace 要求非空 backup path；fresh owned backup 同时保存被替换的 A 身份。
+    [IO.File]::Replace($publishTemporary, $sourceTarget, $publishBackupTemporary, $true)
     $sourcePublishedAsB = $true
     [void](Assert-OwnedRegularFile $sourceTarget 'Tracked PNG source B' $sourceBBytes.Length $sourceBHash)
+    [void](Assert-OwnedRegularFile $publishBackupTemporary 'Verifier-owned source A backup' $sourceABytes.Length $sourceAHash)
 
     $releaseTemporary = Join-Path $barrier ('.release-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
     Write-OwnedFileDurable $releaseTemporary ([byte[]]::new(0))
@@ -468,12 +474,16 @@ try {
             [void](Assert-OwnedRegularFile $sourceTarget 'Tracked PNG source before restoring A' $sourceBBytes.Length $sourceBHash)
             $rootForRestore = [IO.Path]::GetFullPath($KadathRoot)
             $restoreTemporary = Join-Path $rootForRestore ('.kadath-texture-source-a-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+            $restoreBackupTemporary = Join-Path $rootForRestore ('.kadath-texture-source-b-backup-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+            if (Test-Path -LiteralPath $restoreBackupTemporary) { throw 'Verifier-owned B backup path must be fresh' }
             Write-OwnedFileDurable $restoreTemporary $sourceABytes
             [void](Assert-OwnedRegularFile $restoreTemporary 'Verifier-owned A temporary' $sourceABytes.Length $sourceAHash)
             [void](Assert-OwnedRegularFile $sourceTarget 'Tracked PNG source immediately before restoring A' $sourceBBytes.Length $sourceBHash)
-            [IO.File]::Replace($restoreTemporary, $sourceTarget, $null, $true)
+            # 恢复同样使用非空 owned backup；若 target 已未知，前置检查会拒绝覆盖。
+            [IO.File]::Replace($restoreTemporary, $sourceTarget, $restoreBackupTemporary, $true)
             $sourcePublishedAsB = $false
             [void](Assert-OwnedRegularFile $sourceTarget 'Restored tracked PNG source A' $sourceABytes.Length $sourceAHash)
+            [void](Assert-OwnedRegularFile $restoreBackupTemporary 'Verifier-owned source B backup' $sourceBBytes.Length $sourceBHash)
         } catch {
             $restoreError = [InvalidOperationException]::new("未恢复 A：tracked source 不再属于本轮 B，已保留未知外部状态。$($_.Exception.Message)", $_.Exception)
         }
@@ -500,7 +510,7 @@ try {
         if ($null -eq $restoreError) { $restoreError = $_.Exception }
     }
     if ($cleanupRootsSafe) {
-        # 三个 owned temporary 必须全部尝试；单个异常不能短路后续安全清理。
+        # 五个 owned temporary/backup 必须全部尝试；单个异常不能短路后续安全清理。
         $ownedCleanupErrors = [Collections.Generic.List[Exception]]::new()
         try {
             # 正式 release 永久保留；只回收仍存在且精确属于本轮的 zero-byte publish temporary。
@@ -511,6 +521,12 @@ try {
         } catch { $ownedCleanupErrors.Add($_.Exception) }
         try {
             if ($null -ne $restoreTemporary) { Remove-OwnedTemporary $restoreTemporary $sourceABytes.Length $sourceAHash }
+        } catch { $ownedCleanupErrors.Add($_.Exception) }
+        try {
+            if ($null -ne $publishBackupTemporary) { Remove-OwnedTemporary $publishBackupTemporary $sourceABytes.Length $sourceAHash }
+        } catch { $ownedCleanupErrors.Add($_.Exception) }
+        try {
+            if ($null -ne $restoreBackupTemporary) { Remove-OwnedTemporary $restoreBackupTemporary $sourceBBytes.Length $sourceBHash }
         } catch { $ownedCleanupErrors.Add($_.Exception) }
         if ($null -eq $restoreError -and $ownedCleanupErrors.Count -eq 1) {
             $restoreError = $ownedCleanupErrors[0]
