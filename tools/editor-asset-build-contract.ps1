@@ -20,9 +20,72 @@ $script:AssetBuildContractVersion = 1
 $script:AssetBuildCommandVersion = 1
 $script:AssetBuildToolVersion = 'kadath-asset-contract/1'
 
+function Resolve-SafeLocalBuildPath([string]$Path, [string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "$Name cannot be empty" }
+    # 关键 identity 边界：UNC/device/drive-relative alias 不得形成第二套候选或输出根名称。
+    if ($Path.StartsWith('\\', [StringComparison]::Ordinal) -or
+        ([IO.Path]::IsPathRooted($Path) -and -not [IO.Path]::IsPathFullyQualified($Path))) {
+        throw "$Name must use a local fully-qualified or ordinary relative path"
+    }
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($full)
+    if ([string]::IsNullOrWhiteSpace($root) -or $root.StartsWith('\\', [StringComparison]::Ordinal)) {
+        throw "$Name must not use a UNC or device path"
+    }
+    if ($full.Substring($root.Length).Contains(':')) { throw "$Name must not use an alternate data stream" }
+    return $full
+}
+
+function Assert-NoBuildReparsePointInExistingPath([string]$Path, [string]$Name) {
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($full)
+    $relative = [IO.Path]::GetRelativePath($root, $full)
+    $current = $root
+    if ((((Get-Item -LiteralPath $current -Force).Attributes) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Name root cannot be a reparse point: $current"
+    }
+    foreach ($segment in $relative.Split([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar), [StringSplitOptions]::RemoveEmptyEntries)) {
+        $current = Join-Path $current $segment
+        if (-not (Test-Path -LiteralPath $current)) { break }
+        if ((((Get-Item -LiteralPath $current -Force).Attributes) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Name cannot traverse a reparse point: $current"
+        }
+    }
+}
+
+function Resolve-BuildCandidateRelativePath([string]$Candidate, [string]$RelativePath, [string]$Name, [switch]$RequireLeaf) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or [IO.Path]::IsPathRooted($RelativePath) -or $RelativePath.Contains('\')) {
+        throw "$Name must be a portable relative path: $RelativePath"
+    }
+    $segments = @($RelativePath.Split('/'))
+    if ($segments.Count -lt 3 -or $segments[0] -cne 'bin' -or $segments[1] -cne 'assets') {
+        throw "$Name must stay below bin/assets: $RelativePath"
+    }
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..' -or
+            $segment.TrimEnd([char[]]@(' ', '.')) -cne $segment -or
+            $segment.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+            throw "$Name contains an unsafe path segment: $RelativePath"
+        }
+    }
+
+    $assetRoot = [IO.Path]::GetFullPath((Join-Path $Candidate 'bin\assets'))
+    $assetPrefix = $assetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $full = [IO.Path]::GetFullPath((Join-Path $Candidate $RelativePath.Replace('/', [IO.Path]::DirectorySeparatorChar)))
+    if (-not $full.StartsWith($assetPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Name escapes Candidate/bin/assets: $RelativePath"
+    }
+    Assert-NoBuildReparsePointInExistingPath $full $Name
+    if ($RequireLeaf -and -not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "$Name does not exist: $RelativePath" }
+    $canonicalRelative = [IO.Path]::GetRelativePath($Candidate, $full).Replace('\', '/')
+    return [pscustomobject]@{ FullPath = $full; RelativePath = $canonicalRelative }
+}
+
 function Resolve-BuildContractCandidate([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { throw "Candidate root does not exist: $Path" }
-    $candidate = (Resolve-Path -LiteralPath $Path).Path
+    $full = Resolve-SafeLocalBuildPath $Path 'Candidate root'
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) { throw "Candidate root does not exist: $Path" }
+    Assert-NoBuildReparsePointInExistingPath $full 'Candidate root'
+    $candidate = (Resolve-Path -LiteralPath $full).Path
     $info = Get-Item -LiteralPath $candidate
     if (($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Candidate root cannot be a reparse point' }
     if ($candidate -match '(?i)[\\/]bin[\\/]assets([\\/]|$)') { throw 'Candidate root must be the candidate parent, not bin/assets' }
@@ -30,7 +93,7 @@ function Resolve-BuildContractCandidate([string]$Path) {
 }
 
 function Resolve-BuildContractDirectory([string]$Path, [string]$Candidate) {
-    $contract = [IO.Path]::GetFullPath($Path)
+    $contract = Resolve-SafeLocalBuildPath $Path 'Contract directory'
     if ([string]::IsNullOrWhiteSpace($contract) -or $contract -eq [IO.Path]::GetPathRoot($contract)) { throw "Invalid contract directory: $Path" }
     $candidatePrefix = $Candidate.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     $contractPrefix = $contract.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
@@ -38,14 +101,7 @@ function Resolve-BuildContractDirectory([string]$Path, [string]$Candidate) {
     if ($Candidate.StartsWith($contractPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "Contract directory must not contain candidate: $contract" }
     if ($contract -match '(?i)[\\/]bin[\\/]assets([\\/]|$)') { throw 'Contract directory must not be package/bin/assets' }
     if (Test-Path -LiteralPath $contract) { throw "Refusing to overwrite existing contract directory: $contract" }
-    $existingParent = Split-Path -Parent $contract
-    while (-not (Test-Path -LiteralPath $existingParent -PathType Container)) {
-        $nextParent = Split-Path -Parent $existingParent
-        if ([string]::IsNullOrWhiteSpace($nextParent) -or $nextParent -eq $existingParent) { throw "Cannot resolve contract parent: $contract" }
-        $existingParent = $nextParent
-    }
-    $parentInfo = Get-Item -LiteralPath $existingParent
-    if (($parentInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Contract parent cannot be a reparse point' }
+    Assert-NoBuildReparsePointInExistingPath $contract 'Contract directory'
     return $contract
 }
 
@@ -62,6 +118,7 @@ function Get-BuildArtifactType([string]$Category, [string]$Extension, [string]$R
 function Read-BuildContractCandidate([string]$Candidate, [string]$Profile) {
     $promotionPath = Join-Path $Candidate 'bin\asset-promotion.manifest.json'
     if (-not (Test-Path -LiteralPath $promotionPath -PathType Leaf)) { throw "Promotion manifest does not exist: $promotionPath" }
+    Assert-NoBuildReparsePointInExistingPath $promotionPath 'Promotion manifest'
     try { $promotion = Get-Content -LiteralPath $promotionPath -Raw -Encoding utf8 | ConvertFrom-Json } catch { throw "Failed to parse promotion manifest: $($_.Exception.Message)" }
     if ([int]$promotion.PromotionVersion -ne 1 -or [int]$promotion.CommandVersion -ne 1) { throw 'Build Contract requires Promotion Manifest v1 / Command v1' }
     if ([string]$promotion.CandidateKind -cne 'asset-payload-v1' -or [string]$promotion.Processing -cne 'passthrough-v1') { throw 'Unsupported candidate processing contract' }
@@ -70,16 +127,23 @@ function Read-BuildContractCandidate([string]$Candidate, [string]$Profile) {
     if ([int]$promotion.ItemCount -ne $items.Count -or $items.Count -eq 0) { throw 'Candidate ItemCount is invalid' }
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($item in $items) {
-        $inputPath = [string]$item.DestinationPath
-        if ([IO.Path]::IsPathRooted($inputPath) -or -not $inputPath.StartsWith('bin/assets/', [StringComparison]::Ordinal)) { throw "Invalid candidate artifact path: $inputPath" }
+        $candidatePath = Resolve-BuildCandidateRelativePath $Candidate ([string]$item.DestinationPath) 'Candidate artifact' -RequireLeaf
+        $inputPath = $candidatePath.RelativePath
         if (-not $seen.Add($inputPath)) { throw "Duplicate candidate artifact path: $inputPath" }
-        $filePath = Join-Path $Candidate $inputPath.Replace('/', [IO.Path]::DirectorySeparatorChar)
-        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { throw "Candidate artifact does not exist: $inputPath" }
+        $filePath = $candidatePath.FullPath
         $file = Get-Item -LiteralPath $filePath
         if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Candidate artifact cannot be a reparse point: $inputPath" }
+        $normalizedExtension = ([string]$item.Extension).TrimStart('.').ToLowerInvariant()
+        $actualExtension = [IO.Path]::GetExtension($filePath).TrimStart('.').ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($normalizedExtension) -or $normalizedExtension -cne $actualExtension) {
+            throw "Candidate artifact extension metadata mismatch: $inputPath"
+        }
         if ([long]$item.SizeBytes -ne [long]$file.Length) { throw "Candidate artifact size mismatch: $inputPath" }
         $hash = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($hash -cne [string]$item.Sha256) { throw "Candidate artifact hash mismatch: $inputPath" }
+        # 后续 per-item 映射只消费已经 canonicalize 的相对路径和扩展名。
+        $item.DestinationPath = $inputPath
+        $item.Extension = $normalizedExtension
     }
     return $promotion
 }
@@ -99,29 +163,52 @@ $contract = Resolve-BuildContractDirectory $ContractDirectory $candidate
 $promotion = Read-BuildContractCandidate $candidate $Profile
 $contractItems = @($promotion.Items | ForEach-Object {
     $inputPath = [string]$_.DestinationPath
+    $normalizedExtension = ([string]$_.Extension).ToLowerInvariant()
     $inputArtifactType = Get-BuildArtifactType ([string]$_.Category) ([string]$_.Extension) $inputPath
     $isSceneSource = [string]$_.Category -ceq 'Scene' -and $inputPath.EndsWith('.scene.json', [StringComparison]::OrdinalIgnoreCase)
     $isScriptSource = [string]$_.Category -ceq 'Script' -and $inputPath.EndsWith('.script.json', [StringComparison]::OrdinalIgnoreCase)
-    # 关键契约：candidate 仍保存可编辑 JSON，build 输出稳定的 KSCN/KSCP Runtime artifact。
-    $outputPath = if ($isSceneSource -or $isScriptSource) { $inputPath.Substring(0, $inputPath.Length - '.json'.Length) } else { $inputPath }
+    $isTextureSource = [string]$_.Category -ceq 'Texture' -and ($normalizedExtension -eq 'ppm' -or $normalizedExtension -eq 'png')
+    # 关键契约：candidate 仍保存 authoring source，per-item 则描述 build/install 产生的 Runtime artifact。
+    $outputPath = if ($isSceneSource -or $isScriptSource) {
+        $inputPath.Substring(0, $inputPath.Length - '.json'.Length)
+    } elseif ($isTextureSource) {
+        $inputPath.Substring(0, $inputPath.Length - ($normalizedExtension.Length + 1)) + '.texture'
+    } else {
+        $inputPath
+    }
+    $textureTransform = if ($isTextureSource) {
+        $sourcePrefix = if ($normalizedExtension -eq 'png') { 'png' } else { 'ppm' }
+        if ($Profile -eq 'release') { "$sourcePrefix-to-rgba8-mipmap-artifact-v2" } else { "$sourcePrefix-to-rgba8-artifact-v1" }
+    } else {
+        $null
+    }
     [ordered]@{
         AssetId = $_.AssetId
         InputPath = $inputPath
         OutputPath = $outputPath
         InputArtifactType = $inputArtifactType
-        ArtifactType = if ($isSceneSource) { 'RuntimeSceneArtifactV1' } elseif ($isScriptSource) { 'RuntimeScriptArtifactV1' } else { $inputArtifactType }
-        ImporterStatus = if ($isSceneSource -or $isScriptSource) { 'implemented-v1' } else { 'not-defined' }
-        BakerStatus = if ($isSceneSource -or $isScriptSource) { 'implemented-v1' } else { 'not-defined' }
-        Transform = if ($isSceneSource) { 'scene-json-to-kscn-f32-v1' } elseif ($isScriptSource) { 'script-json-to-kscp-v1' } else { 'passthrough-v1' }
+        ArtifactType = if ($isSceneSource) { 'RuntimeSceneArtifactV1' } elseif ($isScriptSource) { 'RuntimeScriptArtifactV1' } elseif ($isTextureSource) { 'RuntimeTextureArtifactV1' } else { $inputArtifactType }
+        ImporterStatus = if ($isSceneSource -or $isScriptSource -or $isTextureSource) { 'implemented-v1' } else { 'not-defined' }
+        BakerStatus = if ($isSceneSource -or $isScriptSource -or $isTextureSource) { 'implemented-v1' } else { 'not-defined' }
+        Transform = if ($isSceneSource) { 'scene-json-to-kscn-f32-v1' } elseif ($isScriptSource) { 'script-json-to-kscp-v1' } elseif ($isTextureSource) { $textureTransform } else { 'passthrough-v1' }
         SizeBytes = $_.SizeBytes
         Sha256 = $_.Sha256
     }
 })
 
+# 输出 identity 属于整份 contract；任两个 source/artifact 映射到同一大小写无关路径时，必须在创建目录前整单拒绝。
+$seenOutputs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($item in $contractItems) {
+    $normalizedOutput = ([string]$item.OutputPath).Replace('\', '/')
+    $canonicalOutput = Resolve-BuildCandidateRelativePath $candidate $normalizedOutput 'Build Contract output'
+    $item.OutputPath = $canonicalOutput.RelativePath
+    if (-not $seenOutputs.Add($canonicalOutput.RelativePath)) { throw "Duplicate Build Contract output path: $($canonicalOutput.RelativePath)" }
+}
+
 # Candidate 本身保持不可变；profile 语义只描述安装阶段会执行的确定性派生变换。
 $profileSemantics = [ordered]@{
-    debug = 'candidate payload unchanged; Texture PPM -> KDAT Texture Artifact v1 base-only; Scene JSON -> KSCN Scene Artifact v1; Script JSON -> KSCP Script Artifact v1; other importer/baker not defined'
-    release = 'candidate payload unchanged; Texture PPM -> KDAT Texture Artifact v2 mipmap chain; Scene JSON -> KSCN Scene Artifact v1; Script JSON -> KSCP Script Artifact v1; other importer/baker not defined'
+    debug = 'candidate payload unchanged; Texture PPM/PNG -> KDAT Texture Artifact v1 base-only; Scene JSON -> KSCN Scene Artifact v1; Script JSON -> KSCP Script Artifact v1; other importer/baker not defined'
+    release = 'candidate payload unchanged; Texture PPM/PNG -> KDAT Texture Artifact v2 mipmap chain; Scene JSON -> KSCN Scene Artifact v1; Script JSON -> KSCP Script Artifact v1; other importer/baker not defined'
 }
 if ($DryRun) {
     $plan = [ordered]@{

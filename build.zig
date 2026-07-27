@@ -175,7 +175,8 @@ pub fn build(b: *std.Build) void {
         async_texture_test_mod.linkSystemLibrary("userenv", .{});
         async_texture_test_mod.linkSystemLibrary("ws2_32", .{});
     }
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
     const preview_status_tests = b.addTest(.{
         .root_module = preview_status_mod,
     });
@@ -190,11 +191,11 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "assets",
     });
     b.getInstallStep().dependOn(&install_assets.step);
-    // Importer/Baker 在安装阶段从 PPM 源生成确定性的 KDAT Texture Artifact。
+    // Importer/Baker 在安装阶段从 PNG 源生成确定性 KDAT；Zig optimize 不改变 release texture profile。
     const texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
     texture_import.addArg("-SourcePath");
-    texture_import.addFileArg(b.path("assets/renderer2d/test.ppm"));
+    texture_import.addFileArg(b.path("assets/renderer2d/test.png"));
     texture_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const texture_artifact = texture_import.addOutputFileArg("test.texture");
     const install_texture_artifact = b.addInstallFile(texture_artifact, "bin/assets/renderer2d/test.texture");
@@ -243,6 +244,93 @@ pub fn build(b: *std.Build) void {
         "README.txt",
     );
     b.getInstallStep().dependOn(&install_package_readme.step);
+
+    // 关键包身份必须绑定当次链接产物；addFileArg 同时建立 exe/source 的依赖与 cache key。
+    const runtime_preflight_sidecar = b.option(
+        []const u8,
+        "runtime-preflight-sidecar",
+        "Absolute path to the operator-created PNG Runtime pre-build witness",
+    );
+    const runtime_build_profile_script =
+        \\$runtimePath, $texturePath, $textureArtifactPath, $vertexPath, $fragmentPath, $optimize, $packageRoot, $localCacheRoot, $globalCacheRoot, $preflightPath, $destination = $args
+        \\$ErrorActionPreference = 'Stop'
+        \\function Get-CanonicalLocalPath([string]$path, [string]$name) {
+        \\    if ([string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathFullyQualified($path)) { throw "$name must be an absolute local path" }
+        \\    $windowsSpelling = $path.Replace('/', '\\')
+        \\    if ($windowsSpelling.StartsWith('\\\\', [StringComparison]::Ordinal) -or $windowsSpelling.StartsWith('\\??\\', [StringComparison]::Ordinal)) { throw "$name cannot use UNC/device syntax" }
+        \\    return [IO.Path]::GetFullPath($windowsSpelling).TrimEnd('\\').ToLowerInvariant()
+        \\}
+        \\$preflightSha256 = $null
+        \\if ($preflightPath -cne '-') {
+        \\    [byte[]]$preflightBytes = [IO.File]::ReadAllBytes($preflightPath)
+        \\    if ($preflightBytes.Length -eq 0 -or $preflightBytes.Length -gt 65536) { throw 'Runtime preflight sidecar must contain 1..65536 bytes' }
+        \\    $preflightSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($preflightBytes)).ToLowerInvariant()
+        \\    $preflightJson = [Text.UTF8Encoding]::new($false, $true).GetString($preflightBytes)
+        \\    $preflight = $preflightJson | ConvertFrom-Json
+        \\    $jsonDocument = [System.Text.Json.JsonDocument]::Parse($preflightJson)
+        \\    try { $generatedAtText = $jsonDocument.RootElement.GetProperty('GeneratedAtUtc').GetString() } finally { $jsonDocument.Dispose() }
+        \\    $generatedAt = [DateTimeOffset]::MinValue
+        \\    if ([int]$preflight.Version -ne 1 -or [string]::IsNullOrWhiteSpace($generatedAtText) -or -not [DateTimeOffset]::TryParseExact($generatedAtText, 'O', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$generatedAt) -or $generatedAt.Offset -ne [TimeSpan]::Zero) { throw 'Runtime preflight sidecar has an invalid v1 GeneratedAtUtc' }
+        \\    if (($preflight.PackageRootAbsentBefore -isnot [bool]) -or -not $preflight.PackageRootAbsentBefore -or ($preflight.TaskLocalCacheAbsentBefore -isnot [bool]) -or -not $preflight.TaskLocalCacheAbsentBefore -or ($preflight.GlobalCacheAbsentBefore -isnot [bool]) -or -not $preflight.GlobalCacheAbsentBefore) { throw 'Runtime preflight sidecar must witness all roots absent before build' }
+        \\    $rootPairs = @(
+        \\        @([string]$preflight.PackageRoot, $packageRoot, 'PackageRoot'),
+        \\        @([string]$preflight.TaskLocalCacheDirectory, $localCacheRoot, 'TaskLocalCacheDirectory'),
+        \\        @([string]$preflight.GlobalCacheDirectory, $globalCacheRoot, 'GlobalCacheDirectory')
+        \\    )
+        \\    foreach ($pair in $rootPairs) {
+        \\        $claimed = Get-CanonicalLocalPath $pair[0] "Preflight $($pair[2])"
+        \\        $actual = Get-CanonicalLocalPath $pair[1] "Build $($pair[2])"
+        \\        if (-not $pair[0].Equals($claimed, [StringComparison]::OrdinalIgnoreCase) -or $claimed -cne $actual) { throw "Runtime preflight $($pair[2]) does not match the Zig build graph" }
+        \\    }
+        \\    $sidecarInfo = Get-Item -LiteralPath $preflightPath -Force
+        \\    $timestampTolerance = [TimeSpan]::FromSeconds(2)
+        \\    if ([math]::Abs(($generatedAt.UtcDateTime - $sidecarInfo.LastWriteTimeUtc).TotalSeconds) -gt $timestampTolerance.TotalSeconds) { throw 'Runtime preflight GeneratedAtUtc and sidecar LastWriteTimeUtc differ by more than 2 seconds' }
+        \\    foreach ($rootPath in @($packageRoot, $localCacheRoot, $globalCacheRoot)) {
+        \\        if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { throw "Zig build graph root does not exist before marker generation: $rootPath" }
+        \\        $rootInfo = Get-Item -LiteralPath $rootPath -Force
+        \\        $latestWitnessTime = $rootInfo.CreationTimeUtc + $timestampTolerance
+        \\        if ($generatedAt.UtcDateTime -gt $latestWitnessTime -or $sidecarInfo.LastWriteTimeUtc -gt $latestWitnessTime) { throw "Runtime preflight witness is newer than a build graph root: $rootPath" }
+        \\    }
+        \\}
+        \\$document = [ordered]@{
+        \\    Version = 1
+        \\    Optimize = $optimize
+        \\    TextureProfile = 'release'
+        \\    RuntimeExeSha256 = (Get-FileHash -LiteralPath $runtimePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        \\    TextureSourceSha256 = (Get-FileHash -LiteralPath $texturePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        \\    TextureArtifactSha256 = (Get-FileHash -LiteralPath $textureArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        \\    VertexShaderSourceSha256 = (Get-FileHash -LiteralPath $vertexPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        \\    FragmentShaderSourceSha256 = (Get-FileHash -LiteralPath $fragmentPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        \\    BuildPreflightSidecarSha256 = $preflightSha256
+        \\}
+        \\$temporary = "$destination.tmp-$([Guid]::NewGuid().ToString('N'))"
+        \\try {
+        \\    $json = ($document | ConvertTo-Json -Compress) + "`n"
+        \\    [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        \\    [IO.File]::Move($temporary, $destination, $false)
+        \\} finally {
+        \\    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        \\}
+    ;
+    const runtime_build_profile_command = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-CommandWithArgs", runtime_build_profile_script });
+    runtime_build_profile_command.step.dependOn(&install_exe.step);
+    runtime_build_profile_command.addFileArg(exe.getEmittedBin());
+    runtime_build_profile_command.addFileArg(b.path("assets/renderer2d/test.png"));
+    runtime_build_profile_command.addFileArg(texture_artifact);
+    runtime_build_profile_command.addFileArg(b.path("shaders/renderer2d/quad.vert.glsl"));
+    runtime_build_profile_command.addFileArg(b.path("shaders/renderer2d/quad.frag.glsl"));
+    runtime_build_profile_command.addArg(@tagName(optimize));
+    runtime_build_profile_command.addArg(b.install_path);
+    runtime_build_profile_command.addArg(b.cache_root.path orelse ".");
+    runtime_build_profile_command.addArg(b.graph.global_cache_root.path orelse ".");
+    if (runtime_preflight_sidecar) |preflight_path| {
+        runtime_build_profile_command.addFileArg(.{ .cwd_relative = preflight_path });
+    } else {
+        runtime_build_profile_command.addArg("-");
+    }
+    const runtime_build_profile = runtime_build_profile_command.addOutputFileArg("kadath-runtime-build-profile.json");
+    const install_runtime_build_profile = b.addInstallFile(runtime_build_profile, "bin/kadath-runtime-build-profile.json");
+    b.getInstallStep().dependOn(&install_runtime_build_profile.step);
 
     const package_step = b.step("package", "Build the distributable runtime directory");
     package_step.dependOn(b.getInstallStep());

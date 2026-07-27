@@ -1468,7 +1468,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         var paths = new[]
         {
             "assets/audio/lost.audio.wav", "assets/audio/lost.wav", "assets/audio/won.audio.wav", "assets/audio/won.wav",
-            "assets/renderer2d/test.ppm", "assets/renderer2d/test.texture",
+            "assets/renderer2d/test.png", "assets/renderer2d/test.texture",
             "assets/scenes/preview.scene", "assets/scenes/preview.scene.json",
             "assets/scripts/preview.script", "assets/scripts/preview.script.json"
         };

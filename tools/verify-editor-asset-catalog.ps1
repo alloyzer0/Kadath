@@ -21,7 +21,7 @@ $expectedPaths = @(
     'assets/audio/lost.wav',
     'assets/audio/won.audio.wav',
     'assets/audio/won.wav',
-    'assets/renderer2d/test.ppm',
+    'assets/renderer2d/test.png',
     'assets/renderer2d/test.texture',
     'assets/scenes/preview.scene',
     'assets/scenes/preview.scene.json',
