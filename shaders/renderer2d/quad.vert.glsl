@@ -22,6 +22,7 @@ void main() {
         pc.rect_ndc.x + local.x * pc.rect_ndc.z,
         pc.rect_ndc.y - local.y * pc.rect_ndc.w
     );
-    gl_Position = vec4(ndc, 0.0, 1.0);
+    // Vulkan 使用正高度 viewport：只翻转 clip-space Y，保持 PNG UV 自上而下。
+    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
     out_uv = local;
 }
