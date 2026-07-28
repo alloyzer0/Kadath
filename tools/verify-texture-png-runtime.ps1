@@ -33,6 +33,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 
 public sealed class KadathClientCapture
@@ -42,6 +43,15 @@ public sealed class KadathClientCapture
     public int Width { get; set; }
     public int Height { get; set; }
     public byte[] Bgra { get; set; } = Array.Empty<byte>();
+}
+
+public sealed class KadathStableFileSnapshot
+{
+    public long Length { get; set; }
+    public string Sha256 { get; set; } = "";
+    public uint VolumeSerialNumber { get; set; }
+    public uint FileIndexHigh { get; set; }
+    public uint FileIndexLow { get; set; }
 }
 
 public sealed class KadathCapturedProcess
@@ -106,6 +116,21 @@ public static class KadathPngRuntimeNative
     private const uint CAPTUREBLT = 0x40000000;
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int Left, Top, Right, Bottom; }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -159,6 +184,27 @@ public static class KadathPngRuntimeNative
     [DllImport("gdi32.dll", SetLastError = true)] private static extern bool DeleteObject(IntPtr value);
     [DllImport("gdi32.dll", SetLastError = true)] private static extern IntPtr CreateDIBSection(IntPtr hDc, ref BITMAPINFO info, uint usage, out IntPtr bits, IntPtr section, uint offset);
     [DllImport("gdi32.dll", SetLastError = true)] private static extern bool BitBlt(IntPtr destination, int x, int y, int width, int height, IntPtr source, int sourceX, int sourceY, uint operation);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION information);
+
+    public static KadathStableFileSnapshot GetStableFileSnapshot(string path)
+    {
+        // 关键身份边界：同一只读 handle 同时取得 NTFS File ID 与 hash，阻止相同字节替换伪装为未变化。
+        using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
+        {
+            if (!GetFileInformationByHandle(stream.SafeFileHandle, out BY_HANDLE_FILE_INFORMATION information))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFileInformationByHandle failed");
+            long length = stream.Length;
+            string sha256 = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+            return new KadathStableFileSnapshot
+            {
+                Length = length,
+                Sha256 = sha256,
+                VolumeSerialNumber = information.VolumeSerialNumber,
+                FileIndexHigh = information.FileIndexHigh,
+                FileIndexLow = information.FileIndexLow
+            };
+        }
+    }
 
     public static IntPtr EnterPerMonitorV2DpiAwareness()
     {
@@ -446,11 +492,16 @@ function Get-IdentitySnapshot([Collections.IDictionary]$Paths) {
     $snapshot = [ordered]@{}
     foreach ($name in $Paths.Keys) {
         $entry = $Paths[$name]
-        $file = Get-Item -LiteralPath ([string]$entry.Path) -Force
+        # 每次前后快照都重新走完整路径门：canonical、regular-file、无 reparse 后才打开身份 handle。
+        $path = Resolve-CanonicalFile ([string]$entry.Path) "Runtime identity file '$name'"
+        $fileSnapshot = [KadathPngRuntimeNative]::GetStableFileSnapshot($path)
         $snapshot[$name] = [ordered]@{
             RelativePath = [string]$entry.RelativePath
-            Length = [int64]$file.Length
-            Sha256 = Get-Hash ([string]$entry.Path)
+            Length = [int64]$fileSnapshot.Length
+            Sha256 = [string]$fileSnapshot.Sha256
+            VolumeSerialNumber = [uint32]$fileSnapshot.VolumeSerialNumber
+            FileIndexHigh = [uint32]$fileSnapshot.FileIndexHigh
+            FileIndexLow = [uint32]$fileSnapshot.FileIndexLow
         }
     }
     return $snapshot
@@ -462,7 +513,10 @@ function Assert-IdentityUnchanged([Collections.IDictionary]$Before, [Collections
         if (-not $After.Contains($name) -or
             [string]$Before[$name].RelativePath -cne [string]$After[$name].RelativePath -or
             [int64]$Before[$name].Length -ne [int64]$After[$name].Length -or
-            [string]$Before[$name].Sha256 -cne [string]$After[$name].Sha256) {
+            [string]$Before[$name].Sha256 -cne [string]$After[$name].Sha256 -or
+            [uint32]$Before[$name].VolumeSerialNumber -ne [uint32]$After[$name].VolumeSerialNumber -or
+            [uint32]$Before[$name].FileIndexHigh -ne [uint32]$After[$name].FileIndexHigh -or
+            [uint32]$Before[$name].FileIndexLow -ne [uint32]$After[$name].FileIndexLow) {
             throw "Runtime identity file changed after preflight: $name"
         }
     }
@@ -1000,6 +1054,8 @@ $identityPaths = [ordered]@{
 }
 $identityBefore = Get-IdentitySnapshot $identityPaths
 $identityAfter = $null
+$identitySnapshotAttempted = $false
+$identityValidationError = $null
 
 New-Item -ItemType Directory -Path $evidence | Out-Null
 $stdoutPath = Join-Path $evidence 'runtime.stdout.log'
@@ -1201,6 +1257,7 @@ try {
         $restartPostedAt -lt $lossObservedAt -or $restartObservedAt -lt $restartPostedAt) {
         throw 'GameSession loss/restart evidence is missing or out of order'
     }
+    $identitySnapshotAttempted = $true
     $identityAfter = Get-IdentitySnapshot $identityPaths
     Assert-IdentityUnchanged $identityBefore $identityAfter
 
@@ -1287,6 +1344,7 @@ try {
     Write-Output 'runtime_shutdown=ok'
     Write-Output 'verification=ok'
 } catch {
+    $primaryFailure = $_
     if ($null -ne $processCapture) { try { $processCapture.FlushLogs($stdoutPath, $stderrPath) } catch { } }
     if ($null -ne $lastCapture -and -not (Test-Path -LiteralPath $screenshotPath)) {
         try { [KadathPngRuntimeNative]::WritePng($screenshotPath, $lastCapture) } catch { }
@@ -1295,14 +1353,22 @@ try {
         if ($window -ne [IntPtr]::Zero) { [void][KadathPngRuntimeNative]::PostMessage($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
         if ($null -eq $processCapture -or -not $processCapture.WaitForExit(3000)) { $forcedKill = $true; $process.Kill($true); $process.WaitForExit() }
     }
-    $identityAfter = Get-IdentitySnapshot $identityPaths
-    Assert-IdentityUnchanged $identityBefore $identityAfter
+    try {
+        $identitySnapshotAttempted = $true
+        $identityAfter = Get-IdentitySnapshot $identityPaths
+        Assert-IdentityUnchanged $identityBefore $identityAfter
+    } catch {
+        # 身份错误必须成为最终失败，且写入 failure evidence，不能被通用证据清理逻辑吞掉。
+        $identityValidationError = $_
+    }
     if (-not (Test-Path -LiteralPath $evidencePath)) {
         try {
             $failureDocument = [ordered]@{
                 VerificationVersion = 1
                 Failed = $true
-                Error = $_.Exception.Message
+                Error = if ($null -ne $identityValidationError) { $identityValidationError.Exception.Message } else { $primaryFailure.Exception.Message }
+                PrimaryError = $primaryFailure.Exception.Message
+                IdentityValidationError = if ($null -ne $identityValidationError) { $identityValidationError.Exception.Message } else { $null }
                 KadathRoot = $kadath
                 GitHead = $gitHead
                 GitTree = $gitTree
@@ -1367,7 +1433,8 @@ try {
             [IO.File]::WriteAllText($evidencePath, ($failureDocument | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
         } catch { }
     }
-    throw
+    if ($null -ne $identityValidationError) { throw $identityValidationError }
+    throw $primaryFailure
 } finally {
     if ($window -ne [IntPtr]::Zero) { [KadathPngRuntimeNative]::RestoreCaptureZOrder($window) }
     if ($null -ne $process -and -not $process.HasExited) {
@@ -1376,7 +1443,8 @@ try {
     }
     if ($null -ne $processCapture) { try { $processCapture.FlushLogs($stdoutPath, $stderrPath) } catch { } }
     [KadathPngRuntimeNative]::RestoreDpiAwareness($previousDpi)
-    if ($null -eq $identityAfter) {
+    if (-not $identitySnapshotAttempted) {
+        $identitySnapshotAttempted = $true
         $identityAfter = Get-IdentitySnapshot $identityPaths
         Assert-IdentityUnchanged $identityBefore $identityAfter
     }

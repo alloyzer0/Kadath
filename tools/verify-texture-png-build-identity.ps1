@@ -348,6 +348,15 @@ $restoreError = $null
 $root = $null
 $output = $null
 $buildRoots = $null
+$faultPrefix = $null
+$faultLocalCache = $null
+$faultGlobalCache = $null
+$fileIdFaultPrefix = $null
+$fileIdFaultLocalCache = $null
+$fileIdFaultGlobalCache = $null
+$replacementFaultPrefix = $null
+$replacementFaultLocalCache = $null
+$replacementFaultGlobalCache = $null
 
 try {
     $root = Resolve-CanonicalDirectory $KadathRoot 'KadathRoot'
@@ -539,6 +548,134 @@ try {
 if ($null -ne $restoreError) { throw $restoreError }
 if ($null -ne $primaryError) { throw $primaryError }
 
+# 使用全新的前缀与缓存运行 build 私有故障开关，避免正常 barrier 构建缓存掩盖快照写入路径。
+$faultPrefix = Join-Path $output 'fault-package'
+$faultLocalCache = Join-Path $output 'fault-local-cache'
+$faultGlobalCache = Join-Path $output 'fault-global-cache'
+$faultRoots = [ordered]@{ FaultPackage = $faultPrefix; FaultLocalCache = $faultLocalCache; FaultGlobalCache = $faultGlobalCache }
+foreach ($entry in $faultRoots.GetEnumerator()) {
+    Assert-DirectChild $output $entry.Value $entry.Key
+    Assert-NoReparsePointInExistingPath $entry.Value $entry.Key
+    if (Test-Path -LiteralPath $entry.Value) { throw "$($entry.Key) must not exist before partial-write fault verification: $($entry.Value)" }
+}
+
+$zig = (Get-Command zig -CommandType Application -ErrorAction Stop).Source
+$faultArguments = [string[]]@(
+    'build', 'package', '-Doptimize=ReleaseSafe',
+    '--prefix', $faultPrefix,
+    '--cache-dir', $faultLocalCache,
+    '--global-cache-dir', $faultGlobalCache,
+    '-Dtexture-source-snapshot-test-fault=snapshot-partial-write-before-flush'
+)
+$faultCapture = Start-CapturedProcess $zig $faultArguments $root
+$faultResult = Complete-CapturedProcess $faultCapture 300000 'Partial-write fault package build'
+$faultOutput = $faultResult.Stdout + [Environment]::NewLine + $faultResult.Stderr
+if ($faultResult.ExitCode -eq 0) { throw 'Partial-write fault package build unexpectedly succeeded.' }
+if ($faultOutput -notmatch [regex]::Escape('Injected snapshot partial-write-before-flush failure')) {
+    throw "Partial-write fault package build failed without the injected cleanup oracle. stdout=$($faultResult.Stdout) stderr=$($faultResult.Stderr)"
+}
+
+# 故障发生在 Flush 之前；残片若仍依赖完整 length/hash 才能清理，将在任一隔离 root 中被检出。
+foreach ($entry in $faultRoots.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $entry.Value)) { continue }
+    $canonicalFaultRoot = Resolve-CanonicalDirectory $entry.Value "$($entry.Key) after partial-write fault"
+    Assert-DirectChild $output $canonicalFaultRoot $entry.Key
+    $faultTemporaryFiles = @(
+        Get-ChildItem -LiteralPath $canonicalFaultRoot -Recurse -Force -File -Filter '.kadath-texture-source-snapshot-*.tmp' -ErrorAction Stop
+    )
+if ($faultTemporaryFiles.Count -ne 0) {
+    throw "Partial-write fault cleanup left snapshot temporary files: $($faultTemporaryFiles.FullName -join '; ')"
+}
+}
+
+# File ID 读取完成、PowerShell 尚未接管 owned object 前的失败必须由原 CreateNew handle 自行 Delete disposition，不能留下残片。
+$fileIdFaultPrefix = Join-Path $output 'file-id-fault-package'
+$fileIdFaultLocalCache = Join-Path $output 'file-id-fault-local-cache'
+$fileIdFaultGlobalCache = Join-Path $output 'file-id-fault-global-cache'
+$fileIdFaultRoots = [ordered]@{
+    FileIdFaultPackage = $fileIdFaultPrefix
+    FileIdFaultLocalCache = $fileIdFaultLocalCache
+    FileIdFaultGlobalCache = $fileIdFaultGlobalCache
+}
+foreach ($entry in $fileIdFaultRoots.GetEnumerator()) {
+    Assert-DirectChild $output $entry.Value $entry.Key
+    Assert-NoReparsePointInExistingPath $entry.Value $entry.Key
+    if (Test-Path -LiteralPath $entry.Value) { throw "$($entry.Key) must not exist before file-id pre-return fault verification: $($entry.Value)" }
+}
+
+$fileIdFaultArguments = [string[]]@(
+    'build', 'package', '-Doptimize=ReleaseSafe',
+    '--prefix', $fileIdFaultPrefix,
+    '--cache-dir', $fileIdFaultLocalCache,
+    '--global-cache-dir', $fileIdFaultGlobalCache,
+    '-Dtexture-source-snapshot-test-fault=snapshot-file-id-before-return'
+)
+$fileIdFaultCapture = Start-CapturedProcess $zig $fileIdFaultArguments $root
+$fileIdFaultResult = Complete-CapturedProcess $fileIdFaultCapture 300000 'File ID pre-return fault package build'
+$fileIdFaultOutput = $fileIdFaultResult.Stdout + [Environment]::NewLine + $fileIdFaultResult.Stderr
+if ($fileIdFaultResult.ExitCode -eq 0) { throw 'File ID pre-return fault package build unexpectedly succeeded.' }
+if ($fileIdFaultOutput -notmatch [regex]::Escape('Injected snapshot file-id-before-return failure')) {
+    throw "File ID pre-return fault package build failed without the injected cleanup oracle. stdout=$($fileIdFaultResult.Stdout) stderr=$($fileIdFaultResult.Stderr)"
+}
+foreach ($entry in $fileIdFaultRoots.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $entry.Value)) { continue }
+    $canonicalFileIdFaultRoot = Resolve-CanonicalDirectory $entry.Value "$($entry.Key) after file-id pre-return fault"
+    Assert-DirectChild $output $canonicalFileIdFaultRoot $entry.Key
+    $fileIdFaultTemporaryFiles = @(
+        Get-ChildItem -LiteralPath $canonicalFileIdFaultRoot -Recurse -Force -File -Filter '.kadath-texture-source-snapshot-*.tmp' -ErrorAction Stop
+    )
+    if ($fileIdFaultTemporaryFiles.Count -ne 0) {
+        throw "File ID pre-return fault cleanup left snapshot temporary files: $($fileIdFaultTemporaryFiles.FullName -join '; ')"
+    }
+}
+
+# 同字节 File.Replace 竞争 smoke：替换后的路径长度/哈希仍相同，但 File ID 不同，cleanup 必须拒绝按路径删除。
+$replacementFaultPrefix = Join-Path $output 'replacement-fault-package'
+$replacementFaultLocalCache = Join-Path $output 'replacement-fault-local-cache'
+$replacementFaultGlobalCache = Join-Path $output 'replacement-fault-global-cache'
+$replacementFaultRoots = [ordered]@{
+    ReplacementFaultPackage = $replacementFaultPrefix
+    ReplacementFaultLocalCache = $replacementFaultLocalCache
+    ReplacementFaultGlobalCache = $replacementFaultGlobalCache
+}
+foreach ($entry in $replacementFaultRoots.GetEnumerator()) {
+    Assert-DirectChild $output $entry.Value $entry.Key
+    Assert-NoReparsePointInExistingPath $entry.Value $entry.Key
+    if (Test-Path -LiteralPath $entry.Value) { throw "$($entry.Key) must not exist before replacement fault verification: $($entry.Value)" }
+}
+
+$replacementFaultArguments = [string[]]@(
+    'build', 'package', '-Doptimize=ReleaseSafe',
+    '--prefix', $replacementFaultPrefix,
+    '--cache-dir', $replacementFaultLocalCache,
+    '--global-cache-dir', $replacementFaultGlobalCache,
+    '-Dtexture-source-snapshot-test-fault=snapshot-replace-before-cleanup'
+)
+$replacementFaultCapture = Start-CapturedProcess $zig $replacementFaultArguments $root
+$replacementFaultResult = Complete-CapturedProcess $replacementFaultCapture 300000 'Same-byte replacement fault package build'
+$replacementFaultOutput = $replacementFaultResult.Stdout + [Environment]::NewLine + $replacementFaultResult.Stderr
+if ($replacementFaultResult.ExitCode -eq 0) { throw 'Same-byte replacement fault package build unexpectedly succeeded.' }
+if ($replacementFaultOutput -notmatch [regex]::Escape('Refusing to delete a replaced snapshot object.')) {
+    throw "Same-byte replacement fault did not fail closed on the replaced File ID. stdout=$($replacementFaultResult.Stdout) stderr=$($replacementFaultResult.Stderr)"
+}
+
+# Zig 失败路径可能随后回收整个 command output directory；拒删诊断才是本回归的对象身份 oracle。
+$retainedReplacementFiles = @()
+foreach ($entry in $replacementFaultRoots.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $entry.Value)) { continue }
+    $canonicalReplacementFaultRoot = Resolve-CanonicalDirectory $entry.Value "$($entry.Key) after replacement fault"
+    Assert-DirectChild $output $canonicalReplacementFaultRoot $entry.Key
+    $retainedReplacementFiles += @(
+        Get-ChildItem -LiteralPath $canonicalReplacementFaultRoot -Recurse -Force -File -Filter '.kadath-texture-source-snapshot-*.tmp' -ErrorAction Stop
+    )
+}
+if ($retainedReplacementFiles.Count -gt 1) {
+    throw "Same-byte replacement fault found multiple replacement remnants: $($retainedReplacementFiles.FullName -join '; ')"
+}
+if ($retainedReplacementFiles.Count -eq 1 -and -not (Test-ByteArraysEqual ([IO.File]::ReadAllBytes($retainedReplacementFiles[0].FullName)) $sourceABytes)) {
+    throw 'Same-byte replacement fault remnant bytes do not match the source snapshot.'
+}
+
 # GREEN oracle：所有最终身份都从独立实物重算，不从 build marker 反推期望值。
 $root = Resolve-CanonicalDirectory $KadathRoot 'KadathRoot after build'
 $headAfter = Assert-CleanWorktree $root $headBefore
@@ -607,6 +744,9 @@ Write-Output "source_b_sha256=$sourceBHash"
 Write-Output "package_source_sha256=$packageSourceHash"
 Write-Output "package_texture_sha256=$packageTextureHash"
 Write-Output 'snapshot_barrier=ok'
+Write-Output 'snapshot_partial_write_cleanup=ok'
+Write-Output 'snapshot_file_id_before_return_cleanup=ok'
+Write-Output 'snapshot_same_byte_replacement_refusal=ok'
 Write-Output 'source_restored=ok'
 Write-Output 'package_identity=ok'
 Write-Output 'verification=ok'

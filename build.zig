@@ -191,9 +191,170 @@ pub fn build(b: *std.Build) void {
         "Verifier-only absolute empty directory used to pause after the PNG source snapshot",
     );
     const texture_source_snapshot_script =
-        \\$sourcePath, $barrierPath, $destination = $args
+        \\$sourcePath, $barrierPath, $faultMode, $destination = $args
         \\$ErrorActionPreference = 'Stop'
         \\Set-StrictMode -Version Latest
+        \\if ($null -eq ('Kadath.TextureSourceSnapshot.Native' -as [type])) {
+        \\    Add-Type -TypeDefinition @'
+        \\using System;
+        \\using System.ComponentModel;
+        \\using System.IO;
+        \\using System.Runtime.InteropServices;
+        \\using Microsoft.Win32.SafeHandles;
+        \\namespace Kadath.TextureSourceSnapshot
+        \\{
+        \\    public sealed class OwnedFile
+        \\    {
+        \\        public string Path { get; private set; }
+        \\        public FileStream Stream { get; private set; }
+        \\        public string VolumeFileId { get; private set; }
+        \\        internal OwnedFile(string path, FileStream stream, string volumeFileId)
+        \\        {
+        \\            Path = path;
+        \\            Stream = stream;
+        \\            VolumeFileId = volumeFileId;
+        \\        }
+        \\        public void CloseStream()
+        \\        {
+        \\            if (Stream != null) {
+        \\                Stream.Dispose();
+        \\                Stream = null;
+        \\            }
+        \\        }
+        \\    }
+        \\    public static class Native
+        \\    {
+        \\        [StructLayout(LayoutKind.Sequential)]
+        \\        private struct ByHandleFileInformation
+        \\        {
+        \\            public uint FileAttributes;
+        \\            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        \\            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        \\            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        \\            public uint VolumeSerialNumber;
+        \\            public uint FileSizeHigh;
+        \\            public uint FileSizeLow;
+        \\            public uint NumberOfLinks;
+        \\            public uint FileIndexHigh;
+        \\            public uint FileIndexLow;
+        \\        }
+        \\        [DllImport("kernel32.dll", SetLastError = true)]
+        \\        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation information);
+        \\        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        \\        private static extern SafeFileHandle CreateFile(
+        \\            string fileName,
+        \\            uint desiredAccess,
+        \\            uint shareMode,
+        \\            IntPtr securityAttributes,
+        \\            uint creationDisposition,
+        \\            uint flagsAndAttributes,
+        \\            IntPtr templateFile);
+        \\        [DllImport("kernel32.dll", SetLastError = true)]
+        \\        private static extern bool SetFileInformationByHandle(
+        \\            SafeFileHandle handle,
+        \\            FileInformationByHandleClass fileInformationClass,
+        \\            ref FileDispositionInformation fileInformation,
+        \\            uint bufferSize);
+        \\        private enum FileInformationByHandleClass
+        \\        {
+        \\            FileDispositionInfo = 4,
+        \\        }
+        \\        [StructLayout(LayoutKind.Sequential)]
+        \\        private struct FileDispositionInformation
+        \\        {
+        \\            [MarshalAs(UnmanagedType.Bool)]
+        \\            public bool DeleteFile;
+        \\        }
+        \\        private const uint DeleteAccess = 0x00010000;
+        \\        private const uint FileReadAttributesAccess = 0x00000080;
+        \\        private const uint GenericWriteAccess = 0x40000000;
+        \\        private const uint CreateNew = 1;
+        \\        private const uint OpenExisting = 3;
+        \\        private const uint FileAttributeNormal = 0x00000080;
+        \\        public static string GetVolumeFileId(SafeFileHandle handle)
+        \\        {
+        \\            if (handle == null || handle.IsInvalid) throw new InvalidOperationException("Owned temporary handle is invalid.");
+        \\            ByHandleFileInformation information;
+        \\            if (!GetFileInformationByHandle(handle, out information)) throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFileInformationByHandle failed.");
+        \\            ulong fileIndex = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
+        \\            return information.VolumeSerialNumber.ToString("x8") + ":" + fileIndex.ToString("x16");
+        \\        }
+        \\        private static void MarkHandleForDelete(SafeFileHandle handle)
+        \\        {
+        \\            if (handle == null || handle.IsInvalid) throw new InvalidOperationException("Owned temporary handle is invalid.");
+        \\            FileDispositionInformation disposition = new FileDispositionInformation { DeleteFile = true };
+        \\            if (!SetFileInformationByHandle(
+        \\                handle,
+        \\                FileInformationByHandleClass.FileDispositionInfo,
+        \\                ref disposition,
+        \\                (uint)Marshal.SizeOf(typeof(FileDispositionInformation)))) {
+        \\                throw new Win32Exception(Marshal.GetLastWin32Error(), "SetFileInformationByHandle(FileDispositionInfo) failed.");
+        \\            }
+        \\        }
+        \\        public static OwnedFile CreateNewOwnedFile(string path, bool injectFileIdBeforeReturnFailure)
+        \\        {
+        \\            SafeFileHandle handle = null;
+        \\            FileStream stream = null;
+        \\            try
+        \\            {
+        \\                // 原 owning handle 从 CreateNew 起同时持有 WRITE 与 DELETE；异常路径绝不按 path 重新打开。
+        \\                handle = CreateFile(
+        \\                    path,
+        \\                    GenericWriteAccess | DeleteAccess | FileReadAttributesAccess,
+        \\                    0,
+        \\                    IntPtr.Zero,
+        \\                    CreateNew,
+        \\                    FileAttributeNormal,
+        \\                    IntPtr.Zero);
+        \\                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateFile(CreateNew) for owned snapshot failed.");
+        \\                string volumeFileId = GetVolumeFileId(handle);
+        \\                if (injectFileIdBeforeReturnFailure) throw new InvalidOperationException("Injected snapshot file-id-before-return failure.");
+        \\                stream = new FileStream(handle, FileAccess.Write);
+        \\                OwnedFile owned = new OwnedFile(path, stream, volumeFileId);
+        \\                stream = null;
+        \\                return owned;
+        \\            }
+        \\            catch (Exception primary)
+        \\            {
+        \\                Exception cleanupFailure = null;
+        \\                try {
+        \\                    if (handle != null && !handle.IsInvalid) MarkHandleForDelete(handle);
+        \\                } catch (Exception cleanup) {
+        \\                    cleanupFailure = cleanup;
+        \\                }
+        \\                try {
+        \\                    if (stream != null) stream.Dispose();
+        \\                    else if (handle != null) handle.Dispose();
+        \\                } catch (Exception cleanup) {
+        \\                    cleanupFailure = cleanupFailure == null ? cleanup : new AggregateException(cleanupFailure, cleanup);
+        \\                }
+        \\                if (cleanupFailure != null) throw new AggregateException("CreateNew owned snapshot cleanup failed.", primary, cleanupFailure);
+        \\                throw;
+        \\            }
+        \\        }
+        \\        public static void DeleteIfVolumeFileIdMatches(string path, string expectedVolumeFileId)
+        \\        {
+        \\            if (String.IsNullOrWhiteSpace(expectedVolumeFileId)) throw new ArgumentException("A recorded File ID is required.", "expectedVolumeFileId");
+        \\            using (SafeFileHandle handle = CreateFile(
+        \\                path,
+        \\                DeleteAccess | FileReadAttributesAccess,
+        \\                0,
+        \\                IntPtr.Zero,
+        \\                OpenExisting,
+        \\                FileAttributeNormal,
+        \\                IntPtr.Zero))
+        \\            {
+        \\                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateFile for owned snapshot cleanup failed.");
+        \\                if (!String.Equals(GetVolumeFileId(handle), expectedVolumeFileId, StringComparison.Ordinal)) {
+        \\                    throw new InvalidOperationException("Refusing to delete a replaced snapshot object.");
+        \\                }
+        \\                MarkHandleForDelete(handle);
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\'@
+        \\}
         \\function Assert-NoWin32DevicePath([string]$path, [string]$name) {
         \\    if ([string]::IsNullOrWhiteSpace($path)) { throw "$name cannot be empty" }
         \\    $windowsSpelling = $path.Replace('/', '\\')
@@ -242,25 +403,36 @@ pub fn build(b: *std.Build) void {
         \\    return $normalizedCandidate.StartsWith($normalizedParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
         \\}
         \\function Get-BytesHash([byte[]]$bytes) { return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant() }
-        \\function Write-OwnedFileDurable([string]$path, [byte[]]$bytes) {
-        \\    $stream = $null
+        \\function New-OwnedFile([string]$path, [bool]$injectFileIdBeforeReturnFailure = $false) {
+        \\    # C# helper 在原 CreateNew handle 仍打开时完成 File ID/对象分配；任何 return 前异常先 Delete disposition 再关闭。
+        \\    return [Kadath.TextureSourceSnapshot.Native]::CreateNewOwnedFile($path, $injectFileIdBeforeReturnFailure)
+        \\}
+        \\function Write-OwnedFileDurable([object]$owned, [byte[]]$bytes, [string]$mode = '-') {
+        \\    if ($null -eq $owned -or $null -eq $owned.Stream) { throw 'Owned temporary stream is unavailable' }
+        \\    $stream = $owned.Stream
         \\    try {
-        \\        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        \\        if ($mode -ceq 'snapshot-partial-write-before-flush') {
+        \\            # verifier 专用：留下部分 bytes 后在 Flush 前失败，回归覆盖不完整临时文件的 File ID cleanup。
+        \\            $partialLength = [Math]::Max(1, [Math]::Min($bytes.Length - 1, 7))
+        \\            $stream.Write($bytes, 0, $partialLength)
+        \\            throw 'Injected snapshot partial-write-before-flush failure'
+        \\        }
         \\        $stream.Write($bytes, 0, $bytes.Length)
         \\        $stream.Flush($true)
         \\    } finally {
-        \\        if ($null -ne $stream) { $stream.Dispose() }
+        \\        $owned.CloseStream()
         \\    }
         \\}
-        \\function Remove-OwnedTemporary([string]$path, [long]$expectedLength, [string]$expectedHash) {
+        \\function Remove-OwnedTemporary([string]$path, [string]$expectedVolumeFileId) {
         \\    if (-not (Test-Path -LiteralPath $path)) { return }
+        \\    if ([string]::IsNullOrWhiteSpace($expectedVolumeFileId)) { throw "Refusing to delete snapshot path without a recorded File ID: $path" }
         \\    Assert-NoReparsePointInExistingPath $path 'Owned snapshot file'
         \\    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Refusing to delete a non-file snapshot path: $path" }
-        \\    $item = Get-Item -LiteralPath $path -Force
-        \\    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or $item.Length -ne $expectedLength -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedHash) { throw "Refusing to delete an unowned snapshot temporary: $path" }
-        \\    Remove-Item -LiteralPath $path -Force
+        \\    # 身份比对与 FileDispositionInfo 删除标记固定在同一 DELETE 句柄上，关闭后才完成删除，避免路径二次解析竞态。
+        \\    [Kadath.TextureSourceSnapshot.Native]::DeleteIfVolumeFileIdMatches($path, $expectedVolumeFileId)
         \\}
         \\$barrier = $null
+        \\if ($faultMode -cne '-' -and $faultMode -cne 'snapshot-file-id-before-return' -and $faultMode -cne 'snapshot-partial-write-before-flush' -and $faultMode -cne 'snapshot-replace-before-cleanup') { throw "Unknown snapshot verifier fault mode: $faultMode" }
         \\if ($barrierPath -cne '-') {
         \\    Assert-NoWin32DevicePath $barrierPath 'Snapshot test barrier'
         \\    if (-not [IO.Path]::IsPathFullyQualified($barrierPath)) { throw 'Snapshot test barrier must be fully qualified' }
@@ -302,18 +474,32 @@ pub fn build(b: *std.Build) void {
         \\$destinationParent = Resolve-CanonicalDirectory $destinationParent 'Texture source snapshot output parent after create'
         \\if (Test-Path -LiteralPath $destination) { throw "Texture source snapshot destination already exists: $destination" }
         \\$snapshotTemporary = Join-Path $destinationParent ('.kadath-texture-source-snapshot-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+        \\$snapshotTemporaryOwned = $null
+        \\$destinationVolumeFileId = $null
         \\$readyTemporary = $null
+        \\$readyTemporaryOwned = $null
         \\$readyTemporaryBytes = $null
-        \\$readyTemporaryHash = $null
+        \\$replacementTemporary = $null
+        \\$replacementTemporaryOwned = $null
         \\$destinationCommitted = $false
         \\$snapshotSucceeded = $false
         \\try {
-        \\    Write-OwnedFileDurable $snapshotTemporary $sourceBytes
+        \\    $snapshotTemporaryOwned = New-OwnedFile $snapshotTemporary ($faultMode -ceq 'snapshot-file-id-before-return')
+        \\    Write-OwnedFileDurable $snapshotTemporaryOwned $sourceBytes $faultMode
+        \\    if ($faultMode -ceq 'snapshot-replace-before-cleanup') {
+        \\        # 同字节 replacement 专门证明 cleanup 不能退化为 length/hash/path：替换后 File ID 必须不同。
+        \\        $replacementTemporary = Join-Path $destinationParent ('.kadath-texture-source-replacement-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+        \\        $replacementTemporaryOwned = New-OwnedFile $replacementTemporary
+        \\        Write-OwnedFileDurable $replacementTemporaryOwned $sourceBytes
+        \\        [IO.File]::Replace($replacementTemporary, $snapshotTemporary, $null, $true)
+        \\        throw 'Injected snapshot replace-before-cleanup failure'
+        \\    }
         \\    if ((Get-FileHash -LiteralPath $snapshotTemporary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sourceHash) { throw 'Durable texture source snapshot hash mismatch' }
         \\    $moveParent = Resolve-CanonicalDirectory $destinationParent 'Texture source snapshot output parent before move'
         \\    if (-not $moveParent.Equals($destinationParent, [StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $destination)) { throw 'Texture source snapshot destination changed before no-replace move' }
         \\    [IO.File]::Move($snapshotTemporary, $destination, $false)
         \\    $destinationCommitted = $true
+        \\    $destinationVolumeFileId = $snapshotTemporaryOwned.VolumeFileId
         \\    $committedDestination = Resolve-CanonicalFile $destination 'Committed texture source snapshot'
         \\    if ((Get-Item -LiteralPath $committedDestination -Force).Length -ne $sourceBytes.Length -or (Get-FileHash -LiteralPath $committedDestination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sourceHash) { throw 'Committed texture source snapshot identity mismatch' }
         \\    if ($null -ne $barrier) {
@@ -323,9 +509,9 @@ pub fn build(b: *std.Build) void {
         \\        if ((Test-Path -LiteralPath $readyPath) -or (Test-Path -LiteralPath $releasePath)) { throw 'Snapshot test barrier contains a pre-existing control path' }
         \\        $readyDocument = [ordered]@{ Version = 1; Length = [long]$sourceBytes.Length; Sha256 = $sourceHash }
         \\        $readyTemporaryBytes = [Text.UTF8Encoding]::new($false).GetBytes(($readyDocument | ConvertTo-Json -Compress) + "`n")
-        \\        $readyTemporaryHash = Get-BytesHash $readyTemporaryBytes
         \\        $readyTemporary = Join-Path $barrier ('.ready-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
-        \\        Write-OwnedFileDurable $readyTemporary $readyTemporaryBytes
+        \\        $readyTemporaryOwned = New-OwnedFile $readyTemporary
+        \\        Write-OwnedFileDurable $readyTemporaryOwned $readyTemporaryBytes
         \\        [IO.File]::Move($readyTemporary, $readyPath, $false)
         \\        $wait = [Diagnostics.Stopwatch]::StartNew()
         \\        while ($true) {
@@ -345,11 +531,16 @@ pub fn build(b: *std.Build) void {
         \\    # cleanup 必须全部尝试：destination rollback 优先，单项失败不得短路其它 owned temp。
         \\    $cleanupErrors = [Collections.Generic.List[Exception]]::new()
         \\    try {
-        \\        if ($destinationCommitted -and -not $snapshotSucceeded) { Remove-OwnedTemporary $destination $sourceBytes.Length $sourceHash }
+        \\        if ($destinationCommitted -and -not $snapshotSucceeded) { Remove-OwnedTemporary $destination $destinationVolumeFileId }
         \\    } catch { $cleanupErrors.Add($_.Exception) }
-        \\    try { Remove-OwnedTemporary $snapshotTemporary $sourceBytes.Length $sourceHash } catch { $cleanupErrors.Add($_.Exception) }
         \\    try {
-        \\        if ($null -ne $readyTemporary -and $null -ne $readyTemporaryBytes) { Remove-OwnedTemporary $readyTemporary $readyTemporaryBytes.Length $readyTemporaryHash }
+        \\        if ($null -ne $snapshotTemporaryOwned) { Remove-OwnedTemporary $snapshotTemporary $snapshotTemporaryOwned.VolumeFileId }
+        \\    } catch { $cleanupErrors.Add($_.Exception) }
+        \\    try {
+        \\        if ($null -ne $replacementTemporaryOwned) { Remove-OwnedTemporary $replacementTemporary $replacementTemporaryOwned.VolumeFileId }
+        \\    } catch { $cleanupErrors.Add($_.Exception) }
+        \\    try {
+        \\        if ($null -ne $readyTemporaryOwned) { Remove-OwnedTemporary $readyTemporary $readyTemporaryOwned.VolumeFileId }
         \\    } catch { $cleanupErrors.Add($_.Exception) }
         \\    if ($cleanupErrors.Count -eq 1) { throw $cleanupErrors[0] }
         \\    if ($cleanupErrors.Count -gt 1) { throw [AggregateException]::new('Texture source snapshot cleanup failures', $cleanupErrors) }
@@ -359,6 +550,16 @@ pub fn build(b: *std.Build) void {
     texture_source_snapshot_command.addFileArg(b.path("assets/renderer2d/test.png"));
     if (texture_source_snapshot_test_barrier) |barrier_path| {
         texture_source_snapshot_command.addArg(barrier_path);
+    } else {
+        texture_source_snapshot_command.addArg("-");
+    }
+    const texture_source_snapshot_test_fault = b.option(
+        []const u8,
+        "texture-source-snapshot-test-fault",
+        "Verifier-only snapshot fault injection for pre-return, partial-write cleanup, or same-byte replacement refusal",
+    );
+    if (texture_source_snapshot_test_fault) |fault_mode| {
+        texture_source_snapshot_command.addArg(fault_mode);
     } else {
         texture_source_snapshot_command.addArg("-");
     }
