@@ -1,0 +1,4 @@
+# Zig 0.16 的格式检查要求 LF；固定行尾，避免 Windows 的 core.autocrlf 破坏 fresh worktree。
+.gitattributes text eol=lf
+*.zig text eol=lf
+*.zon text eol=lf
