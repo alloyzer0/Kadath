@@ -4,6 +4,7 @@ const types = @import("types.zig");
 const max_pipelines: usize = 8;
 const max_textures: usize = 8;
 const max_texture_mip_levels: usize = 32;
+const max_draw_texture_trace: usize = 256;
 
 pub const Extent2D = types.Extent2D;
 pub const FrameOutcome = types.FrameOutcome;
@@ -33,12 +34,18 @@ pub const NullStats = struct {
     frames_finished: u32 = 0,
     failed_frames_consumed: u32 = 0,
     recreates: u32 = 0,
+    textures_created: u32 = 0,
+    textures_destroyed: u32 = 0,
+    textures_live: u32 = 0,
+    draw_texture_trace: [max_draw_texture_trace]types.TextureHandle = [_]types.TextureHandle{types.invalid_texture} ** max_draw_texture_trace,
+    draw_texture_trace_len: usize = 0,
 };
 
 pub const FrameEncoder = struct {
     rhi: *Rhi,
     frame_token: u64,
     bound_pipeline: types.PipelineHandle = types.invalid_pipeline,
+    bound_texture: types.TextureHandle = types.invalid_texture,
     recording: bool = true,
     finished: bool = false,
 
@@ -58,6 +65,7 @@ pub const FrameEncoder = struct {
         const desc = pipeline.desc orelse return error.InvalidPipeline;
         if (!desc.uses_texture) return error.TextureBindingUnsupported;
         _ = self.rhi.textureSlot(texture) orelse return error.InvalidTexture;
+        self.bound_texture = texture;
         self.rhi.stats_value.texture_binds += 1;
     }
 
@@ -77,6 +85,10 @@ pub const FrameEncoder = struct {
         try self.rhi.validateFrame(self);
         if (self.bound_pipeline == types.invalid_pipeline) return error.InvalidPipeline;
         if (vertex_count == 0) return error.InvalidDrawCount;
+        if (self.rhi.stats_value.draw_texture_trace_len < max_draw_texture_trace) {
+            self.rhi.stats_value.draw_texture_trace[self.rhi.stats_value.draw_texture_trace_len] = self.bound_texture;
+            self.rhi.stats_value.draw_texture_trace_len += 1;
+        }
         self.rhi.stats_value.draws += 1;
     }
 
@@ -169,6 +181,8 @@ pub const Rhi = struct {
         for (&self.texture_slots, 0..) |*slot, index| {
             if (!slot.live) {
                 slot.live = true;
+                self.stats_value.textures_created += 1;
+                self.stats_value.textures_live += 1;
                 return @intCast(index + 1);
             }
         }
@@ -178,6 +192,8 @@ pub const Rhi = struct {
     pub fn destroyTexture(self: *Rhi, handle: types.TextureHandle) void {
         const slot = self.textureSlot(handle) orelse return;
         slot.* = .{};
+        self.stats_value.textures_destroyed += 1;
+        self.stats_value.textures_live -= 1;
     }
 
     pub fn beginFrame(self: *Rhi, requested_extent: types.Extent2D, clear_color: [4]f32) !BeginFrameResult {
@@ -397,4 +413,58 @@ test "null adapter validates texture mip chain" {
         .rgba8 = &base,
         .mip_levels = &invalid_mips,
     }));
+}
+
+test "null adapter reports texture ownership counts" {
+    var rhi = try Rhi.init(0, 0, .{});
+    defer rhi.deinit();
+    const pixels = [_]u8{ 255, 255, 255, 255 };
+
+    const first = try rhi.createTexture(.{ .width = 1, .height = 1, .rgba8 = &pixels });
+    const second = try rhi.createTexture(.{ .width = 1, .height = 1, .rgba8 = &pixels });
+    var stats = rhi.stats();
+    try std.testing.expectEqual(@as(u32, 2), stats.textures_created);
+    try std.testing.expectEqual(@as(u32, 0), stats.textures_destroyed);
+    try std.testing.expectEqual(@as(u32, 2), stats.textures_live);
+
+    rhi.destroyTexture(first);
+    rhi.destroyTexture(first);
+    stats = rhi.stats();
+    try std.testing.expectEqual(@as(u32, 2), stats.textures_created);
+    try std.testing.expectEqual(@as(u32, 1), stats.textures_destroyed);
+    try std.testing.expectEqual(@as(u32, 1), stats.textures_live);
+
+    rhi.destroyTexture(second);
+    stats = rhi.stats();
+    try std.testing.expectEqual(@as(u32, 2), stats.textures_created);
+    try std.testing.expectEqual(@as(u32, 2), stats.textures_destroyed);
+    try std.testing.expectEqual(@as(u32, 0), stats.textures_live);
+}
+
+test "null adapter draw trace saturation does not fail rendering" {
+    var rhi = try Rhi.init(0, 0, .{ .width = 32, .height = 32 });
+    defer rhi.deinit();
+    const shader = [_]u8{ 0, 0, 0, 0 };
+    const pipeline = try rhi.createGraphicsPipeline(.{
+        .vertex_shader = &shader,
+        .fragment_shader = &shader,
+        .push_constant_size = 4,
+        .uses_texture = true,
+    });
+    const pixels = [_]u8{ 255, 255, 255, 255 };
+    const texture = try rhi.createTexture(.{ .width = 1, .height = 1, .rgba8 = &pixels });
+
+    const begin = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
+    var encoder = switch (begin) {
+        .ready => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try encoder.bindPipeline(pipeline);
+    try encoder.bindTexture(texture);
+    for (0..max_draw_texture_trace + 1) |_| try encoder.draw(6);
+    try std.testing.expectEqual(.presented, try encoder.finish());
+
+    const stats = rhi.stats();
+    try std.testing.expectEqual(@as(u32, max_draw_texture_trace + 1), stats.draws);
+    try std.testing.expectEqual(max_draw_texture_trace, stats.draw_texture_trace_len);
 }

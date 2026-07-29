@@ -19,7 +19,15 @@ param(
     [string]$PreflightSidecarPath,
 
     [Parameter(Mandatory = $true)]
-    [string]$BuildCommandEvidencePath
+    [string]$BuildCommandEvidencePath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('Debug', 'ReleaseSafe')]
+    [string]$ExpectedOptimize,
+
+    [string]$BuildIdentityPackageRoot = '',
+
+    [string]$ArchiveManifestPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -488,6 +496,103 @@ function Resolve-PackageFile([string]$Root, [string]$RelativePath, [string]$Name
 
 function Get-Hash([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
+function Get-RequiredRuntimePackageFiles() {
+    return [string[]]@(
+        'bin/kadath.exe',
+        'bin/kadath-runtime-build-profile.json',
+        'bin/assets/renderer2d/goal.png',
+        'bin/assets/renderer2d/goal.texture',
+        'bin/assets/renderer2d/test.png',
+        'bin/assets/renderer2d/test.texture',
+        'bin/assets/audio/won.wav',
+        'bin/assets/audio/lost.wav',
+        'bin/assets/audio/won.audio.wav',
+        'bin/assets/audio/lost.audio.wav',
+        'bin/assets/scenes/preview.scene',
+        'bin/assets/scenes/preview.scene.json',
+        'bin/assets/scripts/preview.script',
+        'bin/assets/scripts/preview.script.json',
+        'README.txt'
+    )
+}
+
+function Get-RuntimePackageIdentity([string]$Root, [string[]]$RequiredFiles, [string]$Name) {
+    Assert-NoReparsePointInExistingPath $Root $Name
+    $reparseEntries = @(Get-ChildItem -LiteralPath $Root -Force -Recurse | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
+    if ($reparseEntries.Count -ne 0) { throw "$Name cannot contain a reparse point: $($reparseEntries[0].FullName)" }
+
+    $files = @(Get-ChildItem -LiteralPath $Root -Force -File -Recurse)
+    $actualPaths = @($files | ForEach-Object { [IO.Path]::GetRelativePath($Root, $_.FullName).Replace('\', '/') } | Sort-Object)
+    $expectedPaths = @($RequiredFiles | Sort-Object)
+    if ($actualPaths.Count -ne $expectedPaths.Count -or
+        @(Compare-Object -ReferenceObject $expectedPaths -DifferenceObject $actualPaths -CaseSensitive).Count -ne 0) {
+        throw "$Name must contain exactly the frozen 15-file Runtime package set"
+    }
+
+    $identity = [ordered]@{}
+    foreach ($relativePath in $expectedPaths) {
+        $path = Resolve-PackageFile $Root $relativePath "$Name file '$relativePath'"
+        $info = Get-Item -LiteralPath $path -Force
+        $identity[$relativePath] = [pscustomobject][ordered]@{
+            Length = [int64]$info.Length
+            Sha256 = Get-Hash $path
+        }
+    }
+    return $identity
+}
+
+function Read-ArchiveManifestIdentity([string]$Path, [string[]]$RequiredFiles) {
+    [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0 -or $bytes.Length -gt 65536) { throw 'Archive manifest must contain 1..65536 bytes' }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    if ($text.Length -gt 0 -and $text[0] -eq [char]0xfeff) { throw 'Archive manifest must be UTF-8 without BOM' }
+    $lines = @($text -split '\r?\n' | Where-Object { $_.Length -ne 0 })
+    $expectedPaths = @($RequiredFiles | Sort-Object)
+    if ($lines.Count -ne $expectedPaths.Count) { throw 'Archive manifest must contain exactly 15 non-empty lines' }
+
+    $identity = [ordered]@{}
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $match = [regex]::Match($lines[$index], '^(?<hash>[0-9a-f]{64})  (?<path>[^\\]+(?:/[^\\]+)*)$')
+        if (-not $match.Success) { throw "Archive manifest line $index is not strict lowercase SHA-256 plus relative path" }
+        $relativePath = $match.Groups['path'].Value
+        if ($relativePath -cne $expectedPaths[$index]) { throw "Archive manifest path order mismatch at index $index" }
+        if ($identity.Contains($relativePath)) { throw "Archive manifest contains a duplicate path: $relativePath" }
+        $identity[$relativePath] = [pscustomobject][ordered]@{
+            Sha256 = $match.Groups['hash'].Value
+        }
+    }
+    return $identity
+}
+
+function Assert-RuntimePackageIdentityEqual(
+    [Collections.IDictionary]$Left,
+    [string]$LeftName,
+    [Collections.IDictionary]$Right,
+    [string]$RightName
+) {
+    if ($Left.Count -ne $Right.Count) { throw "$LeftName and $RightName file counts differ" }
+    foreach ($relativePath in $Left.Keys) {
+        if (-not $Right.Contains($relativePath) -or
+            [int64]$Left[$relativePath].Length -ne [int64]$Right[$relativePath].Length -or
+            [string]$Left[$relativePath].Sha256 -cne [string]$Right[$relativePath].Sha256) {
+            throw "$LeftName and $RightName identities differ: $relativePath"
+        }
+    }
+}
+
+function Assert-RuntimePackageMatchesManifest(
+    [Collections.IDictionary]$PackageIdentity,
+    [Collections.IDictionary]$ManifestIdentity
+) {
+    if ($PackageIdentity.Count -ne $ManifestIdentity.Count) { throw 'Runtime package and archive manifest file counts differ' }
+    foreach ($relativePath in $PackageIdentity.Keys) {
+        if (-not $ManifestIdentity.Contains($relativePath) -or
+            [string]$PackageIdentity[$relativePath].Sha256 -cne [string]$ManifestIdentity[$relativePath].Sha256) {
+            throw "Runtime package and archive manifest identities differ: $relativePath"
+        }
+    }
+}
+
 function Get-IdentitySnapshot([Collections.IDictionary]$Paths) {
     $snapshot = [ordered]@{}
     foreach ($name in $Paths.Keys) {
@@ -523,7 +628,7 @@ function Assert-IdentityUnchanged([Collections.IDictionary]$Before, [Collections
 }
 
 function Get-SampleCoordinates([int]$ClientWidth, [int]$ClientHeight, [int]$RenderWidth, [int]$RenderHeight) {
-    if ($RenderWidth -le 552 -or $RenderHeight -le 310) { throw "Runtime render extent is too small for frozen logical samples: ${RenderWidth}x${RenderHeight}" }
+    if ($RenderWidth -le 772 -or $RenderHeight -le 310) { throw "Runtime render extent is too small for frozen logical samples: ${RenderWidth}x${RenderHeight}" }
     $scaleX = $ClientWidth / [double]$RenderWidth
     $scaleY = $ClientHeight / [double]$RenderHeight
     if ([double]::IsNaN($scaleX) -or [double]::IsInfinity($scaleX) -or $scaleX -le 0 -or
@@ -541,6 +646,10 @@ function Get-SampleCoordinates([int]$ClientWidth, [int]$ClientHeight, [int]$Rend
         Alpha64 = @(552, 190)
         Alpha128 = @(392, 310)
         Alpha255 = @(552, 310)
+        GoalTL = @(724, 224)
+        GoalTR = @(772, 224)
+        GoalBL = @(724, 272)
+        GoalBR = @(772, 272)
     }
     $coordinates = [ordered]@{}
     $physicalFlat = [Collections.Generic.List[int]]::new()
@@ -583,15 +692,24 @@ function Convert-LinearToSrgbByte([double]$Value) {
     return [int][math]::Round(255.0 * $encoded, [MidpointRounding]::AwayFromZero)
 }
 
-function Get-ExpectedLinearCompositeRgb([byte[]]$SourceRgba, [double[]]$ClearLinearRgb) {
-    if ($SourceRgba.Length -ne 4 -or $ClearLinearRgb.Length -ne 3) { throw 'Frozen composite inputs have invalid channel counts' }
-    $alpha = $SourceRgba[3] / 255.0
+function Get-ExpectedLinearCompositeRgb(
+    [byte[]]$SourceRgba,
+    [double[]]$TintLinearRgba,
+    [double[]]$ClearLinearRgb,
+    [int64]$SwapchainFormat
+) {
+    if ($SourceRgba.Length -ne 4 -or $TintLinearRgba.Length -ne 4 -or $ClearLinearRgb.Length -ne 3) { throw 'Frozen composite inputs have invalid channel counts' }
+    if ($SwapchainFormat -ne 50 -and $SwapchainFormat -ne 44) { throw "Unsupported frozen swapchain format: $SwapchainFormat" }
+    $alpha = ($SourceRgba[3] / 255.0) * $TintLinearRgba[3]
     [int[]]$expected = @(0, 0, 0)
     for ($channel = 0; $channel -lt 3; $channel++) {
-        # Vulkan 在 linear space 使用 source alpha 混合，swapchain 最后编码为 sRGB。
-        $sourceLinear = Convert-SrgbByteToLinear $SourceRgba[$channel]
+        $sourceLinear = (Convert-SrgbByteToLinear $SourceRgba[$channel]) * $TintLinearRgba[$channel]
         $outLinear = ($sourceLinear * $alpha) + ($ClearLinearRgb[$channel] * (1.0 - $alpha))
-        $expected[$channel] = Convert-LinearToSrgbByte $outLinear
+        $expected[$channel] = if ($SwapchainFormat -eq 50) {
+            Convert-LinearToSrgbByte $outLinear
+        } else {
+            [int][math]::Round(255.0 * [math]::Min(1.0, [math]::Max(0.0, $outLinear)), [MidpointRounding]::AwayFromZero)
+        }
     }
     return $expected
 }
@@ -615,7 +733,7 @@ function Get-CompositeErrorEvidence([Collections.IDictionary]$Actual, [Collectio
 }
 
 function Get-SwapchainFormatGateEvidence([string]$RuntimeLog) {
-    $expectedFormat = 50
+    $expectedFormats = [int64[]](50, 44)
     $creationRecords = @([regex]::Matches($RuntimeLog, '(?im)^.*Vulkan swapchain created:.*$'))
     $formatTokens = @()
     $parsedFormat = $null
@@ -633,8 +751,8 @@ function Get-SwapchainFormatGateEvidence([string]$RuntimeLog) {
                 $failureReason = 'swapchain format token is not an unsigned decimal integer'
             } else {
                 $parsedFormat = [int64]$formatValue
-                if ($parsedFormat -ne $expectedFormat) {
-                    $failureReason = "swapchain format must be VK_FORMAT_B8G8R8A8_SRGB ($expectedFormat)"
+                if ($parsedFormat -notin $expectedFormats) {
+                    $failureReason = 'swapchain format must be VK_FORMAT_B8G8R8A8_SRGB (50) or VK_FORMAT_B8G8R8A8_UNORM (44)'
                 }
             }
         }
@@ -643,8 +761,8 @@ function Get-SwapchainFormatGateEvidence([string]$RuntimeLog) {
     return [pscustomobject][ordered]@{
         ParsedFormat = $parsedFormat
         GateResult = if ($null -eq $failureReason) { 'passed' } else { 'failed' }
-        ExpectedFormat = $expectedFormat
-        ExpectedFormatName = 'VK_FORMAT_B8G8R8A8_SRGB'
+        ExpectedFormats = @($expectedFormats)
+        ParsedFormatName = if ($parsedFormat -eq 50) { 'VK_FORMAT_B8G8R8A8_SRGB' } elseif ($parsedFormat -eq 44) { 'VK_FORMAT_B8G8R8A8_UNORM' } else { $null }
         CreationRecordCount = $creationRecords.Count
         FormatTokenCount = $formatTokens.Count
         FailureReason = $failureReason
@@ -656,16 +774,22 @@ function Get-SampleEvidence(
     [int]$RenderWidth,
     [int]$RenderHeight,
     [byte[]]$TextureBaseRgba8,
+    [byte[]]$SecondaryTextureBaseRgba8,
     [double[]]$ClearLinearRgb,
-    [int]$CompositeTolerance
+    [int]$CompositeTolerance,
+    [int64]$SwapchainFormat
 ) {
-    if ($TextureBaseRgba8.Length -ne 16 -or $CompositeTolerance -lt 0) { throw 'Frozen composite oracle configuration is invalid' }
+    if ($TextureBaseRgba8.Length -ne 16 -or $SecondaryTextureBaseRgba8.Length -ne 16 -or $CompositeTolerance -lt 0) { throw 'Frozen composite oracle configuration is invalid' }
     $mapping = Get-SampleCoordinates $Capture.Width $Capture.Height $RenderWidth $RenderHeight
     $background = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.Background.Physical[0], $mapping.Coordinates.Background.Physical[1])
     $topLeft = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.Alpha0.Physical[0], $mapping.Coordinates.Alpha0.Physical[1])
     $topRight = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.Alpha64.Physical[0], $mapping.Coordinates.Alpha64.Physical[1])
     $bottomLeft = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.Alpha128.Physical[0], $mapping.Coordinates.Alpha128.Physical[1])
     $bottomRight = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.Alpha255.Physical[0], $mapping.Coordinates.Alpha255.Physical[1])
+    $goalTopLeft = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.GoalTL.Physical[0], $mapping.Coordinates.GoalTL.Physical[1])
+    $goalTopRight = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.GoalTR.Physical[0], $mapping.Coordinates.GoalTR.Physical[1])
+    $goalBottomLeft = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.GoalBL.Physical[0], $mapping.Coordinates.GoalBL.Physical[1])
+    $goalBottomRight = [KadathPngRuntimeNative]::SampleRgb($Capture, $mapping.Coordinates.GoalBR.Physical[0], $mapping.Coordinates.GoalBR.Physical[1])
     $distance64 = [math]::Sqrt([math]::Pow($topRight[0] - $background[0], 2) + [math]::Pow($topRight[1] - $background[1], 2) + [math]::Pow($topRight[2] - $background[2], 2))
     $distance128 = [math]::Sqrt([math]::Pow($bottomLeft[0] - $background[0], 2) + [math]::Pow($bottomLeft[1] - $background[1], 2) + [math]::Pow($bottomLeft[2] - $background[2], 2))
 
@@ -677,11 +801,11 @@ function Get-SampleEvidence(
         Alpha255 = [int[]]$bottomRight
     }
     $expected = [ordered]@{
-        Background = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]](0, 0, 0, 0)) $ClearLinearRgb)
-        Alpha0 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[0..3])) $ClearLinearRgb)
-        Alpha64 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[4..7])) $ClearLinearRgb)
-        Alpha128 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[8..11])) $ClearLinearRgb)
-        Alpha255 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[12..15])) $ClearLinearRgb)
+        Background = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]](0, 0, 0, 0)) ([double[]](1.0, 1.0, 1.0, 1.0)) $ClearLinearRgb $SwapchainFormat)
+        Alpha0 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[0..3])) ([double[]](1.0, 1.0, 1.0, 1.0)) $ClearLinearRgb $SwapchainFormat)
+        Alpha64 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[4..7])) ([double[]](1.0, 1.0, 1.0, 1.0)) $ClearLinearRgb $SwapchainFormat)
+        Alpha128 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[8..11])) ([double[]](1.0, 1.0, 1.0, 1.0)) $ClearLinearRgb $SwapchainFormat)
+        Alpha255 = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($TextureBaseRgba8[12..15])) ([double[]](1.0, 1.0, 1.0, 1.0)) $ClearLinearRgb $SwapchainFormat)
     }
     $errorEvidence = Get-CompositeErrorEvidence $actual $expected
     $perSampleMaxChannelError = $errorEvidence.PerSample
@@ -695,18 +819,53 @@ function Get-SampleEvidence(
         if ($bottomRight[$channel] -lt 230) { $coarseAlphaGatesPass = $false }
     }
     $alphaPasses = $compositePasses -and $coarseAlphaGatesPass
+    $goalActual = [ordered]@{
+        GoalTL = [int[]]$goalTopLeft
+        GoalTR = [int[]]$goalTopRight
+        GoalBL = [int[]]$goalBottomLeft
+        GoalBR = [int[]]$goalBottomRight
+    }
+    $goalTint = [double[]](1.0, 0.75, 0.1, 1.0)
+    $goalExpected = [ordered]@{
+        GoalTL = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($SecondaryTextureBaseRgba8[0..3])) $goalTint $ClearLinearRgb $SwapchainFormat)
+        GoalTR = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($SecondaryTextureBaseRgba8[4..7])) $goalTint $ClearLinearRgb $SwapchainFormat)
+        GoalBL = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($SecondaryTextureBaseRgba8[8..11])) $goalTint $ClearLinearRgb $SwapchainFormat)
+        GoalBR = [int[]](Get-ExpectedLinearCompositeRgb ([byte[]]($SecondaryTextureBaseRgba8[12..15])) $goalTint $ClearLinearRgb $SwapchainFormat)
+    }
+    $frozenGoalExpected = if ($SwapchainFormat -eq 50) {
+        [ordered]@{ GoalTL = '255,0,89'; GoalTR = '0,225,89'; GoalBL = '0,0,0'; GoalBR = '255,225,89' }
+    } else {
+        [ordered]@{ GoalTL = '255,0,26'; GoalTR = '0,191,26'; GoalBL = '0,0,0'; GoalBR = '255,191,26' }
+    }
+    foreach ($name in $frozenGoalExpected.Keys) {
+        if (($goalExpected[$name] -join ',') -cne $frozenGoalExpected[$name]) {
+            throw "Frozen goal pixel oracle changed for $name on swapchain format $SwapchainFormat"
+        }
+    }
+    $goalErrorEvidence = Get-CompositeErrorEvidence $goalActual $goalExpected
+    $goalTolerance = 24
+    $goalPasses = $goalErrorEvidence.Maximum -le $goalTolerance
     return [pscustomobject]@{
-        Passed = $alphaPasses
+        Passed = $alphaPasses -and $goalPasses
         AlphaPassed = $alphaPasses
+        GoalPassed = $goalPasses
         Background = @($background)
         Alpha0 = @($topLeft)
         Alpha64 = @($topRight)
         Alpha128 = @($bottomLeft)
         Alpha255 = @($bottomRight)
+        GoalTL = @($goalTopLeft)
+        GoalTR = @($goalTopRight)
+        GoalBL = @($goalBottomLeft)
+        GoalBR = @($goalBottomRight)
         Expected = $expected
+        GoalExpected = $goalExpected
         PerSampleMaxChannelError = $perSampleMaxChannelError
         MaxChannelError = [int]$maxChannelError
         CompositeTolerance = $CompositeTolerance
+        GoalPerSampleMaxChannelError = $goalErrorEvidence.PerSample
+        GoalMaxChannelError = [int]$goalErrorEvidence.Maximum
+        GoalTolerance = $goalTolerance
         CompositePassed = $compositePasses
         CoarseAlphaGatesPassed = $coarseAlphaGatesPass
         Distance64 = $distance64
@@ -719,6 +878,22 @@ function Get-SampleEvidence(
     }
 }
 
+$hasBuildIdentityPackageRoot = $PSBoundParameters.ContainsKey('BuildIdentityPackageRoot')
+$hasArchiveManifestPath = $PSBoundParameters.ContainsKey('ArchiveManifestPath')
+if ($ExpectedOptimize -cne 'Debug' -and $ExpectedOptimize -cne 'ReleaseSafe') {
+    throw 'ExpectedOptimize must use the exact token Debug or ReleaseSafe'
+}
+if ($hasBuildIdentityPackageRoot -ne $hasArchiveManifestPath) {
+    throw 'BuildIdentityPackageRoot and ArchiveManifestPath must be supplied together for extract mode'
+}
+$extractMode = $hasBuildIdentityPackageRoot
+if ($extractMode -and ([string]::IsNullOrWhiteSpace($BuildIdentityPackageRoot) -or [string]::IsNullOrWhiteSpace($ArchiveManifestPath))) {
+    throw 'BuildIdentityPackageRoot and ArchiveManifestPath cannot be empty in extract mode'
+}
+if ($extractMode -and $ExpectedOptimize -cne 'ReleaseSafe') {
+    throw 'Archive extract Runtime verification is only valid for ExpectedOptimize ReleaseSafe'
+}
+
 $rawPathInputs = @(
     [pscustomobject]@{ Path = $KadathRoot; Name = 'KadathRoot' },
     [pscustomobject]@{ Path = $PackageRoot; Name = 'PackageRoot' },
@@ -728,6 +903,12 @@ $rawPathInputs = @(
     [pscustomobject]@{ Path = $PreflightSidecarPath; Name = 'PreflightSidecarPath' },
     [pscustomobject]@{ Path = $BuildCommandEvidencePath; Name = 'BuildCommandEvidencePath' }
 )
+if ($extractMode) {
+    $rawPathInputs += @(
+        [pscustomobject]@{ Path = $BuildIdentityPackageRoot; Name = 'BuildIdentityPackageRoot' },
+        [pscustomobject]@{ Path = $ArchiveManifestPath; Name = 'ArchiveManifestPath' }
+    )
+}
 foreach ($rawPath in $rawPathInputs) {
     Assert-NoWin32DevicePath $rawPath.Path $rawPath.Name
     if (-not [IO.Path]::IsPathFullyQualified($rawPath.Path)) { throw "$($rawPath.Name) must be a fully qualified local path: $($rawPath.Path)" }
@@ -740,11 +921,16 @@ if (-not $kadath.Equals($expectedKadathRoot, [StringComparison]::OrdinalIgnoreCa
 }
 
 $package = Resolve-CanonicalDirectory $PackageRoot 'PackageRoot'
+$buildIdentityPackage = if ($extractMode) {
+    Resolve-CanonicalDirectory $BuildIdentityPackageRoot 'BuildIdentityPackageRoot'
+} else {
+    $package
+}
 $taskLocalCache = Resolve-CanonicalDirectory $TaskLocalCacheDirectory 'TaskLocalCacheDirectory'
 $globalCache = Resolve-CanonicalDirectory $GlobalCacheDirectory 'GlobalCacheDirectory'
 $defaultZigOut = [IO.Path]::GetFullPath((Join-Path $kadath 'zig-out'))
-if (Test-DirectoryContains $defaultZigOut $package) {
-    throw 'Runtime PNG evidence rejects the repository default zig-out and every descendant; use a fresh isolated ReleaseSafe prefix'
+if ((Test-DirectoryContains $defaultZigOut $package) -or (Test-DirectoryContains $defaultZigOut $buildIdentityPackage)) {
+    throw 'Runtime PNG evidence rejects the repository default zig-out and every descendant; use a fresh isolated package prefix'
 }
 
 Assert-NoWin32DevicePath $EvidenceDirectory 'EvidenceDirectory'
@@ -761,6 +947,9 @@ $rootSet = @(
     [pscustomobject]@{ Path = $globalCache; Name = 'GlobalCacheDirectory' },
     [pscustomobject]@{ Path = $evidence; Name = 'EvidenceDirectory' }
 )
+if ($extractMode) {
+    $rootSet += [pscustomobject]@{ Path = $buildIdentityPackage; Name = 'BuildIdentityPackageRoot' }
+}
 for ($leftIndex = 0; $leftIndex -lt $rootSet.Count; $leftIndex++) {
     for ($rightIndex = $leftIndex + 1; $rightIndex -lt $rootSet.Count; $rightIndex++) {
         Assert-DisjointDirectories ($rootSet[$leftIndex].Path) ($rootSet[$leftIndex].Name) ($rootSet[$rightIndex].Path) ($rootSet[$rightIndex].Name)
@@ -769,16 +958,43 @@ for ($leftIndex = 0; $leftIndex -lt $rootSet.Count; $leftIndex++) {
 
 $preflightSidecar = Resolve-CanonicalFile $PreflightSidecarPath 'PreflightSidecarPath'
 $buildCommandEvidencePath = Resolve-CanonicalFile $BuildCommandEvidencePath 'BuildCommandEvidencePath'
-if ($preflightSidecar.Equals($buildCommandEvidencePath, [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'PreflightSidecarPath and BuildCommandEvidencePath must be distinct files'
+$archiveManifest = if ($extractMode) { Resolve-CanonicalFile $ArchiveManifestPath 'ArchiveManifestPath' } else { $null }
+$externalEvidenceFiles = @(
+    [pscustomobject]@{ Path = $preflightSidecar; Name = 'PreflightSidecarPath' },
+    [pscustomobject]@{ Path = $buildCommandEvidencePath; Name = 'BuildCommandEvidencePath' }
+)
+if ($extractMode) {
+    $externalEvidenceFiles += [pscustomobject]@{ Path = $archiveManifest; Name = 'ArchiveManifestPath' }
+}
+for ($leftIndex = 0; $leftIndex -lt $externalEvidenceFiles.Count; $leftIndex++) {
+    for ($rightIndex = $leftIndex + 1; $rightIndex -lt $externalEvidenceFiles.Count; $rightIndex++) {
+        if ($externalEvidenceFiles[$leftIndex].Path.Equals($externalEvidenceFiles[$rightIndex].Path, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$($externalEvidenceFiles[$leftIndex].Name) and $($externalEvidenceFiles[$rightIndex].Name) must be distinct files"
+        }
+    }
 }
 foreach ($rootEntry in $rootSet) {
-    if (Test-DirectoryContains $rootEntry.Path $preflightSidecar) {
-        throw "PreflightSidecarPath must stay outside $($rootEntry.Name): $preflightSidecar"
+    foreach ($externalFile in $externalEvidenceFiles) {
+        if (Test-DirectoryContains $rootEntry.Path $externalFile.Path) {
+            throw "$($externalFile.Name) must stay outside $($rootEntry.Name): $($externalFile.Path)"
+        }
     }
-    if (Test-DirectoryContains $rootEntry.Path $buildCommandEvidencePath) {
-        throw "BuildCommandEvidencePath must stay outside $($rootEntry.Name): $buildCommandEvidencePath"
-    }
+}
+
+$requiredRuntimePackageFiles = @(Get-RequiredRuntimePackageFiles)
+$runtimePackageIdentity = Get-RuntimePackageIdentity $package $requiredRuntimePackageFiles 'Runtime PackageRoot'
+$buildIdentityPackageIdentity = if ($extractMode) {
+    Get-RuntimePackageIdentity $buildIdentityPackage $requiredRuntimePackageFiles 'Build identity PackageRoot'
+} else {
+    $runtimePackageIdentity
+}
+$archiveManifestIdentity = $null
+$archiveManifestSha256 = $null
+if ($extractMode) {
+    $archiveManifestIdentity = Read-ArchiveManifestIdentity $archiveManifest $requiredRuntimePackageFiles
+    $archiveManifestSha256 = Get-Hash $archiveManifest
+    Assert-RuntimePackageIdentityEqual $runtimePackageIdentity 'Archive extract PackageRoot' $buildIdentityPackageIdentity 'Original build identity PackageRoot'
+    Assert-RuntimePackageMatchesManifest $runtimePackageIdentity $archiveManifestIdentity
 }
 [byte[]]$preflightBytes = [IO.File]::ReadAllBytes($preflightSidecar)
 if ($preflightBytes.Length -eq 0 -or $preflightBytes.Length -gt 65536) { throw 'Preflight sidecar must contain 1..65536 bytes' }
@@ -804,7 +1020,7 @@ if ([math]::Abs(($preflightGeneratedAt.UtcDateTime - $preflightSidecarInfo.LastW
     throw 'Preflight GeneratedAtUtc and sidecar LastWriteTimeUtc differ by more than 2 seconds'
 }
 foreach ($rootEntry in @(
-    [pscustomobject]@{ Path = $package; Name = 'PackageRoot' },
+    [pscustomobject]@{ Path = $buildIdentityPackage; Name = 'BuildIdentityPackageRoot' },
     [pscustomobject]@{ Path = $taskLocalCache; Name = 'TaskLocalCacheDirectory' },
     [pscustomobject]@{ Path = $globalCache; Name = 'GlobalCacheDirectory' }
 )) {
@@ -816,7 +1032,7 @@ foreach ($rootEntry in @(
     }
 }
 $claimedRoots = @(
-    [pscustomobject]@{ Value = [string]$preflight.PackageRoot; Expected = $package; Name = 'PackageRoot' },
+    [pscustomobject]@{ Value = [string]$preflight.PackageRoot; Expected = $buildIdentityPackage; Name = 'PackageRoot' },
     [pscustomobject]@{ Value = [string]$preflight.TaskLocalCacheDirectory; Expected = $taskLocalCache; Name = 'TaskLocalCacheDirectory' },
     [pscustomobject]@{ Value = [string]$preflight.GlobalCacheDirectory; Expected = $globalCache; Name = 'GlobalCacheDirectory' }
 )
@@ -838,7 +1054,7 @@ if ([int]$preflight.Version -ne 1 -or
     throw 'Preflight sidecar must be v1 and prove all package/cache roots were absent before build'
 }
 
-# 构建命令证据冻结真实 argv，避免仅凭可伪造的目录快照推断 ReleaseSafe 构建方式。
+# 构建命令证据冻结真实 argv，避免仅凭可伪造的目录快照推断指定 optimize 构建方式。
 [byte[]]$buildCommandEvidenceBytes = [IO.File]::ReadAllBytes($buildCommandEvidencePath)
 if ($buildCommandEvidenceBytes.Length -eq 0 -or $buildCommandEvidenceBytes.Length -gt 65536) { throw 'Build command evidence must contain 1..65536 bytes' }
 $buildCommandEvidenceSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($buildCommandEvidenceBytes)).ToLowerInvariant()
@@ -905,8 +1121,8 @@ if (-not [DateTimeOffset]::TryParseExact($buildCommandStartedAtText, 'O', [Globa
 $expectedBuildArguments = [string[]]@(
     'build',
     'package',
-    '-Doptimize=ReleaseSafe',
-    '--prefix', $package,
+    "-Doptimize=$ExpectedOptimize",
+    '--prefix', $buildIdentityPackage,
     '--cache-dir', $taskLocalCache,
     '--global-cache-dir', $globalCache,
     "-Druntime-preflight-sidecar=$preflightSidecar"
@@ -918,11 +1134,11 @@ if (-not [IO.Path]::IsPathFullyQualified($buildCommandExecutable) -or
     $buildCommandVersion -ne 1 -or
     -not $buildCommandExecutable.Equals($expectedZigExecutable, [StringComparison]::OrdinalIgnoreCase) -or $buildCommandExitCode -ne 0 -or
     -not $buildCommandWorkingDirectory.Equals($kadath, [StringComparison]::OrdinalIgnoreCase) -or
-    -not $buildCommandPackageRoot.Equals($package, [StringComparison]::OrdinalIgnoreCase) -or
+    -not $buildCommandPackageRoot.Equals($buildIdentityPackage, [StringComparison]::OrdinalIgnoreCase) -or
     -not $buildCommandLocalCache.Equals($taskLocalCache, [StringComparison]::OrdinalIgnoreCase) -or
     -not $buildCommandGlobalCache.Equals($globalCache, [StringComparison]::OrdinalIgnoreCase) -or
     $buildCommandArguments.Count -ne $expectedBuildArguments.Count) {
-    throw 'Build command evidence does not describe this successful isolated ReleaseSafe build'
+    throw "Build command evidence does not describe this successful isolated $ExpectedOptimize build"
 }
 for ($argumentIndex = 0; $argumentIndex -lt $expectedBuildArguments.Count; $argumentIndex++) {
     if ($buildCommandArguments[$argumentIndex] -cne $expectedBuildArguments[$argumentIndex]) {
@@ -958,8 +1174,10 @@ $runtime = Resolve-PackageFile $package 'bin\kadath.exe' 'Runtime executable'
 $buildProfilePath = Resolve-PackageFile $package 'bin\kadath-runtime-build-profile.json' 'Runtime build profile marker'
 $scene = Resolve-PackageFile $package 'bin\assets\scenes\preview.scene.json' 'Scene source'
 $script = Resolve-PackageFile $package 'bin\assets\scripts\preview.script.json' 'Script source'
-$source = Resolve-PackageFile $package 'bin\assets\renderer2d\test.png' 'PNG source'
-$texture = Resolve-PackageFile $package 'bin\assets\renderer2d\test.texture' 'KDAT texture'
+$source = Resolve-PackageFile $package 'bin\assets\renderer2d\test.png' 'Primary PNG source'
+$texture = Resolve-PackageFile $package 'bin\assets\renderer2d\test.texture' 'Primary KDAT texture'
+$secondarySource = Resolve-PackageFile $package 'bin\assets\renderer2d\goal.png' 'Secondary PNG source'
+$secondaryTexture = Resolve-PackageFile $package 'bin\assets\renderer2d\goal.texture' 'Secondary KDAT texture'
 [byte[]]$buildProfileBytes = [IO.File]::ReadAllBytes($buildProfilePath)
 if ($buildProfileBytes.Length -eq 0 -or $buildProfileBytes.Length -gt 65536) { throw 'Runtime build profile marker must contain 1..65536 bytes' }
 $buildProfileMarkerSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($buildProfileBytes)).ToLowerInvariant()
@@ -969,26 +1187,28 @@ try {
     try {
         $rootElement = $buildProfileJsonDocument.RootElement
         if ($rootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { throw 'root must be an object' }
-        $expectedBuildProfileFields = [string[]]@('Version', 'Optimize', 'TextureProfile', 'RuntimeExeSha256', 'TextureSourceSha256', 'TextureArtifactSha256', 'VertexShaderSourceSha256', 'FragmentShaderSourceSha256', 'BuildPreflightSidecarSha256')
+        $expectedBuildProfileFields = [string[]]@('Version', 'Optimize', 'TextureProfile', 'RuntimeExeSha256', 'TextureSourceSha256', 'TextureArtifactSha256', 'SecondaryTextureSourceSha256', 'SecondaryTextureArtifactSha256', 'VertexShaderSourceSha256', 'FragmentShaderSourceSha256', 'BuildPreflightSidecarSha256')
         $actualBuildProfileFields = @($rootElement.EnumerateObject() | ForEach-Object { $_.Name })
         $uniqueBuildProfileFields = @($actualBuildProfileFields | Sort-Object -Unique -CaseSensitive)
-        if ($actualBuildProfileFields.Count -ne 9 -or $uniqueBuildProfileFields.Count -ne 9 -or
+        if ($actualBuildProfileFields.Count -ne 11 -or $uniqueBuildProfileFields.Count -ne 11 -or
             @(Compare-Object -ReferenceObject ($expectedBuildProfileFields | Sort-Object) -DifferenceObject ($actualBuildProfileFields | Sort-Object) -CaseSensitive).Count -ne 0) {
-            throw 'properties must be unique and exactly match the nine schema v1 names'
+            throw 'properties must be unique and exactly match the eleven schema v2 names'
         }
         $versionElement = $rootElement.GetProperty('Version')
-        if ($versionElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $versionElement.GetInt32() -ne 1) { throw 'Version must be the JSON number 1' }
+        if ($versionElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $versionElement.GetInt32() -ne 2) { throw 'Version must be the JSON number 2' }
         $stringFields = $expectedBuildProfileFields | Where-Object { $_ -cne 'Version' }
         foreach ($field in $stringFields) {
             if ($rootElement.GetProperty($field).ValueKind -ne [System.Text.Json.JsonValueKind]::String) { throw "$field must be a JSON string" }
         }
         $buildProfile = [pscustomobject][ordered]@{
-            Version = 1
+            Version = 2
             Optimize = $rootElement.GetProperty('Optimize').GetString()
             TextureProfile = $rootElement.GetProperty('TextureProfile').GetString()
             RuntimeExeSha256 = $rootElement.GetProperty('RuntimeExeSha256').GetString()
             TextureSourceSha256 = $rootElement.GetProperty('TextureSourceSha256').GetString()
             TextureArtifactSha256 = $rootElement.GetProperty('TextureArtifactSha256').GetString()
+            SecondaryTextureSourceSha256 = $rootElement.GetProperty('SecondaryTextureSourceSha256').GetString()
+            SecondaryTextureArtifactSha256 = $rootElement.GetProperty('SecondaryTextureArtifactSha256').GetString()
             VertexShaderSourceSha256 = $rootElement.GetProperty('VertexShaderSourceSha256').GetString()
             FragmentShaderSourceSha256 = $rootElement.GetProperty('FragmentShaderSourceSha256').GetString()
             BuildPreflightSidecarSha256 = $rootElement.GetProperty('BuildPreflightSidecarSha256').GetString()
@@ -997,12 +1217,13 @@ try {
         $buildProfileJsonDocument.Dispose()
     }
 } catch {
-    throw "Runtime build profile marker is not strict UTF-8 exact-nine JSON schema v1: $($_.Exception.Message)"
+    throw "Runtime build profile marker is not strict UTF-8 exact-eleven JSON schema v2: $($_.Exception.Message)"
 }
 $runtimeExeSha256 = Get-Hash $runtime
 $sourceSha256 = Get-Hash $source
+$secondarySourceSha256 = Get-Hash $secondarySource
 [byte[]]$textureBytes = [IO.File]::ReadAllBytes($texture)
-if ($textureBytes.Length -ne 44 -or [Text.Encoding]::ASCII.GetString($textureBytes, 0, 4) -cne 'KDAT' -or [BitConverter]::ToUInt32($textureBytes, 4) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 8) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 12) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 16) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 20) -ne 20) { throw 'Package texture is not the frozen KDAT v2 2x2 mip chain' }
+if ($textureBytes.Length -ne 44 -or [Text.Encoding]::ASCII.GetString($textureBytes, 0, 4) -cne 'KDAT' -or [BitConverter]::ToUInt32($textureBytes, 4) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 8) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 12) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 16) -ne 2 -or [BitConverter]::ToUInt32($textureBytes, 20) -ne 20) { throw 'Primary package texture is not the frozen KDAT v2 2x2 mip chain' }
 $frozenTextureBaseBytes = [byte[]](
     255, 0, 0, 0,
     0, 255, 0, 64,
@@ -1012,23 +1233,46 @@ $frozenTextureBaseBytes = [byte[]](
 $frozenTextureMipBytes = [byte[]](127, 127, 127, 111)
 if (-not (Test-ByteSequenceAtOffset $textureBytes 24 $frozenTextureBaseBytes) -or
     -not (Test-ByteSequenceAtOffset $textureBytes 40 $frozenTextureMipBytes)) {
-    throw 'Package KDAT payload does not contain the frozen RGBA base texels and 1x1 mip'
+    throw 'Primary package KDAT payload does not contain the frozen RGBA base texels and 1x1 mip'
+}
+$secondaryTextureBytes = [IO.File]::ReadAllBytes($secondaryTexture)
+if ($secondaryTextureBytes.Length -ne 44 -or [Text.Encoding]::ASCII.GetString($secondaryTextureBytes, 0, 4) -cne 'KDAT' -or [BitConverter]::ToUInt32($secondaryTextureBytes, 4) -ne 2 -or [BitConverter]::ToUInt32($secondaryTextureBytes, 8) -ne 2 -or [BitConverter]::ToUInt32($secondaryTextureBytes, 12) -ne 2 -or [BitConverter]::ToUInt32($secondaryTextureBytes, 16) -ne 2 -or [BitConverter]::ToUInt32($secondaryTextureBytes, 20) -ne 20) { throw 'Secondary package texture is not the frozen KDAT v2 2x2 mip chain' }
+$frozenSecondaryTextureBaseBytes = [byte[]](
+    255, 0, 255, 255,
+    0, 255, 255, 255,
+    0, 0, 0, 255,
+    255, 255, 255, 255
+)
+$frozenSecondaryTextureMipBytes = [byte[]](127, 127, 191, 255)
+if (-not (Test-ByteSequenceAtOffset $secondaryTextureBytes 24 $frozenSecondaryTextureBaseBytes) -or
+    -not (Test-ByteSequenceAtOffset $secondaryTextureBytes 40 $frozenSecondaryTextureMipBytes)) {
+    throw 'Secondary package KDAT payload does not contain the frozen RGBA base texels and 1x1 mip'
 }
 $frozenClearLinearRgb = [double[]](0.035, 0.10, 0.22)
 $compositeTolerance = 8
 $kdatSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($textureBytes)).ToLowerInvariant()
-if ([int]$buildProfile.Version -ne 1 -or [string]$buildProfile.Optimize -cne 'ReleaseSafe' -or
+$secondaryKdatSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($secondaryTextureBytes)).ToLowerInvariant()
+if ([int]$buildProfile.Version -ne 2 -or [string]$buildProfile.Optimize -cne $ExpectedOptimize -or
     [string]$buildProfile.TextureProfile -cne 'release' -or
     [string]$buildProfile.RuntimeExeSha256 -cne $runtimeExeSha256 -or
     [string]$buildProfile.TextureSourceSha256 -cne $sourceSha256 -or
     [string]$buildProfile.TextureArtifactSha256 -cne $kdatSha256 -or
+    [string]$buildProfile.SecondaryTextureSourceSha256 -cne $secondarySourceSha256 -or
+    [string]$buildProfile.SecondaryTextureArtifactSha256 -cne $secondaryKdatSha256 -or
     [string]$buildProfile.VertexShaderSourceSha256 -cne $vertexShaderSha256 -or
     [string]$buildProfile.FragmentShaderSourceSha256 -cne $fragmentShaderSha256 -or
     [string]$buildProfile.BuildPreflightSidecarSha256 -cnotmatch '^[0-9a-f]{64}$' -or
     [string]$buildProfile.BuildPreflightSidecarSha256 -cne $preflightSidecarSha256) {
-    throw 'Runtime PNG evidence requires a sidecar-bound v1 ReleaseSafe marker for this package/cache/exe/texture/shader identity'
+    throw "Runtime PNG evidence requires a sidecar-bound v2 $ExpectedOptimize marker for this package/cache/exe/texture/shader identity"
 }
-if ($sourceSha256 -cne 'a6fab23c053638849d8b64ba72e260c22efb6e60a6876e36c662ae43a42e1eff') { throw 'Package PNG source identity is not the frozen 2x2 RGBA asset' }
+if ($sourceSha256 -cne 'a6fab23c053638849d8b64ba72e260c22efb6e60a6876e36c662ae43a42e1eff' -or
+    $kdatSha256 -cne '9476b7ee373c3a821c6a03ddfcbb2f5e2f343d9c62f53920b5dba29402d9f128') {
+    throw 'Primary package PNG/KDAT identities are not the frozen 2x2 RGBA asset'
+}
+if ($secondarySourceSha256 -cne 'e690b160c98c941210db92c5ae7a1637bc835529e0056e743a5d8eb209c4708f' -or
+    $secondaryKdatSha256 -cne '555c2e554e2e5eb70e9de20e3e3182482d826dcfff230be45c54d321cd7e8c2c') {
+    throw 'Secondary package PNG/KDAT identities are not the frozen goal asset'
+}
 
 # 所有 package/build evidence 已先完成无写入校验；启动 Runtime 前仍必须绑定当前干净 Inner HEAD/tree。
 $gitStatus = @(Invoke-GitLines -Root $kadath -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -Name 'git status')
@@ -1047,10 +1291,21 @@ $identityPaths = [ordered]@{
     BuildProfileMarker = [pscustomobject]@{ Path = $buildProfilePath; RelativePath = 'package:bin/kadath-runtime-build-profile.json' }
     TextureSource = [pscustomobject]@{ Path = $source; RelativePath = 'package:bin/assets/renderer2d/test.png' }
     TextureArtifact = [pscustomobject]@{ Path = $texture; RelativePath = 'package:bin/assets/renderer2d/test.texture' }
+    SecondaryTextureSource = [pscustomobject]@{ Path = $secondarySource; RelativePath = 'package:bin/assets/renderer2d/goal.png' }
+    SecondaryTextureArtifact = [pscustomobject]@{ Path = $secondaryTexture; RelativePath = 'package:bin/assets/renderer2d/goal.texture' }
     VertexShaderSource = [pscustomobject]@{ Path = $vertexShaderPath; RelativePath = 'repository:shaders/renderer2d/quad.vert.glsl' }
     FragmentShaderSource = [pscustomobject]@{ Path = $fragmentShaderPath; RelativePath = 'repository:shaders/renderer2d/quad.frag.glsl' }
     BuildPreflightSidecar = [pscustomobject]@{ Path = $preflightSidecar; RelativePath = 'external:runtime-preflight-sidecar.json' }
     BuildCommandEvidence = [pscustomobject]@{ Path = $buildCommandEvidencePath; RelativePath = 'external:zig-build-command-evidence.json' }
+}
+if ($extractMode) {
+    $identityPaths['BuildIdentityRuntimeExe'] = [pscustomobject]@{ Path = (Resolve-PackageFile $buildIdentityPackage 'bin\kadath.exe' 'Build identity Runtime executable'); RelativePath = 'build-identity-package:bin/kadath.exe' }
+    $identityPaths['BuildIdentityProfileMarker'] = [pscustomobject]@{ Path = (Resolve-PackageFile $buildIdentityPackage 'bin\kadath-runtime-build-profile.json' 'Build identity marker'); RelativePath = 'build-identity-package:bin/kadath-runtime-build-profile.json' }
+    $identityPaths['BuildIdentityTextureSource'] = [pscustomobject]@{ Path = (Resolve-PackageFile $buildIdentityPackage 'bin\assets\renderer2d\test.png' 'Build identity primary PNG'); RelativePath = 'build-identity-package:bin/assets/renderer2d/test.png' }
+    $identityPaths['BuildIdentityTextureArtifact'] = [pscustomobject]@{ Path = (Resolve-PackageFile $buildIdentityPackage 'bin\assets\renderer2d\test.texture' 'Build identity primary KDAT'); RelativePath = 'build-identity-package:bin/assets/renderer2d/test.texture' }
+    $identityPaths['BuildIdentitySecondaryTextureSource'] = [pscustomobject]@{ Path = (Resolve-PackageFile $buildIdentityPackage 'bin\assets\renderer2d\goal.png' 'Build identity secondary PNG'); RelativePath = 'build-identity-package:bin/assets/renderer2d/goal.png' }
+    $identityPaths['BuildIdentitySecondaryTextureArtifact'] = [pscustomobject]@{ Path = (Resolve-PackageFile $buildIdentityPackage 'bin\assets\renderer2d\goal.texture' 'Build identity secondary KDAT'); RelativePath = 'build-identity-package:bin/assets/renderer2d/goal.texture' }
+    $identityPaths['ArchiveManifest'] = [pscustomobject]@{ Path = $archiveManifest; RelativePath = 'external:archive-manifest.sha256' }
 }
 $identityBefore = Get-IdentitySnapshot $identityPaths
 $identityAfter = $null
@@ -1094,8 +1349,8 @@ $captureOverallDeadline = [DateTimeOffset]::MinValue
 $swapchainFormatGate = [pscustomobject][ordered]@{
     ParsedFormat = $null
     GateResult = 'not_evaluated'
-    ExpectedFormat = 50
-    ExpectedFormatName = 'VK_FORMAT_B8G8R8A8_SRGB'
+    ExpectedFormats = [int64[]](50, 44)
+    ParsedFormatName = $null
     CreationRecordCount = 0
     FormatTokenCount = 0
     FailureReason = $null
@@ -1118,7 +1373,8 @@ try {
         $runtimeLog = $processCapture.StderrText
         $ready = $runtimeLog.Contains('Runtime host initialized with Vulkan RHI entities') -and
             $runtimeLog.Contains('RHI texture created: handle=1, extent=2x2, mip_levels=2, upload_bytes=20') -and
-            $runtimeLog.Contains('Renderer2D texture upload complete: mip_levels=2')
+            $runtimeLog.Contains('RHI texture created: handle=2, extent=2x2, mip_levels=2, upload_bytes=20') -and
+            @([regex]::Matches($runtimeLog, '(?im)^.*Renderer2D texture upload complete: mip_levels=2.*$')).Count -ge 2
         if ($window -ne [IntPtr]::Zero -and $ready) { break }
         Start-Sleep -Milliseconds 100
     }
@@ -1131,7 +1387,7 @@ try {
     if (-not $ready) { throw 'Runtime host/texture upload readiness evidence timed out' }
     if ($runtimeLog -match '(?im)\bVUID-|validation\s+error|VulkanCallFailed|error:') { throw 'Runtime log contains Vulkan validation/error evidence' }
 
-    # sRGB composite oracle 只在唯一的 B8G8R8A8_SRGB swapchain 上成立，必须先于任何像素 Green 判定。
+    # 像素 oracle 只接受冻结的 SRGB/UNORM B8G8R8A8 两种 swapchain，必须先于任何 Green 判定。
     $swapchainFormatGate = Get-SwapchainFormatGateEvidence $runtimeLog
     if ($swapchainFormatGate.GateResult -cne 'passed') {
         throw "Runtime swapchain format gate failed: $($swapchainFormatGate.FailureReason)"
@@ -1147,8 +1403,8 @@ try {
     $foregroundAcquired = [KadathPngRuntimeNative]::PrepareUnobscuredCapture($window)
     Start-Sleep -Milliseconds 200
     $clientSize = [KadathPngRuntimeNative]::GetClientSize($window)
-    if ($clientSize[0] -lt 553 -or $clientSize[1] -lt 311) {
-        throw "Runtime physical client is too small for frozen samples: $($clientSize[0])x$($clientSize[1]) < 553x311"
+    if ($clientSize[0] -lt 773 -or $clientSize[1] -lt 311) {
+        throw "Runtime physical client is too small for frozen samples: $($clientSize[0])x$($clientSize[1]) < 773x311"
     }
     $sampleCoordinates = Get-SampleCoordinates $clientSize[0] $clientSize[1] $renderWidth $renderHeight
     $occlusionProbeCount = 25 + ($sampleCoordinates.PhysicalFlat.Length / 2)
@@ -1219,7 +1475,7 @@ try {
         if (-not [KadathPngRuntimeNative]::IsWindowVisible($window) -or [KadathPngRuntimeNative]::IsIconic($window) -or -not [KadathPngRuntimeNative]::ClientEvidencePointsAreUnobscured($window, [int[]]$sampleCoordinates.PhysicalFlat)) { throw 'Runtime window became hidden, minimized, or obscured during capture' }
         $lastCapture = [KadathPngRuntimeNative]::CaptureClient($window)
         if ($lastCapture.Width -ne $clientSize[0] -or $lastCapture.Height -ne $clientSize[1]) { throw "Runtime client area changed during evidence capture: initial=$($clientSize[0])x$($clientSize[1]) current=$($lastCapture.Width)x$($lastCapture.Height)" }
-        $lastSamples = Get-SampleEvidence $lastCapture $renderWidth $renderHeight $frozenTextureBaseBytes $frozenClearLinearRgb $compositeTolerance
+        $lastSamples = Get-SampleEvidence $lastCapture $renderWidth $renderHeight $frozenTextureBaseBytes $frozenSecondaryTextureBaseBytes $frozenClearLinearRgb $compositeTolerance $swapchainFormatGate.ParsedFormat
         $now = [DateTime]::UtcNow
         if ([DateTimeOffset]::UtcNow -gt $captureDeadline) { break }
         if ($lastSamples.Passed) {
@@ -1233,7 +1489,7 @@ try {
         }
         Start-Sleep -Milliseconds 100
     }
-    if ($passTimes.Count -lt 2 -or -not $lastSamples.Passed) { throw 'Runtime client pixels did not pass the alpha evidence on two consecutive captures' }
+    if ($passTimes.Count -lt 2 -or -not $lastSamples.Passed) { throw 'Runtime client pixels did not pass the player and goal evidence on two consecutive captures' }
     [KadathPngRuntimeNative]::WritePng($screenshotPath, $lastCapture)
 
     [KadathPngRuntimeNative]::RestoreCaptureZOrder($window)
@@ -1262,11 +1518,18 @@ try {
     Assert-IdentityUnchanged $identityBefore $identityAfter
 
     $document = [ordered]@{
-        VerificationVersion = 1
+        VerificationVersion = 2
+        Mode = if ($extractMode) { 'archive_extract' } else { 'original_package' }
+        ExpectedOptimize = $ExpectedOptimize
         KadathRoot = $kadath
         GitHead = $gitHead
         GitTree = $gitTree
         PackageRoot = $package
+        BuildIdentityPackageRoot = $buildIdentityPackage
+        ArchiveManifestPath = $archiveManifest
+        ArchiveManifestSha256 = $archiveManifestSha256
+        RuntimePackageIdentity = $runtimePackageIdentity
+        BuildIdentityPackageIdentity = $buildIdentityPackageIdentity
         TaskLocalCacheDirectory = $taskLocalCache
         GlobalCacheDirectory = $globalCache
         PreflightSidecarPath = $preflightSidecar
@@ -1305,6 +1568,8 @@ try {
         Samples = $lastSamples
         SourceSha256 = $sourceSha256
         KdatSha256 = $kdatSha256
+        SecondarySourceSha256 = $secondarySourceSha256
+        SecondaryKdatSha256 = $secondaryKdatSha256
         BuildProfileMarkerSha256 = $buildProfileMarkerSha256
         BuildProfile = $buildProfile
         ScreenshotSha256 = Get-Hash $screenshotPath
@@ -1325,6 +1590,9 @@ try {
     Write-Output "git_head=$gitHead"
     Write-Output "git_tree=$gitTree"
     Write-Output "package_root=$package"
+    Write-Output "build_identity_package_root=$buildIdentityPackage"
+    Write-Output "runtime_mode=$(if ($extractMode) { 'archive_extract' } else { 'original_package' })"
+    if ($extractMode) { Write-Output "archive_manifest_sha256=$archiveManifestSha256" }
     Write-Output "task_local_cache=$taskLocalCache"
     Write-Output "global_cache=$globalCache"
     Write-Output "preflight_sidecar_sha256=$preflightSidecarSha256"
@@ -1337,7 +1605,8 @@ try {
     Write-Output "logical_to_physical_scale=$scaleX,$scaleY"
     Write-Output "dpi=$windowDpi"
     Write-Output 'alpha_samples=ok'
-    Write-Output 'build_profile=ReleaseSafe'
+    Write-Output 'goal_samples=ok'
+    Write-Output "build_profile=$ExpectedOptimize"
     Write-Output 'consecutive_frames=2'
     Write-Output 'capture_state=playing_after_restart'
     Write-Output 'vulkan_validation=ok'
@@ -1364,8 +1633,10 @@ try {
     if (-not (Test-Path -LiteralPath $evidencePath)) {
         try {
             $failureDocument = [ordered]@{
-                VerificationVersion = 1
+                VerificationVersion = 2
                 Failed = $true
+                Mode = if ($extractMode) { 'archive_extract' } else { 'original_package' }
+                ExpectedOptimize = $ExpectedOptimize
                 Error = if ($null -ne $identityValidationError) { $identityValidationError.Exception.Message } else { $primaryFailure.Exception.Message }
                 PrimaryError = $primaryFailure.Exception.Message
                 IdentityValidationError = if ($null -ne $identityValidationError) { $identityValidationError.Exception.Message } else { $null }
@@ -1373,6 +1644,11 @@ try {
                 GitHead = $gitHead
                 GitTree = $gitTree
                 PackageRoot = $package
+                BuildIdentityPackageRoot = $buildIdentityPackage
+                ArchiveManifestPath = $archiveManifest
+                ArchiveManifestSha256 = $archiveManifestSha256
+                RuntimePackageIdentity = $runtimePackageIdentity
+                BuildIdentityPackageIdentity = $buildIdentityPackageIdentity
                 TaskLocalCacheDirectory = $taskLocalCache
                 GlobalCacheDirectory = $globalCache
                 PreflightSidecarPath = $preflightSidecar
@@ -1426,6 +1702,8 @@ try {
                 Samples = $lastSamples
                 SourceSha256 = $sourceSha256
                 KdatSha256 = $kdatSha256
+                SecondarySourceSha256 = $secondarySourceSha256
+                SecondaryKdatSha256 = $secondaryKdatSha256
                 BuildProfileMarkerSha256 = $buildProfileMarkerSha256
                 BuildProfile = $buildProfile
                 ScreenshotSha256 = if (Test-Path -LiteralPath $screenshotPath) { Get-Hash $screenshotPath } else { $null }

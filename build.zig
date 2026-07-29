@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const mingw_gcc_runtime_dir: ?[]const u8 = if (target.result.os.tag == .windows)
+        b.option([]const u8, "mingw-gcc-runtime-dir", "Directory containing libgcc_eh.a for Rust panic unwinding") orelse
+            "C:\\ProgramTools\\mingw64\\lib\\gcc\\x86_64-w64-mingw32\\14.2.0"
+    else
+        null;
     const platform_mod = b.createModule(.{
         .root_source_file = b.path("modules/platform/src/main.zig"),
         .target = target,
@@ -113,6 +118,7 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    var async_texture_test_step: ?*std.Build.Step = null;
     if (target.result.os.tag == .windows) {
         const rust_target = switch (target.result.cpu.arch) {
             .x86_64 => "x86_64-pc-windows-gnu",
@@ -135,8 +141,7 @@ pub fn build(b: *std.Build) void {
         exe.step.dependOn(&cargo_build.step);
         const rust_profile = if (optimize == .Debug) "debug" else "release";
         exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile }) });
-        const gcc_runtime_dir = b.option([]const u8, "mingw-gcc-runtime-dir", "Directory containing libgcc_eh.a for Rust panic unwinding") orelse
-            "C:\\ProgramTools\\mingw64\\lib\\gcc\\x86_64-w64-mingw32\\14.2.0";
+        const gcc_runtime_dir = mingw_gcc_runtime_dir.?;
         exe.root_module.addLibraryPath(.{ .cwd_relative = gcc_runtime_dir });
         exe.root_module.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
@@ -158,8 +163,9 @@ pub fn build(b: *std.Build) void {
         async_texture_test_mod.addImport("resource", resource_mod);
         const async_texture_tests = b.addTest(.{ .root_module = async_texture_test_mod });
         const async_texture_test_run = b.addRunArtifact(async_texture_tests);
-        const async_texture_test_step = b.step("test-resource-async", "Run Resource-owned async texture tests without GPU");
-        async_texture_test_step.dependOn(&async_texture_test_run.step);
+        const windows_async_texture_test_step = b.step("test-resource-async", "Run Resource-owned async texture tests without GPU");
+        windows_async_texture_test_step.dependOn(&async_texture_test_run.step);
+        async_texture_test_step = windows_async_texture_test_step;
         // 直接约束测试编译节点，确保冷缓存时先生成 Scheduler staticlib，再解析 -l 链接输入。
         async_texture_tests.step.dependOn(&cargo_build.step);
         // 该测试与最终 Host 共用同一 Scheduler staticlib，避免“测试拼 bytes”假集成。
@@ -183,6 +189,132 @@ pub fn build(b: *std.Build) void {
     const preview_status_test_run = b.addRunArtifact(preview_status_tests);
     const test_step = b.step("test", "Run Preview protocol unit tests");
     test_step.dependOn(&preview_status_test_run.step);
+
+    const null_rhi_mod = b.createModule(.{
+        .root_source_file = b.path("modules/rhi/src/null.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const null_renderer2d_mod = b.createModule(.{
+        .root_source_file = b.path("modules/renderer2d/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    null_renderer2d_mod.addImport("rhi", null_rhi_mod);
+
+    const renderer2d_null_contract_mod = b.createModule(.{
+        .root_source_file = b.path("modules/renderer2d/tests/null_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    renderer2d_null_contract_mod.addImport("rhi", null_rhi_mod);
+    renderer2d_null_contract_mod.addImport("renderer2d", null_renderer2d_mod);
+    const renderer2d_null_contract_tests = b.addTest(.{ .root_module = renderer2d_null_contract_mod });
+    const renderer2d_null_contract_run = b.addRunArtifact(renderer2d_null_contract_tests);
+
+    const renderer2d_remap_mod = b.createModule(.{
+        .root_source_file = b.path("modules/rhi/tests/renderer2d_remap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    renderer2d_remap_mod.addImport("rhi", null_rhi_mod);
+    renderer2d_remap_mod.addImport("renderer2d", null_renderer2d_mod);
+    const renderer2d_remap_tests = b.addTest(.{ .root_module = renderer2d_remap_mod });
+    const renderer2d_remap_run = b.addRunArtifact(renderer2d_remap_tests);
+
+    const renderer2d_null_test_step = b.step("test-renderer2d-null", "Run Renderer2D contracts against the Null RHI");
+    renderer2d_null_test_step.dependOn(&renderer2d_null_contract_run.step);
+    renderer2d_null_test_step.dependOn(&renderer2d_remap_run.step);
+    test_step.dependOn(renderer2d_null_test_step);
+
+    const runtime_texture_registry_test_mod = b.createModule(.{
+        .root_source_file = b.path("app/runtime_texture_registry.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    runtime_texture_registry_test_mod.addImport("resource", resource_mod);
+    runtime_texture_registry_test_mod.addImport("renderer2d", null_renderer2d_mod);
+    runtime_texture_registry_test_mod.addImport("rhi", null_rhi_mod);
+    runtime_texture_registry_test_mod.addImport("world", world_mod);
+    const runtime_texture_registry_tests = b.addTest(.{ .root_module = runtime_texture_registry_test_mod });
+    const registry_cargo_target_dir = b.pathFromRoot(".zig-cache/cargo-registry-tests");
+    const registry_cargo_build = b.addSystemCommand(&.{
+        "cargo",
+        "build",
+        "--locked",
+        "--manifest-path",
+        b.pathFromRoot("Cargo.toml"),
+        "--package",
+        "kadath_scheduler",
+        "--target-dir",
+        registry_cargo_target_dir,
+    });
+    const registry_rust_target = if (target.result.os.tag == .windows) switch (target.result.cpu.arch) {
+        .x86_64 => "x86_64-pc-windows-gnu",
+        else => @panic("P2-Multi-Texture-01 registry tests support only x86_64 Windows"),
+    } else null;
+    if (registry_rust_target) |rust_target| {
+        registry_cargo_build.addArgs(&.{ "--target", rust_target });
+    }
+    if (optimize != .Debug) registry_cargo_build.addArg("--release");
+    runtime_texture_registry_tests.step.dependOn(&registry_cargo_build.step);
+    const registry_rust_profile = if (optimize == .Debug) "debug" else "release";
+    const registry_library_path = if (registry_rust_target) |rust_target|
+        b.pathJoin(&.{ registry_cargo_target_dir, rust_target, registry_rust_profile })
+    else
+        b.pathJoin(&.{ registry_cargo_target_dir, registry_rust_profile });
+    runtime_texture_registry_test_mod.addLibraryPath(.{ .cwd_relative = registry_library_path });
+    runtime_texture_registry_test_mod.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
+    if (target.result.os.tag == .windows) {
+        runtime_texture_registry_test_mod.addLibraryPath(.{ .cwd_relative = mingw_gcc_runtime_dir.? });
+        runtime_texture_registry_test_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
+        runtime_texture_registry_test_mod.linkSystemLibrary("kernel32", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("dbghelp", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("advapi32", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("bcrypt", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("ntdll", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("userenv", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("ws2_32", .{});
+    } else if (target.result.os.tag == .linux) {
+        runtime_texture_registry_test_mod.linkSystemLibrary("gcc_s", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("util", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("rt", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("pthread", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("m", .{});
+        runtime_texture_registry_test_mod.linkSystemLibrary("dl", .{});
+    }
+
+    if (target.result.os.tag != .windows) {
+        const native_async_texture_test_mod = b.createModule(.{
+            .root_source_file = b.path("modules/resource/tests/async_texture_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        native_async_texture_test_mod.addImport("resource", resource_mod);
+        native_async_texture_test_mod.addLibraryPath(.{ .cwd_relative = registry_library_path });
+        native_async_texture_test_mod.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
+        if (target.result.os.tag == .linux) {
+            native_async_texture_test_mod.linkSystemLibrary("gcc_s", .{});
+            native_async_texture_test_mod.linkSystemLibrary("util", .{});
+            native_async_texture_test_mod.linkSystemLibrary("rt", .{});
+            native_async_texture_test_mod.linkSystemLibrary("pthread", .{});
+            native_async_texture_test_mod.linkSystemLibrary("m", .{});
+            native_async_texture_test_mod.linkSystemLibrary("dl", .{});
+        }
+        const native_async_texture_tests = b.addTest(.{ .root_module = native_async_texture_test_mod });
+        native_async_texture_tests.step.dependOn(&registry_cargo_build.step);
+        const native_async_texture_test_run = b.addRunArtifact(native_async_texture_tests);
+        const native_async_texture_test_step = b.step("test-resource-async", "Run Resource-owned async texture tests without GPU");
+        native_async_texture_test_step.dependOn(&native_async_texture_test_run.step);
+        async_texture_test_step = native_async_texture_test_step;
+    }
+    const runtime_texture_registry_run = b.addRunArtifact(runtime_texture_registry_tests);
+    const runtime_texture_registry_test_step = b.step("test-runtime-texture-registry", "Run fixed Runtime texture registry contracts against the Null RHI");
+    runtime_texture_registry_test_step.dependOn(&runtime_texture_registry_run.step);
+    test_step.dependOn(runtime_texture_registry_test_step);
+    if (async_texture_test_step) |step| test_step.dependOn(step);
 
     // 分发目录以 bin 为运行工作目录，资产必须与 exe 保持稳定的相对位置。
     const texture_source_snapshot_test_barrier = b.option(
@@ -565,16 +697,43 @@ pub fn build(b: *std.Build) void {
     }
     const texture_source_snapshot = texture_source_snapshot_command.addOutputFileArg("test.png");
 
+    const secondary_texture_source_snapshot_test_barrier = b.option(
+        []const u8,
+        "secondary-texture-source-snapshot-test-barrier",
+        "Verifier-only absolute empty directory used to pause after the secondary PNG source snapshot",
+    );
+    const secondary_texture_source_snapshot_command = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-CommandWithArgs", texture_source_snapshot_script });
+    secondary_texture_source_snapshot_command.addFileArg(b.path("assets/renderer2d/goal.png"));
+    if (secondary_texture_source_snapshot_test_barrier) |barrier_path| {
+        secondary_texture_source_snapshot_command.addArg(barrier_path);
+    } else {
+        secondary_texture_source_snapshot_command.addArg("-");
+    }
+    const secondary_texture_source_snapshot_test_fault = b.option(
+        []const u8,
+        "secondary-texture-source-snapshot-test-fault",
+        "Verifier-only secondary snapshot fault injection for pre-return, partial-write cleanup, or same-byte replacement refusal",
+    );
+    if (secondary_texture_source_snapshot_test_fault) |fault_mode| {
+        secondary_texture_source_snapshot_command.addArg(fault_mode);
+    } else {
+        secondary_texture_source_snapshot_command.addArg("-");
+    }
+    const secondary_texture_source_snapshot = secondary_texture_source_snapshot_command.addOutputFileArg("goal.png");
+
     const install_assets = b.addInstallDirectory(.{
         .source_dir = b.path("assets"),
         .install_dir = .bin,
         .install_subdir = "assets",
     });
     b.getInstallStep().dependOn(&install_assets.step);
-    // install_assets 仍提供完整资产树；snapshot install 是 test.png 的唯一有序 final writer。
+    // install_assets 仍提供完整资产树；两个 snapshot install 是对应 PNG 的唯一有序 final writer。
     const install_texture_source_snapshot = b.addInstallFile(texture_source_snapshot, "bin/assets/renderer2d/test.png");
     install_texture_source_snapshot.step.dependOn(&install_assets.step);
     b.getInstallStep().dependOn(&install_texture_source_snapshot.step);
+    const install_secondary_texture_source_snapshot = b.addInstallFile(secondary_texture_source_snapshot, "bin/assets/renderer2d/goal.png");
+    install_secondary_texture_source_snapshot.step.dependOn(&install_assets.step);
+    b.getInstallStep().dependOn(&install_secondary_texture_source_snapshot.step);
     // Importer/Baker 在安装阶段从 PNG 源生成确定性 KDAT；Zig optimize 不改变 release texture profile。
     const texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
@@ -584,6 +743,14 @@ pub fn build(b: *std.Build) void {
     const texture_artifact = texture_import.addOutputFileArg("test.texture");
     const install_texture_artifact = b.addInstallFile(texture_artifact, "bin/assets/renderer2d/test.texture");
     b.getInstallStep().dependOn(&install_texture_artifact.step);
+    const secondary_texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    secondary_texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
+    secondary_texture_import.addArg("-SourcePath");
+    secondary_texture_import.addFileArg(secondary_texture_source_snapshot);
+    secondary_texture_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
+    const secondary_texture_artifact = secondary_texture_import.addOutputFileArg("goal.texture");
+    const install_secondary_texture_artifact = b.addInstallFile(secondary_texture_artifact, "bin/assets/renderer2d/goal.texture");
+    b.getInstallStep().dependOn(&install_secondary_texture_artifact.step);
     // 两个音频 artifact 独立构建，任一失败都会阻止 install/package 完成。
     const audio_import_won = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     audio_import_won.addFileArg(b.path("tools/editor-audio-importer.ps1"));
@@ -636,7 +803,7 @@ pub fn build(b: *std.Build) void {
         "Absolute path to the operator-created PNG Runtime pre-build witness",
     );
     const runtime_build_profile_script =
-        \\$runtimePath, $texturePath, $textureArtifactPath, $vertexPath, $fragmentPath, $optimize, $packageRoot, $localCacheRoot, $globalCacheRoot, $preflightPath, $destination = $args
+        \\$runtimePath, $texturePath, $textureArtifactPath, $secondaryTexturePath, $secondaryTextureArtifactPath, $vertexPath, $fragmentPath, $optimize, $packageRoot, $localCacheRoot, $globalCacheRoot, $preflightPath, $destination = $args
         \\$ErrorActionPreference = 'Stop'
         \\function Get-CanonicalLocalPath([string]$path, [string]$name) {
         \\    if ([string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathFullyQualified($path)) { throw "$name must be an absolute local path" }
@@ -677,12 +844,14 @@ pub fn build(b: *std.Build) void {
         \\    }
         \\}
         \\$document = [ordered]@{
-        \\    Version = 1
+        \\    Version = 2
         \\    Optimize = $optimize
         \\    TextureProfile = 'release'
         \\    RuntimeExeSha256 = (Get-FileHash -LiteralPath $runtimePath -Algorithm SHA256).Hash.ToLowerInvariant()
         \\    TextureSourceSha256 = (Get-FileHash -LiteralPath $texturePath -Algorithm SHA256).Hash.ToLowerInvariant()
         \\    TextureArtifactSha256 = (Get-FileHash -LiteralPath $textureArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        \\    SecondaryTextureSourceSha256 = (Get-FileHash -LiteralPath $secondaryTexturePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        \\    SecondaryTextureArtifactSha256 = (Get-FileHash -LiteralPath $secondaryTextureArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
         \\    VertexShaderSourceSha256 = (Get-FileHash -LiteralPath $vertexPath -Algorithm SHA256).Hash.ToLowerInvariant()
         \\    FragmentShaderSourceSha256 = (Get-FileHash -LiteralPath $fragmentPath -Algorithm SHA256).Hash.ToLowerInvariant()
         \\    BuildPreflightSidecarSha256 = $preflightSha256
@@ -701,6 +870,8 @@ pub fn build(b: *std.Build) void {
     runtime_build_profile_command.addFileArg(exe.getEmittedBin());
     runtime_build_profile_command.addFileArg(texture_source_snapshot);
     runtime_build_profile_command.addFileArg(texture_artifact);
+    runtime_build_profile_command.addFileArg(secondary_texture_source_snapshot);
+    runtime_build_profile_command.addFileArg(secondary_texture_artifact);
     runtime_build_profile_command.addFileArg(b.path("shaders/renderer2d/quad.vert.glsl"));
     runtime_build_profile_command.addFileArg(b.path("shaders/renderer2d/quad.frag.glsl"));
     runtime_build_profile_command.addArg(@tagName(optimize));

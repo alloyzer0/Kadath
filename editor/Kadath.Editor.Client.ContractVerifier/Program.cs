@@ -615,7 +615,7 @@ internal static class Program
         await workspace.RefreshSnapshotsAsync("demo");
         Assert(workspace.ProjectSnapshot.State == EditorSnapshotState.Ready && workspace.ProjectSnapshot.Value?.ModelVersion == 1, "project snapshot state mismatch");
         Assert(workspace.HierarchySnapshot.Value?.Nodes.Length == 8, "hierarchy snapshot count mismatch");
-        Assert(workspace.AssetCatalogSnapshot.Value?.ItemCount == 10, "asset catalog snapshot count mismatch");
+        Assert(workspace.AssetCatalogSnapshot.Value?.ItemCount == 12, "asset catalog snapshot count mismatch");
         Assert(workspace.Publication.State == EditorPublicationState.Current && workspace.Publication.RecommendedBakeTarget is null, "publication snapshot current state mismatch");
 
         // 任一侧缺失都代表 pair 不完整，前端必须选择 Both，避免只修复表面上 dirty 的一侧。
@@ -1468,6 +1468,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         var paths = new[]
         {
             "assets/audio/lost.audio.wav", "assets/audio/lost.wav", "assets/audio/won.audio.wav", "assets/audio/won.wav",
+            "assets/renderer2d/goal.png", "assets/renderer2d/goal.texture",
             "assets/renderer2d/test.png", "assets/renderer2d/test.texture",
             "assets/scenes/preview.scene", "assets/scenes/preview.scene.json",
             "assets/scripts/preview.script", "assets/scripts/preview.script.json"

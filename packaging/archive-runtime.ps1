@@ -7,7 +7,9 @@ param(
     [string]$OutputDirectory,
 
     [Parameter(Mandatory = $true)]
-    [string]$ExtractDirectory
+    [string]$ExtractDirectory,
+
+    [string]$VerificationBarrierDirectory
 )
 
 $ErrorActionPreference = "Stop"
@@ -480,6 +482,26 @@ function Close-PackageSourceSnapshot([object]$Snapshot) {
     if ($disposeErrors.Count -gt 1) { throw [AggregateException]::new('Package retained handle release failures', $disposeErrors) }
 }
 
+function Assert-PackageSourceSnapshotStable([object]$Snapshot, [string]$SourceRoot) {
+    $currentFiles = @(Get-PackageFileSet $SourceRoot)
+    if ($currentFiles.Count -ne $Snapshot.Files.Count) { throw 'Package file set changed after the retained snapshot was acquired' }
+    foreach ($file in $currentFiles) {
+        if (-not $Snapshot.IdentityByRelative.ContainsKey($file.RelativePath)) {
+            throw "Package file set changed after the retained snapshot was acquired: $($file.RelativePath)"
+        }
+        $stream = $null
+        try {
+            $stream = [IO.File]::Open($file.FullPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            $currentIdentity = Get-StableFileIdentityFromHandle $stream
+            if (-not (Test-StableFileIdentityEqual $Snapshot.IdentityByRelative[$file.RelativePath] $currentIdentity)) {
+                throw "Package file identity changed after the retained snapshot was acquired: $($file.RelativePath)"
+            }
+        } finally {
+            if ($stream) { $stream.Dispose() }
+        }
+    }
+}
+
 function Read-PackageSnapshotBytes([object]$Snapshot, [string]$RelativePath) {
     if (-not $Snapshot.StreamByRelative.ContainsKey($RelativePath)) {
         throw "Package snapshot is missing required file: $RelativePath"
@@ -514,7 +536,10 @@ function Copy-PackageToOwnedSnapshot([object]$SourceSnapshot, [string]$SnapshotR
                 [IO.FileOptions]::WriteThrough)
             $sourceStream.CopyTo($destinationStream)
             $destinationStream.Flush($true)
-            $sourceStream.Position = 0
+            $copiedSourceIdentity = Get-StableFileIdentityFromHandle $sourceStream
+            if (-not (Test-StableFileIdentityEqual $SourceSnapshot.IdentityByRelative[$file.RelativePath] $copiedSourceIdentity)) {
+                throw "Package retained source changed while copying to the owned snapshot: $($file.RelativePath)"
+            }
         } finally {
             if ($destinationStream) { $destinationStream.Dispose() }
         }
@@ -531,7 +556,11 @@ function Assert-ReleasePackageMarkerIdentity(
     [byte[]]$ProfileMarkerBytes,
     [string]$RuntimeSha256,
     [string]$TextureSourceSha256,
-    [string]$TextureArtifactSha256
+    [string]$TextureArtifactSha256,
+    [string]$SecondaryTextureSourceSha256,
+    [string]$SecondaryTextureArtifactSha256,
+    [string]$VertexShaderSourceSha256,
+    [string]$FragmentShaderSourceSha256
 ) {
     if ($profileMarkerBytes.Length -eq 0 -or $profileMarkerBytes.Length -gt 65536) {
         throw 'Runtime build profile marker must contain 1..65536 bytes'
@@ -543,26 +572,28 @@ function Assert-ReleasePackageMarkerIdentity(
         try {
             $rootElement = $profileMarkerJsonDocument.RootElement
             if ($rootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { throw 'root must be an object' }
-            $expectedProfileFields = [string[]]@('Version', 'Optimize', 'TextureProfile', 'RuntimeExeSha256', 'TextureSourceSha256', 'TextureArtifactSha256', 'VertexShaderSourceSha256', 'FragmentShaderSourceSha256', 'BuildPreflightSidecarSha256')
+            $expectedProfileFields = [string[]]@('Version', 'Optimize', 'TextureProfile', 'RuntimeExeSha256', 'TextureSourceSha256', 'TextureArtifactSha256', 'SecondaryTextureSourceSha256', 'SecondaryTextureArtifactSha256', 'VertexShaderSourceSha256', 'FragmentShaderSourceSha256', 'BuildPreflightSidecarSha256')
             $actualProfileFields = @($rootElement.EnumerateObject() | ForEach-Object { $_.Name })
             $uniqueProfileFields = @($actualProfileFields | Sort-Object -Unique -CaseSensitive)
-            if ($actualProfileFields.Count -ne 9 -or $uniqueProfileFields.Count -ne 9 -or
+            if ($actualProfileFields.Count -ne 11 -or $uniqueProfileFields.Count -ne 11 -or
                 @(Compare-Object -ReferenceObject ($expectedProfileFields | Sort-Object) -DifferenceObject ($actualProfileFields | Sort-Object) -CaseSensitive).Count -ne 0) {
-                throw 'properties must be unique and exactly match the nine schema v1 names'
+                throw 'properties must be unique and exactly match the eleven schema v2 names'
             }
             $versionElement = $rootElement.GetProperty('Version')
-            if ($versionElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $versionElement.GetInt32() -ne 1) { throw 'Version must be the JSON number 1' }
+            if ($versionElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or $versionElement.GetInt32() -ne 2) { throw 'Version must be the JSON number 2' }
             $stringFields = $expectedProfileFields | Where-Object { $_ -cne 'Version' }
             foreach ($field in $stringFields) {
                 if ($rootElement.GetProperty($field).ValueKind -ne [System.Text.Json.JsonValueKind]::String) { throw "$field must be a JSON string" }
             }
             $profileMarker = [pscustomobject][ordered]@{
-                Version = 1
+                Version = 2
                 Optimize = $rootElement.GetProperty('Optimize').GetString()
                 TextureProfile = $rootElement.GetProperty('TextureProfile').GetString()
                 RuntimeExeSha256 = $rootElement.GetProperty('RuntimeExeSha256').GetString()
                 TextureSourceSha256 = $rootElement.GetProperty('TextureSourceSha256').GetString()
                 TextureArtifactSha256 = $rootElement.GetProperty('TextureArtifactSha256').GetString()
+                SecondaryTextureSourceSha256 = $rootElement.GetProperty('SecondaryTextureSourceSha256').GetString()
+                SecondaryTextureArtifactSha256 = $rootElement.GetProperty('SecondaryTextureArtifactSha256').GetString()
                 VertexShaderSourceSha256 = $rootElement.GetProperty('VertexShaderSourceSha256').GetString()
                 FragmentShaderSourceSha256 = $rootElement.GetProperty('FragmentShaderSourceSha256').GetString()
                 BuildPreflightSidecarSha256 = $rootElement.GetProperty('BuildPreflightSidecarSha256').GetString()
@@ -571,36 +602,49 @@ function Assert-ReleasePackageMarkerIdentity(
             $profileMarkerJsonDocument.Dispose()
         }
     } catch {
-        throw "Runtime build profile marker is not strict UTF-8 exact-nine JSON schema v1: $($_.Exception.Message)"
+        throw "Runtime build profile marker is not strict UTF-8 exact-eleven JSON schema v2: $($_.Exception.Message)"
     }
 
-    if ([int]$profileMarker.Version -ne 1 -or
+    if ([int]$profileMarker.Version -ne 2 -or
         [string]$profileMarker.Optimize -cne 'ReleaseSafe' -or
         [string]$profileMarker.TextureProfile -cne 'release' -or
         [string]$profileMarker.RuntimeExeSha256 -cne $runtimeSha256 -or
         [string]$profileMarker.TextureSourceSha256 -cne $textureSourceSha256 -or
         [string]$profileMarker.TextureArtifactSha256 -cne $textureArtifactSha256 -or
-        [string]$profileMarker.VertexShaderSourceSha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        [string]$profileMarker.FragmentShaderSourceSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$profileMarker.SecondaryTextureSourceSha256 -cne $secondaryTextureSourceSha256 -or
+        [string]$profileMarker.SecondaryTextureArtifactSha256 -cne $secondaryTextureArtifactSha256 -or
+        [string]$profileMarker.VertexShaderSourceSha256 -cne $vertexShaderSourceSha256 -or
+        [string]$profileMarker.FragmentShaderSourceSha256 -cne $fragmentShaderSourceSha256 -or
         [string]$profileMarker.BuildPreflightSidecarSha256 -cnotmatch '^[0-9a-f]{64}$') {
-        throw 'Runtime archive requires a sidecar-bound ReleaseSafe marker matching the package executable, PNG, and KDAT identities'
+        throw 'Runtime archive requires a sidecar-bound ReleaseSafe marker matching the executable, both PNG/KDAT pairs, and clean shader identities'
     }
 }
 
-function Assert-ReleasePackageIdentity([string]$Root, [string[]]$RequiredFiles) {
+function Assert-ReleasePackageIdentity([string]$Root, [string[]]$RequiredFiles, [string]$VertexShaderSha256, [string]$FragmentShaderSha256) {
     Assert-RequiredPackageFiles $Root $RequiredFiles
+    $packageFiles = @(Get-PackageFileSet $Root)
+    if ($packageFiles.Count -ne $RequiredFiles.Count) { throw "Runtime package must contain exactly $($RequiredFiles.Count) files, got $($packageFiles.Count)" }
     $runtimePath = Join-Path $Root 'bin\kadath.exe'
     $textureSourcePath = Join-Path $Root 'bin\assets\renderer2d\test.png'
     $textureArtifactPath = Join-Path $Root 'bin\assets\renderer2d\test.texture'
+    $secondaryTextureSourcePath = Join-Path $Root 'bin\assets\renderer2d\goal.png'
+    $secondaryTextureArtifactPath = Join-Path $Root 'bin\assets\renderer2d\goal.texture'
     $profileMarkerPath = Join-Path $Root 'bin\kadath-runtime-build-profile.json'
     Assert-ReleasePackageMarkerIdentity `
         ([IO.File]::ReadAllBytes($profileMarkerPath)) `
         ((Get-FileHash -LiteralPath $runtimePath -Algorithm SHA256).Hash.ToLowerInvariant()) `
         ((Get-FileHash -LiteralPath $textureSourcePath -Algorithm SHA256).Hash.ToLowerInvariant()) `
-        ((Get-FileHash -LiteralPath $textureArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant())
+        ((Get-FileHash -LiteralPath $textureArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()) `
+        ((Get-FileHash -LiteralPath $secondaryTextureSourcePath -Algorithm SHA256).Hash.ToLowerInvariant()) `
+        ((Get-FileHash -LiteralPath $secondaryTextureArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()) `
+        $VertexShaderSha256 `
+        $FragmentShaderSha256
 }
 
-function Assert-ReleasePackageSnapshotIdentity([object]$Snapshot, [string[]]$RequiredFiles) {
+function Assert-ReleasePackageSnapshotIdentity([object]$Snapshot, [string[]]$RequiredFiles, [string]$VertexShaderSha256, [string]$FragmentShaderSha256) {
+    if ($Snapshot.Files.Count -ne $RequiredFiles.Count) {
+        throw "Package snapshot must contain exactly $($RequiredFiles.Count) files, got $($Snapshot.Files.Count)"
+    }
     foreach ($relative in $RequiredFiles) {
         if (-not $Snapshot.StreamByRelative.ContainsKey($relative)) {
             throw "Package snapshot is missing required file: $relative"
@@ -612,7 +656,11 @@ function Assert-ReleasePackageSnapshotIdentity([object]$Snapshot, [string[]]$Req
         (Read-PackageSnapshotBytes $Snapshot 'bin/kadath-runtime-build-profile.json') `
         ([string]$Snapshot.IdentityByRelative['bin/kadath.exe'].Sha256) `
         ([string]$Snapshot.IdentityByRelative['bin/assets/renderer2d/test.png'].Sha256) `
-        ([string]$Snapshot.IdentityByRelative['bin/assets/renderer2d/test.texture'].Sha256)
+        ([string]$Snapshot.IdentityByRelative['bin/assets/renderer2d/test.texture'].Sha256) `
+        ([string]$Snapshot.IdentityByRelative['bin/assets/renderer2d/goal.png'].Sha256) `
+        ([string]$Snapshot.IdentityByRelative['bin/assets/renderer2d/goal.texture'].Sha256) `
+        $VertexShaderSha256 `
+        $FragmentShaderSha256
 }
 
 function New-OwnedDirectoryRoot(
@@ -675,6 +723,7 @@ $stagingRootOwner = $null
 $outputRootOwner = $null
 $extractRootOwner = $null
 $packageSourceSnapshot = $null
+$packageSourceIdentitySnapshot = $null
 $archiveCompleted = $false
 try {
 
@@ -689,15 +738,43 @@ if (-not [IO.Path]::IsPathFullyQualified($PackageRoot) -or
 $packageInput = [IO.Path]::GetFullPath($PackageRoot)
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 $extract = [IO.Path]::GetFullPath($ExtractDirectory)
+$verificationBarrier = $null
+if (-not [string]::IsNullOrWhiteSpace($VerificationBarrierDirectory)) {
+    Assert-NoWin32DevicePath $VerificationBarrierDirectory 'Verification barrier directory'
+    if (-not [IO.Path]::IsPathFullyQualified($VerificationBarrierDirectory)) { throw 'VerificationBarrierDirectory must be a fully qualified local path' }
+    $verificationBarrierInput = [IO.Path]::GetFullPath($VerificationBarrierDirectory)
+    Assert-NoReparsePointInExistingPath $verificationBarrierInput 'Verification barrier directory'
+    $verificationBarrier = Resolve-ExistingDirectory $verificationBarrierInput 'Verification barrier directory'
+    if (@(Get-ChildItem -LiteralPath $verificationBarrier -Force).Count -ne 0) { throw 'Verification barrier directory must be empty' }
+}
 
 # 关键事务前置：所有路径关系和现存 ancestor 在首次写入前完成校验。
 Assert-NoReparsePointInExistingPath $packageInput 'Package root'
 Assert-NoReparsePointInExistingPath $output 'Output directory'
 Assert-NoReparsePointInExistingPath $extract 'Extract directory'
 $package = Resolve-ExistingDirectory $packageInput "Package root"
+$kadathRootInput = Split-Path -Parent $PSScriptRoot
+Assert-NoWin32DevicePath $kadathRootInput 'Kadath root'
+Assert-NoReparsePointInExistingPath $kadathRootInput 'Kadath root'
+$kadathRoot = Resolve-ExistingDirectory $kadathRootInput 'Kadath root'
+$buildDefinitionPath = Join-Path $kadathRoot 'build.zig'
+$vertexShaderPath = Join-Path $kadathRoot 'shaders\renderer2d\quad.vert.glsl'
+$fragmentShaderPath = Join-Path $kadathRoot 'shaders\renderer2d\quad.frag.glsl'
+foreach ($sourceFile in @($buildDefinitionPath, $vertexShaderPath, $fragmentShaderPath)) {
+    Assert-NoReparsePointInExistingPath $sourceFile 'Kadath source identity file'
+    if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) { throw "Kadath source identity file is missing: $sourceFile" }
+}
+$vertexShaderSha256 = (Get-FileHash -LiteralPath $vertexShaderPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$fragmentShaderSha256 = (Get-FileHash -LiteralPath $fragmentShaderPath -Algorithm SHA256).Hash.ToLowerInvariant()
 Assert-DisjointDirectories $package 'Package root' $output 'Output directory'
 Assert-DisjointDirectories $package 'Package root' $extract 'Extract directory'
 Assert-DisjointDirectories $output 'Output directory' $extract 'Extract directory'
+if ($verificationBarrier) {
+    Assert-DisjointDirectories $package 'Package root' $verificationBarrier 'Verification barrier directory'
+    Assert-DisjointDirectories $output 'Output directory' $verificationBarrier 'Verification barrier directory'
+    Assert-DisjointDirectories $extract 'Extract directory' $verificationBarrier 'Verification barrier directory'
+    Assert-DisjointDirectories $kadathRoot 'Kadath root' $verificationBarrier 'Verification barrier directory'
+}
 
 if (Test-Path -LiteralPath $output) {
     throw "Output directory already exists; refusing to overwrite: $output"
@@ -721,6 +798,8 @@ if ($reparseEntries.Count -ne 0) { throw "Package tree cannot contain a reparse 
 $requiredFiles = @(
     'bin/kadath.exe',
     'bin/kadath-runtime-build-profile.json',
+    'bin/assets/renderer2d/goal.png',
+    'bin/assets/renderer2d/goal.texture',
     'bin/assets/renderer2d/test.png',
     'bin/assets/renderer2d/test.texture',
     'bin/assets/audio/won.wav',
@@ -747,10 +826,29 @@ Assert-NoReparsePointInExistingPath $staging 'Package snapshot'
 Assert-DisjointDirectories $package 'Package root' $staging 'Package snapshot'
 Assert-DisjointDirectories $output 'Output directory' $staging 'Package snapshot'
 Assert-DisjointDirectories $extract 'Extract directory' $staging 'Package snapshot'
+if ($verificationBarrier) { Assert-DisjointDirectories $verificationBarrier 'Verification barrier directory' $staging 'Package snapshot' }
 
 # retained file set 与 strict marker gate 都发生在首次写入前；失败必须报告 archive_write_started=false。
 $packageSourceSnapshot = Open-PackageSourceSnapshot $package
-Assert-ReleasePackageSnapshotIdentity $packageSourceSnapshot $requiredFiles
+Assert-ReleasePackageSnapshotIdentity $packageSourceSnapshot $requiredFiles $vertexShaderSha256 $fragmentShaderSha256
+$packageSourceIdentitySnapshot = $packageSourceSnapshot
+
+if ($verificationBarrier) {
+    $readyPath = Join-Path $verificationBarrier 'snapshot-ready'
+    $continuePath = Join-Path $verificationBarrier 'continue'
+    if ((Test-Path -LiteralPath $readyPath) -or (Test-Path -LiteralPath $continuePath)) { throw 'Verification barrier contains a pre-existing control path' }
+    $readyStream = [IO.File]::Open($readyPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    $readyStream.Dispose()
+    $wait = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath $continuePath -PathType Leaf)) {
+        if ($wait.ElapsedMilliseconds -ge 10000) { throw 'Timed out waiting for archive verification barrier continue signal' }
+        Start-Sleep -Milliseconds 25
+    }
+    Assert-NoReparsePointInExistingPath $verificationBarrier 'Verification barrier before continue'
+    $continueInfo = Get-Item -LiteralPath $continuePath -Force
+    if (($continueInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $continueInfo.Length -ne 0) { throw 'Verification barrier continue signal must be an empty non-reparse file' }
+    Assert-PackageSourceSnapshotStable $packageSourceSnapshot $package
+}
 
 $transactionFailure = $null
 try {
@@ -782,7 +880,7 @@ try {
     $packageSnapshot = Resolve-ExistingDirectory $staging 'Package snapshot'
 
     # 关键身份门禁：marker 和三项 payload 只在 owned snapshot 内重新解析与重算。
-    Assert-ReleasePackageIdentity $packageSnapshot $requiredFiles
+    Assert-ReleasePackageIdentity $packageSnapshot $requiredFiles $vertexShaderSha256 $fragmentShaderSha256
 
     $outputRootOwner = New-OwnedDirectoryRoot $output 'Output directory'
     $archivePath = Join-Path $output 'kadath-runtime-win-x64.zip'
@@ -865,7 +963,15 @@ foreach ($relative in $expectedMap.Keys) {
 Assert-NoReparsePointInExistingPath $extract 'Extract directory'
 $extractReparseEntries = @(Get-ChildItem -LiteralPath $extract -Force -Recurse | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
 if ($extractReparseEntries.Count -ne 0) { throw "Extracted archive cannot contain a reparse point: $($extractReparseEntries[0].FullName)" }
-Assert-ReleasePackageIdentity $extract $requiredFiles
+Assert-ReleasePackageIdentity $extract $requiredFiles $vertexShaderSha256 $fragmentShaderSha256
+
+# live source/package 终验必须仍等于首次写入前冻结的 identity；任何替换都使整个事务失败。
+Assert-PackageSourceSnapshotStable $packageSourceIdentitySnapshot $package
+if ((Get-FileHash -LiteralPath $vertexShaderPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $vertexShaderSha256 -or
+    (Get-FileHash -LiteralPath $fragmentShaderPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fragmentShaderSha256) {
+    throw 'Shader source identity changed during archive transaction'
+}
+Assert-ReleasePackageIdentity $package $requiredFiles $vertexShaderSha256 $fragmentShaderSha256
 
 $archiveSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 } catch {

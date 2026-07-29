@@ -489,7 +489,7 @@ function Invoke-GuiWorkflowSmokeTick(
                 if ($null -eq $script:hierarchySnapshot -or [int]$script:hierarchySnapshot.SnapshotVersion -ne 1) { throw 'Hierarchy Snapshot v1 was not rebound after Apply' }
                 if (@($script:hierarchySnapshot.Nodes).Count -ne 8 -or $script:controls.Hierarchy.Nodes.Count -ne 3) { throw 'Hierarchy tree does not contain the expected 8 nodes / 3 roots' }
                 if ($script:controls.Inspector.Items.Count -eq 0) { throw 'Inspector did not show the selected node properties' }
-                if (@($script:assetCatalogSnapshot.Items).Count -ne 10 -or $script:controls.AssetTree.Nodes.Count -ne 4) { throw 'Asset panel does not contain the expected 10 items / 4 categories' }
+                if (@($script:assetCatalogSnapshot.Items).Count -ne 12 -or $script:controls.AssetTree.Nodes.Count -ne 4) { throw 'Asset panel does not contain the expected 12 items / 4 categories' }
                 if ($null -eq $script:controls.AssetTree.SelectedNode) { throw 'Asset panel did not select a catalog item' }
                 Show-InspectorProperties $script:controls.AssetTree.SelectedNode.Tag
                 if ($script:controls.Inspector.Items.Count -lt 5) { throw 'Inspector did not show the selected asset properties' }
@@ -545,7 +545,7 @@ function Invoke-GuiWorkflowSmokeTick(
                 $snapshot = Get-EditorHierarchySnapshot $model
                 if ([int]$snapshot.SnapshotVersion -ne 1 -or @($snapshot.Nodes).Count -ne 8) { throw 'Final Hierarchy Snapshot is invalid' }
                 $catalog = Get-EditorAssetCatalogSnapshot $script:resolvedPackageRoot
-                if ([int]$catalog.CatalogVersion -ne 1 -or @($catalog.Items).Count -ne 10) { throw 'Final Asset Catalog Snapshot is invalid' }
+                if ([int]$catalog.CatalogVersion -ne 1 -or @($catalog.Items).Count -ne 12) { throw 'Final Asset Catalog Snapshot is invalid' }
                 $script:workflowEvidence = @(
                     'workflow_create=ok',
                     'workflow_apply=ok',

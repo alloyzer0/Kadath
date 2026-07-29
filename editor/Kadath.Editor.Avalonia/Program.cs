@@ -65,7 +65,7 @@ internal static class Program
         var avaloniaViewModel = new AvaloniaEditorViewModel(workspace, new InlineEditorViewDispatcher(), packageRoot);
         avaloniaViewModel.ProjectName = openProjectName;
         await avaloniaViewModel.RefreshSnapshotsForCurrentProjectAsync(cancellationToken);
-        Require(avaloniaViewModel.HierarchyItems.Count == 8 && avaloniaViewModel.AssetItems.Count == 10, "Avalonia should project real snapshot collections.");
+        Require(avaloniaViewModel.HierarchyItems.Count == 8 && avaloniaViewModel.AssetItems.Count == 12, "Avalonia should project real snapshot collections.");
         Require(avaloniaViewModel.InspectorText.Contains("scene.goal", StringComparison.Ordinal), "Avalonia hierarchy inspector did not use snapshot data");
         Console.WriteLine("workflow_snapshot_projection=ok");
         Console.WriteLine("workflow_project_open=ok");
@@ -116,7 +116,7 @@ internal static class Program
             && workspace.ProjectSnapshot.Value?.ProjectName == createdProjectName
             && workspace.HierarchySnapshot.Value?.ProjectName == createdProjectName
             && avaloniaViewModel.HierarchyItems.Count == 8
-            && avaloniaViewModel.AssetItems.Count == 10
+            && avaloniaViewModel.AssetItems.Count == 12
             && avaloniaViewModel.InspectorText.Contains("scene.goal", StringComparison.Ordinal),
             "Avalonia public Create did not project the new Session snapshots after atomic cache invalidation");
         Console.WriteLine("workflow_project_create=ok");
@@ -579,5 +579,4 @@ internal static class Program
         public ValueTask DisposeAsync() { IsOpen = false; _lines.Writer.TryComplete(); return ValueTask.CompletedTask; }
     }
 }
-
 

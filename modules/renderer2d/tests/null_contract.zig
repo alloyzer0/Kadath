@@ -19,11 +19,12 @@ fn makeTexture(backend: *rhi.Rhi, renderer: *renderer2d.Renderer2D) !rhi.Texture
     );
 }
 
-fn sprite(x: f32, y: f32) renderer2d.SpriteInstance {
+fn sprite(x: f32, y: f32, texture: rhi.TextureHandle) renderer2d.SpriteInstance {
     return .{
         .position = .{ x, y },
         .size = .{ 8, 8 },
         .color = .{ 1, 1, 1, 1 },
+        .texture = texture,
     };
 }
 
@@ -64,12 +65,38 @@ test "Renderer2D records one command sequence per sprite" {
     const texture = try makeTexture(&backend, &renderer);
     defer backend.destroyTexture(texture);
 
-    const sprites = [_]renderer2d.SpriteInstance{ sprite(4, 4), sprite(16, 8), sprite(28, 12) };
+    const sprites = [_]renderer2d.SpriteInstance{ sprite(4, 4, texture), sprite(16, 8, texture), sprite(28, 12, texture) };
     const before = backend.stats();
-    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites, texture));
+    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites));
     const after = backend.stats();
     try expectRecordingDelta(before, after, 3);
     try std.testing.expectEqual(@as(u32, 1), after.frames_finished - before.frames_finished);
+}
+
+test "Renderer2D binds each sprite texture in input order" {
+    var backend = try rhi.Rhi.init(0, 0, extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const primary = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(primary);
+    const secondary = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(secondary);
+
+    const sprites = [_]renderer2d.SpriteInstance{
+        .{ .position = .{ 4, 4 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture = secondary },
+        .{ .position = .{ 16, 8 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture = primary },
+        .{ .position = .{ 28, 12 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture = primary },
+    };
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites));
+    const after = backend.stats();
+    try expectRecordingDelta(before, after, 3);
+    try std.testing.expectEqualSlices(
+        rhi.TextureHandle,
+        &.{ secondary, primary, primary },
+        after.draw_texture_trace[before.draw_texture_trace_len..after.draw_texture_trace_len],
+    );
 }
 
 test "Renderer2D accepts an empty sprite slice without recording draws" {
@@ -77,11 +104,8 @@ test "Renderer2D accepts an empty sprite slice without recording draws" {
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
     defer renderer.deinit(&backend);
-    const texture = try makeTexture(&backend, &renderer);
-    defer backend.destroyTexture(texture);
-
     const before = backend.stats();
-    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &[_]renderer2d.SpriteInstance{}, texture));
+    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &[_]renderer2d.SpriteInstance{}));
     const after = backend.stats();
     try expectNoRecordingDelta(before, after);
     try std.testing.expectEqual(@as(u32, 1), after.frames_finished - before.frames_finished);
@@ -94,22 +118,22 @@ test "Renderer2D preserves minimized and recreated outcomes without recording" {
     defer renderer.deinit(&backend);
     const texture = try makeTexture(&backend, &renderer);
     defer backend.destroyTexture(texture);
-    const sprites = [_]renderer2d.SpriteInstance{sprite(4, 4)};
+    const sprites = [_]renderer2d.SpriteInstance{sprite(4, 4, texture)};
 
     var before = backend.stats();
-    try std.testing.expectEqual(.skipped_minimized, try renderer.renderSprites(&backend, .{}, &sprites, texture));
+    try std.testing.expectEqual(.skipped_minimized, try renderer.renderSprites(&backend, .{}, &sprites));
     var after = backend.stats();
     try expectNoRecordingDelta(before, after);
     try std.testing.expectEqual(before.frames_finished, after.frames_finished);
 
     before = after;
-    try std.testing.expectEqual(.recreated, try renderer.renderSprites(&backend, .{ .width = 128, .height = 64 }, &sprites, texture));
+    try std.testing.expectEqual(.recreated, try renderer.renderSprites(&backend, .{ .width = 128, .height = 64 }, &sprites));
     after = backend.stats();
     try expectNoRecordingDelta(before, after);
     try std.testing.expectEqual(before.frames_finished, after.frames_finished);
 
     // recreated 只更新 RHI 尺寸状态；下一次稳定尺寸才进入正常录制路径。
-    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, .{ .width = 128, .height = 64 }, &sprites, texture));
+    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, .{ .width = 128, .height = 64 }, &sprites));
     try std.testing.expectEqual(@as(u32, 1), backend.stats().draws - after.draws);
 }
 
@@ -118,26 +142,44 @@ test "Renderer2D consumes a failed frame and can present the next frame" {
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
     defer renderer.deinit(&backend);
-    const texture = try makeTexture(&backend, &renderer);
-    defer backend.destroyTexture(texture);
-    const sprites = [_]renderer2d.SpriteInstance{sprite(4, 4)};
+    const primary = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(primary);
+    const stale = try makeTexture(&backend, &renderer);
+    backend.destroyTexture(stale);
+    const invalid_sprites = [_]renderer2d.SpriteInstance{
+        sprite(4, 4, primary),
+        sprite(16, 8, stale),
+        sprite(28, 12, primary),
+    };
 
     const before = backend.stats();
     try std.testing.expectError(
         error.InvalidTexture,
-        renderer.renderSprites(&backend, extent, &sprites, rhi.invalid_texture),
+        renderer.renderSprites(&backend, extent, &invalid_sprites),
     );
     const after_failure = backend.stats();
-    try std.testing.expectEqual(@as(u32, 1), after_failure.pipeline_binds - before.pipeline_binds);
-    try std.testing.expectEqual(@as(u32, 0), after_failure.texture_binds - before.texture_binds);
-    try std.testing.expectEqual(@as(u32, 0), after_failure.push_constant_writes - before.push_constant_writes);
-    try std.testing.expectEqual(@as(u32, 0), after_failure.draws - before.draws);
+    try std.testing.expectEqual(@as(u32, 2), after_failure.pipeline_binds - before.pipeline_binds);
+    try std.testing.expectEqual(@as(u32, 1), after_failure.texture_binds - before.texture_binds);
+    try std.testing.expectEqual(@as(u32, 1), after_failure.push_constant_writes - before.push_constant_writes);
+    try std.testing.expectEqual(@as(u32, 1), after_failure.draws - before.draws);
     try std.testing.expectEqual(@as(u32, 1), after_failure.failed_frames_consumed - before.failed_frames_consumed);
     try std.testing.expectEqual(@as(u32, 0), after_failure.frames_finished - before.frames_finished);
+    try std.testing.expectEqualSlices(
+        rhi.TextureHandle,
+        &.{primary},
+        after_failure.draw_texture_trace[before.draw_texture_trace_len..after_failure.draw_texture_trace_len],
+    );
 
     // 失败路径的 errdefer 必须消费 active token，否则这一帧会被错误卡在 FrameAlreadyActive。
-    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites, texture));
+    const replacement = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(replacement);
+    const valid_sprites = [_]renderer2d.SpriteInstance{
+        sprite(4, 4, primary),
+        sprite(16, 8, replacement),
+        sprite(28, 12, primary),
+    };
+    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &valid_sprites));
     const after_success = backend.stats();
     try std.testing.expectEqual(@as(u32, 1), after_success.frames_finished - after_failure.frames_finished);
-    try std.testing.expectEqual(@as(u32, 1), after_success.draws - after_failure.draws);
+    try std.testing.expectEqual(@as(u32, 3), after_success.draws - after_failure.draws);
 }

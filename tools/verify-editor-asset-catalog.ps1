@@ -14,13 +14,15 @@ if (-not (Test-Path -LiteralPath $adapter -PathType Leaf)) { throw "Asset Catalo
 $first = Get-EditorAssetCatalogSnapshot $PackageRoot
 $second = Get-EditorAssetCatalogSnapshot $PackageRoot
 if ([int]$first.CatalogVersion -ne 1) { throw "Unexpected Asset Catalog version: $($first.CatalogVersion)" }
-if ([int]$first.ItemCount -ne 10 -or @($first.Items).Count -ne 10) { throw "Expected 10 package assets, got $($first.ItemCount)" }
+if ([int]$first.ItemCount -ne 12 -or @($first.Items).Count -ne 12) { throw "Expected 12 package assets, got $($first.ItemCount)" }
 
 $expectedPaths = @(
     'assets/audio/lost.audio.wav',
     'assets/audio/lost.wav',
     'assets/audio/won.audio.wav',
     'assets/audio/won.wav',
+    'assets/renderer2d/goal.png',
+    'assets/renderer2d/goal.texture',
     'assets/renderer2d/test.png',
     'assets/renderer2d/test.texture',
     'assets/scenes/preview.scene',
@@ -45,7 +47,7 @@ $secondJson = $second | ConvertTo-Json -Depth 8 -Compress
 if ($firstJson -cne $secondJson) { throw 'Repeated Asset Catalog snapshots must be byte-equivalent JSON' }
 
 $categorySummary = @($first.Items | Group-Object Category | Sort-Object Name | ForEach-Object { "$($_.Name):$($_.Count)" }) -join ','
-if ($categorySummary -cne 'Audio:4,Scene:2,Script:2,Texture:2') { throw "Unexpected asset categories: $categorySummary" }
+if ($categorySummary -cne 'Audio:4,Scene:2,Script:2,Texture:4') { throw "Unexpected asset categories: $categorySummary" }
 
 Write-Output "asset_catalog_version=$($first.CatalogVersion)"
 Write-Output "asset_item_count=$($first.ItemCount)"

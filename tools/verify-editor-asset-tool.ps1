@@ -38,7 +38,7 @@ function Assert-StagingManifest([string]$StagingRoot, [string]$ExpectedAction, [
     if ([int]$manifest.ManifestVersion -ne 1 -or [int]$manifest.CommandVersion -ne 1) { throw 'Unexpected Asset Tool manifest version' }
     if ([string]$manifest.Action -cne $ExpectedAction -or [string]$manifest.Processing -cne 'passthrough-v1') { throw "Unexpected manifest action/processing: $($manifest.Action)/$($manifest.Processing)" }
     if ([string]$manifest.SourceRoot -cne 'assets' -or [string]$manifest.StagingRoot -cne 'staging') { throw 'Manifest roots must be portable logical paths' }
-    if ([int]$manifest.ItemCount -ne 5 -or @($manifest.Items).Count -ne 5) { throw "Expected 5 manifest items, got $($manifest.ItemCount)" }
+    if ([int]$manifest.ItemCount -ne 6 -or @($manifest.Items).Count -ne 6) { throw "Expected 6 manifest items, got $($manifest.ItemCount)" }
     foreach ($item in @($manifest.Items)) {
         $sourcePath = [string]$item.SourcePath
         $stagedPath = [string]$item.StagedPath
@@ -63,7 +63,7 @@ try {
     $dryRun = Invoke-AssetTool @('-Action', 'Import', '-SourceRoot', $source, '-StagingDirectory', $dryRunStaging, '-DryRun')
     $plan = $dryRun.Output[-1] | ConvertFrom-Json
     if ([int]$plan.CommandVersion -ne 1 -or [string]$plan.Action -cne 'import' -or -not [bool]$plan.DryRun) { throw 'Invalid Asset Tool dry-run plan header' }
-    if ([int]$plan.ItemCount -ne 5 -or @($plan.Items).Count -ne 5) { throw "Expected 5 dry-run items, got $($plan.ItemCount)" }
+    if ([int]$plan.ItemCount -ne 6 -or @($plan.Items).Count -ne 6) { throw "Expected 6 dry-run items, got $($plan.ItemCount)" }
     if (Test-Path -LiteralPath $dryRunStaging) { throw 'Dry-run must not create staging output' }
 
     [void](Invoke-AssetTool @('-Action', 'Import', '-SourceRoot', $source, '-StagingDirectory', $importStaging))

@@ -26,8 +26,8 @@ test "Renderer2D compiles and renders through the Null RHI module remap" {
             .position = .{ 4, 4 },
             .size = .{ 8, 8 },
             .color = .{ 1, 1, 1, 1 },
+            .texture = texture,
         }},
-        texture,
     );
     try std.testing.expectEqual(.presented, outcome);
     const stats = backend.stats();

@@ -476,6 +476,38 @@ function Assert-CheckedPngV2Artifact([string]$Path) {
     return Get-Hash $Path
 }
 
+function Assert-GoalPngV1Artifact([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Goal PNG KDAT v1 artifact missing: $Path" }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ne 36 -or [Text.Encoding]::ASCII.GetString($bytes[0..3]) -cne 'KDAT') { throw 'Goal PNG produced an unexpected KDAT v1 header/size' }
+    if ([BitConverter]::ToUInt32($bytes, 4) -ne 1 -or [BitConverter]::ToUInt32($bytes, 8) -ne 2 -or [BitConverter]::ToUInt32($bytes, 12) -ne 2 -or [BitConverter]::ToUInt32($bytes, 16) -ne 16) { throw 'Goal PNG produced unexpected KDAT v1 dimensions/payload size' }
+    $expectedPixels = [byte[]](255,0,255,255, 0,255,255,255, 0,0,0,255, 255,255,255,255)
+    for ($index = 0; $index -lt $expectedPixels.Length; $index++) {
+        if ($bytes[20 + $index] -ne $expectedPixels[$index]) { throw "Goal PNG KDAT v1 pixel mismatch at byte $index" }
+    }
+    $hash = Get-Hash $Path
+    if ($hash -cne '625e07aeff6335a3f3c42ec4e5c759470f0c54672a777c0809771ec5050436c2') { throw "Goal PNG KDAT v1 hash mismatch: $hash" }
+    return $hash
+}
+
+function Assert-GoalPngV2Artifact([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Goal PNG KDAT v2 artifact missing: $Path" }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ne 44 -or [Text.Encoding]::ASCII.GetString($bytes[0..3]) -cne 'KDAT') { throw 'Goal PNG produced an unexpected KDAT v2 header/size' }
+    if ([BitConverter]::ToUInt32($bytes, 4) -ne 2 -or [BitConverter]::ToUInt32($bytes, 8) -ne 2 -or [BitConverter]::ToUInt32($bytes, 12) -ne 2 -or [BitConverter]::ToUInt32($bytes, 16) -ne 2 -or [BitConverter]::ToUInt32($bytes, 20) -ne 20) { throw 'Goal PNG produced unexpected KDAT v2 dimensions/mip payload' }
+    $expectedBase = [byte[]](255,0,255,255, 0,255,255,255, 0,0,0,255, 255,255,255,255)
+    for ($index = 0; $index -lt $expectedBase.Length; $index++) {
+        if ($bytes[24 + $index] -ne $expectedBase[$index]) { throw "Goal PNG KDAT v2 base pixel mismatch at byte $index" }
+    }
+    $expectedMip = [byte[]](127,127,191,255)
+    for ($index = 0; $index -lt $expectedMip.Length; $index++) {
+        if ($bytes[40 + $index] -ne $expectedMip[$index]) { throw "Goal PNG KDAT v2 mip mismatch at byte $index" }
+    }
+    $hash = Get-Hash $Path
+    if ($hash -cne '555c2e554e2e5eb70e9de20e3e3182482d826dcfff230be45c54d321cd7e8c2c') { throw "Goal PNG KDAT v2 hash mismatch: $hash" }
+    return $hash
+}
+
 $debugArtifact = Join-Path $output 'debug\test.texture'
 $releaseArtifact = Join-Path $output 'release\test.texture'
 $ppmSource = Join-Path $output 'compatibility.ppm'
@@ -487,6 +519,9 @@ $pngTracerArtifact = Join-Path $output 'tracer\test.texture'
 $checkedPngSource = $source
 $checkedPngDebug = Join-Path $output 'png-debug\test.texture'
 $checkedPngRelease = Join-Path $output 'png-release\test.texture'
+$goalPngSource = Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\renderer2d\goal.png'
+$goalPngDebug = Join-Path $output 'goal-png-debug\goal.texture'
+$goalPngRelease = Join-Path $output 'goal-png-release\goal.texture'
 $raceRoot = Join-Path $output 'destination-races'
 $fixtureRoot = Join-Path $output 'generated-fixtures'
 $opaquePngSource = Join-Path $fixtureRoot 'ppm-equivalent-opaque.png'
@@ -501,6 +536,7 @@ try {
     [IO.File]::WriteAllText($ppmSource, "P3`n2 2`n255`n255 40 40`n40 255 40`n40 40 255`n255 230 40`n", [Text.UTF8Encoding]::new($false))
     $ppmSourceHashBefore = Get-Hash $ppmSource
     $checkedPngHashBefore = Get-Hash $checkedPngSource
+    $goalPngHashBefore = Get-Hash $goalPngSource
     Write-PngDispatchTracer $pngTracerSource
     $pngTracer = Invoke-TextureTool @('-SourcePath', $pngTracerSource, '-DestinationPath', $pngTracerArtifact, '-Profile', 'debug', '-DryRun')
     $pngTracerPlan = $pngTracer.Output[-1] | ConvertFrom-Json
@@ -514,6 +550,15 @@ try {
     [void](Invoke-TextureTool @('-SourcePath', $checkedPngSource, '-DestinationPath', $checkedPngRelease, '-Profile', 'release'))
     [void](Assert-CheckedPngV1Artifact $checkedPngDebug)
     $checkedPngReleaseHash = Assert-CheckedPngV2Artifact $checkedPngRelease
+
+    if ($goalPngHashBefore -cne 'e690b160c98c941210db92c5ae7a1637bc835529e0056e743a5d8eb209c4708f') { throw 'Goal PNG source bytes changed' }
+    $goalDryRelease = Invoke-TextureTool @('-SourcePath', $goalPngSource, '-DestinationPath', $goalPngRelease, '-Profile', 'release', '-DryRun')
+    $goalPlan = $goalDryRelease.Output[-1] | ConvertFrom-Json
+    if ([string]$goalPlan.SourceFormat -cne 'PNG-RGBA8' -or [string]$goalPlan.Transform -cne 'png-to-rgba8-mipmap-artifact-v2' -or [int]$goalPlan.Width -ne 2 -or [int]$goalPlan.Height -ne 2 -or [int]$goalPlan.MipLevelCount -ne 2 -or [int]$goalPlan.ArtifactBytes -ne 44 -or (Test-Path $goalPngRelease)) { throw 'Goal PNG release dry-run plan is invalid' }
+    [void](Invoke-TextureTool @('-SourcePath', $goalPngSource, '-DestinationPath', $goalPngDebug, '-Profile', 'debug'))
+    [void](Invoke-TextureTool @('-SourcePath', $goalPngSource, '-DestinationPath', $goalPngRelease, '-Profile', 'release'))
+    [void](Assert-GoalPngV1Artifact $goalPngDebug)
+    [void](Assert-GoalPngV2Artifact $goalPngRelease)
 
     # 路径边界通过公开 CLI 验证：device alias、UNC 与任一祖先 reparse point 都不能绕过 source/destination 约束。
     New-Item -ItemType Directory -Path $pathSafetyRoot | Out-Null
@@ -906,6 +951,7 @@ try {
     if (Test-Path $invalidPackageArtifact) { throw 'Package boundary violation created an artifact' }
     if ($ppmSourceHashBefore -cne (Get-Hash $ppmSource)) { throw 'Dynamic PPM source changed during texture import verification' }
     if ($checkedPngHashBefore -cne (Get-Hash $checkedPngSource)) { throw 'Checked PNG source changed during texture import verification' }
+    if ($goalPngHashBefore -cne (Get-Hash $goalPngSource)) { throw 'Goal PNG source changed during texture import verification' }
 
     Write-Output 'texture_importer_version=1'
     Write-Output 'texture_baker_version=1'
@@ -924,6 +970,7 @@ try {
     Write-Output 'png_checked_source=ok'
     Write-Output 'png_rgba_alpha=ok'
     Write-Output 'png_debug_release=ok'
+    Write-Output 'png_secondary_debug_release=ok'
     Write-Output 'destination_race=ok'
     Write-Output 'png_rgb_alpha_expansion=ok'
     Write-Output 'png_filters=0,1,2,3,4'

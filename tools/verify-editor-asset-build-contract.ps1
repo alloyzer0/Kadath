@@ -63,13 +63,14 @@ function Assert-BuildContract([string]$ContractDirectory, [string]$ExpectedProfi
     if ([string]$contract.TransformPolicy -cne 'passthrough-v1' -or [string]$contract.ImporterStatus -cne 'not-defined' -or [string]$contract.BakerStatus -cne 'not-defined') { throw 'Build contract must explicitly mark importer/baker as not-defined' }
     if ([string]$contract.ProfileSemantics.debug -notlike '*KDAT Texture Artifact v1 base-only*' -or [string]$contract.ProfileSemantics.release -notlike '*KDAT Texture Artifact v2 mipmap chain*' -or [string]$contract.ProfileSemantics.debug -notlike '*KSCN Scene Artifact v1*' -or [string]$contract.ProfileSemantics.release -notlike '*KSCN Scene Artifact v1*' -or [string]$contract.ProfileSemantics.debug -notlike '*KSCP Script Artifact v1*' -or [string]$contract.ProfileSemantics.release -notlike '*KSCP Script Artifact v1*') { throw 'Build Contract profile semantics do not describe texture/scene/script transforms' }
     if (-not [bool]$contract.PromotionRequired -or [string]$contract.InputAssetRoot -cne 'bin/assets' -or [string]$contract.OutputAssetRoot -cne 'bin/assets') { throw 'Build contract promotion/root boundary is invalid' }
-    $expectedItemCount = if ($IncludeCompatibilityPpm) { 6 } else { 5 }
+    $expectedItemCount = if ($IncludeCompatibilityPpm) { 7 } else { 6 }
     if ([int]$contract.ItemCount -ne $expectedItemCount -or @($contract.Items).Count -ne $expectedItemCount) { throw "Expected $expectedItemCount contract items, got $($contract.ItemCount)" }
     $textureTransform = if ($ExpectedProfile -eq 'debug') { 'png-to-rgba8-artifact-v1' } else { 'png-to-rgba8-mipmap-artifact-v2' }
     $expectedContracts = @{
         'bin/assets/audio/lost.wav' = @{ OutputPath = 'bin/assets/audio/lost.wav'; InputArtifactType = 'RuntimeAudioSourceV1'; ArtifactType = 'RuntimeAudioSourceV1'; Transform = 'passthrough-v1'; ImporterStatus = 'not-defined'; BakerStatus = 'not-defined' }
         'bin/assets/audio/won.wav' = @{ OutputPath = 'bin/assets/audio/won.wav'; InputArtifactType = 'RuntimeAudioSourceV1'; ArtifactType = 'RuntimeAudioSourceV1'; Transform = 'passthrough-v1'; ImporterStatus = 'not-defined'; BakerStatus = 'not-defined' }
         # PNG source 仍是 candidate 输入；Build Contract 必须描述真正的离线 Texture bake，而不是伪装成 passthrough。
+        'bin/assets/renderer2d/goal.png' = @{ OutputPath = 'bin/assets/renderer2d/goal.texture'; InputArtifactType = 'RuntimeTextureSourceV1'; ArtifactType = 'RuntimeTextureArtifactV1'; Transform = $textureTransform; ImporterStatus = 'implemented-v1'; BakerStatus = 'implemented-v1' }
         'bin/assets/renderer2d/test.png' = @{ OutputPath = 'bin/assets/renderer2d/test.texture'; InputArtifactType = 'RuntimeTextureSourceV1'; ArtifactType = 'RuntimeTextureArtifactV1'; Transform = $textureTransform; ImporterStatus = 'implemented-v1'; BakerStatus = 'implemented-v1' }
         'bin/assets/scenes/preview.scene.json' = @{ OutputPath = 'bin/assets/scenes/preview.scene'; InputArtifactType = 'RuntimeSceneDocumentV1'; ArtifactType = 'RuntimeSceneArtifactV1'; Transform = 'scene-json-to-kscn-f32-v1'; ImporterStatus = 'implemented-v1'; BakerStatus = 'implemented-v1' }
         'bin/assets/scripts/preview.script.json' = @{ OutputPath = 'bin/assets/scripts/preview.script'; InputArtifactType = 'RuntimeScriptDocumentV1'; ArtifactType = 'RuntimeScriptArtifactV1'; Transform = 'script-json-to-kscp-v1'; ImporterStatus = 'implemented-v1'; BakerStatus = 'implemented-v1' }
@@ -196,7 +197,7 @@ try {
     $dry = Invoke-Tool $contractTool @('-CandidateRoot', $candidate, '-ContractDirectory', $dryContract, '-Profile', 'debug', '-DryRun')
     $plan = $dry.Output[-1] | ConvertFrom-Json
     if ([int]$plan.CommandVersion -ne 1 -or [int]$plan.ContractVersion -ne 1 -or [string]$plan.ToolVersion -cne 'kadath-asset-contract/1' -or [string]$plan.Profile -cne 'debug' -or -not [bool]$plan.DryRun) { throw 'Invalid Build Contract dry-run plan' }
-    if ([int]$plan.ItemCount -ne 5 -or (Test-Path -LiteralPath $dryContract)) { throw 'Build Contract dry-run must not create output' }
+    if ([int]$plan.ItemCount -ne 6 -or (Test-Path -LiteralPath $dryContract)) { throw 'Build Contract dry-run must not create output' }
     if ([string]$plan.ProfileSemantics.debug -notlike '*KDAT Texture Artifact v1 base-only*' -or [string]$plan.ProfileSemantics.release -notlike '*KDAT Texture Artifact v2 mipmap chain*' -or [string]$plan.ProfileSemantics.debug -notlike '*KSCN Scene Artifact v1*' -or [string]$plan.ProfileSemantics.release -notlike '*KSCN Scene Artifact v1*' -or [string]$plan.ProfileSemantics.debug -notlike '*KSCP Script Artifact v1*' -or [string]$plan.ProfileSemantics.release -notlike '*KSCP Script Artifact v1*') { throw 'Build Contract dry-run profile semantics are invalid' }
 
     [void](Invoke-Tool $contractTool @('-CandidateRoot', $candidate, '-ContractDirectory', $debugContract, '-Profile', 'debug'))

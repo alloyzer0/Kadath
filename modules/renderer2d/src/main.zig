@@ -26,6 +26,7 @@ pub const SpriteInstance = struct {
     position: [2]f32,
     size: [2]f32,
     color: [4]f32,
+    texture: rhi.TextureHandle,
 };
 
 pub const TextureSamplingProfile = enum {
@@ -84,23 +85,11 @@ pub const Renderer2D = struct {
         std.log.info("Renderer2D texture upload complete: mip_levels={d}, sampler={s}", .{ 1 + desc.mip_levels.len, @tagName(upload.sampler_profile) });
         return texture;
     }
-    pub fn render(
-        self: *Renderer2D,
-        backend: *rhi.Rhi,
-        extent: rhi.Extent2D,
-        sprite: SpriteInstance,
-        texture: rhi.TextureHandle,
-    ) !rhi.FrameOutcome {
-        const sprites = [_]SpriteInstance{sprite};
-        return self.renderSprites(backend, extent, sprites[0..], texture);
-    }
-
     pub fn renderSprites(
         self: *Renderer2D,
         backend: *rhi.Rhi,
         extent: rhi.Extent2D,
         sprites: []const SpriteInstance,
-        texture: rhi.TextureHandle,
     ) !rhi.FrameOutcome {
         const begin = try backend.beginFrame(extent, .{ 0.035, 0.10, 0.22, 1.0 });
         switch (begin) {
@@ -123,9 +112,8 @@ pub const Renderer2D = struct {
                         .color = sprite.color,
                     };
 
-                    // 同一帧共享 pipeline/texture，只重复录制每个 sprite 的 push constants 与 quad。
                     try encoder.bindPipeline(self.pipeline);
-                    try encoder.bindTexture(texture);
+                    try encoder.bindTexture(sprite.texture);
                     try encoder.pushConstants(std.mem.asBytes(&push));
                     try encoder.draw(6);
                 }

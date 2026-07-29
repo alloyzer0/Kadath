@@ -39,7 +39,7 @@ function Assert-Candidate([string]$Candidate, [string]$ExpectedProfile, [hashtab
     if ([int]$manifest.PromotionVersion -ne 1 -or [int]$manifest.CommandVersion -ne 1) { throw 'Unexpected promotion manifest version' }
     if ([string]$manifest.Action -cne 'promote' -or [string]$manifest.Profile -cne $ExpectedProfile) { throw "Unexpected candidate action/profile: $($manifest.Action)/$($manifest.Profile)" }
     if ([string]$manifest.CandidateKind -cne 'asset-payload-v1' -or [string]$manifest.Processing -cne 'passthrough-v1') { throw 'Unexpected candidate processing contract' }
-    if ([int]$manifest.ItemCount -ne 5 -or @($manifest.Items).Count -ne 5) { throw "Expected 5 candidate items, got $($manifest.ItemCount)" }
+    if ([int]$manifest.ItemCount -ne 6 -or @($manifest.Items).Count -ne 6) { throw "Expected 6 candidate items, got $($manifest.ItemCount)" }
     if (Test-Path -LiteralPath (Join-Path $Candidate 'bin\kadath.exe')) { throw 'Candidate asset payload must not contain Runtime executable' }
     foreach ($item in @($manifest.Items)) {
         $destinationPath = [string]$item.DestinationPath
@@ -65,7 +65,7 @@ try {
     $dry = Invoke-Tool $promoteTool @('-StagingDirectory', $staging, '-DestinationRoot', $dryCandidate, '-Profile', 'debug', '-DryRun')
     $plan = $dry.Output[-1] | ConvertFrom-Json
     if ([int]$plan.CommandVersion -ne 1 -or [int]$plan.PromotionVersion -ne 1 -or [string]$plan.Action -cne 'promote' -or [string]$plan.Profile -cne 'debug' -or -not [bool]$plan.DryRun) { throw 'Invalid promotion dry-run plan' }
-    if ([int]$plan.ItemCount -ne 5 -or (Test-Path -LiteralPath $dryCandidate)) { throw 'Promotion dry-run must not create candidate output' }
+    if ([int]$plan.ItemCount -ne 6 -or (Test-Path -LiteralPath $dryCandidate)) { throw 'Promotion dry-run must not create candidate output' }
 
     [void](Invoke-Tool $promoteTool @('-StagingDirectory', $staging, '-DestinationRoot', $debugCandidate, '-Profile', 'debug'))
     $debugManifest = Assert-Candidate $debugCandidate 'debug' $stagingHashesBefore

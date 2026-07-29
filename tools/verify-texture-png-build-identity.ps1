@@ -300,7 +300,7 @@ function Read-ReadyIdentity([string]$Path) {
 }
 
 function Read-BuildMarker([string]$Path) {
-    $fields = [string[]]@('Version', 'Optimize', 'TextureProfile', 'RuntimeExeSha256', 'TextureSourceSha256', 'TextureArtifactSha256', 'VertexShaderSourceSha256', 'FragmentShaderSourceSha256', 'BuildPreflightSidecarSha256')
+    $fields = [string[]]@('Version', 'Optimize', 'TextureProfile', 'RuntimeExeSha256', 'TextureSourceSha256', 'TextureArtifactSha256', 'SecondaryTextureSourceSha256', 'SecondaryTextureArtifactSha256', 'VertexShaderSourceSha256', 'FragmentShaderSourceSha256', 'BuildPreflightSidecarSha256')
     $document = Read-StrictJsonObject $Path $fields 'Runtime build profile marker'
     try {
         $root = $document.RootElement
@@ -317,8 +317,14 @@ function Read-BuildMarker([string]$Path) {
             Version = $root.GetProperty('Version').GetInt32()
             Optimize = $root.GetProperty('Optimize').GetString()
             TextureProfile = $root.GetProperty('TextureProfile').GetString()
+            RuntimeExeSha256 = $root.GetProperty('RuntimeExeSha256').GetString()
             TextureSourceSha256 = $root.GetProperty('TextureSourceSha256').GetString()
             TextureArtifactSha256 = $root.GetProperty('TextureArtifactSha256').GetString()
+            SecondaryTextureSourceSha256 = $root.GetProperty('SecondaryTextureSourceSha256').GetString()
+            SecondaryTextureArtifactSha256 = $root.GetProperty('SecondaryTextureArtifactSha256').GetString()
+            VertexShaderSourceSha256 = $root.GetProperty('VertexShaderSourceSha256').GetString()
+            FragmentShaderSourceSha256 = $root.GetProperty('FragmentShaderSourceSha256').GetString()
+            BuildPreflightSidecarSha256 = if ($root.GetProperty('BuildPreflightSidecarSha256').ValueKind -eq [System.Text.Json.JsonValueKind]::Null) { $null } else { $root.GetProperty('BuildPreflightSidecarSha256').GetString() }
         }
     } finally {
         $document.Dispose()
@@ -333,16 +339,25 @@ function Invoke-Importer([string]$PowerShellPath, [string]$ImporterPath, [string
 
 $buildCapture = $null
 $sourcePublishedAsB = $false
+$secondarySourcePublishedAsB = $false
 $sourceTarget = $null
+$secondarySourceTarget = $null
 $sourceABytes = $null
 $sourceAHash = $null
+$secondarySourceABytes = $null
+$secondarySourceAHash = $null
 $sourceBBytes = $null
 $sourceBHash = $null
 $publishTemporary = $null
 $publishBackupTemporary = $null
+$secondaryPublishTemporary = $null
+$secondaryPublishBackupTemporary = $null
 $restoreTemporary = $null
 $restoreBackupTemporary = $null
+$secondaryRestoreTemporary = $null
+$secondaryRestoreBackupTemporary = $null
 $releaseTemporary = $null
+$secondaryReleaseTemporary = $null
 $primaryError = $null
 $restoreError = $null
 $root = $null
@@ -375,7 +390,8 @@ try {
     $localCache = Join-Path $output 'local-cache'
     $globalCache = Join-Path $output 'global-cache'
     $barrier = Join-Path $output 'barrier'
-    $buildRoots = [ordered]@{ Package = $package; LocalCache = $localCache; GlobalCache = $globalCache; Barrier = $barrier }
+    $secondaryBarrier = Join-Path $output 'secondary-barrier'
+    $buildRoots = [ordered]@{ Package = $package; LocalCache = $localCache; GlobalCache = $globalCache; Barrier = $barrier; SecondaryBarrier = $secondaryBarrier }
     foreach ($entry in $buildRoots.GetEnumerator()) {
         Assert-DirectChild $output $entry.Value $entry.Key
         Assert-NoReparsePointInExistingPath $entry.Value $entry.Key
@@ -398,27 +414,36 @@ try {
         Assert-NoReparsePointInExistingPath $entry.Value "$($entry.Key) before barrier create"
         if (Test-Path -LiteralPath $entry.Value) { throw "$($entry.Key) appeared during OutputDirectory creation" }
     }
-    New-Item -ItemType Directory -Path $barrier | Out-Null
-    $createdBarrier = Resolve-CanonicalDirectory $barrier 'Barrier immediately after create'
-    if (-not $createdBarrier.Equals($barrier, [StringComparison]::OrdinalIgnoreCase)) { throw 'Barrier identity changed during create' }
-    Assert-DirectChild $createdOutput $createdBarrier 'Barrier'
-    if (@(Get-ChildItem -LiteralPath $createdBarrier -Force).Count -ne 0) { throw 'Barrier must start empty' }
+    New-Item -ItemType Directory -Path $barrier,$secondaryBarrier | Out-Null
+    foreach ($barrierEntry in @(
+        [pscustomobject]@{ Path = $barrier; Name = 'Barrier' },
+        [pscustomobject]@{ Path = $secondaryBarrier; Name = 'SecondaryBarrier' }
+    )) {
+        $createdBarrier = Resolve-CanonicalDirectory $barrierEntry.Path "$($barrierEntry.Name) immediately after create"
+        if (-not $createdBarrier.Equals($barrierEntry.Path, [StringComparison]::OrdinalIgnoreCase)) { throw "$($barrierEntry.Name) identity changed during create" }
+        Assert-DirectChild $createdOutput $createdBarrier $barrierEntry.Name
+        if (@(Get-ChildItem -LiteralPath $createdBarrier -Force).Count -ne 0) { throw "$($barrierEntry.Name) must start empty" }
+    }
     foreach ($entry in $buildRoots.GetEnumerator()) {
         Assert-DirectChild $createdOutput $entry.Value $entry.Key
         Assert-NoReparsePointInExistingPath $entry.Value "$($entry.Key) after barrier create"
-        if ($entry.Key -eq 'Barrier') {
-            [void](Resolve-CanonicalDirectory $entry.Value 'Barrier after create')
+        if ($entry.Key -eq 'Barrier' -or $entry.Key -eq 'SecondaryBarrier') {
+            [void](Resolve-CanonicalDirectory $entry.Value "$($entry.Key) after create")
         } elseif (Test-Path -LiteralPath $entry.Value) {
             throw "$($entry.Key) appeared before build start"
         }
     }
 
     $sourceTarget = Resolve-CanonicalFile (Join-Path $root 'assets\renderer2d\test.png') 'Tracked PNG source'
+    $secondarySourceTarget = Resolve-CanonicalFile (Join-Path $root 'assets\renderer2d\goal.png') 'Tracked secondary PNG source'
     $sourceABytes = [IO.File]::ReadAllBytes($sourceTarget)
     $sourceAHash = Get-BytesHash $sourceABytes
+    $secondarySourceABytes = [IO.File]::ReadAllBytes($secondarySourceTarget)
+    $secondarySourceAHash = Get-BytesHash $secondarySourceABytes
     $sourceBBytes = [KadathPngBuildIdentityFixture]::CreateVariantB()
     $sourceBHash = Get-BytesHash $sourceBBytes
     if ($sourceAHash -ceq $sourceBHash) { throw 'Fixture B must have a different source identity from fixture A' }
+    if ($secondarySourceAHash -ceq $sourceBHash) { throw 'Fixture B must have a different source identity from secondary fixture A' }
 
     $zig = (Get-Command zig -CommandType Application -ErrorAction Stop).Source
     $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
@@ -427,27 +452,36 @@ try {
         '--prefix', $package,
         '--cache-dir', $localCache,
         '--global-cache-dir', $globalCache,
-        "-Dtexture-source-snapshot-test-barrier=$barrier"
+        "-Dtexture-source-snapshot-test-barrier=$barrier",
+        "-Dsecondary-texture-source-snapshot-test-barrier=$secondaryBarrier"
     )
     $buildCapture = Start-CapturedProcess $zig $buildArguments $root
 
     $readyPath = Join-Path $barrier 'ready.json'
     $releasePath = Join-Path $barrier 'release'
+    $secondaryReadyPath = Join-Path $secondaryBarrier 'ready.json'
+    $secondaryReleasePath = Join-Path $secondaryBarrier 'release'
     $readyDeadline = [DateTime]::UtcNow.AddSeconds(120)
-    while (-not (Test-Path -LiteralPath $readyPath)) {
+    while (-not (Test-Path -LiteralPath $readyPath) -or -not (Test-Path -LiteralPath $secondaryReadyPath)) {
         if ($buildCapture.Process.HasExited) {
             $early = Complete-CapturedProcess $buildCapture 1000 'Barrier package build'
-            throw "Build exited before snapshot ready.json: exit=$($early.ExitCode) stdout=$($early.Stdout) stderr=$($early.Stderr)"
+            throw "Build exited before both snapshot ready.json files: exit=$($early.ExitCode) stdout=$($early.Stdout) stderr=$($early.Stderr)"
         }
         if ([DateTime]::UtcNow -ge $readyDeadline) { throw 'Timed out waiting for snapshot ready.json' }
         Start-Sleep -Milliseconds 25
     }
 
     Assert-NoReparsePointInExistingPath $barrier 'Barrier before source mutation'
+    Assert-NoReparsePointInExistingPath $secondaryBarrier 'Secondary barrier before source mutation'
     if (Test-Path -LiteralPath $releasePath) { throw 'Barrier release must not exist before verifier publishes it' }
+    if (Test-Path -LiteralPath $secondaryReleasePath) { throw 'Secondary barrier release must not exist before verifier publishes it' }
     $ready = Read-ReadyIdentity $readyPath
+    $secondaryReady = Read-ReadyIdentity $secondaryReadyPath
     if ($ready.Length -ne $sourceABytes.Length -or $ready.Sha256 -cne $sourceAHash) {
         throw "Snapshot ready identity does not match source A: ready=$($ready.Sha256) A=$sourceAHash"
+    }
+    if ($secondaryReady.Length -ne $secondarySourceABytes.Length -or $secondaryReady.Sha256 -cne $secondarySourceAHash) {
+        throw "Secondary snapshot ready identity does not match source A: ready=$($secondaryReady.Sha256) A=$secondarySourceAHash"
     }
 
     # 关键 race：ready 后才以 owned temp + same-volume replace 发布 B。
@@ -463,11 +497,27 @@ try {
     [void](Assert-OwnedRegularFile $sourceTarget 'Tracked PNG source B' $sourceBBytes.Length $sourceBHash)
     [void](Assert-OwnedRegularFile $publishBackupTemporary 'Verifier-owned source A backup' $sourceABytes.Length $sourceAHash)
 
+    [void](Assert-OwnedRegularFile $secondarySourceTarget 'Tracked secondary PNG source before B publish' $secondarySourceABytes.Length $secondarySourceAHash)
+    $secondaryPublishTemporary = Join-Path $root ('.kadath-secondary-texture-source-b-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+    $secondaryPublishBackupTemporary = Join-Path $root ('.kadath-secondary-texture-source-a-backup-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $secondaryPublishBackupTemporary) { throw 'Verifier-owned secondary A backup path must be fresh' }
+    Write-OwnedFileDurable $secondaryPublishTemporary $sourceBBytes
+    [void](Assert-OwnedRegularFile $secondaryPublishTemporary 'Verifier-owned secondary B temporary' $sourceBBytes.Length $sourceBHash)
+    [IO.File]::Replace($secondaryPublishTemporary, $secondarySourceTarget, $secondaryPublishBackupTemporary, $true)
+    $secondarySourcePublishedAsB = $true
+    [void](Assert-OwnedRegularFile $secondarySourceTarget 'Tracked secondary PNG source B' $sourceBBytes.Length $sourceBHash)
+    [void](Assert-OwnedRegularFile $secondaryPublishBackupTemporary 'Verifier-owned secondary source A backup' $secondarySourceABytes.Length $secondarySourceAHash)
+
     $releaseTemporary = Join-Path $barrier ('.release-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
     Write-OwnedFileDurable $releaseTemporary ([byte[]]::new(0))
     [IO.File]::Move($releaseTemporary, $releasePath, $false)
     $release = Resolve-CanonicalFile $releasePath 'Barrier release'
     if ((Get-Item -LiteralPath $release -Force).Length -ne 0) { throw 'Barrier release must be zero length' }
+    $secondaryReleaseTemporary = Join-Path $secondaryBarrier ('.release-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+    Write-OwnedFileDurable $secondaryReleaseTemporary ([byte[]]::new(0))
+    [IO.File]::Move($secondaryReleaseTemporary, $secondaryReleasePath, $false)
+    $secondaryRelease = Resolve-CanonicalFile $secondaryReleasePath 'Secondary barrier release'
+    if ((Get-Item -LiteralPath $secondaryRelease -Force).Length -ne 0) { throw 'Secondary barrier release must be zero length' }
 
     $buildResult = Complete-CapturedProcess $buildCapture 300000 'Barrier package build'
     if ($buildResult.ExitCode -ne 0) {
@@ -497,6 +547,29 @@ try {
             $restoreError = [InvalidOperationException]::new("未恢复 A：tracked source 不再属于本轮 B，已保留未知外部状态。$($_.Exception.Message)", $_.Exception)
         }
     }
+    if ($secondarySourcePublishedAsB) {
+        try {
+            [void](Assert-OwnedRegularFile $secondarySourceTarget 'Tracked secondary PNG source before restoring A' $sourceBBytes.Length $sourceBHash)
+            $rootForSecondaryRestore = [IO.Path]::GetFullPath($KadathRoot)
+            $secondaryRestoreTemporary = Join-Path $rootForSecondaryRestore ('.kadath-secondary-texture-source-a-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+            $secondaryRestoreBackupTemporary = Join-Path $rootForSecondaryRestore ('.kadath-secondary-texture-source-b-backup-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
+            if (Test-Path -LiteralPath $secondaryRestoreBackupTemporary) { throw 'Verifier-owned secondary B backup path must be fresh' }
+            Write-OwnedFileDurable $secondaryRestoreTemporary $secondarySourceABytes
+            [void](Assert-OwnedRegularFile $secondaryRestoreTemporary 'Verifier-owned secondary A temporary' $secondarySourceABytes.Length $secondarySourceAHash)
+            [void](Assert-OwnedRegularFile $secondarySourceTarget 'Tracked secondary PNG source immediately before restoring A' $sourceBBytes.Length $sourceBHash)
+            [IO.File]::Replace($secondaryRestoreTemporary, $secondarySourceTarget, $secondaryRestoreBackupTemporary, $true)
+            $secondarySourcePublishedAsB = $false
+            [void](Assert-OwnedRegularFile $secondarySourceTarget 'Restored tracked secondary PNG source A' $secondarySourceABytes.Length $secondarySourceAHash)
+            [void](Assert-OwnedRegularFile $secondaryRestoreBackupTemporary 'Verifier-owned secondary source B backup' $sourceBBytes.Length $sourceBHash)
+        } catch {
+            $secondaryRestoreError = [InvalidOperationException]::new("未恢复 secondary A：tracked source 不再属于本轮 B，已保留未知外部状态。$($_.Exception.Message)", $_.Exception)
+            if ($null -eq $restoreError) {
+                $restoreError = $secondaryRestoreError
+            } else {
+                $restoreError = [AggregateException]::new('Texture source restore failures', [Exception[]]@($restoreError, $secondaryRestoreError))
+            }
+        }
+    }
     $cleanupRootsSafe = $true
     try {
         # 不清理 evidence roots；任何 owned temp cleanup 前仍重新证明 root layout 未被替换。
@@ -516,10 +589,14 @@ try {
         }
     } catch {
         $cleanupRootsSafe = $false
-        if ($null -eq $restoreError) { $restoreError = $_.Exception }
+        if ($null -eq $restoreError) {
+            $restoreError = $_.Exception
+        } else {
+            $restoreError = [AggregateException]::new('Texture source restore and cleanup-root validation failures', [Exception[]]@($restoreError, $_.Exception))
+        }
     }
     if ($cleanupRootsSafe) {
-        # 五个 owned temporary/backup 必须全部尝试；单个异常不能短路后续安全清理。
+        # 十个 owned temporary/backup 必须全部尝试；单个异常不能短路后续安全清理。
         $ownedCleanupErrors = [Collections.Generic.List[Exception]]::new()
         try {
             # 正式 release 永久保留；只回收仍存在且精确属于本轮的 zero-byte publish temporary。
@@ -537,10 +614,32 @@ try {
         try {
             if ($null -ne $restoreBackupTemporary) { Remove-OwnedTemporary $restoreBackupTemporary $sourceBBytes.Length $sourceBHash }
         } catch { $ownedCleanupErrors.Add($_.Exception) }
-        if ($null -eq $restoreError -and $ownedCleanupErrors.Count -eq 1) {
-            $restoreError = $ownedCleanupErrors[0]
-        } elseif ($null -eq $restoreError -and $ownedCleanupErrors.Count -gt 1) {
-            $restoreError = [AggregateException]::new('Verifier-owned temporary cleanup failures', $ownedCleanupErrors)
+        try {
+            if ($null -ne $secondaryReleaseTemporary) { Remove-OwnedTemporary $secondaryReleaseTemporary 0 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' }
+        } catch { $ownedCleanupErrors.Add($_.Exception) }
+        try {
+            if ($null -ne $secondaryPublishTemporary) { Remove-OwnedTemporary $secondaryPublishTemporary $sourceBBytes.Length $sourceBHash }
+        } catch { $ownedCleanupErrors.Add($_.Exception) }
+        try {
+            if ($null -ne $secondaryRestoreTemporary) { Remove-OwnedTemporary $secondaryRestoreTemporary $secondarySourceABytes.Length $secondarySourceAHash }
+        } catch { $ownedCleanupErrors.Add($_.Exception) }
+        try {
+            if ($null -ne $secondaryPublishBackupTemporary) { Remove-OwnedTemporary $secondaryPublishBackupTemporary $secondarySourceABytes.Length $secondarySourceAHash }
+        } catch { $ownedCleanupErrors.Add($_.Exception) }
+        try {
+            if ($null -ne $secondaryRestoreBackupTemporary) { Remove-OwnedTemporary $secondaryRestoreBackupTemporary $sourceBBytes.Length $sourceBHash }
+        } catch { $ownedCleanupErrors.Add($_.Exception) }
+        if ($ownedCleanupErrors.Count -gt 0) {
+            $cleanupError = if ($ownedCleanupErrors.Count -eq 1) {
+                $ownedCleanupErrors[0]
+            } else {
+                [AggregateException]::new('Verifier-owned temporary cleanup failures', $ownedCleanupErrors)
+            }
+            if ($null -eq $restoreError) {
+                $restoreError = $cleanupError
+            } else {
+                $restoreError = [AggregateException]::new('Texture source restore and cleanup failures', [Exception[]]@($restoreError, $cleanupError))
+            }
         }
     }
 }
@@ -557,6 +656,47 @@ foreach ($entry in $faultRoots.GetEnumerator()) {
     Assert-DirectChild $output $entry.Value $entry.Key
     Assert-NoReparsePointInExistingPath $entry.Value $entry.Key
     if (Test-Path -LiteralPath $entry.Value) { throw "$($entry.Key) must not exist before partial-write fault verification: $($entry.Value)" }
+}
+
+# 同一故障必须独立覆盖 secondary 快照边；不得因 primary producer 已缓存而漏测。
+$secondaryFaultPrefix = Join-Path $output 'secondary-fault-package'
+$secondaryFaultLocalCache = Join-Path $output 'secondary-fault-local-cache'
+$secondaryFaultGlobalCache = Join-Path $output 'secondary-fault-global-cache'
+$secondaryFaultRoots = [ordered]@{
+    SecondaryFaultPackage = $secondaryFaultPrefix
+    SecondaryFaultLocalCache = $secondaryFaultLocalCache
+    SecondaryFaultGlobalCache = $secondaryFaultGlobalCache
+}
+foreach ($entry in $secondaryFaultRoots.GetEnumerator()) {
+    Assert-DirectChild $output $entry.Value $entry.Key
+    Assert-NoReparsePointInExistingPath $entry.Value $entry.Key
+    if (Test-Path -LiteralPath $entry.Value) { throw "$($entry.Key) must not exist before secondary partial-write fault verification: $($entry.Value)" }
+}
+
+$secondaryFaultArguments = [string[]]@(
+    'build', 'package', '-Doptimize=ReleaseSafe',
+    '--prefix', $secondaryFaultPrefix,
+    '--cache-dir', $secondaryFaultLocalCache,
+    '--global-cache-dir', $secondaryFaultGlobalCache,
+    '-Dsecondary-texture-source-snapshot-test-fault=snapshot-partial-write-before-flush'
+)
+$secondaryFaultCapture = Start-CapturedProcess $zig $secondaryFaultArguments $root
+$secondaryFaultResult = Complete-CapturedProcess $secondaryFaultCapture 300000 'Secondary partial-write fault package build'
+$secondaryFaultOutput = $secondaryFaultResult.Stdout + [Environment]::NewLine + $secondaryFaultResult.Stderr
+if ($secondaryFaultResult.ExitCode -eq 0) { throw 'Secondary partial-write fault package build unexpectedly succeeded.' }
+if ($secondaryFaultOutput -notmatch [regex]::Escape('Injected snapshot partial-write-before-flush failure')) {
+    throw "Secondary partial-write fault package build failed without the injected cleanup oracle. stdout=$($secondaryFaultResult.Stdout) stderr=$($secondaryFaultResult.Stderr)"
+}
+foreach ($entry in $secondaryFaultRoots.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $entry.Value)) { continue }
+    $canonicalSecondaryFaultRoot = Resolve-CanonicalDirectory $entry.Value "$($entry.Key) after secondary partial-write fault"
+    Assert-DirectChild $output $canonicalSecondaryFaultRoot $entry.Key
+    $secondaryFaultTemporaryFiles = @(
+        Get-ChildItem -LiteralPath $canonicalSecondaryFaultRoot -Recurse -Force -File -Filter '.kadath-texture-source-snapshot-*.tmp' -ErrorAction Stop
+    )
+    if ($secondaryFaultTemporaryFiles.Count -ne 0) {
+        throw "Secondary partial-write fault cleanup left snapshot temporary files: $($secondaryFaultTemporaryFiles.FullName -join '; ')"
+    }
 }
 
 $zig = (Get-Command zig -CommandType Application -ErrorAction Stop).Source
@@ -693,6 +833,8 @@ for ($left = 0; $left -lt $rootNames.Count; $left++) {
 
 $packageSource = Resolve-CanonicalFile (Join-Path $package 'bin\assets\renderer2d\test.png') 'Package PNG source'
 $packageTexture = Resolve-CanonicalFile (Join-Path $package 'bin\assets\renderer2d\test.texture') 'Package KDAT'
+$packageSecondarySource = Resolve-CanonicalFile (Join-Path $package 'bin\assets\renderer2d\goal.png') 'Package secondary PNG source'
+$packageSecondaryTexture = Resolve-CanonicalFile (Join-Path $package 'bin\assets\renderer2d\goal.texture') 'Package secondary KDAT'
 $markerPath = Resolve-CanonicalFile (Join-Path $package 'bin\kadath-runtime-build-profile.json') 'Runtime build profile marker'
 $packageSourceBytes = [IO.File]::ReadAllBytes($packageSource)
 if (-not (Test-ByteArraysEqual $packageSourceBytes $sourceABytes)) { throw 'Package PNG is not byte-identical to source A snapshot' }
@@ -704,49 +846,78 @@ $expectedASource = Join-Path $expectedA 'source.png'
 $expectedBSource = Join-Path $expectedB 'source.png'
 $expectedAKdat = Join-Path $expectedA 'test.texture'
 $expectedBKdat = Join-Path $expectedB 'test.texture'
+$expectedSecondaryKdat = Join-Path $expectedA 'goal.texture'
 Write-OwnedFileDurable $expectedASource $sourceABytes
 Write-OwnedFileDurable $expectedBSource $sourceBBytes
 $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
 $importer = Resolve-CanonicalFile (Join-Path $root 'tools\editor-texture-importer.ps1') 'Production texture importer'
 Invoke-Importer $pwsh $importer $expectedASource $expectedAKdat $root
 Invoke-Importer $pwsh $importer $expectedBSource $expectedBKdat $root
+Invoke-Importer $pwsh $importer (Join-Path $root 'assets\renderer2d\goal.png') $expectedSecondaryKdat $root
 
 $packageTextureBytes = [IO.File]::ReadAllBytes($packageTexture)
 $expectedATextureBytes = [IO.File]::ReadAllBytes($expectedAKdat)
 if (-not (Test-ByteArraysEqual $packageTextureBytes $expectedATextureBytes)) { throw 'Package KDAT is not byte-identical to importer(A)' }
 $packageSourceHash = Get-Hash $packageSource
 $packageTextureHash = Get-Hash $packageTexture
+$packageSecondarySourceHash = Get-Hash $packageSecondarySource
+$packageSecondaryTextureHash = Get-Hash $packageSecondaryTexture
+$expectedSecondaryTextureHash = Get-Hash $expectedSecondaryKdat
+if ($packageSecondarySourceHash -cne 'e690b160c98c941210db92c5ae7a1637bc835529e0056e743a5d8eb209c4708f' -or
+    $packageSecondaryTextureHash -cne $expectedSecondaryTextureHash -or
+    $packageSecondaryTextureHash -cne '555c2e554e2e5eb70e9de20e3e3182482d826dcfff230be45c54d321cd7e8c2c') {
+    throw 'Package secondary PNG/KDAT identities do not match the independent oracle'
+}
 $expectedBTextureHash = Get-Hash $expectedBKdat
 if ($packageSourceHash -ceq $sourceBHash -or $packageTextureHash -ceq $expectedBTextureHash) {
     throw 'Package unexpectedly contains source or KDAT identity from B'
 }
 
 $marker = Read-BuildMarker $markerPath
-if ($marker.Version -ne 1 -or $marker.Optimize -cne 'ReleaseSafe' -or $marker.TextureProfile -cne 'release' -or
-    $marker.TextureSourceSha256 -cne $packageSourceHash -or $marker.TextureArtifactSha256 -cne $packageTextureHash) {
-    throw 'Runtime marker does not bind the package A/KDAT(A) identities'
+$runtimeHash = Get-Hash (Resolve-CanonicalFile (Join-Path $package 'bin\kadath.exe') 'Packaged Runtime executable')
+$vertexShaderHash = Get-Hash (Resolve-CanonicalFile (Join-Path $root 'shaders\renderer2d\quad.vert.glsl') 'Vertex shader source')
+$fragmentShaderHash = Get-Hash (Resolve-CanonicalFile (Join-Path $root 'shaders\renderer2d\quad.frag.glsl') 'Fragment shader source')
+if ($marker.Version -ne 2 -or $marker.Optimize -cne 'ReleaseSafe' -or $marker.TextureProfile -cne 'release' -or
+    $marker.RuntimeExeSha256 -cne $runtimeHash -or
+    $marker.TextureSourceSha256 -cne $packageSourceHash -or $marker.TextureArtifactSha256 -cne $packageTextureHash -or
+    $marker.SecondaryTextureSourceSha256 -cne $packageSecondarySourceHash -or $marker.SecondaryTextureArtifactSha256 -cne $packageSecondaryTextureHash -or
+    $marker.VertexShaderSourceSha256 -cne $vertexShaderHash -or $marker.FragmentShaderSourceSha256 -cne $fragmentShaderHash -or
+    $null -ne $marker.BuildPreflightSidecarSha256) {
+    throw 'Runtime marker does not bind the exact-eleven development package identities'
 }
 
 $ready = Read-ReadyIdentity (Join-Path $barrier 'ready.json')
 if ($ready.Length -ne $sourceABytes.Length -or $ready.Sha256 -cne $sourceAHash) { throw 'Retained ready.json identity changed' }
+$secondaryReady = Read-ReadyIdentity (Join-Path $secondaryBarrier 'ready.json')
+if ($secondaryReady.Length -ne $secondarySourceABytes.Length -or $secondaryReady.Sha256 -cne $secondarySourceAHash) { throw 'Retained secondary ready.json identity changed' }
 $release = Resolve-CanonicalFile (Join-Path $barrier 'release') 'Retained barrier release'
 if ((Get-Item -LiteralPath $release -Force).Length -ne 0) { throw 'Retained barrier release is not zero length' }
+$secondaryRelease = Resolve-CanonicalFile (Join-Path $secondaryBarrier 'release') 'Retained secondary barrier release'
+if ((Get-Item -LiteralPath $secondaryRelease -Force).Length -ne 0) { throw 'Retained secondary barrier release is not zero length' }
 [void](Assert-OwnedRegularFile $sourceTarget 'Final tracked PNG source A' $sourceABytes.Length $sourceAHash)
+[void](Assert-OwnedRegularFile $secondarySourceTarget 'Final tracked secondary PNG source A' $secondarySourceABytes.Length $secondarySourceAHash)
 [void](Assert-CleanWorktree $root $headAfter)
 
-Write-Output 'texture_png_build_identity_version=1'
+Write-Output 'texture_png_build_identity_version=2'
 Write-Output "head=$headAfter"
 Write-Output "source_target=$sourceTarget"
 Write-Output "source_a_length=$($sourceABytes.Length)"
 Write-Output "source_a_sha256=$sourceAHash"
 Write-Output "source_b_length=$($sourceBBytes.Length)"
 Write-Output "source_b_sha256=$sourceBHash"
+Write-Output "secondary_source_a_length=$($secondarySourceABytes.Length)"
+Write-Output "secondary_source_a_sha256=$secondarySourceAHash"
 Write-Output "package_source_sha256=$packageSourceHash"
 Write-Output "package_texture_sha256=$packageTextureHash"
+Write-Output "package_secondary_source_sha256=$packageSecondarySourceHash"
+Write-Output "package_secondary_texture_sha256=$packageSecondaryTextureHash"
 Write-Output 'snapshot_barrier=ok'
+Write-Output 'secondary_snapshot_barrier=ok'
 Write-Output 'snapshot_partial_write_cleanup=ok'
+Write-Output 'secondary_snapshot_partial_write_cleanup=ok'
 Write-Output 'snapshot_file_id_before_return_cleanup=ok'
 Write-Output 'snapshot_same_byte_replacement_refusal=ok'
 Write-Output 'source_restored=ok'
+Write-Output 'secondary_source_restored=ok'
 Write-Output 'package_identity=ok'
 Write-Output 'verification=ok'
