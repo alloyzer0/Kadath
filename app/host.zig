@@ -167,8 +167,7 @@ pub const Host = struct {
 
         const extent = platform.clientExtent();
         var backend = try Rhi.init(
-            platform.nativeWindowHandle(),
-            platform.nativeInstanceHandle(),
+            platform.nativeSurface(),
             .{ .width = extent.width, .height = extent.height },
         );
         errdefer backend.deinit();

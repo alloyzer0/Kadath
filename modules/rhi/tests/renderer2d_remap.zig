@@ -3,7 +3,7 @@ const rhi = @import("rhi");
 const renderer2d = @import("renderer2d");
 
 test "Renderer2D compiles and renders through the Null RHI module remap" {
-    var backend = try rhi.Rhi.init(0, 0, .{ .width = 64, .height = 64 });
+    var backend = try rhi.Rhi.init(.{ .width = 64, .height = 64 });
     defer backend.deinit();
 
     const shader = [_]u8{ 0, 0, 0, 0 };

@@ -9,6 +9,7 @@ pub const TextureSamplerProfile = types.TextureSamplerProfile;
 pub const TextureMipUpload = types.TextureMipUpload;
 pub const TextureUploadDesc = types.TextureUploadDesc;
 pub const GraphicsPipelineDesc = types.GraphicsPipelineDesc;
+pub const NativeSurface = @import("native_surface").NativeSurface;
 
 const backend = @import("vulkan/backend.zig");
 pub const Rhi = backend.Rhi;

@@ -387,7 +387,7 @@ fn testTextureData(allocator: std.mem.Allocator, rgba: [4]u8) !resource.TextureD
 }
 
 test "prepared textures publish one complete owned registry" {
-    var backend = try rhi.Rhi.init(0, 0, .{ .width = 64, .height = 64 });
+    var backend = try rhi.Rhi.init(.{ .width = 64, .height = 64 });
     defer backend.deinit();
     const shader = [_]u8{ 0, 0, 0, 0 };
     const pipeline = try backend.createGraphicsPipeline(.{
@@ -468,7 +468,7 @@ test "refresh accumulator reports the lowest failed spec ordinal" {
 }
 
 test "initial upload failure never publishes a partial registry" {
-    var backend = try rhi.Rhi.init(0, 0, .{ .width = 64, .height = 64 });
+    var backend = try rhi.Rhi.init(.{ .width = 64, .height = 64 });
     defer backend.deinit();
     const shader = [_]u8{ 0, 0, 0, 0 };
     const pipeline = try backend.createGraphicsPipeline(.{
@@ -505,7 +505,7 @@ test "initial upload failure never publishes a partial registry" {
 }
 
 test "refresh failure preserves the complete active registry" {
-    var backend = try rhi.Rhi.init(0, 0, .{ .width = 64, .height = 64 });
+    var backend = try rhi.Rhi.init(.{ .width = 64, .height = 64 });
     defer backend.deinit();
     const shader = [_]u8{ 0, 0, 0, 0 };
     const pipeline = try backend.createGraphicsPipeline(.{
@@ -551,7 +551,7 @@ test "refresh failure preserves the complete active registry" {
 }
 
 test "refresh swaps both handles only after both candidate uploads succeed" {
-    var backend = try rhi.Rhi.init(0, 0, .{ .width = 64, .height = 64 });
+    var backend = try rhi.Rhi.init(.{ .width = 64, .height = 64 });
     defer backend.deinit();
     const shader = [_]u8{ 0, 0, 0, 0 };
     const pipeline = try backend.createGraphicsPipeline(.{
@@ -593,7 +593,7 @@ test "refresh swaps both handles only after both candidate uploads succeed" {
 }
 
 test "refresh rolls back the first candidate when the second upload fails" {
-    var backend = try rhi.Rhi.init(0, 0, .{ .width = 64, .height = 64 });
+    var backend = try rhi.Rhi.init(.{ .width = 64, .height = 64 });
     defer backend.deinit();
     const shader = [_]u8{ 0, 0, 0, 0 };
     const pipeline = try backend.createGraphicsPipeline(.{

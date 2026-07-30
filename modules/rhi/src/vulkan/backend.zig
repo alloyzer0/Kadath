@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
-const surface_bridge = @import("win32_surface.zig");
+const NativeSurface = @import("native_surface").NativeSurface;
+const surface_bridge = @import("surface.zig");
 const c = surface_bridge.C;
 
 const allocator = std.heap.page_allocator;
@@ -189,12 +190,12 @@ pub const Rhi = struct {
     sampler_anisotropy_supported: bool = false,
     max_sampler_anisotropy: f32 = 1.0,
 
-    pub fn init(window_handle: usize, instance_handle: usize, requested_extent: types.Extent2D) !Rhi {
+    pub fn init(native_surface: NativeSurface, requested_extent: types.Extent2D) !Rhi {
         var self = Rhi{};
         errdefer self.deinit();
 
         try self.createInstance();
-        try surface_bridge.create(self.instance, window_handle, instance_handle, &self.surface);
+        try surface_bridge.create(self.instance, native_surface, &self.surface);
         try self.selectPhysicalDevice();
         try self.createDevice();
         try self.createTextureDescriptors();
@@ -525,15 +526,12 @@ pub const Rhi = struct {
         app_info.engineVersion = 1;
         app_info.apiVersion = api_version;
 
-        const extensions = [_][*:0]const u8{
-            "VK_KHR_surface",
-            "VK_KHR_win32_surface",
-        };
+        try validateInstanceExtensions(surface_bridge.required_instance_extensions[0..]);
         var create_info = std.mem.zeroes(c.VkInstanceCreateInfo);
         create_info.sType = c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         create_info.pApplicationInfo = &app_info;
-        create_info.enabledExtensionCount = extensions.len;
-        create_info.ppEnabledExtensionNames = @ptrCast(&extensions);
+        create_info.enabledExtensionCount = surface_bridge.required_instance_extensions.len;
+        create_info.ppEnabledExtensionNames = @ptrCast(&surface_bridge.required_instance_extensions);
 
         try check(c.vkCreateInstance(&create_info, null, &self.instance), "vkCreateInstance");
         std.log.info("Vulkan loader API {d}.{d}.{d}; instance API 1.0", .{
@@ -541,6 +539,38 @@ pub const Rhi = struct {
             (loader_api_version >> 12) & 0x3ff,
             loader_api_version & 0xfff,
         });
+    }
+
+    fn validateInstanceExtensions(required_extensions: []const [*:0]const u8) !void {
+        var count: u32 = 0;
+        try check(
+            c.vkEnumerateInstanceExtensionProperties(null, &count, null),
+            "vkEnumerateInstanceExtensionProperties(count)",
+        );
+        const properties = try allocator.alloc(c.VkExtensionProperties, count);
+        defer allocator.free(properties);
+        if (count != 0) {
+            try check(
+                c.vkEnumerateInstanceExtensionProperties(null, &count, properties.ptr),
+                "vkEnumerateInstanceExtensionProperties(list)",
+            );
+        }
+
+        for (required_extensions) |required_extension| {
+            const required_name = std.mem.span(required_extension);
+            var available = false;
+            for (properties[0..count]) |property| {
+                const available_name = std.mem.sliceTo(&property.extensionName, 0);
+                if (std.mem.eql(u8, available_name, required_name)) {
+                    available = true;
+                    break;
+                }
+            }
+            if (!available) {
+                std.log.err("Required Vulkan instance extension missing: {s}", .{required_name});
+                return error.RequiredInstanceExtensionMissing;
+            }
+        }
     }
 
     fn selectPhysicalDevice(self: *Rhi) !void {

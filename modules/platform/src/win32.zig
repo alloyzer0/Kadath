@@ -2,6 +2,7 @@ const std = @import("std");
 const WindowExtent = @import("main.zig").WindowExtent;
 const PumpResult = @import("main.zig").PumpResult;
 const InputSnapshot = @import("main.zig").InputSnapshot;
+const NativeSurface = @import("main.zig").NativeSurface;
 const preview_reload_scene_message = @import("main.zig").preview_reload_scene_message;
 const preview_reload_script_message = @import("main.zig").preview_reload_script_message;
 
@@ -220,18 +221,11 @@ pub const Platform = struct {
         c.Sleep(milliseconds);
     }
 
-    pub fn nativeWindowHandle(self: *Platform) usize {
-        if (self.window) |window| {
-            return @intFromPtr(window);
-        }
-        return 0;
-    }
-
-    pub fn nativeInstanceHandle(self: *Platform) usize {
-        if (self.instance) |instance| {
-            return @intFromPtr(instance);
-        }
-        return 0;
+    pub fn nativeSurface(self: *Platform) NativeSurface {
+        return .{ .win32 = .{
+            .window = @ptrCast(self.window orelse unreachable),
+            .instance = @ptrCast(self.instance orelse unreachable),
+        } };
     }
 
     pub fn clientExtent(self: *Platform) WindowExtent {

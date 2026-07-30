@@ -40,7 +40,7 @@ fn expectNoRecordingDelta(before: rhi.NullStats, after: rhi.NullStats) !void {
 }
 
 test "Renderer2D init and deinit use the existing RHI seam" {
-    var backend = try rhi.Rhi.init(0, 0, extent);
+    var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
 
     var renderer = try renderer2d.Renderer2D.init(&backend);
@@ -58,7 +58,7 @@ test "Renderer2D init and deinit use the existing RHI seam" {
 }
 
 test "Renderer2D records one command sequence per sprite" {
-    var backend = try rhi.Rhi.init(0, 0, extent);
+    var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
     defer renderer.deinit(&backend);
@@ -74,7 +74,7 @@ test "Renderer2D records one command sequence per sprite" {
 }
 
 test "Renderer2D binds each sprite texture in input order" {
-    var backend = try rhi.Rhi.init(0, 0, extent);
+    var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
     defer renderer.deinit(&backend);
@@ -100,7 +100,7 @@ test "Renderer2D binds each sprite texture in input order" {
 }
 
 test "Renderer2D accepts an empty sprite slice without recording draws" {
-    var backend = try rhi.Rhi.init(0, 0, extent);
+    var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
     defer renderer.deinit(&backend);
@@ -112,7 +112,7 @@ test "Renderer2D accepts an empty sprite slice without recording draws" {
 }
 
 test "Renderer2D preserves minimized and recreated outcomes without recording" {
-    var backend = try rhi.Rhi.init(0, 0, extent);
+    var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
     defer renderer.deinit(&backend);
@@ -138,7 +138,7 @@ test "Renderer2D preserves minimized and recreated outcomes without recording" {
 }
 
 test "Renderer2D consumes a failed frame and can present the next frame" {
-    var backend = try rhi.Rhi.init(0, 0, extent);
+    var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
     defer renderer.deinit(&backend);

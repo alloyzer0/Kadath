@@ -1,5 +1,7 @@
 const builtin = @import("builtin");
 
+pub const NativeSurface = @import("native_surface").NativeSurface;
+
 pub const WindowExtent = struct {
     width: u32 = 0,
     height: u32 = 0,
@@ -24,10 +26,10 @@ pub const PumpResult = struct {
     script_reload_request_id: ?u64 = null,
 };
 
-pub const Platform = if (builtin.os.tag == .windows)
-    @import("win32.zig").Platform
-else
-    struct {
+pub const Platform = switch (builtin.os.tag) {
+    .windows => @import("win32.zig").Platform,
+    .linux => @import("xcb.zig").Platform,
+    else => struct {
         pub fn init() !@This() {
             return error.UnsupportedPlatform;
         }
@@ -51,18 +53,14 @@ else
             _ = milliseconds;
         }
 
-        pub fn nativeWindowHandle(self: *@This()) usize {
+        pub fn nativeSurface(self: *@This()) NativeSurface {
             _ = self;
-            return 0;
-        }
-
-        pub fn nativeInstanceHandle(self: *@This()) usize {
-            _ = self;
-            return 0;
+            unreachable;
         }
 
         pub fn clientExtent(self: *@This()) WindowExtent {
             _ = self;
             return .{};
         }
-    };
+    },
+};

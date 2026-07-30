@@ -3,11 +3,17 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const configured_glslc = b.option([]const u8, "glslc", "Absolute path to the glslc executable");
     const mingw_gcc_runtime_dir: ?[]const u8 = if (target.result.os.tag == .windows)
         b.option([]const u8, "mingw-gcc-runtime-dir", "Directory containing libgcc_eh.a for Rust panic unwinding") orelse
             "C:\\ProgramTools\\mingw64\\lib\\gcc\\x86_64-w64-mingw32\\14.2.0"
     else
         null;
+    const native_surface_mod = b.createModule(.{
+        .root_source_file = b.path("modules/platform/src/native_surface.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const platform_mod = b.createModule(.{
         .root_source_file = b.path("modules/platform/src/main.zig"),
         .target = target,
@@ -19,6 +25,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    platform_mod.addImport("native_surface", native_surface_mod);
+    rhi_mod.addImport("native_surface", native_surface_mod);
 
     const resource_mod = b.createModule(.{
         .root_source_file = b.path("modules/resource/src/main.zig"),
@@ -70,23 +78,34 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("world", world_mod);
     exe_mod.addImport("preview_status", preview_status_mod);
 
-    if (target.result.os.tag == .windows) {
-        platform_mod.linkSystemLibrary("user32", .{});
-        platform_mod.linkSystemLibrary("gdi32", .{});
-        audio_mod.linkSystemLibrary("winmm", .{});
+    var glslc_path = configured_glslc orelse "glslc";
+    switch (target.result.os.tag) {
+        .windows => {
+            platform_mod.linkSystemLibrary("user32", .{});
+            platform_mod.linkSystemLibrary("gdi32", .{});
+            audio_mod.linkSystemLibrary("winmm", .{});
 
-        // Work around Zig 0.16 translating unused MinGW fortified wchar wrappers in ReleaseSafe.
-        platform_mod.addCMacro("_FORTIFY_SOURCE", "0");
-        rhi_mod.addCMacro("_FORTIFY_SOURCE", "0");
+            // Work around Zig 0.16 translating unused MinGW fortified wchar wrappers in ReleaseSafe.
+            platform_mod.addCMacro("_FORTIFY_SOURCE", "0");
+            rhi_mod.addCMacro("_FORTIFY_SOURCE", "0");
 
-        const sdk_root = b.option([]const u8, "vulkan-sdk", "Vulkan SDK root") orelse
-            (b.graph.environ_map.get("VULKAN_SDK") orelse
-                @panic("VULKAN_SDK is required for the Windows Vulkan backend"));
-        const include_path = b.pathJoin(&.{ sdk_root, "Include" });
-        const library_path = b.pathJoin(&.{ sdk_root, "Lib" });
+            var sdk_root: ?[]const u8 = b.option([]const u8, "vulkan-sdk", "Vulkan SDK root");
+            if (sdk_root == null) sdk_root = b.graph.environ_map.get("VULKAN_SDK");
+            if (sdk_root) |root| {
+                rhi_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ root, "Include" }) });
+                rhi_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root, "Lib" }) });
+                if (configured_glslc == null) glslc_path = b.pathJoin(&.{ root, "Bin", "glslc.exe" });
+            }
+            rhi_mod.linkSystemLibrary("vulkan-1", .{});
+        },
+        .linux => {
+            platform_mod.linkSystemLibrary("xcb", .{});
+            rhi_mod.linkSystemLibrary("vulkan", .{});
+        },
+        else => {},
+    }
 
-        const glslc_path = b.pathJoin(&.{ sdk_root, "Bin", "glslc.exe" });
-
+    if (target.result.os.tag == .windows or target.result.os.tag == .linux) {
         const vertex_shader_cmd = b.addSystemCommand(&.{glslc_path});
         vertex_shader_cmd.addArgs(&.{ "-c", "--target-env=vulkan1.0", "-O", "-mfmt=c", "-fshader-stage=vert" });
         vertex_shader_cmd.addFileArg(b.path("shaders/renderer2d/quad.vert.glsl"));
@@ -107,16 +126,14 @@ pub fn build(b: *std.Build) void {
         renderer2d_mod.addCSourceFile(.{
             .file = b.path("shaders/renderer2d/embed_frag.c"),
         });
-
-        rhi_mod.addIncludePath(.{ .cwd_relative = include_path });
-        rhi_mod.addLibraryPath(.{ .cwd_relative = library_path });
-        rhi_mod.linkSystemLibrary("vulkan-1", .{});
     }
 
     const exe = b.addExecutable(.{
         .name = "kadath",
         .root_module = exe_mod,
     });
+    const runtime_build_step = b.step("build-runtime", "Build the production runtime without packaging");
+    runtime_build_step.dependOn(&exe.step);
 
     var async_texture_test_step: ?*std.Build.Step = null;
     if (target.result.os.tag == .windows) {
@@ -180,6 +197,36 @@ pub fn build(b: *std.Build) void {
         async_texture_test_mod.linkSystemLibrary("ntdll", .{});
         async_texture_test_mod.linkSystemLibrary("userenv", .{});
         async_texture_test_mod.linkSystemLibrary("ws2_32", .{});
+    } else if (target.result.os.tag == .linux) {
+        const rust_target = switch (target.result.cpu.arch) {
+            .x86_64 => "x86_64-unknown-linux-gnu",
+            else => @panic("P2-Linux-Window-01 supports only x86_64 Linux Rust linking"),
+        };
+        const cargo_target_dir = b.pathFromRoot(".zig-cache/cargo");
+        const cargo_build = b.addSystemCommand(&.{
+            "cargo",
+            "build",
+            "--locked",
+            "--manifest-path",
+            b.pathFromRoot("Cargo.toml"),
+            "--target",
+            rust_target,
+            "--target-dir",
+            cargo_target_dir,
+        });
+        if (optimize != .Debug) cargo_build.addArg("--release");
+
+        exe.step.dependOn(&cargo_build.step);
+        const rust_profile = if (optimize == .Debug) "debug" else "release";
+        exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile }) });
+        exe.root_module.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+        exe.root_module.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
+        exe.root_module.linkSystemLibrary("gcc_s", .{});
+        exe.root_module.linkSystemLibrary("util", .{});
+        exe.root_module.linkSystemLibrary("rt", .{});
+        exe.root_module.linkSystemLibrary("pthread", .{});
+        exe.root_module.linkSystemLibrary("m", .{});
+        exe.root_module.linkSystemLibrary("dl", .{});
     }
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
@@ -315,6 +362,53 @@ pub fn build(b: *std.Build) void {
     runtime_texture_registry_test_step.dependOn(&runtime_texture_registry_run.step);
     test_step.dependOn(runtime_texture_registry_test_step);
     if (async_texture_test_step) |step| test_step.dependOn(step);
+
+    if (target.result.os.tag == .linux) {
+        const platform_contract_mod = b.createModule(.{
+            .root_source_file = b.path("modules/platform/tests/xcb_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        platform_contract_mod.addImport("platform", platform_mod);
+        const platform_contract_tests = b.addTest(.{ .root_module = platform_contract_mod });
+        const platform_contract_run = b.addRunArtifact(platform_contract_tests);
+        const platform_contract_step = b.step("test-platform-xcb", "Run XCB Platform contracts on the current DISPLAY");
+        platform_contract_step.dependOn(&platform_contract_run.step);
+
+        const linux_verifier_mod = b.createModule(.{
+            .root_source_file = b.path("tools/verify-linux-window.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        linux_verifier_mod.linkSystemLibrary("xcb", .{});
+        const linux_verifier = b.addExecutable(.{
+            .name = "verify-linux-window",
+            .root_module = linux_verifier_mod,
+        });
+        const linux_verifier_test_mod = b.createModule(.{
+            .root_source_file = b.path("tools/verify-linux-window.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        linux_verifier_test_mod.linkSystemLibrary("xcb", .{});
+        const linux_verifier_tests = b.addTest(.{ .root_module = linux_verifier_test_mod });
+        const linux_verifier_test_run = b.addRunArtifact(linux_verifier_tests);
+        const linux_verifier_test_step = b.step(
+            "test-linux-window-verifier",
+            "Run Xvfb ownership and bounded cleanup failure-path tests",
+        );
+        linux_verifier_test_step.dependOn(&linux_verifier_test_run.step);
+        const linux_verifier_run = b.addRunArtifact(linux_verifier);
+        linux_verifier_run.addFileArg(platform_contract_tests.getEmittedBin());
+        linux_verifier_run.addFileArg(exe.getEmittedBin());
+        linux_verifier_run.addArg(@tagName(optimize));
+        const linux_verifier_step = b.step("verify-linux-window", "Verify Linux XCB, Lavapipe, validation, Runtime pixels, and shutdown");
+        linux_verifier_step.dependOn(&linux_verifier_test_run.step);
+        linux_verifier_step.dependOn(&linux_verifier_run.step);
+    }
 
     // 分发目录以 bin 为运行工作目录，资产必须与 exe 保持稳定的相对位置。
     const texture_source_snapshot_test_barrier = b.option(

@@ -130,9 +130,7 @@ pub const Rhi = struct {
     texture_slots: [max_textures]TextureSlot = [_]TextureSlot{.{}} ** max_textures,
     stats_value: NullStats = .{},
 
-    pub fn init(window_handle: usize, instance_handle: usize, requested_extent: types.Extent2D) !Rhi {
-        _ = window_handle;
-        _ = instance_handle;
+    pub fn init(requested_extent: types.Extent2D) !Rhi {
         return .{
             .requested_extent = requested_extent,
             // 非零尺寸表示 Vulkan 初始化阶段已经准备好 swapchain；保持首次 begin 的语义一致。
@@ -279,7 +277,7 @@ fn textureUploadBytes(desc: types.TextureUploadDesc) !usize {
 }
 
 test "null adapter validates lifecycle and failed frame recovery" {
-    var rhi = try Rhi.init(0, 0, .{ .width = 64, .height = 64 });
+    var rhi = try Rhi.init(.{ .width = 64, .height = 64 });
     defer rhi.deinit();
 
     const shader = [_]u8{ 0, 0, 0, 0 };
@@ -312,7 +310,7 @@ test "null adapter validates lifecycle and failed frame recovery" {
 }
 
 test "null adapter validates bindings handles and completed frames" {
-    var rhi = try Rhi.init(0, 0, .{ .width = 80, .height = 60 });
+    var rhi = try Rhi.init(.{ .width = 80, .height = 60 });
     defer rhi.deinit();
 
     const shader = [_]u8{ 0, 0, 0, 0 };
@@ -354,7 +352,7 @@ test "null adapter validates bindings handles and completed frames" {
 }
 
 test "null adapter rejects stale frame encoders" {
-    var rhi = try Rhi.init(0, 0, .{ .width = 32, .height = 32 });
+    var rhi = try Rhi.init(.{ .width = 32, .height = 32 });
     defer rhi.deinit();
     const shader = [_]u8{ 0, 0, 0, 0 };
     const pipeline = try rhi.createGraphicsPipeline(.{
@@ -382,7 +380,7 @@ test "null adapter rejects stale frame encoders" {
 }
 
 test "null adapter validates texture mip chain" {
-    var rhi = try Rhi.init(0, 0, .{});
+    var rhi = try Rhi.init(.{});
     defer rhi.deinit();
 
     try std.testing.expectError(error.InvalidTextureExtent, rhi.createTexture(.{ .width = 0, .height = 1, .rgba8 = &.{} }));
@@ -416,7 +414,7 @@ test "null adapter validates texture mip chain" {
 }
 
 test "null adapter reports texture ownership counts" {
-    var rhi = try Rhi.init(0, 0, .{});
+    var rhi = try Rhi.init(.{});
     defer rhi.deinit();
     const pixels = [_]u8{ 255, 255, 255, 255 };
 
@@ -442,7 +440,7 @@ test "null adapter reports texture ownership counts" {
 }
 
 test "null adapter draw trace saturation does not fail rendering" {
-    var rhi = try Rhi.init(0, 0, .{ .width = 32, .height = 32 });
+    var rhi = try Rhi.init(.{ .width = 32, .height = 32 });
     defer rhi.deinit();
     const shader = [_]u8{ 0, 0, 0, 0 };
     const pipeline = try rhi.createGraphicsPipeline(.{
