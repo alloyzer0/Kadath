@@ -17,7 +17,13 @@ const initial_width: u16 = 960;
 const initial_height: u16 = 540;
 const primary_fixture = Color{ .r = 32, .g = 220, .b = 80 };
 const secondary_fixture = Color{ .r = 220, .g = 80, .b = 240 };
+const package_primary_expected = Color{ .r = 97, .g = 104, .b = 124 };
 const sample_tolerance: u8 = 14;
+
+const AssetMode = enum {
+    generated_fixture,
+    package_root,
+};
 
 const Color = struct {
     r: u8,
@@ -93,6 +99,7 @@ const OwnedChildren = struct {
 
 const VerifierSuccess = struct {
     evidence_root: []u8,
+    asset_mode: AssetMode,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -108,20 +115,22 @@ pub fn main(init: std.process.Init) !void {
     };
     defer init.gpa.free(success.evidence_root);
     try owned_children.cleanup(init.io);
-    try printVerificationSuccess(init.io, success.evidence_root);
+    try printVerificationSuccess(init.io, success.evidence_root, success.asset_mode);
 }
 
 fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !VerifierSuccess {
     const allocator = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 4) return error.InvalidVerifierArguments;
+    if (args.len != 4 and args.len != 5) return error.InvalidVerifierArguments;
 
     const platform_test_path = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
     defer allocator.free(platform_test_path);
     const runtime_path = try std.Io.Dir.cwd().realPathFileAlloc(io, args[2], allocator);
     defer allocator.free(runtime_path);
     const profile = args[3];
+    const asset_mode: AssetMode = if (args.len == 5) .package_root else .generated_fixture;
+    const package_root = if (asset_mode == .package_root) args[4] else null;
 
     const current_path = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(current_path);
@@ -133,11 +142,13 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     errdefer allocator.free(evidence_root);
     try std.Io.Dir.cwd().createDirPath(io, evidence_root);
 
-    const fixture_assets = try std.fs.path.join(allocator, &.{ evidence_root, "fixture", "assets", "renderer2d" });
-    defer allocator.free(fixture_assets);
-    try std.Io.Dir.cwd().createDirPath(io, fixture_assets);
-    try writeTextureFixture(io, allocator, fixture_assets, "test.texture", primary_fixture);
-    try writeTextureFixture(io, allocator, fixture_assets, "goal.texture", secondary_fixture);
+    if (asset_mode == .generated_fixture) {
+        const fixture_assets = try std.fs.path.join(allocator, &.{ evidence_root, "fixture", "assets", "renderer2d" });
+        defer allocator.free(fixture_assets);
+        try std.Io.Dir.cwd().createDirPath(io, fixture_assets);
+        try writeTextureFixture(io, allocator, fixture_assets, "test.texture", primary_fixture);
+        try writeTextureFixture(io, allocator, fixture_assets, "goal.texture", secondary_fixture);
+    }
 
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
@@ -158,8 +169,8 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
 
     const metadata = try std.fmt.allocPrint(
         allocator,
-        "profile={s}\ndisplay={s}\ndriver={s}\nvalidation_layer_path={s}\nplatform_test={s}\nruntime={s}\nfixture_package=true\n",
-        .{ profile, display, driver_path, layer_path, platform_test_path, runtime_path },
+        "profile={s}\ndisplay={s}\ndriver={s}\nvalidation_layer_path={s}\nplatform_test={s}\nruntime={s}\nasset_mode={s}\n",
+        .{ profile, display, driver_path, layer_path, platform_test_path, runtime_path, @tagName(asset_mode) },
     );
     defer allocator.free(metadata);
     const metadata_path = try std.fs.path.join(allocator, &.{ evidence_root, "metadata.txt" });
@@ -209,7 +220,8 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
         allocator,
         io,
         runtime_path,
-        evidence_root,
+        package_root orelse evidence_root,
+        asset_mode,
         &environment,
         runtime_stdout,
         runtime_stderr,
@@ -242,6 +254,7 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
         window_info,
         pixel_layout,
         evidence_root,
+        asset_mode,
         5_000,
     );
     defer frame_one.deinit(allocator);
@@ -259,6 +272,7 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
         window_info,
         pixel_layout,
         evidence_root,
+        asset_mode,
         5_000,
     );
     defer frame_two.deinit(allocator);
@@ -277,10 +291,10 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     defer allocator.free(runtime_out);
     try validateRuntimeLogs(runtime_log, runtime_out);
 
-    return .{ .evidence_root = evidence_root };
+    return .{ .evidence_root = evidence_root, .asset_mode = asset_mode };
 }
 
-fn printVerificationSuccess(io: std.Io, evidence_root: []const u8) !void {
+fn printVerificationSuccess(io: std.Io, evidence_root: []const u8, asset_mode: AssetMode) !void {
     var stdout_buffer: [2048]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
@@ -295,7 +309,7 @@ fn printVerificationSuccess(io: std.Io, evidence_root: []const u8) !void {
     try stdout.print("linux_two_frame_evidence=ok\n", .{});
     try stdout.print("linux_close_exit=0\n", .{});
     try stdout.print("linux_owned_cleanup=ok\n", .{});
-    try stdout.print("fixture_package=true\n", .{});
+    try stdout.print("asset_mode={s}\n", .{@tagName(asset_mode)});
     try stdout.print("evidence_root={s}\n", .{evidence_root});
     try stdout.flush();
 }
@@ -508,7 +522,8 @@ fn spawnRuntime(
     allocator: std.mem.Allocator,
     io: std.Io,
     runtime_path: []const u8,
-    evidence_root: []const u8,
+    working_root: []const u8,
+    asset_mode: AssetMode,
     environment: *const std.process.Environ.Map,
     stdout_path: []const u8,
     stderr_path: []const u8,
@@ -517,10 +532,21 @@ fn spawnRuntime(
     defer stdout_file.close(io);
     var stderr_file = try std.Io.Dir.cwd().createFile(io, stderr_path, .{});
     defer stderr_file.close(io);
-    const fixture_root = try std.fs.path.join(allocator, &.{ evidence_root, "fixture" });
+    const fixture_root = if (asset_mode == .generated_fixture)
+        try std.fs.path.join(allocator, &.{ working_root, "fixture" })
+    else
+        try allocator.dupe(u8, working_root);
     defer allocator.free(fixture_root);
+    const package_argv = [_][]const u8{
+        runtime_path,
+        "--scene",
+        "assets/scenes/preview.scene",
+        "--script",
+        "assets/scripts/preview.script",
+    };
+    const fixture_argv = [_][]const u8{runtime_path};
     return try std.process.spawn(io, .{
-        .argv = &.{runtime_path},
+        .argv = if (asset_mode == .package_root) &package_argv else &fixture_argv,
         .cwd = .{ .path = fixture_root },
         .environ_map = environment,
         .stdin = .ignore,
@@ -725,6 +751,7 @@ fn waitForRenderedFrame(
     window: WindowInfo,
     layout: PixelLayout,
     evidence_root: []const u8,
+    asset_mode: AssetMode,
     timeout_ms: u32,
 ) !Capture {
     const expected_background = Color{
@@ -734,6 +761,8 @@ fn waitForRenderedFrame(
     };
     const expected_primary = tintedSrgb(primary_fixture, .{ 1.0, 1.0, 1.0 });
     const expected_secondary = tintedSrgb(secondary_fixture, .{ 1.0, 0.75, 0.10 });
+    const package_goal_left = tintedSrgb(.{ .r = 255, .g = 0, .b = 255 }, .{ 1.0, 0.75, 0.10 });
+    const package_goal_right = tintedSrgb(.{ .r = 0, .g = 255, .b = 255 }, .{ 1.0, 0.75, 0.10 });
     var last_capture: ?Capture = null;
     defer if (last_capture) |*capture| capture.deinit(allocator);
 
@@ -744,10 +773,15 @@ fn waitForRenderedFrame(
         const background = capture.sample(20, 20);
         const primary = capture.sample(450, 200);
         const secondary = capture.sample(748, 224);
-        if (colorNear(background, expected_background, sample_tolerance) and
-            colorNear(primary, expected_primary, sample_tolerance) and
-            colorNear(secondary, expected_secondary, sample_tolerance))
-        {
+        const pixels_match = switch (asset_mode) {
+            .generated_fixture => colorNear(background, expected_background, sample_tolerance) and
+                colorNear(primary, expected_primary, sample_tolerance) and
+                colorNear(secondary, expected_secondary, sample_tolerance),
+            .package_root => colorNear(background, expected_background, sample_tolerance) and
+                colorNear(primary, package_primary_expected, sample_tolerance) and
+                hasPackageGoalSignature(capture, package_goal_left, package_goal_right),
+        };
+        if (pixels_match) {
             if (last_capture) |*previous| previous.deinit(allocator);
             last_capture = null;
             return capture;
@@ -770,6 +804,30 @@ fn waitForRenderedFrame(
         );
     }
     return error.RuntimePixelEvidenceTimeout;
+}
+
+fn hasPackageGoalSignature(capture: Capture, expected_left: Color, expected_right: Color) bool {
+    const row: u16 = 224;
+    if (capture.height <= row or capture.width <= 600) return false;
+    const scan_end: u16 = @min(capture.width, 840);
+    var left_x: u16 = 600;
+    while (left_x < scan_end) : (left_x += 1) {
+        if (!colorNear(capture.sample(left_x, row), expected_left, 5)) continue;
+        var right_x = left_x + 48;
+        const right_end: u16 = @min(scan_end, left_x + 97);
+        while (right_x < right_end) : (right_x += 1) {
+            if (colorNear(capture.sample(right_x, row), expected_right, 32)) return true;
+        }
+    }
+    return false;
+}
+
+fn colorDistance(first: Color, second: Color) u16 {
+    return channelDistance(first.r, second.r) + channelDistance(first.g, second.g) + channelDistance(first.b, second.b);
+}
+
+fn channelDistance(first: u8, second: u8) u16 {
+    return if (first >= second) first - second else second - first;
 }
 
 fn captureWindow(

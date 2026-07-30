@@ -3,7 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const linux_package_supported = target.query.isNative() and
+        target.result.cpu.arch == .x86_64 and
+        target.result.os.tag == .linux and
+        target.result.abi == .gnu;
     const configured_glslc = b.option([]const u8, "glslc", "Absolute path to the glslc executable");
+    var linux_platform_contract_binary: ?std.Build.LazyPath = null;
+    var linux_window_verifier_binary: ?std.Build.LazyPath = null;
     const mingw_gcc_runtime_dir: ?[]const u8 = if (target.result.os.tag == .windows)
         b.option([]const u8, "mingw-gcc-runtime-dir", "Directory containing libgcc_eh.a for Rust panic unwinding") orelse
             "C:\\ProgramTools\\mingw64\\lib\\gcc\\x86_64-w64-mingw32\\14.2.0"
@@ -197,7 +203,8 @@ pub fn build(b: *std.Build) void {
         async_texture_test_mod.linkSystemLibrary("ntdll", .{});
         async_texture_test_mod.linkSystemLibrary("userenv", .{});
         async_texture_test_mod.linkSystemLibrary("ws2_32", .{});
-    } else if (target.result.os.tag == .linux) {
+    } else if (target.result.os.tag == .linux and target.result.cpu.arch == .x86_64) {
+        exe.each_lib_rpath = false;
         const rust_target = switch (target.result.cpu.arch) {
             .x86_64 => "x86_64-unknown-linux-gnu",
             else => @panic("P2-Linux-Window-01 supports only x86_64 Linux Rust linking"),
@@ -363,7 +370,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(runtime_texture_registry_test_step);
     if (async_texture_test_step) |step| test_step.dependOn(step);
 
-    if (target.result.os.tag == .linux) {
+    if (linux_package_supported) {
         const platform_contract_mod = b.createModule(.{
             .root_source_file = b.path("modules/platform/tests/xcb_contract.zig"),
             .target = target,
@@ -372,6 +379,7 @@ pub fn build(b: *std.Build) void {
         });
         platform_contract_mod.addImport("platform", platform_mod);
         const platform_contract_tests = b.addTest(.{ .root_module = platform_contract_mod });
+        linux_platform_contract_binary = platform_contract_tests.getEmittedBin();
         const platform_contract_run = b.addRunArtifact(platform_contract_tests);
         const platform_contract_step = b.step("test-platform-xcb", "Run XCB Platform contracts on the current DISPLAY");
         platform_contract_step.dependOn(&platform_contract_run.step);
@@ -387,6 +395,7 @@ pub fn build(b: *std.Build) void {
             .name = "verify-linux-window",
             .root_module = linux_verifier_mod,
         });
+        linux_window_verifier_binary = linux_verifier.getEmittedBin();
         const linux_verifier_test_mod = b.createModule(.{
             .root_source_file = b.path("tools/verify-linux-window.zig"),
             .target = target,
@@ -820,14 +829,14 @@ pub fn build(b: *std.Build) void {
         .install_dir = .bin,
         .install_subdir = "assets",
     });
-    b.getInstallStep().dependOn(&install_assets.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_assets.step);
     // install_assets 仍提供完整资产树；两个 snapshot install 是对应 PNG 的唯一有序 final writer。
     const install_texture_source_snapshot = b.addInstallFile(texture_source_snapshot, "bin/assets/renderer2d/test.png");
     install_texture_source_snapshot.step.dependOn(&install_assets.step);
-    b.getInstallStep().dependOn(&install_texture_source_snapshot.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_texture_source_snapshot.step);
     const install_secondary_texture_source_snapshot = b.addInstallFile(secondary_texture_source_snapshot, "bin/assets/renderer2d/goal.png");
     install_secondary_texture_source_snapshot.step.dependOn(&install_assets.step);
-    b.getInstallStep().dependOn(&install_secondary_texture_source_snapshot.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_secondary_texture_source_snapshot.step);
     // Importer/Baker 在安装阶段从 PNG 源生成确定性 KDAT；Zig optimize 不改变 release texture profile。
     const texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
@@ -836,7 +845,7 @@ pub fn build(b: *std.Build) void {
     texture_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const texture_artifact = texture_import.addOutputFileArg("test.texture");
     const install_texture_artifact = b.addInstallFile(texture_artifact, "bin/assets/renderer2d/test.texture");
-    b.getInstallStep().dependOn(&install_texture_artifact.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_texture_artifact.step);
     const secondary_texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     secondary_texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
     secondary_texture_import.addArg("-SourcePath");
@@ -844,7 +853,7 @@ pub fn build(b: *std.Build) void {
     secondary_texture_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const secondary_texture_artifact = secondary_texture_import.addOutputFileArg("goal.texture");
     const install_secondary_texture_artifact = b.addInstallFile(secondary_texture_artifact, "bin/assets/renderer2d/goal.texture");
-    b.getInstallStep().dependOn(&install_secondary_texture_artifact.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_secondary_texture_artifact.step);
     // 两个音频 artifact 独立构建，任一失败都会阻止 install/package 完成。
     const audio_import_won = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     audio_import_won.addFileArg(b.path("tools/editor-audio-importer.ps1"));
@@ -853,7 +862,7 @@ pub fn build(b: *std.Build) void {
     audio_import_won.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const won_audio_artifact = audio_import_won.addOutputFileArg("won.audio.wav");
     const install_won_audio_artifact = b.addInstallFile(won_audio_artifact, "bin/assets/audio/won.audio.wav");
-    b.getInstallStep().dependOn(&install_won_audio_artifact.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_won_audio_artifact.step);
 
     const audio_import_lost = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     audio_import_lost.addFileArg(b.path("tools/editor-audio-importer.ps1"));
@@ -862,7 +871,7 @@ pub fn build(b: *std.Build) void {
     audio_import_lost.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const lost_audio_artifact = audio_import_lost.addOutputFileArg("lost.audio.wav");
     const install_lost_audio_artifact = b.addInstallFile(lost_audio_artifact, "bin/assets/audio/lost.audio.wav");
-    b.getInstallStep().dependOn(&install_lost_audio_artifact.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_lost_audio_artifact.step);
 
     // Scene 源 JSON 只保留给 Editor authoring；安装包同时生成 Runtime 消费的 KSCN v1 artifact。
     const scene_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
@@ -872,7 +881,7 @@ pub fn build(b: *std.Build) void {
     scene_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const scene_artifact = scene_import.addOutputFileArg("preview.scene");
     const install_scene_artifact = b.addInstallFile(scene_artifact, "bin/assets/scenes/preview.scene");
-    b.getInstallStep().dependOn(&install_scene_artifact.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_scene_artifact.step);
 
     // Script 源 JSON 只保留给 Editor authoring；安装包同时生成 Runtime 消费的 KSCP v1 artifact。
     const script_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
@@ -882,13 +891,13 @@ pub fn build(b: *std.Build) void {
     script_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const script_artifact = script_import.addOutputFileArg("preview.script");
     const install_script_artifact = b.addInstallFile(script_artifact, "bin/assets/scripts/preview.script");
-    b.getInstallStep().dependOn(&install_script_artifact.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_script_artifact.step);
 
     const install_package_readme = b.addInstallFile(
         b.path("packaging/README.txt"),
         "README.txt",
     );
-    b.getInstallStep().dependOn(&install_package_readme.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_package_readme.step);
 
     // 关键包身份必须绑定当次链接产物；addFileArg 同时建立 exe/source 的依赖与 cache key。
     const runtime_preflight_sidecar = b.option(
@@ -979,10 +988,129 @@ pub fn build(b: *std.Build) void {
     }
     const runtime_build_profile = runtime_build_profile_command.addOutputFileArg("kadath-runtime-build-profile.json");
     const install_runtime_build_profile = b.addInstallFile(runtime_build_profile, "bin/kadath-runtime-build-profile.json");
-    b.getInstallStep().dependOn(&install_runtime_build_profile.step);
+    if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_runtime_build_profile.step);
+    if (linux_package_supported) {
+        const package_support_mod = b.createModule(.{
+            .root_source_file = b.path("linux_package_support.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const package_assets_mod = b.createModule(.{
+            .root_source_file = b.path("tools/build-linux-runtime-assets.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        package_assets_mod.addImport("package_support", package_support_mod);
+        package_assets_mod.addCMacro("_FORTIFY_SOURCE", "0");
+        package_assets_mod.linkSystemLibrary("png", .{});
+        const package_assets = b.addExecutable(.{
+            .name = "build-linux-runtime-assets",
+            .root_module = package_assets_mod,
+        });
+        const package_assets_run = b.addRunArtifact(package_assets);
+        const linux_texture_artifact = package_assets_run.addOutputFileArg("test.texture");
+        const linux_secondary_texture_artifact = package_assets_run.addOutputFileArg("goal.texture");
+        const linux_won_audio_artifact = package_assets_run.addOutputFileArg("won.audio.wav");
+        const linux_lost_audio_artifact = package_assets_run.addOutputFileArg("lost.audio.wav");
+        const linux_scene_artifact = package_assets_run.addOutputFileArg("preview.scene");
+        const linux_script_artifact = package_assets_run.addOutputFileArg("preview.script");
+
+        const package_assets_test_mod = b.createModule(.{
+            .root_source_file = b.path("tools/build-linux-runtime-assets.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        package_assets_test_mod.addImport("package_support", package_support_mod);
+        package_assets_test_mod.addCMacro("_FORTIFY_SOURCE", "0");
+        package_assets_test_mod.linkSystemLibrary("png", .{});
+        const package_assets_tests = b.addTest(.{ .root_module = package_assets_test_mod });
+        const package_assets_test_run = b.addRunArtifact(package_assets_tests);
+        const package_assets_test_step = b.step("test-linux-package-assets", "Run Linux Runtime package asset builder tests");
+        package_assets_test_step.dependOn(&package_assets_test_run.step);
+        test_step.dependOn(package_assets_test_step);
+
+        const install_linux_texture_artifact = b.addInstallFile(linux_texture_artifact, "bin/assets/renderer2d/test.texture");
+        const install_linux_secondary_texture_artifact = b.addInstallFile(linux_secondary_texture_artifact, "bin/assets/renderer2d/goal.texture");
+        const install_linux_won_audio_artifact = b.addInstallFile(linux_won_audio_artifact, "bin/assets/audio/won.audio.wav");
+        const install_linux_lost_audio_artifact = b.addInstallFile(linux_lost_audio_artifact, "bin/assets/audio/lost.audio.wav");
+        const install_linux_scene_artifact = b.addInstallFile(linux_scene_artifact, "bin/assets/scenes/preview.scene");
+        const install_linux_script_artifact = b.addInstallFile(linux_script_artifact, "bin/assets/scripts/preview.script");
+        const install_linux_package_readme = b.addInstallFile(b.path("packaging/README-linux.txt"), "README.txt");
+        b.getInstallStep().dependOn(&install_linux_texture_artifact.step);
+        b.getInstallStep().dependOn(&install_linux_secondary_texture_artifact.step);
+        b.getInstallStep().dependOn(&install_linux_won_audio_artifact.step);
+        b.getInstallStep().dependOn(&install_linux_lost_audio_artifact.step);
+        b.getInstallStep().dependOn(&install_linux_scene_artifact.step);
+        b.getInstallStep().dependOn(&install_linux_script_artifact.step);
+        b.getInstallStep().dependOn(&install_linux_package_readme.step);
+
+        const package_manifest_command = b.addSystemCommand(&.{"sh"});
+        package_manifest_command.addFileArg(b.path("packaging/finalize-linux-runtime.sh"));
+        package_manifest_command.addArg(b.install_path);
+        const package_manifest = package_manifest_command.addOutputFileArg("SHA256SUMS");
+        package_manifest_command.addFileInput(exe.getEmittedBin());
+        package_manifest_command.addFileInput(linux_texture_artifact);
+        package_manifest_command.addFileInput(linux_secondary_texture_artifact);
+        package_manifest_command.addFileInput(linux_won_audio_artifact);
+        package_manifest_command.addFileInput(linux_lost_audio_artifact);
+        package_manifest_command.addFileInput(linux_scene_artifact);
+        package_manifest_command.addFileInput(linux_script_artifact);
+        package_manifest_command.addFileInput(b.path("packaging/README-linux.txt"));
+        package_manifest_command.step.dependOn(&install_exe.step);
+        package_manifest_command.step.dependOn(&install_linux_texture_artifact.step);
+        package_manifest_command.step.dependOn(&install_linux_secondary_texture_artifact.step);
+        package_manifest_command.step.dependOn(&install_linux_won_audio_artifact.step);
+        package_manifest_command.step.dependOn(&install_linux_lost_audio_artifact.step);
+        package_manifest_command.step.dependOn(&install_linux_scene_artifact.step);
+        package_manifest_command.step.dependOn(&install_linux_script_artifact.step);
+        package_manifest_command.step.dependOn(&install_linux_package_readme.step);
+        const install_package_manifest = b.addInstallFile(package_manifest, "SHA256SUMS");
+        b.getInstallStep().dependOn(&install_package_manifest.step);
+
+        const package_scripts_test_command = b.addSystemCommand(&.{"sh"});
+        package_scripts_test_command.addFileArg(b.path("tools/test-linux-package-scripts.sh"));
+        package_scripts_test_command.addArg(b.install_path);
+        package_scripts_test_command.addFileArg(b.path("packaging/finalize-linux-runtime.sh"));
+        package_scripts_test_command.addFileArg(b.path("packaging/archive-runtime-linux.sh"));
+        package_scripts_test_command.addFileArg(b.path("tools/verify-linux-package.sh"));
+        package_scripts_test_command.step.dependOn(&install_package_manifest.step);
+        const package_scripts_test_step = b.step("test-linux-package-tools", "Run Linux package archive and failure-path tests");
+        package_scripts_test_step.dependOn(&package_scripts_test_command.step);
+        test_step.dependOn(package_scripts_test_step);
+
+        const archive_linux_command = b.addSystemCommand(&.{"sh"});
+        archive_linux_command.addFileArg(b.path("packaging/archive-runtime-linux.sh"));
+        archive_linux_command.addArg(b.install_path);
+        archive_linux_command.addArg(b.pathFromRoot("zig-out/dist/kadath-linux-x86_64.tar.gz"));
+        archive_linux_command.step.dependOn(&install_package_manifest.step);
+        const archive_linux_step = b.step("archive-linux-runtime", "Create the deterministic Linux x86_64 Runtime archive");
+        archive_linux_step.dependOn(&archive_linux_command.step);
+
+        const verify_linux_package_command = b.addSystemCommand(&.{"sh"});
+        verify_linux_package_command.addFileArg(b.path("tools/verify-linux-package.sh"));
+        verify_linux_package_command.addArg(b.pathFromRoot("zig-out/dist/kadath-linux-x86_64.tar.gz"));
+        verify_linux_package_command.addFileArg(linux_window_verifier_binary.?);
+        verify_linux_package_command.addFileArg(linux_platform_contract_binary.?);
+        verify_linux_package_command.addArg(@tagName(optimize));
+        verify_linux_package_command.addArg(b.pathFromRoot(".zig-cache/linux-package-evidence"));
+        verify_linux_package_command.step.dependOn(&archive_linux_command.step);
+        const verify_linux_package_step = b.step("verify-linux-package", "Verify the clean-extracted Linux Runtime archive");
+        verify_linux_package_step.dependOn(&verify_linux_package_command.step);
+    }
 
     const package_step = b.step("package", "Build the distributable runtime directory");
-    package_step.dependOn(b.getInstallStep());
+    if (target.result.os.tag == .linux and !linux_package_supported) {
+        const unsupported_linux_package = b.addFail("Unsupported: Linux Runtime package requires the native x86_64-linux-gnu target");
+        package_step.dependOn(&unsupported_linux_package.step);
+        const archive_linux_step = b.step("archive-linux-runtime", "Create the deterministic Linux x86_64 Runtime archive");
+        archive_linux_step.dependOn(&unsupported_linux_package.step);
+        const verify_linux_package_step = b.step("verify-linux-package", "Verify the clean-extracted Linux Runtime archive");
+        verify_linux_package_step.dependOn(&unsupported_linux_package.step);
+    } else {
+        package_step.dependOn(b.getInstallStep());
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
