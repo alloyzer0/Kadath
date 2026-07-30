@@ -471,12 +471,26 @@ fn runCaptured(
 }
 
 fn validateVulkanPreflight(stdout: []const u8, stderr: []const u8) !void {
+    const forbidden_diagnostics = [_][]const u8{
+        "VUID-",
+        "Validation Error",
+    };
+    for (forbidden_diagnostics) |needle| {
+        if (containsEither(stdout, stderr, needle)) {
+            return error.VulkanPreflightDiagnostic;
+        }
+    }
+    if (containsLinePrefixIgnoreCase(stdout, "error:") or
+        containsLinePrefixIgnoreCase(stderr, "error:"))
+    {
+        return error.VulkanPreflightDiagnostic;
+    }
     if (!containsEither(stdout, stderr, "VK_KHR_surface") or
         !containsEither(stdout, stderr, "VK_KHR_xcb_surface"))
     {
         return error.VulkanSurfaceExtensionMissing;
     }
-    if (!containsEither(stdout, stderr, "VK_LAYER_KHRONOS_validation")) {
+    if (!containsEither(stdout, stderr, "adding layers \"VK_LAYER_KHRONOS_validation\"")) {
         return error.ValidationLayerInactive;
     }
     if (!containsEither(stdout, stderr, "llvmpipe") or
@@ -1066,11 +1080,24 @@ fn validateRuntimeLogs(stderr: []const u8, stdout: []const u8) !void {
             return error.RuntimeLogFailureDiagnostic;
         }
     }
+    if (containsLinePrefixIgnoreCase(stderr, "error:") or
+        containsLinePrefixIgnoreCase(stdout, "error:"))
+    {
+        return error.RuntimeLogFailureDiagnostic;
+    }
     const rhi_shutdown = std.mem.indexOf(u8, stderr, "Vulkan RHI shutdown complete") orelse
         return error.RuntimeShutdownEvidenceMissing;
     const platform_shutdown = std.mem.indexOf(u8, stderr, "Platform shutdown complete") orelse
         return error.RuntimeShutdownEvidenceMissing;
     if (rhi_shutdown >= platform_shutdown) return error.RuntimeShutdownOrderMismatch;
+}
+
+fn containsLinePrefixIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(std.mem.trimStart(u8, line, " \t\r"), prefix)) return true;
+    }
+    return false;
 }
 
 fn countSubstring(haystack: []const u8, needle: []const u8) usize {
@@ -1141,4 +1168,45 @@ test "owned child cleanup escalates ignored TERM and reaps within its deadline" 
     try std.testing.expect(termination.escalated);
     try std.testing.expect(child.id == null);
     try std.testing.expect(elapsed < 1_000);
+}
+
+test "Vulkan preflight rejects validation diagnostics" {
+    try std.testing.expectError(
+        error.VulkanPreflightDiagnostic,
+        validateVulkanPreflight(
+            "VK_KHR_surface VK_KHR_xcb_surface llvmpipe DRIVER_ID_MESA_LLVMPIPE",
+            "adding layers \"VK_LAYER_KHRONOS_validation\"\nValidation Error: [ VUID-review-probe ] layer reported a failure",
+        ),
+    );
+}
+
+test "Vulkan preflight rejects generic loader errors" {
+    try std.testing.expectError(
+        error.VulkanPreflightDiagnostic,
+        validateVulkanPreflight(
+            "VK_KHR_surface VK_KHR_xcb_surface llvmpipe DRIVER_ID_MESA_LLVMPIPE",
+            "adding layers \"VK_LAYER_KHRONOS_validation\"\nERROR: [Loader Message] review probe failed",
+        ),
+    );
+}
+
+test "Runtime log validation rejects unexpected error records" {
+    const runtime_log =
+        "info: Platform XCB window created (960x540)\n" ++
+        "info: Vulkan GPU selected: llvmpipe\n" ++
+        "info: Vulkan RHI initialized\n" ++
+        "info: Renderer2D texture upload complete\n" ++
+        "info: Renderer2D texture upload complete\n" ++
+        "info: RHI texture created\n" ++
+        "info: RHI texture created\n" ++
+        "info: Runtime host initialized with Vulkan RHI entities\n" ++
+        "info: Runtime main loop entered\n" ++
+        "error: Async texture set refresh failed: review probe\n" ++
+        "info: Vulkan RHI shutdown complete\n" ++
+        "info: Platform shutdown complete\n" ++
+        "info: Kadath runtime shutdown complete\n";
+    try std.testing.expectError(
+        error.RuntimeLogFailureDiagnostic,
+        validateRuntimeLogs(runtime_log, ""),
+    );
 }

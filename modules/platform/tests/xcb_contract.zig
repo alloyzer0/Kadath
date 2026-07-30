@@ -88,6 +88,19 @@ test "xcb platform clears focus updates extent and accepts window close" {
     try std.testing.expect(closed);
 }
 
+test "xcb platform clears held input on keyboard mapping notification" {
+    var platform = try platform_api.Platform.init();
+    defer platform.deinit();
+    const surface = try xcbSurface(&platform);
+
+    const left = try keycodeForKeysym(surface.connection, c.XK_Left);
+    try sendKey(surface, left, c.XCB_KEY_PRESS, 80);
+    try std.testing.expectEqual(@as(i8, -1), platform.pumpEvents().input.move_x);
+
+    try sendMappingNotify(surface, left);
+    try std.testing.expectEqual(@as(i8, 0), platform.pumpEvents().input.move_x);
+}
+
 fn xcbSurface(platform: *platform_api.Platform) !Surface {
     return switch (platform.nativeSurface()) {
         .xcb => |xcb| .{
@@ -139,6 +152,15 @@ fn sendKey(surface: Surface, keycode: c.xcb_keycode_t, response_type: u8, timest
     event.event = surface.window;
     event.same_screen = 1;
     try sendEvent(surface, if (response_type == c.XCB_KEY_PRESS) c.XCB_EVENT_MASK_KEY_PRESS else c.XCB_EVENT_MASK_KEY_RELEASE, &event);
+}
+
+fn sendMappingNotify(surface: Surface, keycode: c.xcb_keycode_t) !void {
+    var event = std.mem.zeroes(c.xcb_mapping_notify_event_t);
+    event.response_type = c.XCB_MAPPING_NOTIFY;
+    event.request = c.XCB_MAPPING_KEYBOARD;
+    event.first_keycode = keycode;
+    event.count = 1;
+    try sendEvent(surface, c.XCB_EVENT_MASK_NO_EVENT, &event);
 }
 
 fn sendFocusOut(surface: Surface) !void {

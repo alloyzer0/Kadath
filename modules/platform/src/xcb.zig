@@ -211,13 +211,15 @@ pub const Platform = struct {
                     }
                 },
                 c.XCB_MAPPING_NOTIFY => {
-                    self.key_codes = loadKeyCodes(connection) catch |err| blk: {
+                    const refreshed_key_codes = loadKeyCodes(connection) catch |err| {
                         self.key_mapping_valid = false;
                         self.clearInput();
                         std.log.err("XCB keyboard mapping refresh failed: {s}", .{@errorName(err)});
-                        break :blk .{};
+                        continue;
                     };
-                    self.key_mapping_valid = self.key_codes.complete();
+                    self.clearInput();
+                    self.key_codes = refreshed_key_codes;
+                    self.key_mapping_valid = refreshed_key_codes.complete();
                 },
                 else => {},
             }
