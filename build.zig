@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("modules/audio/src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = target.result.os.tag == .linux,
     });
     const preview_status_mod = b.createModule(.{
         .root_source_file = b.path("app/preview_status.zig"),
@@ -107,6 +108,8 @@ pub fn build(b: *std.Build) void {
         .linux => {
             platform_mod.linkSystemLibrary("xcb", .{});
             rhi_mod.linkSystemLibrary("vulkan", .{});
+            audio_mod.addCMacro("_FORTIFY_SOURCE", "0");
+            audio_mod.linkSystemLibrary("asound", .{});
         },
         else => {},
     }
@@ -280,6 +283,24 @@ pub fn build(b: *std.Build) void {
     renderer2d_null_test_step.dependOn(&renderer2d_null_contract_run.step);
     renderer2d_null_test_step.dependOn(&renderer2d_remap_run.step);
     test_step.dependOn(renderer2d_null_test_step);
+
+    const audio_test_mod = b.createModule(.{
+        .root_source_file = b.path("modules/audio/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = target.result.os.tag == .linux,
+    });
+    if (target.result.os.tag == .windows) {
+        audio_test_mod.linkSystemLibrary("winmm", .{});
+    } else if (target.result.os.tag == .linux) {
+        audio_test_mod.addCMacro("_FORTIFY_SOURCE", "0");
+        audio_test_mod.linkSystemLibrary("asound", .{});
+    }
+    const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
+    const audio_test_run = b.addRunArtifact(audio_tests);
+    const audio_test_step = b.step("test-audio", "Run Audio module and platform Adapter tests");
+    audio_test_step.dependOn(&audio_test_run.step);
+    test_step.dependOn(audio_test_step);
 
     const runtime_texture_registry_test_mod = b.createModule(.{
         .root_source_file = b.path("app/runtime_texture_registry.zig"),

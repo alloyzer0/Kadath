@@ -73,6 +73,7 @@ if grep -E '\((RPATH|RUNPATH)\)' "$evidence_root/readelf-dynamic.txt"; then
 fi
 grep -F 'Shared library: [libxcb.so.1]' "$evidence_root/readelf-dynamic.txt" >/dev/null
 grep -F 'Shared library: [libvulkan.so.1]' "$evidence_root/readelf-dynamic.txt" >/dev/null
+grep -F 'Shared library: [libasound.so.2]' "$evidence_root/readelf-dynamic.txt" >/dev/null
 
 sha256sum "$archive_path" > "$evidence_root/archive.sha256"
 cp "$package_root/SHA256SUMS" "$evidence_root/SHA256SUMS"
@@ -81,12 +82,24 @@ cp "$package_root/SHA256SUMS" "$evidence_root/SHA256SUMS"
     2> "$evidence_root/window-verifier.stderr.log"
 grep -F 'asset_mode=package_root' "$evidence_root/window-verifier.stdout.log" >/dev/null
 grep -F 'linux_two_frame_evidence=ok' "$evidence_root/window-verifier.stdout.log" >/dev/null
+grep -F 'linux_audio_backend=alsa' "$evidence_root/window-verifier.stdout.log" >/dev/null
+grep -F 'linux_audio_lost_cue=ok' "$evidence_root/window-verifier.stdout.log" >/dev/null
+grep -F 'linux_audio_won_cue=ok' "$evidence_root/window-verifier.stdout.log" >/dev/null
 grep -F 'linux_close_exit=0' "$evidence_root/window-verifier.stdout.log" >/dev/null
+
+"$window_verifier" "$platform_test" "$package_root/bin/kadath" "$profile-AudioFallback" "$package_root/bin" expect-silent-audio \
+    > "$evidence_root/audio-fallback.stdout.log" \
+    2> "$evidence_root/audio-fallback.stderr.log"
+grep -F 'asset_mode=package_root' "$evidence_root/audio-fallback.stdout.log" >/dev/null
+grep -F 'linux_audio_fallback=silent' "$evidence_root/audio-fallback.stdout.log" >/dev/null
+grep -F 'linux_close_exit=0' "$evidence_root/audio-fallback.stdout.log" >/dev/null
 
 printf 'linux_package_archive=ok\n'
 printf 'linux_package_manifest=ok\n'
 printf 'linux_package_elf_dependencies=ok\n'
 printf 'linux_package_clean_extract=ok\n'
 printf 'linux_package_runtime_pixels=ok\n'
+printf 'linux_package_audio_feedback=ok\n'
+printf 'linux_package_audio_fallback=ok\n'
 printf 'linux_package_shutdown=ok\n'
 printf 'evidence_root=%s\n' "$evidence_root"

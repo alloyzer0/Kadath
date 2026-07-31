@@ -6,6 +6,7 @@ const c = @cImport({
     @cInclude("unistd.h");
     @cInclude("signal.h");
     @cInclude("sys/wait.h");
+    @cInclude("X11/keysym.h");
     @cInclude("xcb/xcb.h");
 });
 
@@ -23,6 +24,12 @@ const sample_tolerance: u8 = 14;
 const AssetMode = enum {
     generated_fixture,
     package_root,
+};
+
+const AudioExpectation = enum {
+    not_applicable,
+    alsa,
+    silent,
 };
 
 const Color = struct {
@@ -100,6 +107,7 @@ const OwnedChildren = struct {
 const VerifierSuccess = struct {
     evidence_root: []u8,
     asset_mode: AssetMode,
+    audio_expectation: AudioExpectation,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -115,22 +123,28 @@ pub fn main(init: std.process.Init) !void {
     };
     defer init.gpa.free(success.evidence_root);
     try owned_children.cleanup(init.io);
-    try printVerificationSuccess(init.io, success.evidence_root, success.asset_mode);
+    try printVerificationSuccess(init.io, success.evidence_root, success.asset_mode, success.audio_expectation);
 }
 
 fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !VerifierSuccess {
     const allocator = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 4 and args.len != 5) return error.InvalidVerifierArguments;
+    if (args.len < 4 or args.len > 6) return error.InvalidVerifierArguments;
 
     const platform_test_path = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
     defer allocator.free(platform_test_path);
     const runtime_path = try std.Io.Dir.cwd().realPathFileAlloc(io, args[2], allocator);
     defer allocator.free(runtime_path);
     const profile = args[3];
-    const asset_mode: AssetMode = if (args.len == 5) .package_root else .generated_fixture;
+    const asset_mode: AssetMode = if (args.len >= 5) .package_root else .generated_fixture;
     const package_root = if (asset_mode == .package_root) args[4] else null;
+    const audio_expectation: AudioExpectation = switch (args.len) {
+        4 => .not_applicable,
+        5 => .alsa,
+        6 => if (std.mem.eql(u8, args[5], "expect-silent-audio")) .silent else return error.InvalidVerifierArguments,
+        else => unreachable,
+    };
 
     const current_path = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(current_path);
@@ -158,6 +172,11 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     try environment.put("VK_ICD_FILENAMES", driver_path);
     try environment.put("VK_LAYER_PATH", layer_path);
     try environment.put("VK_INSTANCE_LAYERS", "VK_LAYER_KHRONOS_validation");
+    switch (audio_expectation) {
+        .not_applicable => {},
+        .alsa => try environment.put("KADATH_AUDIO_DEVICE", "null"),
+        .silent => try environment.put("KADATH_AUDIO_DEVICE", "kadath-invalid-device"),
+    }
 
     const xvfb_log = try std.fs.path.join(allocator, &.{ evidence_root, "xvfb.log" });
     defer allocator.free(xvfb_log);
@@ -169,8 +188,8 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
 
     const metadata = try std.fmt.allocPrint(
         allocator,
-        "profile={s}\ndisplay={s}\ndriver={s}\nvalidation_layer_path={s}\nplatform_test={s}\nruntime={s}\nasset_mode={s}\n",
-        .{ profile, display, driver_path, layer_path, platform_test_path, runtime_path, @tagName(asset_mode) },
+        "profile={s}\ndisplay={s}\ndriver={s}\nvalidation_layer_path={s}\nplatform_test={s}\nruntime={s}\nasset_mode={s}\naudio_expectation={s}\n",
+        .{ profile, display, driver_path, layer_path, platform_test_path, runtime_path, @tagName(asset_mode), @tagName(audio_expectation) },
     );
     defer allocator.free(metadata);
     const metadata_path = try std.fs.path.join(allocator, &.{ evidence_root, "metadata.txt" });
@@ -278,6 +297,10 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     defer frame_two.deinit(allocator);
     try savePpm(io, allocator, frame_two_path, frame_two);
 
+    if (audio_expectation == .alsa) {
+        try verifyPackageAudioGameplay(allocator, io, &observer, runtime, runtime_window, runtime_stderr);
+    }
+
     try sendClose(&observer, runtime_window);
     const exit_code = try waitForOwnedChild(runtime, 10_000);
     if (exit_code != 0) {
@@ -289,12 +312,17 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     defer allocator.free(runtime_log);
     const runtime_out = try std.Io.Dir.cwd().readFileAlloc(io, runtime_stdout, allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(runtime_out);
-    try validateRuntimeLogs(runtime_log, runtime_out);
+    try validateRuntimeLogs(runtime_log, runtime_out, audio_expectation);
 
-    return .{ .evidence_root = evidence_root, .asset_mode = asset_mode };
+    return .{ .evidence_root = evidence_root, .asset_mode = asset_mode, .audio_expectation = audio_expectation };
 }
 
-fn printVerificationSuccess(io: std.Io, evidence_root: []const u8, asset_mode: AssetMode) !void {
+fn printVerificationSuccess(
+    io: std.Io,
+    evidence_root: []const u8,
+    asset_mode: AssetMode,
+    audio_expectation: AudioExpectation,
+) !void {
     var stdout_buffer: [2048]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
@@ -307,6 +335,15 @@ fn printVerificationSuccess(io: std.Io, evidence_root: []const u8, asset_mode: A
     try stdout.print("linux_primary_texture_pixels=ok\n", .{});
     try stdout.print("linux_secondary_texture_pixels=ok\n", .{});
     try stdout.print("linux_two_frame_evidence=ok\n", .{});
+    switch (audio_expectation) {
+        .not_applicable => {},
+        .alsa => {
+            try stdout.print("linux_audio_backend=alsa\n", .{});
+            try stdout.print("linux_audio_lost_cue=ok\n", .{});
+            try stdout.print("linux_audio_won_cue=ok\n", .{});
+        },
+        .silent => try stdout.print("linux_audio_fallback=silent\n", .{}),
+    }
     try stdout.print("linux_close_exit=0\n", .{});
     try stdout.print("linux_owned_cleanup=ok\n", .{});
     try stdout.print("asset_mode={s}\n", .{@tagName(asset_mode)});
@@ -964,6 +1001,120 @@ fn sendClose(context: *XcbContext, window: c.xcb_window_t) !void {
     if (c.xcb_flush(context.connection) <= 0) return error.XcbFlushFailed;
 }
 
+fn verifyPackageAudioGameplay(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *XcbContext,
+    runtime: *std.process.Child,
+    window: c.xcb_window_t,
+    runtime_stderr: []const u8,
+) !void {
+    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Game session lost: timer expired", 5_000);
+    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Audio cue played: lost", 2_000);
+
+    const restart = try keycodeForKeysym(context.connection, c.XK_r);
+    const up = try keycodeForKeysym(context.connection, c.XK_Up);
+    const right = try keycodeForKeysym(context.connection, c.XK_Right);
+    var timestamp: c.xcb_timestamp_t = 100;
+    try sendKey(context, window, restart, c.XCB_KEY_PRESS, timestamp);
+    timestamp += 1;
+    try sendKey(context, window, restart, c.XCB_KEY_RELEASE, timestamp);
+    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Game session restarted", 2_000);
+
+    timestamp += 1;
+    try sendKey(context, window, up, c.XCB_KEY_PRESS, timestamp);
+    sleepMilliseconds(800);
+    timestamp += 1;
+    try sendKey(context, window, up, c.XCB_KEY_RELEASE, timestamp);
+    sleepMilliseconds(50);
+
+    timestamp += 1;
+    try sendKey(context, window, right, c.XCB_KEY_PRESS, timestamp);
+    sleepMilliseconds(450);
+    timestamp += 1;
+    try sendKey(context, window, right, c.XCB_KEY_RELEASE, timestamp);
+
+    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Game session won:", 2_000);
+    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Audio cue played: won", 2_000);
+}
+
+fn waitForRuntimeLog(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime: *std.process.Child,
+    path: []const u8,
+    needle: []const u8,
+    timeout_ms: u32,
+) !void {
+    var elapsed: u32 = 0;
+    while (elapsed <= timeout_ms) : (elapsed += 25) {
+        try ensureChildRunning(runtime);
+        const log = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
+        defer allocator.free(log);
+        if (std.mem.indexOf(u8, log, needle) != null) return;
+        if (elapsed == timeout_ms) break;
+        sleepMilliseconds(25);
+    }
+    std.log.err("Runtime log evidence timeout: {s}", .{needle});
+    return error.RuntimeLogEvidenceTimeout;
+}
+
+fn keycodeForKeysym(connection: *c.xcb_connection_t, keysym: c.xcb_keysym_t) !c.xcb_keycode_t {
+    const setup = c.xcb_get_setup(connection);
+    if (setup == null) return error.XcbSetupUnavailable;
+    const minimum = setup.*.min_keycode;
+    const maximum = setup.*.max_keycode;
+    const count: u8 = @intCast(@as(u16, maximum) - @as(u16, minimum) + 1);
+    var protocol_error: ?*c.xcb_generic_error_t = null;
+    const reply = c.xcb_get_keyboard_mapping_reply(
+        connection,
+        c.xcb_get_keyboard_mapping(connection, minimum, count),
+        &protocol_error,
+    );
+    if (protocol_error) |xcb_error| {
+        c.free(xcb_error);
+        if (reply != null) c.free(reply);
+        return error.KeyboardMappingFailed;
+    }
+    if (reply == null) return error.KeyboardMappingFailed;
+    defer c.free(reply);
+
+    const keysyms = c.xcb_get_keyboard_mapping_keysyms(reply);
+    const per_keycode: usize = reply.*.keysyms_per_keycode;
+    var keycode = minimum;
+    while (keycode <= maximum) : (keycode += 1) {
+        const offset = (@as(usize, keycode) - minimum) * per_keycode;
+        for (0..per_keycode) |index| {
+            if (keysyms[offset + index] == keysym) return keycode;
+        }
+        if (keycode == maximum) break;
+    }
+    return error.KeysymUnavailable;
+}
+
+fn sendKey(
+    context: *XcbContext,
+    window: c.xcb_window_t,
+    keycode: c.xcb_keycode_t,
+    response_type: u8,
+    timestamp: c.xcb_timestamp_t,
+) !void {
+    var event = std.mem.zeroes(c.xcb_key_press_event_t);
+    event.response_type = response_type;
+    event.detail = keycode;
+    event.time = timestamp;
+    event.event = window;
+    event.same_screen = 1;
+    try checkRequest(context.connection, c.xcb_send_event_checked(
+        context.connection,
+        0,
+        window,
+        if (response_type == c.XCB_KEY_PRESS) c.XCB_EVENT_MASK_KEY_PRESS else c.XCB_EVENT_MASK_KEY_RELEASE,
+        @ptrCast(&event),
+    ));
+    if (c.xcb_flush(context.connection) <= 0) return error.XcbFlushFailed;
+}
+
 fn internAtom(connection: *c.xcb_connection_t, name: []const u8) !c.xcb_atom_t {
     var protocol_error: ?*c.xcb_generic_error_t = null;
     const reply = c.xcb_intern_atom_reply(
@@ -1102,7 +1253,7 @@ fn closeOwnedChildStreams(io: std.Io, child: *std.process.Child) void {
     child.stderr = null;
 }
 
-fn validateRuntimeLogs(stderr: []const u8, stdout: []const u8) !void {
+fn validateRuntimeLogs(stderr: []const u8, stdout: []const u8, audio_expectation: AudioExpectation) !void {
     const required = [_][]const u8{
         "Platform XCB window created (960x540)",
         "Vulkan GPU selected: llvmpipe",
@@ -1118,6 +1269,23 @@ fn validateRuntimeLogs(stderr: []const u8, stdout: []const u8) !void {
             std.log.err("Runtime log evidence missing: {s}", .{needle});
             return error.RuntimeLogEvidenceMissing;
         }
+    }
+    const audio_required: []const []const u8 = switch (audio_expectation) {
+        .not_applicable => &.{},
+        .alsa => &.{
+            "Audio initialized: backend=alsa device=null",
+            "Audio cue played: lost",
+            "Audio cue played: won",
+            "Audio shutdown complete",
+        },
+        .silent => &.{
+            "Linux audio unavailable; using silent fallback: AlsaDeviceOpenFailed",
+            "Audio initialized: backend=silent",
+            "Audio shutdown complete",
+        },
+    };
+    for (audio_required) |needle| {
+        if (!containsEither(stderr, stdout, needle)) return error.RuntimeAudioEvidenceMissing;
     }
     if (countSubstring(stderr, "Renderer2D texture upload complete") < 2 or
         countSubstring(stderr, "RHI texture created") < 2)
@@ -1265,6 +1433,6 @@ test "Runtime log validation rejects unexpected error records" {
         "info: Kadath runtime shutdown complete\n";
     try std.testing.expectError(
         error.RuntimeLogFailureDiagnostic,
-        validateRuntimeLogs(runtime_log, ""),
+        validateRuntimeLogs(runtime_log, "", .not_applicable),
     );
 }
