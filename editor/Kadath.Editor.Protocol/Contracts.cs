@@ -126,7 +126,10 @@ public sealed record ProjectModelFiles(
 
 public sealed record ProjectModelScene(
     int SchemaVersion,
-    double[] GoalPosition);
+    double[] GoalPosition,
+    uint PlayerTextureId,
+    uint GoalTextureId,
+    uint HazardTextureId);
 
 public sealed record ProjectModelScript(
     int SchemaVersion,
@@ -207,7 +210,10 @@ public sealed record AssetCatalogSnapshot(
 public sealed record AuthoringPatch(
     double[]? SceneGoalPosition = null,
     double[]? ScriptGoalPosition = null,
-    double[]? ScriptGoalVelocity = null);
+    double[]? ScriptGoalVelocity = null,
+    uint? ScenePlayerTextureId = null,
+    uint? SceneGoalTextureId = null,
+    uint? SceneHazardTextureId = null);
 
 public sealed record AuthoringApplyParameters(
     string? ProjectName,
@@ -325,4 +331,3 @@ public sealed record PreviewReloadNotification(
     string? ErrorCode = null,
     string? Message = null,
     bool Ignored = false);
-

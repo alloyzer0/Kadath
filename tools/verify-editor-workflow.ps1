@@ -109,7 +109,7 @@ try {
 
     # 非法 Scene 编辑：schema 失败必须保留旧 World。
     $invalidScene = $validScene | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-    $invalidScene.schemaVersion = 2
+    $invalidScene.schemaVersion = 3
     Write-JsonDocument $invalidScene $scene
     Send-RuntimeKey $window 0x74
     Start-Sleep -Milliseconds 250

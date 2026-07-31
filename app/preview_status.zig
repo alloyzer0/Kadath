@@ -178,6 +178,7 @@ pub fn errorCode(err: anyerror) []const u8 {
     if (err == error.UnsupportedScriptSchema) return "UnsupportedScriptSchema";
     if (err == error.MissingScenePath) return "MissingScenePath";
     if (err == error.MissingScriptPath) return "MissingScriptPath";
+    if (err == error.UnknownWorldTexture) return "UnknownWorldTexture";
     if (err == error.FileNotFound) return "FileNotFound";
     if (err == error.AccessDenied) return "AccessDenied";
     return "ReloadFailed";
@@ -187,6 +188,7 @@ test "protocol error codes stay stable" {
     try std.testing.expectEqualStrings("UnsupportedScriptSchema", errorCode(error.UnsupportedScriptSchema));
     try std.testing.expectEqualStrings("MissingScenePath", errorCode(error.MissingScenePath));
     try std.testing.expectEqualStrings("MissingScriptPath", errorCode(error.MissingScriptPath));
+    try std.testing.expectEqualStrings("UnknownWorldTexture", errorCode(error.UnknownWorldTexture));
     try std.testing.expectEqualStrings("FileNotFound", errorCode(error.FileNotFound));
     try std.testing.expectEqualStrings("AccessDenied", errorCode(error.AccessDenied));
     try std.testing.expectEqualStrings("ReloadFailed", errorCode(error.UnexpectedReloadFailure));

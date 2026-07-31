@@ -58,7 +58,7 @@ fn playerSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
         .position = scene.player.position,
         .size = scene.player.size,
         .color = scene.player.color,
-        .texture_id = runtime_texture_registry.primary_texture_id,
+        .texture_id = scene.player.textureId,
         .move_speed = scene.player.moveSpeed,
     };
 }
@@ -68,7 +68,7 @@ fn goalSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
         .position = scene.goal.position,
         .size = scene.goal.size,
         .color = scene.goal.color,
-        .texture_id = runtime_texture_registry.secondary_texture_id,
+        .texture_id = scene.goal.textureId,
         .move_speed = 0.0,
     };
 }
@@ -78,9 +78,15 @@ fn hazardSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
         .position = scene.hazard.position,
         .size = scene.hazard.size,
         .color = scene.hazard.color,
-        .texture_id = runtime_texture_registry.primary_texture_id,
+        .texture_id = scene.hazard.textureId,
         .move_speed = 0.0,
     };
+}
+
+fn validateSceneTextureBindings(registry: *const runtime_texture_registry.RuntimeTextureRegistry, scene: *const scene_api.Scene) !void {
+    _ = try registry.resolve(scene.player.textureId);
+    _ = try registry.resolve(scene.goal.textureId);
+    _ = try registry.resolve(scene.hazard.textureId);
 }
 
 fn initialLoadedTarget(identity: ?content_identity.ContentIdentity) preview_status_api.InitialLoadedTarget {
@@ -134,10 +140,10 @@ pub const Host = struct {
         const scene = if (scene_path) |path| blk: {
             const loaded = try scene_api.loadWithIdentity(io, std.heap.page_allocator, path);
             scene_identity = loaded.identity;
-            // `.scene` 是运行时消费的 KSCN v1 二进制；JSON 仍保留原日志和兼容路径，
+            // `.scene` 是运行时消费的 KSCN 二进制；JSON 仍保留原日志和兼容路径，
             // 让作者态热重载可以继续直接读取 source document。
             if (std.ascii.endsWithIgnoreCase(path, ".scene")) {
-                std.log.info("Loaded preview scene artifact: {s}, artifact_version={d}", .{ path, scene_api.scene_artifact_version });
+                std.log.info("Loaded preview scene artifact: {s}, artifact_version={d}", .{ path, loaded.artifact_version orelse unreachable });
             } else {
                 std.log.info("Loaded preview scene: {s}", .{path});
             }
@@ -182,6 +188,7 @@ pub const Host = struct {
             &prepared_textures,
         );
         errdefer texture_registry.deinit(&backend);
+        try validateSceneTextureBindings(&texture_registry, &scene);
 
         const spawned = try spawnSceneWorld(&scene, extent);
         var runtime_world = spawned.world;
@@ -459,6 +466,7 @@ pub const Host = struct {
             return error.MissingScenePath;
         };
         const candidate = try scene_api.load(self.io, std.heap.page_allocator, path);
+        try validateSceneTextureBindings(&self.texture_registry, &candidate);
         // 关键事务边界：完整新 World 成功后才替换旧 World，解析/创建失败不会破坏当前运行场景。
         const replacement = try spawnSceneWorld(&candidate, self.world_extent);
         var previous_world = self.world;
@@ -620,3 +628,14 @@ pub const Host = struct {
         }
     }
 };
+
+test "scene texture bindings must resolve before world replacement" {
+    var registry = runtime_texture_registry.RuntimeTextureRegistry{
+        .allocator = std.testing.allocator,
+        .handles = .{ rhi.invalid_texture, rhi.invalid_texture },
+    };
+    var scene = scene_api.default_scene;
+    try validateSceneTextureBindings(&registry, &scene);
+    scene.hazard.textureId = 3;
+    try std.testing.expectError(error.UnknownWorldTexture, validateSceneTextureBindings(&registry, &scene));
+}

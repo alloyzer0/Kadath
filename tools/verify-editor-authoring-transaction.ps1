@@ -44,19 +44,27 @@ try {
     $scriptBefore = [IO.File]::ReadAllText($before.Files.Script)
     $nextX = [double]$before.Scene.GoalPosition[0] + 7.0
     $nextY = [double]$before.Scene.GoalPosition[1] - 3.0
+    $nextPlayerTextureId = if ([uint32]$before.Scene.PlayerTextureId -eq 1) { [uint32]2 } else { [uint32]1 }
+    $nextGoalTextureId = if ([uint32]$before.Scene.GoalTextureId -eq 1) { [uint32]2 } else { [uint32]1 }
+    $nextHazardTextureId = if ([uint32]$before.Scene.HazardTextureId -eq 1) { [uint32]2 } else { [uint32]1 }
 
     $applyOutput = @(& pwsh -NoProfile -File $author -Action Update -PackageRoot $package -ProjectName $ProjectName `
-        -ExpectedRevision $before.AuthoringRevision -SceneGoalX $nextX -SceneGoalY $nextY 2>&1)
+        -ExpectedRevision $before.AuthoringRevision -SceneGoalX $nextX -SceneGoalY $nextY `
+        -ScenePlayerTextureId $nextPlayerTextureId -SceneGoalTextureId $nextGoalTextureId -SceneHazardTextureId $nextHazardTextureId 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "Authoring apply failed: $($applyOutput -join ' | ')" }
     $after = Read-EditorProjectModel -PackageRoot $package -Name $ProjectName
     if ($after.AuthoringRevision -eq $before.AuthoringRevision) { throw 'Authoring revision did not change after mutation.' }
     if ([double]$after.Scene.GoalPosition[0] -ne $nextX -or [double]$after.Scene.GoalPosition[1] -ne $nextY) {
         throw 'Authoring mutation was not reflected in Project Snapshot.'
     }
+    if ([uint32]$after.Scene.PlayerTextureId -ne $nextPlayerTextureId -or [uint32]$after.Scene.GoalTextureId -ne $nextGoalTextureId -or [uint32]$after.Scene.HazardTextureId -ne $nextHazardTextureId) {
+        throw 'Scene texture binding mutation was not reflected in Project Snapshot.'
+    }
     if ($applyOutput -notcontains "previous_revision=$($before.AuthoringRevision)" -or $applyOutput -notcontains "authoring_revision=$($after.AuthoringRevision)") {
         throw 'Authoring adapter output is missing revision evidence.'
     }
     Write-Output 'revision_apply=ok'
+    Write-Output 'scene_texture_binding_transaction=ok'
 
     $sceneAfter = [IO.File]::ReadAllText($after.Files.Scene)
     $scriptAfter = [IO.File]::ReadAllText($after.Files.Script)

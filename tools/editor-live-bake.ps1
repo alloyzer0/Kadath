@@ -63,8 +63,8 @@ function Get-ArtifactInfo([string]$Path, [ValidateSet('Scene', 'Script')][string
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Kind artifact does not exist: $Path" }
     [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
     if ($Kind -eq 'Scene') {
-        if ($bytes.Length -ne 128 -or [Text.Encoding]::ASCII.GetString($bytes, 0, 4) -cne 'KSCN') { throw 'Scene artifact layout mismatch' }
-        if ([BitConverter]::ToUInt32($bytes, 4) -ne 1 -or [BitConverter]::ToUInt32($bytes, 8) -ne 1 -or [BitConverter]::ToUInt32($bytes, 12) -ne 112) { throw 'Scene artifact header mismatch' }
+        if ($bytes.Length -ne 140 -or [Text.Encoding]::ASCII.GetString($bytes, 0, 4) -cne 'KSCN') { throw 'Scene artifact layout mismatch' }
+        if ([BitConverter]::ToUInt32($bytes, 4) -ne 2 -or [BitConverter]::ToUInt32($bytes, 8) -ne 2 -or [BitConverter]::ToUInt32($bytes, 12) -ne 124) { throw 'Scene artifact header mismatch' }
     } else {
         if ($bytes.Length -lt 16 -or [Text.Encoding]::ASCII.GetString($bytes, 0, 4) -cne 'KSCP') { throw 'Script artifact layout mismatch' }
         $count = [BitConverter]::ToUInt32($bytes, 12)
@@ -163,9 +163,9 @@ function New-Entry([string]$Source, [string]$Artifact, [object]$Info, [string]$K
         artifactPath = Get-RelativePath $root $Artifact
         artifactSha256 = $Info.sha256
         artifactBytes = $Info.bytes
-        artifactFormat = if ($Kind -eq 'Scene') { 'KSCN-SCENE-V1' } else { 'KSCP-SCRIPT-V1' }
-        importerVersion = 1
-        bakerVersion = 1
+        artifactFormat = if ($Kind -eq 'Scene') { 'KSCN-SCENE-V2' } else { 'KSCP-SCRIPT-V1' }
+        importerVersion = if ($Kind -eq 'Scene') { 2 } else { 1 }
+        bakerVersion = if ($Kind -eq 'Scene') { 2 } else { 1 }
     }
 }
 

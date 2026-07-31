@@ -73,6 +73,9 @@ function Read-EditorProjectModel([string]$PackageRoot, [string]$Name) {
         Scene = [pscustomobject]@{
             SchemaVersion = [int]$scene.schemaVersion
             GoalPosition = @([double]$scene.goal.position[0], [double]$scene.goal.position[1])
+            PlayerTextureId = [uint32]$scene.player.textureId
+            GoalTextureId = [uint32]$scene.goal.textureId
+            HazardTextureId = [uint32]$scene.hazard.textureId
         }
         Script = [pscustomobject]@{
             SchemaVersion = [int]$scriptDocument.schemaVersion
@@ -93,6 +96,9 @@ function Get-EditorProjectEditableValues([object]$Model) {
     return @{
         SceneGoalX = $Model.Scene.GoalPosition[0]
         SceneGoalY = $Model.Scene.GoalPosition[1]
+        ScenePlayerTextureId = $Model.Scene.PlayerTextureId
+        SceneGoalTextureId = $Model.Scene.GoalTextureId
+        SceneHazardTextureId = $Model.Scene.HazardTextureId
         ScriptGoalX = $Model.Script.GoalPosition[0]
         ScriptGoalY = $Model.Script.GoalPosition[1]
         ScriptVelocityX = $Model.Script.GoalVelocity[0]
@@ -134,16 +140,19 @@ function Get-EditorHierarchySnapshot([object]$Model) {
         Size = Convert-EditorVectorToText $scene.player.size
         Color = Convert-EditorVectorToText $scene.player.color
         MoveSpeed = ([double]$scene.player.moveSpeed).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture)
+        TextureId = [uint32]$scene.player.textureId
     })))
     $nodes.Add((New-EditorHierarchyNode 'scene.goal' 'scene' 'Goal' 'Sprite' ([ordered]@{
         Position = Convert-EditorVectorToText $scene.goal.position
         Size = Convert-EditorVectorToText $scene.goal.size
         Color = Convert-EditorVectorToText $scene.goal.color
+        TextureId = [uint32]$scene.goal.textureId
     })))
     $nodes.Add((New-EditorHierarchyNode 'scene.hazard' 'scene' 'Hazard' 'Sprite' ([ordered]@{
         Position = Convert-EditorVectorToText $scene.hazard.position
         Size = Convert-EditorVectorToText $scene.hazard.size
         Color = Convert-EditorVectorToText $scene.hazard.color
+        TextureId = [uint32]$scene.hazard.textureId
         PatrolRange = "$( [double]$scene.hazard.patrolMinY ) - $( [double]$scene.hazard.patrolMaxY )"
         PatrolSpeed = ([double]$scene.hazard.patrolSpeed).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture)
     })))
@@ -178,4 +187,3 @@ function Get-EditorHierarchySnapshot([object]$Model) {
         Nodes = @($nodes)
     }
 }
-

@@ -52,7 +52,7 @@ try {
     Invoke-Bake 'Both'
     $current = Invoke-Publication
     if ($current.state -ne 'current' -or $current.scene.state -ne 'current' -or $current.script.state -ne 'current' -or
-        [int64]$current.scene.artifactBytes -ne 128 -or [int64]$current.script.artifactBytes -lt 16) {
+        [int64]$current.scene.artifactBytes -ne 140 -or [int64]$current.script.artifactBytes -lt 16) {
         throw 'Publication snapshot did not validate the baked pair.'
     }
 

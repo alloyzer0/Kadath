@@ -162,6 +162,10 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
         try std.Io.Dir.cwd().createDirPath(io, fixture_assets);
         try writeTextureFixture(io, allocator, fixture_assets, "test.texture", primary_fixture);
         try writeTextureFixture(io, allocator, fixture_assets, "goal.texture", secondary_fixture);
+        const fixture_scenes = try std.fs.path.join(allocator, &.{ evidence_root, "fixture", "assets", "scenes" });
+        defer allocator.free(fixture_scenes);
+        try std.Io.Dir.cwd().createDirPath(io, fixture_scenes);
+        try writeSceneFixture(io, allocator, fixture_scenes);
     }
 
     var environment = try init.environ_map.clone(allocator);
@@ -334,6 +338,7 @@ fn printVerificationSuccess(
     try stdout.print("linux_background_pixels=ok\n", .{});
     try stdout.print("linux_primary_texture_pixels=ok\n", .{});
     try stdout.print("linux_secondary_texture_pixels=ok\n", .{});
+    if (asset_mode == .generated_fixture) try stdout.print("linux_scene_texture_binding=ok\n", .{});
     try stdout.print("linux_two_frame_evidence=ok\n", .{});
     switch (audio_expectation) {
         .not_applicable => {},
@@ -382,6 +387,31 @@ fn writeLittleU32(destination: []u8, value: u32) void {
     destination[1] = @truncate(value >> 8);
     destination[2] = @truncate(value >> 16);
     destination[3] = @truncate(value >> 24);
+}
+
+fn writeLittleF32(destination: []u8, value: f32) void {
+    writeLittleU32(destination, @bitCast(value));
+}
+
+fn writeSceneFixture(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !void {
+    var artifact: [140]u8 = @splat(0);
+    @memcpy(artifact[0..4], "KSCN");
+    writeLittleU32(artifact[4..8], 2);
+    writeLittleU32(artifact[8..12], 2);
+    writeLittleU32(artifact[12..16], 124);
+    const values = [_]f32{
+        312, 130, 320, 240,  1,    1,    1,    1,   180,
+        700, 200, 96,  96,   1,    0.75, 0.10, 1,   650,
+        280, 96,  96,  0.95, 0.20, 0.20, 1,    245, 330,
+        80,
+    };
+    for (values, 0..) |value, index| writeLittleF32(artifact[16 + index * 4 ..][0..4], value);
+    writeLittleU32(artifact[128..132], 2);
+    writeLittleU32(artifact[132..136], 1);
+    writeLittleU32(artifact[136..140], 2);
+    const path = try std.fs.path.join(allocator, &.{ directory, "preview.scene" });
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &artifact });
 }
 
 const OwnedXvfb = struct {
@@ -581,7 +611,7 @@ fn spawnRuntime(
         "--script",
         "assets/scripts/preview.script",
     };
-    const fixture_argv = [_][]const u8{runtime_path};
+    const fixture_argv = [_][]const u8{ runtime_path, "--scene", "assets/scenes/preview.scene" };
     return try std.process.spawn(io, .{
         .argv = if (asset_mode == .package_root) &package_argv else &fixture_argv,
         .cwd = .{ .path = fixture_root },
@@ -796,8 +826,8 @@ fn waitForRenderedFrame(
         .g = linearToSrgbByte(0.10),
         .b = linearToSrgbByte(0.22),
     };
-    const expected_primary = tintedSrgb(primary_fixture, .{ 1.0, 1.0, 1.0 });
-    const expected_secondary = tintedSrgb(secondary_fixture, .{ 1.0, 0.75, 0.10 });
+    const expected_primary = tintedSrgb(secondary_fixture, .{ 1.0, 1.0, 1.0 });
+    const expected_secondary = tintedSrgb(primary_fixture, .{ 1.0, 0.75, 0.10 });
     const package_goal_left = tintedSrgb(.{ .r = 255, .g = 0, .b = 255 }, .{ 1.0, 0.75, 0.10 });
     const package_goal_right = tintedSrgb(.{ .r = 0, .g = 255, .b = 255 }, .{ 1.0, 0.75, 0.10 });
     var last_capture: ?Capture = null;

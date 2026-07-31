@@ -61,7 +61,7 @@ function Assert-BuildContract([string]$ContractDirectory, [string]$ExpectedProfi
     if ([string]$contract.Action -cne 'build-contract' -or [string]$contract.Profile -cne $ExpectedProfile) { throw "Unexpected build contract action/profile: $($contract.Action)/$($contract.Profile)" }
     if ([string]$contract.InputCandidateKind -cne 'asset-payload-v1' -or [string]$contract.OutputKind -cne 'runtime-source-payload-v1') { throw 'Unexpected build contract input/output kind' }
     if ([string]$contract.TransformPolicy -cne 'passthrough-v1' -or [string]$contract.ImporterStatus -cne 'not-defined' -or [string]$contract.BakerStatus -cne 'not-defined') { throw 'Build contract must explicitly mark importer/baker as not-defined' }
-    if ([string]$contract.ProfileSemantics.debug -notlike '*KDAT Texture Artifact v1 base-only*' -or [string]$contract.ProfileSemantics.release -notlike '*KDAT Texture Artifact v2 mipmap chain*' -or [string]$contract.ProfileSemantics.debug -notlike '*KSCN Scene Artifact v1*' -or [string]$contract.ProfileSemantics.release -notlike '*KSCN Scene Artifact v1*' -or [string]$contract.ProfileSemantics.debug -notlike '*KSCP Script Artifact v1*' -or [string]$contract.ProfileSemantics.release -notlike '*KSCP Script Artifact v1*') { throw 'Build Contract profile semantics do not describe texture/scene/script transforms' }
+    if ([string]$contract.ProfileSemantics.debug -notlike '*KDAT Texture Artifact v1 base-only*' -or [string]$contract.ProfileSemantics.release -notlike '*KDAT Texture Artifact v2 mipmap chain*' -or [string]$contract.ProfileSemantics.debug -notlike '*KSCN Scene Artifact v2*' -or [string]$contract.ProfileSemantics.release -notlike '*KSCN Scene Artifact v2*' -or [string]$contract.ProfileSemantics.debug -notlike '*KSCP Script Artifact v1*' -or [string]$contract.ProfileSemantics.release -notlike '*KSCP Script Artifact v1*') { throw 'Build Contract profile semantics do not describe texture/scene/script transforms' }
     if (-not [bool]$contract.PromotionRequired -or [string]$contract.InputAssetRoot -cne 'bin/assets' -or [string]$contract.OutputAssetRoot -cne 'bin/assets') { throw 'Build contract promotion/root boundary is invalid' }
     $expectedItemCount = if ($IncludeCompatibilityPpm) { 7 } else { 6 }
     if ([int]$contract.ItemCount -ne $expectedItemCount -or @($contract.Items).Count -ne $expectedItemCount) { throw "Expected $expectedItemCount contract items, got $($contract.ItemCount)" }
@@ -72,7 +72,7 @@ function Assert-BuildContract([string]$ContractDirectory, [string]$ExpectedProfi
         # PNG source 仍是 candidate 输入；Build Contract 必须描述真正的离线 Texture bake，而不是伪装成 passthrough。
         'bin/assets/renderer2d/goal.png' = @{ OutputPath = 'bin/assets/renderer2d/goal.texture'; InputArtifactType = 'RuntimeTextureSourceV1'; ArtifactType = 'RuntimeTextureArtifactV1'; Transform = $textureTransform; ImporterStatus = 'implemented-v1'; BakerStatus = 'implemented-v1' }
         'bin/assets/renderer2d/test.png' = @{ OutputPath = 'bin/assets/renderer2d/test.texture'; InputArtifactType = 'RuntimeTextureSourceV1'; ArtifactType = 'RuntimeTextureArtifactV1'; Transform = $textureTransform; ImporterStatus = 'implemented-v1'; BakerStatus = 'implemented-v1' }
-        'bin/assets/scenes/preview.scene.json' = @{ OutputPath = 'bin/assets/scenes/preview.scene'; InputArtifactType = 'RuntimeSceneDocumentV1'; ArtifactType = 'RuntimeSceneArtifactV1'; Transform = 'scene-json-to-kscn-f32-v1'; ImporterStatus = 'implemented-v1'; BakerStatus = 'implemented-v1' }
+        'bin/assets/scenes/preview.scene.json' = @{ OutputPath = 'bin/assets/scenes/preview.scene'; InputArtifactType = 'RuntimeSceneDocumentV2'; ArtifactType = 'RuntimeSceneArtifactV2'; Transform = 'scene-json-to-kscn-v2'; ImporterStatus = 'implemented-v2'; BakerStatus = 'implemented-v2' }
         'bin/assets/scripts/preview.script.json' = @{ OutputPath = 'bin/assets/scripts/preview.script'; InputArtifactType = 'RuntimeScriptDocumentV1'; ArtifactType = 'RuntimeScriptArtifactV1'; Transform = 'script-json-to-kscp-v1'; ImporterStatus = 'implemented-v1'; BakerStatus = 'implemented-v1' }
     }
     if ($IncludeCompatibilityPpm) {
@@ -198,7 +198,7 @@ try {
     $plan = $dry.Output[-1] | ConvertFrom-Json
     if ([int]$plan.CommandVersion -ne 1 -or [int]$plan.ContractVersion -ne 1 -or [string]$plan.ToolVersion -cne 'kadath-asset-contract/1' -or [string]$plan.Profile -cne 'debug' -or -not [bool]$plan.DryRun) { throw 'Invalid Build Contract dry-run plan' }
     if ([int]$plan.ItemCount -ne 6 -or (Test-Path -LiteralPath $dryContract)) { throw 'Build Contract dry-run must not create output' }
-    if ([string]$plan.ProfileSemantics.debug -notlike '*KDAT Texture Artifact v1 base-only*' -or [string]$plan.ProfileSemantics.release -notlike '*KDAT Texture Artifact v2 mipmap chain*' -or [string]$plan.ProfileSemantics.debug -notlike '*KSCN Scene Artifact v1*' -or [string]$plan.ProfileSemantics.release -notlike '*KSCN Scene Artifact v1*' -or [string]$plan.ProfileSemantics.debug -notlike '*KSCP Script Artifact v1*' -or [string]$plan.ProfileSemantics.release -notlike '*KSCP Script Artifact v1*') { throw 'Build Contract dry-run profile semantics are invalid' }
+    if ([string]$plan.ProfileSemantics.debug -notlike '*KDAT Texture Artifact v1 base-only*' -or [string]$plan.ProfileSemantics.release -notlike '*KDAT Texture Artifact v2 mipmap chain*' -or [string]$plan.ProfileSemantics.debug -notlike '*KSCN Scene Artifact v2*' -or [string]$plan.ProfileSemantics.release -notlike '*KSCN Scene Artifact v2*' -or [string]$plan.ProfileSemantics.debug -notlike '*KSCP Script Artifact v1*' -or [string]$plan.ProfileSemantics.release -notlike '*KSCP Script Artifact v1*') { throw 'Build Contract dry-run profile semantics are invalid' }
 
     [void](Invoke-Tool $contractTool @('-CandidateRoot', $candidate, '-ContractDirectory', $debugContract, '-Profile', 'debug'))
     $debugManifest = Assert-BuildContract $debugContract 'debug'
@@ -207,8 +207,8 @@ try {
     $debugTexture = @($debugManifest.Items | Where-Object { [string]$_.InputPath -ceq 'bin/assets/renderer2d/test.png' })
     $releaseTexture = @($releaseManifest.Items | Where-Object { [string]$_.InputPath -ceq 'bin/assets/renderer2d/test.png' })
     if ($debugTexture.Count -ne 1 -or $releaseTexture.Count -ne 1 -or [string]$debugTexture[0].Transform -cne 'png-to-rgba8-artifact-v1' -or [string]$releaseTexture[0].Transform -cne 'png-to-rgba8-mipmap-artifact-v2') { throw 'Build Contract did not project the profile-specific PNG transform' }
-    $debugNonTexture = @($debugManifest.Items | Where-Object { [string]$_.InputPath -cne 'bin/assets/renderer2d/test.png' }) | ConvertTo-Json -Depth 8 -Compress
-    $releaseNonTexture = @($releaseManifest.Items | Where-Object { [string]$_.InputPath -cne 'bin/assets/renderer2d/test.png' }) | ConvertTo-Json -Depth 8 -Compress
+    $debugNonTexture = @($debugManifest.Items | Where-Object { [string]$_.InputArtifactType -cne 'RuntimeTextureSourceV1' }) | ConvertTo-Json -Depth 8 -Compress
+    $releaseNonTexture = @($releaseManifest.Items | Where-Object { [string]$_.InputArtifactType -cne 'RuntimeTextureSourceV1' }) | ConvertTo-Json -Depth 8 -Compress
     if ($debugNonTexture -cne $releaseNonTexture) { throw 'Non-texture Build Contract items changed across profiles' }
 
     # 独立成功 candidate 证明 PPM 兼容 source 仍获得完整 per-item Runtime contract，而不只出现在失败 collision 中。

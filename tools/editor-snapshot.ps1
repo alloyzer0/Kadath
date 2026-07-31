@@ -33,7 +33,7 @@ function Assert-EditorSnapshotProjectBoundary([string]$Root, [string]$Name) {
 
 function Assert-EditorSnapshotModelVersion([object]$Model) {
     if ([int]$Model.ModelVersion -ne 1 -or
-        [int]$Model.Scene.SchemaVersion -ne 1 -or
+        [int]$Model.Scene.SchemaVersion -ne 2 -or
         [int]$Model.Script.SchemaVersion -ne 1 -or
         [int]$Model.Preview.SchemaVersion -ne 1) {
         throw 'Snapshot project/model schema version is unsupported'
@@ -64,7 +64,6 @@ switch ($Target) {
 
 # stdout 只写一条压缩 JSON；Service 负责把它转换成稳定 Protocol DTO。
 $snapshot | ConvertTo-Json -Depth 16 -Compress
-
 
 
 

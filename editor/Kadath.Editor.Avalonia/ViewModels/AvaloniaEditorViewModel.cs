@@ -35,6 +35,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _inspectorText = "选择项目、场景或资产查看其会话信息。";
     private string _sceneGoalX = string.Empty;
     private string _sceneGoalY = string.Empty;
+    private string _scenePlayerTextureId = "1";
+    private string _sceneGoalTextureId = "2";
+    private string _sceneHazardTextureId = "1";
     private string _scriptGoalX = string.Empty;
     private string _scriptGoalY = string.Empty;
     private string _scriptVelocityX = string.Empty;
@@ -107,6 +110,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public string? SelectedAssetItem { get => _selectedAssetItem; set { if (SetProperty(ref _selectedAssetItem, value) && value is not null && _assetItemsByLabel.TryGetValue(value, out var item)) { InspectorText = FormatAssetInspector(item); } } }
     public string InspectorText { get => _inspectorText; private set => SetProperty(ref _inspectorText, value); }    public string SceneGoalX { get => _sceneGoalX; set => SetProperty(ref _sceneGoalX, value); }
     public string SceneGoalY { get => _sceneGoalY; set => SetProperty(ref _sceneGoalY, value); }
+    public string ScenePlayerTextureId { get => _scenePlayerTextureId; set => SetProperty(ref _scenePlayerTextureId, value); }
+    public string SceneGoalTextureId { get => _sceneGoalTextureId; set => SetProperty(ref _sceneGoalTextureId, value); }
+    public string SceneHazardTextureId { get => _sceneHazardTextureId; set => SetProperty(ref _sceneHazardTextureId, value); }
     public string ScriptGoalX { get => _scriptGoalX; set => SetProperty(ref _scriptGoalX, value); }
     public string ScriptGoalY { get => _scriptGoalY; set => SetProperty(ref _scriptGoalY, value); }
     public string ScriptVelocityX { get => _scriptVelocityX; set => SetProperty(ref _scriptVelocityX, value); }
@@ -312,7 +318,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         var patch = new AuthoringPatch(
             ParseVector(SceneGoalX, SceneGoalY, "scene.goal.position"),
             ParseVector(ScriptGoalX, ScriptGoalY, "script.goal.position"),
-            ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity"));
+            ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity"),
+            ParseTextureId(ScenePlayerTextureId, "scene.player.textureId"),
+            ParseTextureId(SceneGoalTextureId, "scene.goal.textureId"),
+            ParseTextureId(SceneHazardTextureId, "scene.hazard.textureId"));
         var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
         ApplySnapshotProjection(session);
         RaiseAll();
@@ -333,6 +342,15 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         ApplySnapshotProjection(session);
         RaiseAll();
         return result;
+    }
+
+    private static uint ParseTextureId(string value, string field)
+    {
+        if (!uint.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var textureId) || textureId is not 1 and not 2)
+        {
+            throw new EditorRpcException("invalid_authoring_patch", $"{field} 必须为 1 或 2。");
+        }
+        return textureId;
     }
 
     private static double[] ParseVector(string x, string y, string field)
@@ -410,6 +428,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     {
         SceneGoalX = project.Scene.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         SceneGoalY = project.Scene.GoalPosition[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        ScenePlayerTextureId = project.Scene.PlayerTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        SceneGoalTextureId = project.Scene.GoalTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        SceneHazardTextureId = project.Scene.HazardTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
         ScriptGoalX = project.Script.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         ScriptGoalY = project.Script.GoalPosition[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         ScriptVelocityX = project.Script.GoalVelocity[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
@@ -537,8 +558,6 @@ public sealed class DelegateUiCommand : ICommand
     public bool CanExecute(object? parameter) => true;
     public void Execute(object? parameter) => _execute();
 }
-
-
 
 
 

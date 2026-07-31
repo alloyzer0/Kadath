@@ -14,6 +14,9 @@ param(
 
     [float]$SceneGoalX = [float]::NaN,
     [float]$SceneGoalY = [float]::NaN,
+    [uint32]$ScenePlayerTextureId = 0,
+    [uint32]$SceneGoalTextureId = 0,
+    [uint32]$SceneHazardTextureId = 0,
     [float]$ScriptGoalX = [float]::NaN,
     [float]$ScriptGoalY = [float]::NaN,
     [float]$ScriptVelocityX = [float]::NaN,
@@ -124,21 +127,25 @@ function Assert-SceneSprite([object]$Sprite, [string]$Name) {
     [void](Get-Vector $position 2 "$Name.position")
     Assert-PositiveVector $size "$Name.size"
     Assert-Color $color "$Name.color"
+    $textureId = Get-RequiredProperty $Sprite 'textureId' $Name
+    $integerTypes = @([sbyte], [byte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+    $isInteger = $null -ne ($integerTypes | Where-Object { $_.IsInstanceOfType($textureId) } | Select-Object -First 1)
+    if (-not $isInteger -or [uint64]$textureId -lt 1 -or [uint64]$textureId -gt 2) { throw "$Name.textureId must be 1 or 2" }
 }
 
 function Validate-SceneDocument([object]$Scene) {
     Assert-Properties $Scene @('schemaVersion', 'player', 'goal', 'hazard') 'Scene'
     $schemaVersion = Get-RequiredProperty $Scene 'schemaVersion' 'Scene'
     if ($schemaVersion -isnot [int] -and $schemaVersion -isnot [long]) { throw 'Scene schemaVersion must be an integer' }
-    if ([int64]$schemaVersion -ne 1) { throw "Unsupported Scene schemaVersion: $schemaVersion" }
+    if ([int64]$schemaVersion -ne 2) { throw "Unsupported Scene schemaVersion: $schemaVersion" }
 
     $player = Get-RequiredProperty $Scene 'player' 'Scene'
     $goal = Get-RequiredProperty $Scene 'goal' 'Scene'
     $hazard = Get-RequiredProperty $Scene 'hazard' 'Scene'
     # 与 Runtime 严格 JSON 解析保持一致，避免 CLI 接受 Runtime 会拒绝的未知字段。
-    Assert-Properties $player @('position', 'size', 'color', 'moveSpeed') 'Scene.player'
-    Assert-Properties $goal @('position', 'size', 'color') 'Scene.goal'
-    Assert-Properties $hazard @('position', 'size', 'color', 'patrolMinY', 'patrolMaxY', 'patrolSpeed') 'Scene.hazard'
+    Assert-Properties $player @('position', 'size', 'color', 'moveSpeed', 'textureId') 'Scene.player'
+    Assert-Properties $goal @('position', 'size', 'color', 'textureId') 'Scene.goal'
+    Assert-Properties $hazard @('position', 'size', 'color', 'patrolMinY', 'patrolMaxY', 'patrolSpeed', 'textureId') 'Scene.hazard'
     Assert-SceneSprite $player 'Scene.player'
     Assert-SceneSprite $goal 'Scene.goal'
     Assert-SceneSprite $hazard 'Scene.hazard'
@@ -421,12 +428,14 @@ switch ($Action) {
     'Update' {
         foreach ($path in $files.Values) { if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Project file does not exist: $path" } }
         $hasScene = (Test-ProvidedFloat $SceneGoalX) -or (Test-ProvidedFloat $SceneGoalY)
+        $hasSceneTexture = $ScenePlayerTextureId -ne 0 -or $SceneGoalTextureId -ne 0 -or $SceneHazardTextureId -ne 0
         $hasScriptGoal = (Test-ProvidedFloat $ScriptGoalX) -or (Test-ProvidedFloat $ScriptGoalY)
         $hasScriptVelocity = (Test-ProvidedFloat $ScriptVelocityX) -or (Test-ProvidedFloat $ScriptVelocityY)
         if ((Test-ProvidedFloat $SceneGoalX) -xor (Test-ProvidedFloat $SceneGoalY)) { throw 'SceneGoalX and SceneGoalY must be supplied together' }
         if ((Test-ProvidedFloat $ScriptGoalX) -xor (Test-ProvidedFloat $ScriptGoalY)) { throw 'ScriptGoalX and ScriptGoalY must be supplied together' }
         if ((Test-ProvidedFloat $ScriptVelocityX) -xor (Test-ProvidedFloat $ScriptVelocityY)) { throw 'ScriptVelocityX and ScriptVelocityY must be supplied together' }
-        if (-not ($hasScene -or $hasScriptGoal -or $hasScriptVelocity)) { throw 'Update requires at least one editable field' }
+        foreach ($textureId in @($ScenePlayerTextureId, $SceneGoalTextureId, $SceneHazardTextureId)) { if ($textureId -ne 0 -and $textureId -notin @(1, 2)) { throw 'Scene texture ids must be 1 or 2' } }
+        if (-not ($hasScene -or $hasSceneTexture -or $hasScriptGoal -or $hasScriptVelocity)) { throw 'Update requires at least one editable field' }
 
         $originalScene = [IO.File]::ReadAllText($files.Scene)
         $originalScript = [IO.File]::ReadAllText($files.Script)
@@ -443,11 +452,14 @@ switch ($Action) {
             Validate-SceneDocument $scene
             Validate-ScriptDocument $script
             if ($hasScene) { $scene.goal.position = @([double]$SceneGoalX, [double]$SceneGoalY) }
+            if ($ScenePlayerTextureId -ne 0) { $scene.player.textureId = [uint32]$ScenePlayerTextureId }
+            if ($SceneGoalTextureId -ne 0) { $scene.goal.textureId = [uint32]$SceneGoalTextureId }
+            if ($SceneHazardTextureId -ne 0) { $scene.hazard.textureId = [uint32]$SceneHazardTextureId }
             if ($hasScriptGoal) { (Get-Instruction $script 'on_start' 'set_goal_position').value = @([double]$ScriptGoalX, [double]$ScriptGoalY) }
             if ($hasScriptVelocity) { (Get-Instruction $script 'fixed_update' 'move_goal_velocity').value = @([double]$ScriptVelocityX, [double]$ScriptVelocityY) }
             Validate-SceneDocument $scene
             Validate-ScriptDocument $script
-            if ($hasScene) { Write-JsonAtomic $scene $files.Scene }
+            if ($hasScene -or $hasSceneTexture) { Write-JsonAtomic $scene $files.Scene }
             if ($hasScriptGoal -or $hasScriptVelocity) { Write-JsonAtomic $script $files.Script }
             $authoringRevision = Get-EditorAuthoringRevision $files.Scene $files.Script
             Write-Output 'action=Update'

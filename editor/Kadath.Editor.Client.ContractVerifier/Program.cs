@@ -548,6 +548,10 @@ internal static class Program
         var assetSnapshot = await client.GetAssetCatalogSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var publicationSnapshot = await client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, "debug")).ConfigureAwait(false);
         Assert(projectSnapshot.ModelVersion == 1 && hierarchySnapshot.SnapshotVersion == 1, "real service snapshot version mismatch");
+        Assert(projectSnapshot.Scene.SchemaVersion == 2
+            && projectSnapshot.Scene.PlayerTextureId is 1 or 2
+            && projectSnapshot.Scene.GoalTextureId is 1 or 2
+            && projectSnapshot.Scene.HazardTextureId is 1 or 2, "real service scene texture snapshot mismatch");
         Assert(hierarchySnapshot.Nodes.Length == 8, "real service hierarchy snapshot count mismatch");
         Assert(assetSnapshot.CatalogVersion == 1 && assetSnapshot.ItemCount == assetSnapshot.Items.Length, "real service asset snapshot mismatch");
         Assert(projectSnapshot.AuthoringRevision.Length == 64, "real service authoring revision mismatch");
@@ -563,15 +567,26 @@ internal static class Program
             throw new InvalidOperationException("invalid authoring patch unexpectedly succeeded");
         }
         catch (EditorRpcException exception) when (exception.Code == "invalid_authoring_patch") { }
+        try
+        {
+            _ = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(projectName, projectSnapshot.AuthoringRevision,
+                new AuthoringPatch(ScenePlayerTextureId: 3))).ConfigureAwait(false);
+            throw new InvalidOperationException("invalid scene texture patch unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "invalid_authoring_patch") { }
 
         var unchanged = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(projectName, projectSnapshot.AuthoringRevision,
             new AuthoringPatch(SceneGoalPosition: projectSnapshot.Scene.GoalPosition))).ConfigureAwait(false);
         Assert(unchanged.State == "unchanged" && unchanged.UndoDepth == 0, "real service authoring no-op mismatch");
 
         var updatedGoal = new[] { projectSnapshot.Scene.GoalPosition[0] + 1d, projectSnapshot.Scene.GoalPosition[1] + 1d };
+        var updatedPlayerTextureId = projectSnapshot.Scene.PlayerTextureId == 1 ? 2u : 1u;
         var applied = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(projectName, projectSnapshot.AuthoringRevision,
-            new AuthoringPatch(SceneGoalPosition: updatedGoal))).ConfigureAwait(false);
-        Assert(applied.State == "succeeded" && applied.ChangedFields.Contains("scene.goal.position"), "real service authoring apply failed");
+            new AuthoringPatch(SceneGoalPosition: updatedGoal, ScenePlayerTextureId: updatedPlayerTextureId))).ConfigureAwait(false);
+        Assert(applied.State == "succeeded"
+            && applied.ChangedFields.Contains("scene.goal.position")
+            && applied.ChangedFields.Contains("scene.player.textureId")
+            && applied.ProjectSnapshot.Scene.PlayerTextureId == updatedPlayerTextureId, "real service authoring apply failed");
         try
         {
             _ = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(projectName, projectSnapshot.AuthoringRevision,
@@ -581,7 +596,8 @@ internal static class Program
         catch (EditorRpcException exception) when (exception.Code == "authoring_revision_conflict") { }
 
         var undone = await client.UndoAuthoringAsync(new AuthoringUndoParameters(projectName, applied.Revision)).ConfigureAwait(false);
-        Assert(undone.Operation == "undo" && undone.UndoDepth == 0, "real service authoring undo failed");
+        Assert(undone.Operation == "undo" && undone.UndoDepth == 0
+            && undone.ProjectSnapshot.Scene.PlayerTextureId == projectSnapshot.Scene.PlayerTextureId, "real service authoring undo failed");
         try
         {
             _ = await client.UndoAuthoringAsync(new AuthoringUndoParameters(projectName, undone.Revision)).ConfigureAwait(false);
@@ -1434,7 +1450,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
             $"{packageRoot}/bin/projects/{projectName}/scene.json",
             $"{packageRoot}/bin/projects/{projectName}/script.json",
             $"{packageRoot}/bin/projects/{projectName}/preview.json"),
-        new ProjectModelScene(1, [3d, 4d]),
+        new ProjectModelScene(2, [3d, 4d], 1, 2, 1),
         new ProjectModelScript(1, [3d, 4d], [1d, 0d]),
         new ProjectModelPreview(1));
 
@@ -1453,10 +1469,10 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         1,
         projectName,
         [
-            new HierarchyNode("scene", null, "Scene", "SceneDocument", Props(("SchemaVersion", 1))),
-            new HierarchyNode("scene.player", "scene", "Player", "Sprite", Props(("Position", "0, 0"))),
-            new HierarchyNode("scene.goal", "scene", "Goal", "Sprite", Props(("Position", "3, 4"))),
-            new HierarchyNode("scene.hazard", "scene", "Hazard", "Sprite", Props(("Position", "5, 6"))),
+            new HierarchyNode("scene", null, "Scene", "SceneDocument", Props(("SchemaVersion", 2))),
+            new HierarchyNode("scene.player", "scene", "Player", "Sprite", Props(("Position", "0, 0"), ("TextureId", 1))),
+            new HierarchyNode("scene.goal", "scene", "Goal", "Sprite", Props(("Position", "3, 4"), ("TextureId", 2))),
+            new HierarchyNode("scene.hazard", "scene", "Hazard", "Sprite", Props(("Position", "5, 6"), ("TextureId", 1))),
             new HierarchyNode("script", null, "Script", "ScriptDocument", Props(("InstructionCount", 2))),
             new HierarchyNode("script.instructions[0]", "script", "Instruction 0", "HookInstruction", Props(("Hook", "on_start"))),
             new HierarchyNode("script.instructions[1]", "script", "Instruction 1", "HookInstruction", Props(("Hook", "fixed_update"))),

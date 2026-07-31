@@ -133,11 +133,11 @@ fn downsample(
 
 fn buildSceneArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     const scene = try scene_api.parse(allocator, json);
-    const artifact = try allocator.alloc(u8, 128);
+    const artifact = try allocator.alloc(u8, 140);
     @memcpy(artifact[0..4], "KSCN");
     putU32(artifact[4..8], scene_api.scene_artifact_version);
     putU32(artifact[8..12], scene.schemaVersion);
-    putU32(artifact[12..16], 112);
+    putU32(artifact[12..16], 124);
     const values = [_]f32{
         scene.player.position[0], scene.player.position[1], scene.player.size[0],     scene.player.size[1],
         scene.player.color[0],    scene.player.color[1],    scene.player.color[2],    scene.player.color[3],
@@ -148,6 +148,9 @@ fn buildSceneArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
         scene.hazard.color[3],    scene.hazard.patrolMinY,  scene.hazard.patrolMaxY,  scene.hazard.patrolSpeed,
     };
     for (values, 0..) |value, index| putF32(artifact[16 + index * 4 ..][0..4], value);
+    putU32(artifact[128..132], scene.player.textureId);
+    putU32(artifact[132..136], scene.goal.textureId);
+    putU32(artifact[136..140], scene.hazard.textureId);
     return artifact;
 }
 
@@ -236,7 +239,10 @@ test "scene and script artifacts preserve their frozen disk ABI" {
     defer std.testing.allocator.free(scene);
     const script = try buildScriptArtifact(std.testing.allocator, script_json);
     defer std.testing.allocator.free(script);
-    try std.testing.expectEqual(@as(usize, 128), scene.len);
+    try std.testing.expectEqual(@as(usize, 140), scene.len);
+    try std.testing.expectEqual(@as(u32, 1), readU32(scene[128..132]));
+    try std.testing.expectEqual(@as(u32, 2), readU32(scene[132..136]));
+    try std.testing.expectEqual(@as(u32, 1), readU32(scene[136..140]));
     try std.testing.expectEqual(@as(usize, 48), script.len);
     try std.testing.expectEqualSlices(u8, "KSCN", scene[0..4]);
     try std.testing.expectEqualSlices(u8, "KSCP", script[0..4]);

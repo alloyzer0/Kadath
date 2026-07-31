@@ -125,17 +125,21 @@ internal static class Program
 
         // 工作流 smoke 覆盖真实 authoring transaction：Apply 更新文件并建立撤销记录，Undo 恢复原值。
         var originalSceneGoalX = avaloniaViewModel.SceneGoalX;
+        var originalPlayerTextureId = avaloniaViewModel.ScenePlayerTextureId;
         var originalSceneGoal = double.Parse(originalSceneGoalX, CultureInfo.InvariantCulture);
         avaloniaViewModel.SceneGoalX = (originalSceneGoal + 11d).ToString("R", CultureInfo.InvariantCulture);
+        avaloniaViewModel.ScenePlayerTextureId = originalPlayerTextureId == "1" ? "2" : "1";
         var appliedAuthoring = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(appliedAuthoring.State, "succeeded", StringComparison.OrdinalIgnoreCase)
-            && workspace.Authoring.UndoDepth == 1, "authoring apply did not create a successful undo record");
+            && workspace.Authoring.UndoDepth == 1
+            && appliedAuthoring.ChangedFields.Contains("scene.player.textureId"), "authoring apply did not create a successful texture-aware undo record");
         Console.WriteLine("workflow_authoring_apply=ok");
 
         var undoneAuthoring = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(undoneAuthoring.Operation, "undo", StringComparison.OrdinalIgnoreCase)
             && workspace.Authoring.UndoDepth == 0
-            && avaloniaViewModel.SceneGoalX == originalSceneGoalX, "authoring undo did not restore the prior value");
+            && avaloniaViewModel.SceneGoalX == originalSceneGoalX
+            && avaloniaViewModel.ScenePlayerTextureId == originalPlayerTextureId, "authoring undo did not restore the prior values");
         Console.WriteLine("workflow_authoring_undo=ok");
 
         var validation = await workspace.ValidateProjectAsync(createdProjectName, cancellationToken);
@@ -529,7 +533,7 @@ internal static class Program
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/scene.json",
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/script.json",
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/preview.json"),
-            new ProjectModelScene(1, [3d, 4d]),
+            new ProjectModelScene(2, [3d, 4d], 1, 2, 1),
             new ProjectModelScript(1, [3d, 4d], [1d, 0d]),
             new ProjectModelPreview(1));
 
@@ -579,4 +583,3 @@ internal static class Program
         public ValueTask DisposeAsync() { IsOpen = false; _lines.Writer.TryComplete(); return ValueTask.CompletedTask; }
     }
 }
-

@@ -246,7 +246,10 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
             _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, next.AuthoringRevision, changedFields,
                 patch.SceneGoalPosition is null ? null : current.Scene.GoalPosition,
                 patch.ScriptGoalPosition is null ? null : current.Script.GoalPosition,
-                patch.ScriptGoalVelocity is null ? null : current.Script.GoalVelocity));
+                patch.ScriptGoalVelocity is null ? null : current.Script.GoalVelocity,
+                patch.ScenePlayerTextureId is null ? null : current.Scene.PlayerTextureId,
+                patch.SceneGoalTextureId is null ? null : current.Scene.GoalTextureId,
+                patch.SceneHazardTextureId is null ? null : current.Scene.HazardTextureId));
             if (_authoringHistory.Count > MaxAuthoringHistory) { _authoringHistory.RemoveAt(0); }
             return new AuthoringMutationResult("apply", "succeeded", project.ProjectName, current.AuthoringRevision, next.AuthoringRevision, changedFields, _authoringHistory.Count, next, hierarchy);
         }
@@ -269,7 +272,7 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
             }
 
             await InvokeAuthoringAdapterAsync(project, parameters.ExpectedRevision,
-                new AuthoringPatch(record.SceneGoalPosition, record.ScriptGoalPosition, record.ScriptGoalVelocity), cancellationToken);
+                new AuthoringPatch(record.SceneGoalPosition, record.ScriptGoalPosition, record.ScriptGoalVelocity, record.ScenePlayerTextureId, record.SceneGoalTextureId, record.SceneHazardTextureId), cancellationToken);
             var next = await ReadSnapshotAsync<ProjectModelSnapshot>(project, "Project", cancellationToken);
             var hierarchy = await ReadSnapshotAsync<HierarchySnapshot>(project, "Hierarchy", cancellationToken);
             _authoringHistory.RemoveAt(_authoringHistory.Count - 1);
@@ -410,7 +413,10 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion != 1
+                    || model.Scene.SchemaVersion != 2
+                    || model.Scene.PlayerTextureId is not 1 and not 2
+                    || model.Scene.GoalTextureId is not 1 and not 2
+                    || model.Scene.HazardTextureId is not 1 and not 2
                     || model.Script.SchemaVersion != 1
                     || model.Preview.SchemaVersion != 1
                     || !string.Equals(model.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
@@ -548,6 +554,9 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         AppendVector(arguments, "SceneGoal", patch.SceneGoalPosition);
         AppendVector(arguments, "ScriptGoal", patch.ScriptGoalPosition);
         AppendVector(arguments, "ScriptVelocity", patch.ScriptGoalVelocity);
+        AppendScalar(arguments, "ScenePlayerTextureId", patch.ScenePlayerTextureId);
+        AppendScalar(arguments, "SceneGoalTextureId", patch.SceneGoalTextureId);
+        AppendScalar(arguments, "SceneHazardTextureId", patch.SceneHazardTextureId);
         var output = await RunPowerShellAsync(Path.Combine(_kadathRoot, "tools", "editor-author.ps1"), arguments.ToArray(), cancellationToken);
         if (output.ExitCode != 0)
         {
@@ -574,20 +583,35 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         arguments.Add(vector[1].ToString("R", System.Globalization.CultureInfo.InvariantCulture));
     }
 
+    private static void AppendScalar(List<string> arguments, string name, uint? value)
+    {
+        if (value is null) { return; }
+        arguments.Add($"-{name}");
+        arguments.Add(value.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
+
     private static AuthoringPatch NormalizePatch(ProjectModelSnapshot current, AuthoringPatch? patch)
     {
         if (patch is null) { throw new EditorOperationException("invalid_authoring_patch", "Authoring patch is required."); }
         ValidateVector(patch.SceneGoalPosition, "scene.goal.position");
         ValidateVector(patch.ScriptGoalPosition, "script.goal.position");
         ValidateVector(patch.ScriptGoalVelocity, "script.goal.velocity");
+        ValidateTextureId(patch.ScenePlayerTextureId, "scene.player.textureId");
+        ValidateTextureId(patch.SceneGoalTextureId, "scene.goal.textureId");
+        ValidateTextureId(patch.SceneHazardTextureId, "scene.hazard.textureId");
         var scene = patch.SceneGoalPosition is not null && !patch.SceneGoalPosition.SequenceEqual(current.Scene.GoalPosition) ? patch.SceneGoalPosition : null;
         var scriptGoal = patch.ScriptGoalPosition is not null && !patch.ScriptGoalPosition.SequenceEqual(current.Script.GoalPosition) ? patch.ScriptGoalPosition : null;
         var velocity = patch.ScriptGoalVelocity is not null && !patch.ScriptGoalVelocity.SequenceEqual(current.Script.GoalVelocity) ? patch.ScriptGoalVelocity : null;
-        if (scene is null && scriptGoal is null && velocity is null && patch.SceneGoalPosition is null && patch.ScriptGoalPosition is null && patch.ScriptGoalVelocity is null)
+        var playerTexture = patch.ScenePlayerTextureId is not null && patch.ScenePlayerTextureId != current.Scene.PlayerTextureId ? patch.ScenePlayerTextureId : null;
+        var goalTexture = patch.SceneGoalTextureId is not null && patch.SceneGoalTextureId != current.Scene.GoalTextureId ? patch.SceneGoalTextureId : null;
+        var hazardTexture = patch.SceneHazardTextureId is not null && patch.SceneHazardTextureId != current.Scene.HazardTextureId ? patch.SceneHazardTextureId : null;
+        if (scene is null && scriptGoal is null && velocity is null && playerTexture is null && goalTexture is null && hazardTexture is null
+            && patch.SceneGoalPosition is null && patch.ScriptGoalPosition is null && patch.ScriptGoalVelocity is null
+            && patch.ScenePlayerTextureId is null && patch.SceneGoalTextureId is null && patch.SceneHazardTextureId is null)
         {
             throw new EditorOperationException("invalid_authoring_patch", "At least one authoring field is required.");
         }
-        return new AuthoringPatch(scene, scriptGoal, velocity);
+        return new AuthoringPatch(scene, scriptGoal, velocity, playerTexture, goalTexture, hazardTexture);
     }
 
     private static void ValidateVector(double[]? vector, string field)
@@ -598,12 +622,20 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         }
     }
 
+    private static void ValidateTextureId(uint? value, string field)
+    {
+        if (value is not null && value is not 1 and not 2) { throw new EditorOperationException("invalid_authoring_patch", $"{field} must be 1 or 2."); }
+    }
+
     private static string[] GetChangedFields(AuthoringPatch patch)
     {
         var fields = new List<string>();
         if (patch.SceneGoalPosition is not null) { fields.Add("scene.goal.position"); }
         if (patch.ScriptGoalPosition is not null) { fields.Add("script.goal.position"); }
         if (patch.ScriptGoalVelocity is not null) { fields.Add("script.goal.velocity"); }
+        if (patch.ScenePlayerTextureId is not null) { fields.Add("scene.player.textureId"); }
+        if (patch.SceneGoalTextureId is not null) { fields.Add("scene.goal.textureId"); }
+        if (patch.SceneHazardTextureId is not null) { fields.Add("scene.hazard.textureId"); }
         return fields.ToArray();
     }
 
@@ -625,7 +657,10 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         string[] ChangedFields,
         double[]? SceneGoalPosition,
         double[]? ScriptGoalPosition,
-        double[]? ScriptGoalVelocity);
+        double[]? ScriptGoalVelocity,
+        uint? ScenePlayerTextureId,
+        uint? SceneGoalTextureId,
+        uint? SceneHazardTextureId);
     private static string NormalizeTarget(string target) => target.ToLowerInvariant() switch
     {
         "scene" => "Scene",
@@ -717,9 +752,6 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 
     private sealed record PowerShellResult(int ExitCode, string[] Stdout, string[] Stderr);
 }
-
-
-
 
 
 

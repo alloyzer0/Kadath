@@ -135,10 +135,10 @@ try {
     })
     $artifactLogs = @($events | Where-Object {
         $_.event -eq 'runtime_log' -and
-        [string]$_.message -match 'Loaded preview scene artifact: .*artifact_version=1'
+        [string]$_.message -match 'Loaded preview scene artifact: .*artifact_version=2'
     })
     if ($artifactLogs.Count -ne 1) {
-        throw "Expected one KSCN artifact load log with artifact_version=1, got $($artifactLogs.Count)"
+        throw "Expected one KSCN artifact load log with artifact_version=2, got $($artifactLogs.Count)"
     }
 
     $exitEvents = @($events | Where-Object {
@@ -153,6 +153,7 @@ try {
 
     Write-Output "artifact=$scenePackagePath"
     Write-Output "artifact_bytes=$((Get-Item -LiteralPath $artifact).Length)"
+    Write-Output 'scene_texture_binding_runtime=ok'
     Write-Output 'artifact_load_log=ok'
     Write-Output 'runtime_exit_code=0'
     Write-Output 'preview=ok'

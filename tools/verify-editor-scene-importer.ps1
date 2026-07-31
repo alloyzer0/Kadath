@@ -53,20 +53,32 @@ function Get-ExpectedSceneFields([string]$Path) {
     return ,$values.ToArray()
 }
 
-function Assert-SceneArtifact([string]$Path, [single[]]$ExpectedFields) {
+function Get-ExpectedTextureIds([string]$Path) {
+    $scene = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+    return [uint32[]]@($scene.player.textureId, $scene.goal.textureId, $scene.hazard.textureId)
+}
+
+function Assert-SceneArtifact([string]$Path, [single[]]$ExpectedFields, [uint32[]]$ExpectedTextureIds) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Scene artifact does not exist: $Path" }
     [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -ne 128) { throw "Scene artifact size mismatch: expected=128 actual=$($bytes.Length)" }
+    if ($bytes.Length -ne 140) { throw "Scene artifact size mismatch: expected=140 actual=$($bytes.Length)" }
     if ([Text.Encoding]::ASCII.GetString($bytes, 0, 4) -cne 'KSCN') { throw 'Scene artifact magic mismatch' }
-    if ((Read-U32Le $bytes 4) -ne 1) { throw 'Scene artifact version mismatch' }
-    if ((Read-U32Le $bytes 8) -ne 1) { throw 'Scene artifact schema version mismatch' }
-    if ((Read-U32Le $bytes 12) -ne 112) { throw 'Scene artifact payload size mismatch' }
+    if ((Read-U32Le $bytes 4) -ne 2) { throw 'Scene artifact version mismatch' }
+    if ((Read-U32Le $bytes 8) -ne 2) { throw 'Scene artifact schema version mismatch' }
+    if ((Read-U32Le $bytes 12) -ne 124) { throw 'Scene artifact payload size mismatch' }
     if ($ExpectedFields.Count -ne 28) { throw 'Verifier expected field layout is invalid' }
     for ($index = 0; $index -lt $ExpectedFields.Count; $index++) {
         [single]$actual = [BitConverter]::ToSingle($bytes, 16 + ($index * 4))
         # 关键布局验证：按 Scene struct 的固定顺序逐个比较 f32，不只检查头部或文件哈希。
         if ([BitConverter]::SingleToInt32Bits($actual) -ne [BitConverter]::SingleToInt32Bits($ExpectedFields[$index])) {
             throw "Scene artifact field mismatch at index $index`: expected=$($ExpectedFields[$index]) actual=$actual"
+        }
+    }
+    if ($ExpectedTextureIds.Count -ne 3) { throw 'Verifier expected texture binding layout is invalid' }
+    for ($index = 0; $index -lt $ExpectedTextureIds.Count; $index++) {
+        [uint32]$actual = Read-U32Le $bytes (128 + ($index * 4))
+        if ($actual -ne $ExpectedTextureIds[$index]) {
+            throw "Scene artifact texture binding mismatch at index $index`: expected=$($ExpectedTextureIds[$index]) actual=$actual"
         }
     }
     return [pscustomobject]@{
@@ -77,6 +89,7 @@ function Assert-SceneArtifact([string]$Path, [single[]]$ExpectedFields) {
 
 $sourceHashBefore = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
 $expectedFields = Get-ExpectedSceneFields $source
+$expectedTextureIds = Get-ExpectedTextureIds $source
 $dryArtifact = Join-Path $output 'dry-run\preview.scene'
 $debugArtifact = Join-Path $output 'debug\preview.scene'
 $releaseArtifact = Join-Path $output 'release\preview.scene'
@@ -85,22 +98,22 @@ try {
     $dry = Invoke-SceneImporter @('-SourcePath', $source, '-DestinationPath', $dryArtifact, '-Profile', 'debug', '-DryRun')
     if ($dry.Output.Count -eq 0) { throw 'Scene importer dry-run produced no plan' }
     $plan = $dry.Output[-1] | ConvertFrom-Json
-    if ([int]$plan.ImporterVersion -ne 1 -or [int]$plan.BakerVersion -ne 1 -or [string]$plan.ToolVersion -cne 'kadath-scene-importer/1') { throw 'Scene importer dry-run version/tool mismatch' }
+    if ([int]$plan.ImporterVersion -ne 2 -or [int]$plan.BakerVersion -ne 2 -or [string]$plan.ToolVersion -cne 'kadath-scene-importer/2') { throw 'Scene importer dry-run version/tool mismatch' }
     if ([string]$plan.Action -cne 'scene-import-bake' -or [string]$plan.Profile -cne 'debug' -or -not [bool]$plan.DryRun) { throw 'Scene importer dry-run action/profile mismatch' }
-    if ([string]$plan.ArtifactFormat -cne 'KSCN-SCENE-V1' -or [int]$plan.SchemaVersion -ne 1 -or [int]$plan.FieldCount -ne 28 -or [int]$plan.PayloadBytes -ne 112 -or [int]$plan.ArtifactBytes -ne 128) { throw 'Scene importer dry-run artifact contract mismatch' }
-    if ([string]$plan.Transform -cne 'scene-json-to-kscn-f32-v1') { throw 'Scene importer dry-run transform mismatch' }
+    if ([string]$plan.ArtifactFormat -cne 'KSCN-SCENE-V2' -or [int]$plan.SchemaVersion -ne 2 -or [int]$plan.FieldCount -ne 28 -or [int]$plan.PayloadBytes -ne 124 -or [int]$plan.ArtifactBytes -ne 140) { throw 'Scene importer dry-run artifact contract mismatch' }
+    if ([string]$plan.Transform -cne 'scene-json-to-kscn-v2') { throw 'Scene importer dry-run transform mismatch' }
     if (Test-Path -LiteralPath $output) { throw 'Scene importer dry-run created an output directory or artifact' }
 
     [void](Invoke-SceneImporter @('-SourcePath', $source, '-DestinationPath', $debugArtifact, '-Profile', 'debug'))
     [void](Invoke-SceneImporter @('-SourcePath', $source, '-DestinationPath', $releaseArtifact, '-Profile', 'release'))
-    $debug = Assert-SceneArtifact $debugArtifact $expectedFields
-    $release = Assert-SceneArtifact $releaseArtifact $expectedFields
+    $debug = Assert-SceneArtifact $debugArtifact $expectedFields $expectedTextureIds
+    $release = Assert-SceneArtifact $releaseArtifact $expectedFields $expectedTextureIds
     if ($debug.Sha256 -cne $release.Sha256) { throw 'Debug and release Scene artifacts are not byte-equivalent' }
 
     $inputDirectory = Join-Path $output 'invalid-inputs'
     $invalidSchemaPath = Join-Path $inputDirectory 'invalid-schema.scene.json'
     $invalidSchema = Get-Content -LiteralPath $source -Raw -Encoding utf8 | ConvertFrom-Json
-    $invalidSchema.schemaVersion = 2
+    $invalidSchema.schemaVersion = 3
     Write-JsonFile $invalidSchema $invalidSchemaPath
     $invalidSchemaArtifact = Join-Path $output 'invalid-artifacts\invalid-schema.scene'
     [void](Invoke-SceneImporter @('-SourcePath', $invalidSchemaPath, '-DestinationPath', $invalidSchemaArtifact, '-Profile', 'debug') -ExpectFailure)
@@ -113,6 +126,14 @@ try {
     $invalidRangeArtifact = Join-Path $output 'invalid-artifacts\invalid-range.scene'
     [void](Invoke-SceneImporter @('-SourcePath', $invalidRangePath, '-DestinationPath', $invalidRangeArtifact, '-Profile', 'release') -ExpectFailure)
     if (Test-Path -LiteralPath $invalidRangeArtifact) { throw 'Invalid range left a Scene artifact' }
+
+    $invalidTexturePath = Join-Path $inputDirectory 'invalid-texture.scene.json'
+    $invalidTexture = Get-Content -LiteralPath $source -Raw -Encoding utf8 | ConvertFrom-Json
+    $invalidTexture.goal.textureId = 0
+    Write-JsonFile $invalidTexture $invalidTexturePath
+    $invalidTextureArtifact = Join-Path $output 'invalid-artifacts\invalid-texture.scene'
+    [void](Invoke-SceneImporter @('-SourcePath', $invalidTexturePath, '-DestinationPath', $invalidTextureArtifact, '-Profile', 'debug') -ExpectFailure)
+    if (Test-Path -LiteralPath $invalidTextureArtifact) { throw 'Invalid texture binding left a Scene artifact' }
 
     $debugHashBeforeOverwrite = (Get-FileHash -LiteralPath $debugArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
     [void](Invoke-SceneImporter @('-SourcePath', $source, '-DestinationPath', $debugArtifact, '-Profile', 'debug') -ExpectFailure)
@@ -128,14 +149,15 @@ try {
     $sourceHashAfter = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($sourceHashBefore -cne $sourceHashAfter) { throw 'Scene importer changed the source document' }
 
-    Write-Output 'scene_importer_version=1'
-    Write-Output 'scene_baker_version=1'
-    Write-Output 'artifact_format=KSCN-SCENE-V1'
-    Write-Output 'artifact_version=1'
-    Write-Output 'schema_version=1'
+    Write-Output 'scene_importer_version=2'
+    Write-Output 'scene_baker_version=2'
+    Write-Output 'artifact_format=KSCN-SCENE-V2'
+    Write-Output 'artifact_version=2'
+    Write-Output 'schema_version=2'
     Write-Output 'field_count=28'
-    Write-Output 'payload_bytes=112'
-    Write-Output 'artifact_bytes=128'
+    Write-Output 'texture_binding_count=3'
+    Write-Output 'payload_bytes=124'
+    Write-Output 'artifact_bytes=140'
     Write-Output 'dry_run=ok'
     Write-Output 'debug_artifact=ok'
     Write-Output 'release_artifact=ok'
@@ -143,6 +165,7 @@ try {
     Write-Output 'payload_layout=ok'
     Write-Output 'invalid_schema_rejected=ok'
     Write-Output 'invalid_range_rejected=ok'
+    Write-Output 'invalid_texture_binding_rejected=ok'
     Write-Output 'overwrite_rejected=ok'
     Write-Output 'package_boundary=ok'
     Write-Output 'atomic_write=ok'
