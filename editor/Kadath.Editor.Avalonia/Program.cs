@@ -533,7 +533,7 @@ internal static class Program
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/scene.json",
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/script.json",
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/preview.json"),
-            new ProjectModelScene(2, [3d, 4d], 1, 2, 1),
+            new ProjectModelScene(3, [3d, 4d], 1, 2, 3, [new ProjectModelTexture(1, "assets/renderer2d/test.texture"), new ProjectModelTexture(2, "assets/renderer2d/goal.texture"), new ProjectModelTexture(3, "assets/renderer2d/goal.texture")]),
             new ProjectModelScript(1, [3d, 4d], [1d, 0d]),
             new ProjectModelPreview(1));
 

@@ -109,7 +109,7 @@ function Get-BuildArtifactType([string]$Category, [string]$Extension, [string]$R
     switch ($Category) {
         'Texture' { if ($Extension -eq 'texture') { return 'RuntimeTextureArtifactV1' }; return 'RuntimeTextureSourceV1' }
         'Audio' { if ($RelativePath.EndsWith('.audio.wav', [StringComparison]::OrdinalIgnoreCase)) { return 'RuntimeAudioArtifactV1' }; return 'RuntimeAudioSourceV1' }
-        'Scene' { if ($Extension -eq 'scene') { return 'RuntimeSceneArtifactV2' }; return 'RuntimeSceneDocumentV2' }
+        'Scene' { if ($Extension -eq 'scene') { return 'RuntimeSceneArtifactV3' }; return 'RuntimeSceneDocumentV3' }
         'Script' { if ($Extension -eq 'script') { return 'RuntimeScriptArtifactV1' }; return 'RuntimeScriptDocumentV1' }
         default { return 'RuntimeBinarySourceV1' }
     }
@@ -187,10 +187,10 @@ $contractItems = @($promotion.Items | ForEach-Object {
         InputPath = $inputPath
         OutputPath = $outputPath
         InputArtifactType = $inputArtifactType
-        ArtifactType = if ($isSceneSource) { 'RuntimeSceneArtifactV2' } elseif ($isScriptSource) { 'RuntimeScriptArtifactV1' } elseif ($isTextureSource) { 'RuntimeTextureArtifactV1' } else { $inputArtifactType }
-        ImporterStatus = if ($isSceneSource) { 'implemented-v2' } elseif ($isScriptSource -or $isTextureSource) { 'implemented-v1' } else { 'not-defined' }
-        BakerStatus = if ($isSceneSource) { 'implemented-v2' } elseif ($isScriptSource -or $isTextureSource) { 'implemented-v1' } else { 'not-defined' }
-        Transform = if ($isSceneSource) { 'scene-json-to-kscn-v2' } elseif ($isScriptSource) { 'script-json-to-kscp-v1' } elseif ($isTextureSource) { $textureTransform } else { 'passthrough-v1' }
+        ArtifactType = if ($isSceneSource) { 'RuntimeSceneArtifactV3' } elseif ($isScriptSource) { 'RuntimeScriptArtifactV1' } elseif ($isTextureSource) { 'RuntimeTextureArtifactV1' } else { $inputArtifactType }
+        ImporterStatus = if ($isSceneSource) { 'implemented-v3' } elseif ($isScriptSource -or $isTextureSource) { 'implemented-v1' } else { 'not-defined' }
+        BakerStatus = if ($isSceneSource) { 'implemented-v3' } elseif ($isScriptSource -or $isTextureSource) { 'implemented-v1' } else { 'not-defined' }
+        Transform = if ($isSceneSource) { 'scene-json-to-kscn-v3' } elseif ($isScriptSource) { 'script-json-to-kscp-v1' } elseif ($isTextureSource) { $textureTransform } else { 'passthrough-v1' }
         SizeBytes = $_.SizeBytes
         Sha256 = $_.Sha256
     }
@@ -207,8 +207,8 @@ foreach ($item in $contractItems) {
 
 # Candidate 本身保持不可变；profile 语义只描述安装阶段会执行的确定性派生变换。
 $profileSemantics = [ordered]@{
-    debug = 'candidate payload unchanged; Texture PPM/PNG -> KDAT Texture Artifact v1 base-only; Scene JSON -> KSCN Scene Artifact v2; Script JSON -> KSCP Script Artifact v1; other importer/baker not defined'
-    release = 'candidate payload unchanged; Texture PPM/PNG -> KDAT Texture Artifact v2 mipmap chain; Scene JSON -> KSCN Scene Artifact v2; Script JSON -> KSCP Script Artifact v1; other importer/baker not defined'
+    debug = 'candidate payload unchanged; Texture PPM/PNG -> KDAT Texture Artifact v1 base-only; Scene JSON -> KSCN Scene Artifact v3; Script JSON -> KSCP Script Artifact v1; other importer/baker not defined'
+    release = 'candidate payload unchanged; Texture PPM/PNG -> KDAT Texture Artifact v2 mipmap chain; Scene JSON -> KSCN Scene Artifact v3; Script JSON -> KSCP Script Artifact v1; other importer/baker not defined'
 }
 if ($DryRun) {
     $plan = [ordered]@{

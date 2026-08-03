@@ -16,14 +16,14 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$script:SceneImporterVersion = 2
-$script:SceneBakerVersion = 2
+$script:SceneImporterVersion = 3
+$script:SceneBakerVersion = 3
 $script:SceneArtifactMagic = 'KSCN'
-$script:SceneArtifactVersion = 2
-$script:SceneSchemaVersion = 2
+$script:SceneArtifactVersion = 3
+$script:SceneSchemaVersion = 3
 $script:SceneArtifactHeaderBytes = 16
 $script:SceneArtifactFieldCount = 28
-$script:SceneArtifactPayloadBytes = ($script:SceneArtifactFieldCount + 3) * 4
+$script:SceneArtifactV2PayloadBytes = ($script:SceneArtifactFieldCount + 3) * 4
 $script:SceneSourceMaxBytes = 64 * 1024
 
 function Resolve-SceneSource([string]$Path) {
@@ -107,6 +107,17 @@ function Get-JsonTextureId([System.Text.Json.JsonElement]$Value, [string]$Name) 
     return $textureId
 }
 
+function Test-TextureArtifactPath([string]$Artifact) {
+    if ([string]::IsNullOrEmpty($Artifact) -or [Text.Encoding]::UTF8.GetByteCount($Artifact) -gt 255) { return $false }
+    if (-not $Artifact.StartsWith('assets/renderer2d/', [StringComparison]::Ordinal) -or
+        -not $Artifact.EndsWith('.texture', [StringComparison]::Ordinal) -or
+        $Artifact.Contains('\')) { return $false }
+    foreach ($segment in $Artifact.Split('/')) {
+        if ($segment.Length -eq 0 -or $segment -eq '.' -or $segment -eq '..') { return $false }
+    }
+    return $true
+}
+
 function Get-SceneSpriteFields(
     [System.Text.Json.JsonElement]$Sprite,
     [string]$Owner,
@@ -149,7 +160,7 @@ function Parse-SceneDocument([string]$Path) {
     try {
         $document = [System.Text.Json.JsonDocument]::Parse($contents, $options)
         $root = $document.RootElement
-        $rootExpected = @('schemaVersion', 'player', 'goal', 'hazard')
+        $rootExpected = @('schemaVersion', 'textures', 'player', 'goal', 'hazard')
         $schemaElement = Get-RequiredJsonProperty $root 'schemaVersion' $rootExpected 'Scene'
         if ($schemaElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Number) { throw 'Scene.schemaVersion must be an integer' }
         [uint32]$schemaVersion = 0
@@ -158,6 +169,23 @@ function Parse-SceneDocument([string]$Path) {
         $player = Get-RequiredJsonProperty $root 'player' $rootExpected 'Scene'
         $goal = Get-RequiredJsonProperty $root 'goal' $rootExpected 'Scene'
         $hazard = Get-RequiredJsonProperty $root 'hazard' $rootExpected 'Scene'
+        $textureArray = Get-RequiredJsonProperty $root 'textures' $rootExpected 'Scene'
+        if ($textureArray.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { throw 'Scene.textures must be an array' }
+        $textureElements = @($textureArray.EnumerateArray())
+        if ($textureElements.Count -lt 1 -or $textureElements.Count -gt 4) { throw 'Scene.textures must contain 1 to 4 entries' }
+        $textureIdsSet = [System.Collections.Generic.HashSet[uint32]]::new()
+        $textures = [System.Collections.Generic.List[object]]::new()
+        foreach ($texture in $textureElements) {
+            $expected = @('textureId', 'artifact')
+            $textureId = Get-JsonTextureId (Get-RequiredJsonProperty $texture 'textureId' $expected 'Scene.textures[]') 'Scene.textures[].textureId'
+            if (-not $textureIdsSet.Add($textureId)) { throw "Scene.textures contains duplicate textureId: $textureId" }
+            $artifactElement = Get-RequiredJsonProperty $texture 'artifact' $expected 'Scene.textures[]'
+            if ($artifactElement.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { throw 'Scene.textures[].artifact must be a string' }
+            $artifact = $artifactElement.GetString()
+            [byte[]]$artifactBytes = [Text.Encoding]::UTF8.GetBytes($artifact)
+            if (-not (Test-TextureArtifactPath $artifact)) { throw "Invalid Scene texture artifact: $artifact" }
+            $textures.Add([pscustomobject]@{ TextureId = $textureId; Artifact = $artifact; ArtifactBytes = $artifactBytes })
+        }
 
         $fields = [System.Collections.Generic.List[single]]::new($script:SceneArtifactFieldCount)
         $playerData = Get-SceneSpriteFields $player 'Scene.player' -HasMoveSpeed
@@ -190,7 +218,10 @@ function Parse-SceneDocument([string]$Path) {
             $goalData.TextureId,
             (Get-JsonTextureId (Get-RequiredJsonProperty $hazard 'textureId' $hazardExpected 'Scene.hazard') 'Scene.hazard.textureId')
         )
-        return [pscustomobject]@{ SchemaVersion = $schemaVersion; Fields = [single[]]$fields.ToArray(); TextureIds = $textureIds }
+        foreach ($textureId in $textureIds) { if (-not $textureIdsSet.Contains($textureId)) { throw "Scene object references undeclared textureId: $textureId" } }
+        $payloadBytes = $script:SceneArtifactV2PayloadBytes + 4
+        foreach ($texture in $textures) { $payloadBytes += 8 + $texture.ArtifactBytes.Length }
+        return [pscustomobject]@{ SchemaVersion = $schemaVersion; Fields = [single[]]$fields.ToArray(); TextureIds = $textureIds; Textures = $textures.ToArray(); PayloadBytes = $payloadBytes }
     } catch [System.Text.Json.JsonException] {
         throw "Failed to parse Scene JSON: $($_.Exception.Message)"
     } finally {
@@ -209,9 +240,15 @@ function Write-SceneArtifactAtomic([object]$Scene, [string]$Path) {
         $writer.Write([Text.Encoding]::ASCII.GetBytes($script:SceneArtifactMagic))
         $writer.Write([uint32]$script:SceneArtifactVersion)
         $writer.Write([uint32]$Scene.SchemaVersion)
-        $writer.Write([uint32]$script:SceneArtifactPayloadBytes)
+        $writer.Write([uint32]$Scene.PayloadBytes)
         foreach ($field in [single[]]$Scene.Fields) { $writer.Write([single]$field) }
         foreach ($textureId in [uint32[]]$Scene.TextureIds) { $writer.Write([uint32]$textureId) }
+        $writer.Write([uint32]$Scene.Textures.Count)
+        foreach ($texture in $Scene.Textures) {
+            $writer.Write([uint32]$texture.TextureId)
+            $writer.Write([uint32]$texture.ArtifactBytes.Length)
+            $writer.Write([byte[]]$texture.ArtifactBytes)
+        }
         $writer.Flush()
         $writer.Dispose(); $writer = $null
         $stream.Dispose(); $stream = $null
@@ -226,24 +263,24 @@ function Write-SceneArtifactAtomic([object]$Scene, [string]$Path) {
 $source = Resolve-SceneSource $SourcePath
 $scene = Parse-SceneDocument $source
 $destination = Resolve-SceneDestination $DestinationPath
-$artifactBytes = $script:SceneArtifactHeaderBytes + $script:SceneArtifactPayloadBytes
+$artifactBytes = $script:SceneArtifactHeaderBytes + $scene.PayloadBytes
 
 if ($DryRun) {
     $plan = [ordered]@{
         ImporterVersion = $script:SceneImporterVersion
         BakerVersion = $script:SceneBakerVersion
-        ToolVersion = 'kadath-scene-importer/2'
+        ToolVersion = 'kadath-scene-importer/3'
         Action = 'scene-import-bake'
         Profile = $Profile
         DryRun = $true
-        SourceFormat = 'KADATH-SCENE-JSON-V2'
+        SourceFormat = 'KADATH-SCENE-JSON-V3'
         ArtifactVersion = $script:SceneArtifactVersion
-        ArtifactFormat = 'KSCN-SCENE-V2'
+        ArtifactFormat = 'KSCN-SCENE-V3'
         SchemaVersion = $scene.SchemaVersion
         FieldCount = $script:SceneArtifactFieldCount
-        PayloadBytes = $script:SceneArtifactPayloadBytes
+        PayloadBytes = $scene.PayloadBytes
         ArtifactBytes = $artifactBytes
-        Transform = 'scene-json-to-kscn-v2'
+        Transform = 'scene-json-to-kscn-v3'
         Destination = 'generated-assets/scenes/preview.scene'
     }
     Write-Output ($plan | ConvertTo-Json -Depth 8 -Compress)
@@ -255,15 +292,15 @@ Write-SceneArtifactAtomic $scene $destination
 $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
 Write-Output "scene_importer_version=$($script:SceneImporterVersion)"
 Write-Output "scene_baker_version=$($script:SceneBakerVersion)"
-Write-Output 'tool_version=kadath-scene-importer/2'
+Write-Output 'tool_version=kadath-scene-importer/3'
 Write-Output "profile=$Profile"
-Write-Output 'source_format=KADATH-SCENE-JSON-V2'
+Write-Output 'source_format=KADATH-SCENE-JSON-V3'
 Write-Output "artifact_version=$($script:SceneArtifactVersion)"
-Write-Output 'artifact_format=KSCN-SCENE-V2'
+Write-Output 'artifact_format=KSCN-SCENE-V3'
 Write-Output "schema_version=$($scene.SchemaVersion)"
 Write-Output "field_count=$($script:SceneArtifactFieldCount)"
-Write-Output "payload_bytes=$($script:SceneArtifactPayloadBytes)"
-Write-Output 'transform=scene-json-to-kscn-v2'
+Write-Output "payload_bytes=$($scene.PayloadBytes)"
+Write-Output 'transform=scene-json-to-kscn-v3'
 Write-Output "artifact_bytes=$artifactBytes"
 Write-Output "sha256=$hash"
 Write-Output "artifact=$destination"

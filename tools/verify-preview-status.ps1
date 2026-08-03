@@ -58,7 +58,7 @@ try {
     Write-JsonDocument $sceneDocument $scene
     Start-Sleep -Milliseconds 900
     $invalidScene = $sceneDocument | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-    $invalidScene.schemaVersion = 3
+    $invalidScene.schemaVersion = 4
     Write-JsonDocument $invalidScene $scene
     Start-Sleep -Milliseconds 900
 

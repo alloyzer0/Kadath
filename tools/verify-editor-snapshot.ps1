@@ -44,12 +44,12 @@ try {
 
     $projectSnapshot = Invoke-Snapshot 'Project'
     if ([int]$projectSnapshot.ModelVersion -ne 1 -or [string]$projectSnapshot.ProjectName -ne $ProjectName) { throw 'Project snapshot contract mismatch' }
-    if ([int]$projectSnapshot.Scene.SchemaVersion -ne 2 -or [uint32]$projectSnapshot.Scene.PlayerTextureId -ne 1 -or [uint32]$projectSnapshot.Scene.GoalTextureId -ne 2 -or [uint32]$projectSnapshot.Scene.HazardTextureId -ne 1) { throw 'Project snapshot texture binding mismatch' }
+    if ([int]$projectSnapshot.Scene.SchemaVersion -ne 3 -or [uint32]$projectSnapshot.Scene.PlayerTextureId -ne 1 -or [uint32]$projectSnapshot.Scene.GoalTextureId -ne 2 -or [uint32]$projectSnapshot.Scene.HazardTextureId -ne 3 -or @($projectSnapshot.Scene.Textures).Count -ne 3) { throw 'Project snapshot texture set/binding mismatch' }
 
     $hierarchy = Invoke-Snapshot 'Hierarchy'
-    if ([int]$hierarchy.SnapshotVersion -ne 1 -or @($hierarchy.Nodes).Count -ne 8) { throw 'Hierarchy snapshot contract mismatch' }
+    if ([int]$hierarchy.SnapshotVersion -ne 1 -or @($hierarchy.Nodes).Count -ne 11) { throw 'Hierarchy snapshot contract mismatch' }
     if (@($hierarchy.Nodes | Where-Object { [string]::IsNullOrEmpty([string]$_.ParentId) }).Count -ne 3) { throw 'Hierarchy roots must use null parentId' }
-    foreach ($expected in @(@('scene.player', 1), @('scene.goal', 2), @('scene.hazard', 1))) {
+    foreach ($expected in @(@('scene.player', 1), @('scene.goal', 2), @('scene.hazard', 3))) {
         $node = @($hierarchy.Nodes | Where-Object { [string]$_.Id -ceq [string]$expected[0] })
         if ($node.Count -ne 1 -or [uint32]$node[0].Properties.TextureId -ne [uint32]$expected[1]) { throw "Hierarchy texture binding mismatch: $($expected[0])" }
     }
@@ -60,7 +60,7 @@ try {
 
     $scenePath = Join-Path $project 'scene.json'
     $scene = Get-Content -LiteralPath $scenePath -Raw -Encoding utf8 | ConvertFrom-Json
-    $scene.schemaVersion = 3
+    $scene.schemaVersion = 4
     [IO.File]::WriteAllText($scenePath, ($scene | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
     [void](Invoke-Snapshot 'Project' -ExpectFailure)
     [void](Invoke-Snapshot 'Hierarchy' -ExpectFailure)

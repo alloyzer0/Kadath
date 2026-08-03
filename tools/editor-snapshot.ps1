@@ -33,11 +33,12 @@ function Assert-EditorSnapshotProjectBoundary([string]$Root, [string]$Name) {
 
 function Assert-EditorSnapshotModelVersion([object]$Model) {
     if ([int]$Model.ModelVersion -ne 1 -or
-        [int]$Model.Scene.SchemaVersion -ne 2 -or
+        [int]$Model.Scene.SchemaVersion -ne 3 -or
         [int]$Model.Script.SchemaVersion -ne 1 -or
         [int]$Model.Preview.SchemaVersion -ne 1) {
         throw 'Snapshot project/model schema version is unsupported'
     }
+    if (@($Model.Scene.Textures).Count -lt 1 -or @($Model.Scene.Textures).Count -gt 4) { throw 'Snapshot Scene texture set is invalid' }
     if (@($Model.Scene.GoalPosition).Count -ne 2 -or
         @($Model.Script.GoalPosition).Count -ne 2 -or
         @($Model.Script.GoalVelocity).Count -ne 2) {
@@ -64,6 +65,5 @@ switch ($Target) {
 
 # stdout 只写一条压缩 JSON；Service 负责把它转换成稳定 Protocol DTO。
 $snapshot | ConvertTo-Json -Depth 16 -Compress
-
 
 

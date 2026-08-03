@@ -61,11 +61,11 @@ function Get-ExpectedTextureIds([string]$Path) {
 function Assert-SceneArtifact([string]$Path, [single[]]$ExpectedFields, [uint32[]]$ExpectedTextureIds) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Scene artifact does not exist: $Path" }
     [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -ne 140) { throw "Scene artifact size mismatch: expected=140 actual=$($bytes.Length)" }
+    if ($bytes.Length -ne 258) { throw "Scene artifact size mismatch: expected=258 actual=$($bytes.Length)" }
     if ([Text.Encoding]::ASCII.GetString($bytes, 0, 4) -cne 'KSCN') { throw 'Scene artifact magic mismatch' }
-    if ((Read-U32Le $bytes 4) -ne 2) { throw 'Scene artifact version mismatch' }
-    if ((Read-U32Le $bytes 8) -ne 2) { throw 'Scene artifact schema version mismatch' }
-    if ((Read-U32Le $bytes 12) -ne 124) { throw 'Scene artifact payload size mismatch' }
+    if ((Read-U32Le $bytes 4) -ne 3) { throw 'Scene artifact version mismatch' }
+    if ((Read-U32Le $bytes 8) -ne 3) { throw 'Scene artifact schema version mismatch' }
+    if ((Read-U32Le $bytes 12) -ne 242) { throw 'Scene artifact payload size mismatch' }
     if ($ExpectedFields.Count -ne 28) { throw 'Verifier expected field layout is invalid' }
     for ($index = 0; $index -lt $ExpectedFields.Count; $index++) {
         [single]$actual = [BitConverter]::ToSingle($bytes, 16 + ($index * 4))
@@ -98,10 +98,10 @@ try {
     $dry = Invoke-SceneImporter @('-SourcePath', $source, '-DestinationPath', $dryArtifact, '-Profile', 'debug', '-DryRun')
     if ($dry.Output.Count -eq 0) { throw 'Scene importer dry-run produced no plan' }
     $plan = $dry.Output[-1] | ConvertFrom-Json
-    if ([int]$plan.ImporterVersion -ne 2 -or [int]$plan.BakerVersion -ne 2 -or [string]$plan.ToolVersion -cne 'kadath-scene-importer/2') { throw 'Scene importer dry-run version/tool mismatch' }
+    if ([int]$plan.ImporterVersion -ne 3 -or [int]$plan.BakerVersion -ne 3 -or [string]$plan.ToolVersion -cne 'kadath-scene-importer/3') { throw 'Scene importer dry-run version/tool mismatch' }
     if ([string]$plan.Action -cne 'scene-import-bake' -or [string]$plan.Profile -cne 'debug' -or -not [bool]$plan.DryRun) { throw 'Scene importer dry-run action/profile mismatch' }
-    if ([string]$plan.ArtifactFormat -cne 'KSCN-SCENE-V2' -or [int]$plan.SchemaVersion -ne 2 -or [int]$plan.FieldCount -ne 28 -or [int]$plan.PayloadBytes -ne 124 -or [int]$plan.ArtifactBytes -ne 140) { throw 'Scene importer dry-run artifact contract mismatch' }
-    if ([string]$plan.Transform -cne 'scene-json-to-kscn-v2') { throw 'Scene importer dry-run transform mismatch' }
+    if ([string]$plan.ArtifactFormat -cne 'KSCN-SCENE-V3' -or [int]$plan.SchemaVersion -ne 3 -or [int]$plan.FieldCount -ne 28 -or [int]$plan.PayloadBytes -ne 242 -or [int]$plan.ArtifactBytes -ne 258) { throw 'Scene importer dry-run artifact contract mismatch' }
+    if ([string]$plan.Transform -cne 'scene-json-to-kscn-v3') { throw 'Scene importer dry-run transform mismatch' }
     if (Test-Path -LiteralPath $output) { throw 'Scene importer dry-run created an output directory or artifact' }
 
     [void](Invoke-SceneImporter @('-SourcePath', $source, '-DestinationPath', $debugArtifact, '-Profile', 'debug'))
@@ -113,7 +113,7 @@ try {
     $inputDirectory = Join-Path $output 'invalid-inputs'
     $invalidSchemaPath = Join-Path $inputDirectory 'invalid-schema.scene.json'
     $invalidSchema = Get-Content -LiteralPath $source -Raw -Encoding utf8 | ConvertFrom-Json
-    $invalidSchema.schemaVersion = 3
+    $invalidSchema.schemaVersion = 4
     Write-JsonFile $invalidSchema $invalidSchemaPath
     $invalidSchemaArtifact = Join-Path $output 'invalid-artifacts\invalid-schema.scene'
     [void](Invoke-SceneImporter @('-SourcePath', $invalidSchemaPath, '-DestinationPath', $invalidSchemaArtifact, '-Profile', 'debug') -ExpectFailure)
@@ -135,6 +135,14 @@ try {
     [void](Invoke-SceneImporter @('-SourcePath', $invalidTexturePath, '-DestinationPath', $invalidTextureArtifact, '-Profile', 'debug') -ExpectFailure)
     if (Test-Path -LiteralPath $invalidTextureArtifact) { throw 'Invalid texture binding left a Scene artifact' }
 
+    $invalidTexturePathPath = Join-Path $inputDirectory 'invalid-texture-path.scene.json'
+    $invalidTexturePathDocument = Get-Content -LiteralPath $source -Raw -Encoding utf8 | ConvertFrom-Json
+    $invalidTexturePathDocument.textures[0].artifact = 'assets/renderer2d/nested/../test.texture'
+    Write-JsonFile $invalidTexturePathDocument $invalidTexturePathPath
+    $invalidTexturePathArtifact = Join-Path $output 'invalid-artifacts\invalid-texture-path.scene'
+    [void](Invoke-SceneImporter @('-SourcePath', $invalidTexturePathPath, '-DestinationPath', $invalidTexturePathArtifact, '-Profile', 'debug') -ExpectFailure)
+    if (Test-Path -LiteralPath $invalidTexturePathArtifact) { throw 'Invalid texture artifact path left a Scene artifact' }
+
     $debugHashBeforeOverwrite = (Get-FileHash -LiteralPath $debugArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
     [void](Invoke-SceneImporter @('-SourcePath', $source, '-DestinationPath', $debugArtifact, '-Profile', 'debug') -ExpectFailure)
     $debugHashAfterOverwrite = (Get-FileHash -LiteralPath $debugArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -149,15 +157,15 @@ try {
     $sourceHashAfter = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($sourceHashBefore -cne $sourceHashAfter) { throw 'Scene importer changed the source document' }
 
-    Write-Output 'scene_importer_version=2'
-    Write-Output 'scene_baker_version=2'
-    Write-Output 'artifact_format=KSCN-SCENE-V2'
-    Write-Output 'artifact_version=2'
-    Write-Output 'schema_version=2'
+    Write-Output 'scene_importer_version=3'
+    Write-Output 'scene_baker_version=3'
+    Write-Output 'artifact_format=KSCN-SCENE-V3'
+    Write-Output 'artifact_version=3'
+    Write-Output 'schema_version=3'
     Write-Output 'field_count=28'
     Write-Output 'texture_binding_count=3'
-    Write-Output 'payload_bytes=124'
-    Write-Output 'artifact_bytes=140'
+    Write-Output 'payload_bytes=242'
+    Write-Output 'artifact_bytes=258'
     Write-Output 'dry_run=ok'
     Write-Output 'debug_artifact=ok'
     Write-Output 'release_artifact=ok'

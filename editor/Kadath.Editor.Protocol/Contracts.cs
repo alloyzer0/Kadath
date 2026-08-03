@@ -129,7 +129,10 @@ public sealed record ProjectModelScene(
     double[] GoalPosition,
     uint PlayerTextureId,
     uint GoalTextureId,
-    uint HazardTextureId);
+    uint HazardTextureId,
+    IReadOnlyList<ProjectModelTexture>? Textures = null);
+
+public sealed record ProjectModelTexture(uint TextureId, string Artifact);
 
 public sealed record ProjectModelScript(
     int SchemaVersion,

@@ -406,6 +406,14 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         switch (snapshot)
         {
             case ProjectModelSnapshot model:
+                var sceneModel = model.Scene;
+                var textures = sceneModel?.Textures;
+                var textureSetValid = sceneModel is not null && textures is { Count: >= 1 and <= 4 }
+                    && textures.All(texture => texture.TextureId != 0 && IsTextureArtifactPath(texture.Artifact))
+                    && textures.Select(texture => texture.TextureId).Distinct().Count() == textures.Count
+                    && textures.Any(texture => texture.TextureId == sceneModel.PlayerTextureId)
+                    && textures.Any(texture => texture.TextureId == sceneModel.GoalTextureId)
+                    && textures.Any(texture => texture.TextureId == sceneModel.HazardTextureId);
                 if (model is null || model.Files is null || model.Scene is null || model.Script is null || model.Preview is null
                     || model.Scene.GoalPosition is null || model.Script.GoalPosition is null || model.Script.GoalVelocity is null
                     // Revision 是 authoring transaction 的并发令牌，非法值必须在跨越 backend seam 前被拒绝。
@@ -413,10 +421,8 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion != 2
-                    || model.Scene.PlayerTextureId is not 1 and not 2
-                    || model.Scene.GoalTextureId is not 1 and not 2
-                    || model.Scene.HazardTextureId is not 1 and not 2
+                    || model.Scene.SchemaVersion != 3
+                    || !textureSetValid
                     || model.Script.SchemaVersion != 1
                     || model.Preview.SchemaVersion != 1
                     || !string.Equals(model.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
@@ -495,6 +501,19 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
                 throw new EditorOperationException("snapshot_protocol_error", "Unknown snapshot DTO.");
         }
     }
+
+    private static bool IsTextureArtifactPath(string artifact)
+    {
+        if (string.IsNullOrEmpty(artifact) || System.Text.Encoding.UTF8.GetByteCount(artifact) > 255
+            || !artifact.StartsWith("assets/renderer2d/", StringComparison.Ordinal)
+            || !artifact.EndsWith(".texture", StringComparison.Ordinal)
+            || artifact.Contains('\\'))
+        {
+            return false;
+        }
+        return artifact.Split('/').All(segment => segment.Length > 0 && segment is not "." and not "..");
+    }
+
     private static void ValidatePublicationTarget(PublicationTargetSnapshot target, string expectedTarget)
     {
         if (target is null || !string.Equals(target.Target, expectedTarget, StringComparison.Ordinal)
@@ -596,9 +615,9 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         ValidateVector(patch.SceneGoalPosition, "scene.goal.position");
         ValidateVector(patch.ScriptGoalPosition, "script.goal.position");
         ValidateVector(patch.ScriptGoalVelocity, "script.goal.velocity");
-        ValidateTextureId(patch.ScenePlayerTextureId, "scene.player.textureId");
-        ValidateTextureId(patch.SceneGoalTextureId, "scene.goal.textureId");
-        ValidateTextureId(patch.SceneHazardTextureId, "scene.hazard.textureId");
+        ValidateTextureId(current.Scene, patch.ScenePlayerTextureId, "scene.player.textureId");
+        ValidateTextureId(current.Scene, patch.SceneGoalTextureId, "scene.goal.textureId");
+        ValidateTextureId(current.Scene, patch.SceneHazardTextureId, "scene.hazard.textureId");
         var scene = patch.SceneGoalPosition is not null && !patch.SceneGoalPosition.SequenceEqual(current.Scene.GoalPosition) ? patch.SceneGoalPosition : null;
         var scriptGoal = patch.ScriptGoalPosition is not null && !patch.ScriptGoalPosition.SequenceEqual(current.Script.GoalPosition) ? patch.ScriptGoalPosition : null;
         var velocity = patch.ScriptGoalVelocity is not null && !patch.ScriptGoalVelocity.SequenceEqual(current.Script.GoalVelocity) ? patch.ScriptGoalVelocity : null;
@@ -622,9 +641,13 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         }
     }
 
-    private static void ValidateTextureId(uint? value, string field)
+    private static void ValidateTextureId(ProjectModelScene scene, uint? value, string field)
     {
-        if (value is not null && value is not 1 and not 2) { throw new EditorOperationException("invalid_authoring_patch", $"{field} must be 1 or 2."); }
+        if (value is not null && value <= 0) { throw new EditorOperationException("invalid_authoring_patch", $"{field} must be a non-zero TextureId."); }
+        if (value is not null && scene.Textures is { Count: > 0 } && !scene.Textures.Any(texture => texture.TextureId == value))
+        {
+            throw new EditorOperationException("invalid_authoring_patch", $"{field} must reference a TextureId declared by the Scene texture set.");
+        }
     }
 
     private static string[] GetChangedFields(AuthoringPatch patch)
@@ -752,10 +775,5 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 
     private sealed record PowerShellResult(int ExitCode, string[] Stdout, string[] Stderr);
 }
-
-
-
-
-
 
 

@@ -65,10 +65,10 @@ function Get-ArtifactInfo([string]$Path, [ValidateSet('Scene', 'Script')][string
     # 这里仅验证 magic/version/布局并计算摘要，不对 artifact 做任何写入。
     [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
     if ($Kind -eq 'Scene') {
-        if ($bytes.Length -ne 140 -or [Text.Encoding]::ASCII.GetString($bytes, 0, 4) -cne 'KSCN') {
+        if ($bytes.Length -lt 144 -or [Text.Encoding]::ASCII.GetString($bytes, 0, 4) -cne 'KSCN') {
             throw 'Scene artifact layout mismatch'
         }
-        if ([BitConverter]::ToUInt32($bytes, 4) -ne 2 -or [BitConverter]::ToUInt32($bytes, 8) -ne 2 -or [BitConverter]::ToUInt32($bytes, 12) -ne 124) {
+        if ([BitConverter]::ToUInt32($bytes, 4) -ne 3 -or [BitConverter]::ToUInt32($bytes, 8) -ne 3 -or [BitConverter]::ToUInt32($bytes, 12) -ne ($bytes.Length - 16)) {
             throw 'Scene artifact header mismatch'
         }
     }

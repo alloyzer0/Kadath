@@ -166,7 +166,7 @@ pub const Host = struct {
             break :blk loaded.value;
         } else script_api.Program{};
 
-        var prepared_textures = try runtime_texture_registry.prepareDefault(io, std.heap.page_allocator);
+        var prepared_textures = try runtime_texture_registry.prepareScene(io, std.heap.page_allocator, &scene);
         defer prepared_textures.deinit();
 
         var platform = try Platform.init();
@@ -487,11 +487,22 @@ pub const Host = struct {
             return error.MissingScenePath;
         };
         const candidate = try scene_api.load(self.io, std.heap.page_allocator, path);
-        try validateSceneTextureBindings(&self.texture_registry, &candidate);
-        // 关键事务边界：完整新 World 成功后才替换旧 World，解析/创建失败不会破坏当前运行场景。
+        var prepared_textures = try runtime_texture_registry.prepareScene(self.io, std.heap.page_allocator, &candidate);
+        defer prepared_textures.deinit();
+        var candidate_registry = try runtime_texture_registry.RuntimeTextureRegistry.initPrepared(
+            std.heap.page_allocator,
+            &self.renderer2d,
+            &self.rhi,
+            &prepared_textures,
+        );
+        errdefer candidate_registry.deinit(&self.rhi);
+        try validateSceneTextureBindings(&candidate_registry, &candidate);
+        // 关键事务边界：候选纹理集合与完整新 World 都成功后，才同时替换旧 Registry/Scene/World。
         const replacement = try spawnSceneWorld(&candidate, self.world_extent);
         var previous_world = self.world;
+        var previous_registry = self.texture_registry;
         self.world = replacement.world;
+        self.texture_registry = candidate_registry.take();
         self.scene = candidate;
         self.sprite_entity = replacement.player_entity;
         self.goal_entity = replacement.goal_entity;
@@ -503,6 +514,7 @@ pub const Host = struct {
         self.accumulator_seconds = 0.0;
         self.render_count = 0;
         previous_world.deinit();
+        previous_registry.deinit(&self.rhi);
         self.resetScript() catch |err| self.disableScript(err);
         std.log.info("Scene reloaded explicitly: player={d}, goal={d}, hazard={d}", .{
             self.sprite_entity,
@@ -653,10 +665,12 @@ pub const Host = struct {
 test "scene texture bindings must resolve before world replacement" {
     var registry = runtime_texture_registry.RuntimeTextureRegistry{
         .allocator = std.testing.allocator,
-        .handles = .{ rhi.invalid_texture, rhi.invalid_texture },
+        .specs = scene_api.default_scene.textures.entries,
+        .handles = [_]rhi.TextureHandle{rhi.invalid_texture} ** scene_api.max_texture_count,
+        .count = scene_api.default_scene.textures.count,
     };
     var scene = scene_api.default_scene;
     try validateSceneTextureBindings(&registry, &scene);
-    scene.hazard.textureId = 3;
+    scene.hazard.textureId = 4;
     try std.testing.expectError(error.UnknownWorldTexture, validateSceneTextureBindings(&registry, &scene));
 }

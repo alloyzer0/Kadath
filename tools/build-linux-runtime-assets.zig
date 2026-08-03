@@ -133,11 +133,13 @@ fn downsample(
 
 fn buildSceneArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     const scene = try scene_api.parse(allocator, json);
-    const artifact = try allocator.alloc(u8, 140);
+    var payload_bytes: usize = 124 + 4;
+    for (scene.textures.slice()) |texture| payload_bytes += 8 + texture.artifact().len;
+    const artifact = try allocator.alloc(u8, 16 + payload_bytes);
     @memcpy(artifact[0..4], "KSCN");
     putU32(artifact[4..8], scene_api.scene_artifact_version);
     putU32(artifact[8..12], scene.schemaVersion);
-    putU32(artifact[12..16], 124);
+    putU32(artifact[12..16], @intCast(payload_bytes));
     const values = [_]f32{
         scene.player.position[0], scene.player.position[1], scene.player.size[0],     scene.player.size[1],
         scene.player.color[0],    scene.player.color[1],    scene.player.color[2],    scene.player.color[3],
@@ -151,6 +153,16 @@ fn buildSceneArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     putU32(artifact[128..132], scene.player.textureId);
     putU32(artifact[132..136], scene.goal.textureId);
     putU32(artifact[136..140], scene.hazard.textureId);
+    var cursor: usize = 140;
+    putU32(artifact[cursor..][0..4], scene.textures.count);
+    cursor += 4;
+    for (scene.textures.slice()) |texture| {
+        putU32(artifact[cursor..][0..4], texture.textureId);
+        putU32(artifact[cursor + 4 ..][0..4], @intCast(texture.artifact().len));
+        cursor += 8;
+        @memcpy(artifact[cursor .. cursor + texture.artifact().len], texture.artifact());
+        cursor += texture.artifact().len;
+    }
     return artifact;
 }
 
@@ -239,10 +251,11 @@ test "scene and script artifacts preserve their frozen disk ABI" {
     defer std.testing.allocator.free(scene);
     const script = try buildScriptArtifact(std.testing.allocator, script_json);
     defer std.testing.allocator.free(script);
-    try std.testing.expectEqual(@as(usize, 140), scene.len);
+    try std.testing.expectEqual(@as(usize, 258), scene.len);
     try std.testing.expectEqual(@as(u32, 1), readU32(scene[128..132]));
     try std.testing.expectEqual(@as(u32, 2), readU32(scene[132..136]));
-    try std.testing.expectEqual(@as(u32, 1), readU32(scene[136..140]));
+    try std.testing.expectEqual(@as(u32, 3), readU32(scene[136..140]));
+    try std.testing.expectEqual(@as(u32, 3), readU32(scene[140..144]));
     try std.testing.expectEqual(@as(usize, 48), script.len);
     try std.testing.expectEqualSlices(u8, "KSCN", scene[0..4]);
     try std.testing.expectEqualSlices(u8, "KSCP", script[0..4]);

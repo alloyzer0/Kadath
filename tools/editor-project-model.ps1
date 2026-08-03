@@ -76,6 +76,7 @@ function Read-EditorProjectModel([string]$PackageRoot, [string]$Name) {
             PlayerTextureId = [uint32]$scene.player.textureId
             GoalTextureId = [uint32]$scene.goal.textureId
             HazardTextureId = [uint32]$scene.hazard.textureId
+            Textures = @($scene.textures | ForEach-Object { [pscustomobject]@{ TextureId = [uint32]$_.textureId; Artifact = [string]$_.artifact } })
         }
         Script = [pscustomobject]@{
             SchemaVersion = [int]$scriptDocument.schemaVersion
@@ -133,8 +134,15 @@ function Get-EditorHierarchySnapshot([object]$Model) {
 
     $nodes.Add((New-EditorHierarchyNode 'scene' $null 'Scene' 'SceneDocument' ([ordered]@{
         SchemaVersion = [int]$scene.schemaVersion
+        TextureCount = @($scene.textures).Count
         File = $Model.Files.Scene
     })))
+    foreach ($texture in @($scene.textures)) {
+        $nodes.Add((New-EditorHierarchyNode "scene.textures[$([uint32]$texture.textureId)]" 'scene' "Texture $([uint32]$texture.textureId)" 'TextureReference' ([ordered]@{
+            TextureId = [uint32]$texture.textureId
+            Artifact = [string]$texture.artifact
+        })))
+    }
     $nodes.Add((New-EditorHierarchyNode 'scene.player' 'scene' 'Player' 'Sprite' ([ordered]@{
         Position = Convert-EditorVectorToText $scene.player.position
         Size = Convert-EditorVectorToText $scene.player.size

@@ -346,9 +346,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
     private static uint ParseTextureId(string value, string field)
     {
-        if (!uint.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var textureId) || textureId is not 1 and not 2)
+        if (!uint.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var textureId) || textureId == 0)
         {
-            throw new EditorRpcException("invalid_authoring_patch", $"{field} 必须为 1 或 2。");
+            throw new EditorRpcException("invalid_authoring_patch", $"{field} 必须为非零 TextureId。");
         }
         return textureId;
     }
@@ -558,7 +558,6 @@ public sealed class DelegateUiCommand : ICommand
     public bool CanExecute(object? parameter) => true;
     public void Execute(object? parameter) => _execute();
 }
-
 
 
 

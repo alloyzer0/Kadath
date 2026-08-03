@@ -548,11 +548,11 @@ internal static class Program
         var assetSnapshot = await client.GetAssetCatalogSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var publicationSnapshot = await client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, "debug")).ConfigureAwait(false);
         Assert(projectSnapshot.ModelVersion == 1 && hierarchySnapshot.SnapshotVersion == 1, "real service snapshot version mismatch");
-        Assert(projectSnapshot.Scene.SchemaVersion == 2
-            && projectSnapshot.Scene.PlayerTextureId is 1 or 2
-            && projectSnapshot.Scene.GoalTextureId is 1 or 2
-            && projectSnapshot.Scene.HazardTextureId is 1 or 2, "real service scene texture snapshot mismatch");
-        Assert(hierarchySnapshot.Nodes.Length == 8, "real service hierarchy snapshot count mismatch");
+        Assert(projectSnapshot.Scene.SchemaVersion == 3
+            && projectSnapshot.Scene.Textures is { Count: 3 }
+            && projectSnapshot.Scene.Textures.Any(texture => texture.TextureId == 3)
+            && projectSnapshot.Scene.HazardTextureId == 3, "real service scene texture snapshot mismatch");
+        Assert(hierarchySnapshot.Nodes.Length == 11, "real service hierarchy snapshot count mismatch");
         Assert(assetSnapshot.CatalogVersion == 1 && assetSnapshot.ItemCount == assetSnapshot.Items.Length, "real service asset snapshot mismatch");
         Assert(projectSnapshot.AuthoringRevision.Length == 64, "real service authoring revision mismatch");
         Assert(publicationSnapshot.SnapshotVersion == EditorSnapshotVersions.Publication, "real service publication snapshot version mismatch");
@@ -1450,7 +1450,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
             $"{packageRoot}/bin/projects/{projectName}/scene.json",
             $"{packageRoot}/bin/projects/{projectName}/script.json",
             $"{packageRoot}/bin/projects/{projectName}/preview.json"),
-        new ProjectModelScene(2, [3d, 4d], 1, 2, 1),
+        new ProjectModelScene(3, [3d, 4d], 1, 2, 3, [new ProjectModelTexture(1, "assets/renderer2d/test.texture"), new ProjectModelTexture(2, "assets/renderer2d/goal.texture"), new ProjectModelTexture(3, "assets/renderer2d/goal.texture")]),
         new ProjectModelScript(1, [3d, 4d], [1d, 0d]),
         new ProjectModelPreview(1));
 
@@ -1469,10 +1469,13 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         1,
         projectName,
         [
-            new HierarchyNode("scene", null, "Scene", "SceneDocument", Props(("SchemaVersion", 2))),
+            new HierarchyNode("scene", null, "Scene", "SceneDocument", Props(("SchemaVersion", 3), ("TextureCount", 3))),
+            new HierarchyNode("scene.textures[1]", "scene", "Texture 1", "TextureReference", Props(("TextureId", 1), ("Artifact", "assets/renderer2d/test.texture"))),
+            new HierarchyNode("scene.textures[2]", "scene", "Texture 2", "TextureReference", Props(("TextureId", 2), ("Artifact", "assets/renderer2d/goal.texture"))),
+            new HierarchyNode("scene.textures[3]", "scene", "Texture 3", "TextureReference", Props(("TextureId", 3), ("Artifact", "assets/renderer2d/goal.texture"))),
             new HierarchyNode("scene.player", "scene", "Player", "Sprite", Props(("Position", "0, 0"), ("TextureId", 1))),
             new HierarchyNode("scene.goal", "scene", "Goal", "Sprite", Props(("Position", "3, 4"), ("TextureId", 2))),
-            new HierarchyNode("scene.hazard", "scene", "Hazard", "Sprite", Props(("Position", "5, 6"), ("TextureId", 1))),
+            new HierarchyNode("scene.hazard", "scene", "Hazard", "Sprite", Props(("Position", "5, 6"), ("TextureId", 3))),
             new HierarchyNode("script", null, "Script", "ScriptDocument", Props(("InstructionCount", 2))),
             new HierarchyNode("script.instructions[0]", "script", "Instruction 0", "HookInstruction", Props(("Hook", "on_start"))),
             new HierarchyNode("script.instructions[1]", "script", "Instruction 1", "HookInstruction", Props(("Hook", "fixed_update"))),

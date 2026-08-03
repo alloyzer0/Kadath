@@ -40,11 +40,12 @@ try {
 
     $before = Read-EditorProjectModel -PackageRoot $package -Name $ProjectName
     if ($before.AuthoringRevision -notmatch '^[0-9a-f]{64}$') { throw 'Initial authoring revision is not SHA-256.' }
+    if (@($before.Scene.Textures).Count -ne 3 -or @($before.Scene.Textures | ForEach-Object { [uint32]$_.TextureId }) -notcontains 3) { throw 'Project Snapshot did not expose the Scene texture set.' }
     $sceneBefore = [IO.File]::ReadAllText($before.Files.Scene)
     $scriptBefore = [IO.File]::ReadAllText($before.Files.Script)
     $nextX = [double]$before.Scene.GoalPosition[0] + 7.0
     $nextY = [double]$before.Scene.GoalPosition[1] - 3.0
-    $nextPlayerTextureId = if ([uint32]$before.Scene.PlayerTextureId -eq 1) { [uint32]2 } else { [uint32]1 }
+    $nextPlayerTextureId = [uint32]3
     $nextGoalTextureId = if ([uint32]$before.Scene.GoalTextureId -eq 1) { [uint32]2 } else { [uint32]1 }
     $nextHazardTextureId = if ([uint32]$before.Scene.HazardTextureId -eq 1) { [uint32]2 } else { [uint32]1 }
 
@@ -65,6 +66,7 @@ try {
     }
     Write-Output 'revision_apply=ok'
     Write-Output 'scene_texture_binding_transaction=ok'
+    Write-Output 'scene_texture_set_snapshot=ok'
 
     $sceneAfter = [IO.File]::ReadAllText($after.Files.Scene)
     $scriptAfter = [IO.File]::ReadAllText($after.Files.Script)
@@ -76,6 +78,12 @@ try {
         throw 'Revision conflict changed an authoring source.'
     }
     Write-Output 'revision_conflict=ok'
+
+    $invalidTextureOutput = @(& pwsh -NoProfile -File $author -Action Update -PackageRoot $package -ProjectName $ProjectName `
+        -ExpectedRevision $after.AuthoringRevision -ScenePlayerTextureId 4 2>&1)
+    if ($LASTEXITCODE -eq 0 -or ($invalidTextureOutput -join "`n") -notmatch 'not declared') { throw 'Undeclared Scene TextureId was not rejected.' }
+    if ([IO.File]::ReadAllText($after.Files.Scene) -ne $sceneAfter) { throw 'Undeclared TextureId rejection changed the Scene source.' }
+    Write-Output 'undeclared_scene_texture_rejected=ok'
 
     # 关键事务边界：使用当前 revision 同时改 Scene/Script，结果必须只暴露一个新的 pair revision。
     $pairOutput = @(& pwsh -NoProfile -File $author -Action Update -PackageRoot $package -ProjectName $ProjectName `

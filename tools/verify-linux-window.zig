@@ -394,11 +394,13 @@ fn writeLittleF32(destination: []u8, value: f32) void {
 }
 
 fn writeSceneFixture(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !void {
-    var artifact: [140]u8 = @splat(0);
+    const primary = "assets/renderer2d/test.texture";
+    const secondary = "assets/renderer2d/goal.texture";
+    var artifact: [258]u8 = @splat(0);
     @memcpy(artifact[0..4], "KSCN");
-    writeLittleU32(artifact[4..8], 2);
-    writeLittleU32(artifact[8..12], 2);
-    writeLittleU32(artifact[12..16], 124);
+    writeLittleU32(artifact[4..8], 3);
+    writeLittleU32(artifact[8..12], 3);
+    writeLittleU32(artifact[12..16], 242);
     const values = [_]f32{
         312, 130, 320, 240,  1,    1,    1,    1,   180,
         700, 200, 96,  96,   1,    0.75, 0.10, 1,   650,
@@ -408,7 +410,22 @@ fn writeSceneFixture(io: std.Io, allocator: std.mem.Allocator, directory: []cons
     for (values, 0..) |value, index| writeLittleF32(artifact[16 + index * 4 ..][0..4], value);
     writeLittleU32(artifact[128..132], 2);
     writeLittleU32(artifact[132..136], 1);
-    writeLittleU32(artifact[136..140], 2);
+    writeLittleU32(artifact[136..140], 3);
+    var cursor: usize = 140;
+    writeLittleU32(artifact[cursor..][0..4], 3);
+    cursor += 4;
+    const entries = [_]struct { id: u32, path: []const u8 }{
+        .{ .id = 1, .path = primary },
+        .{ .id = 2, .path = secondary },
+        .{ .id = 3, .path = secondary },
+    };
+    for (entries) |entry| {
+        writeLittleU32(artifact[cursor..][0..4], entry.id);
+        writeLittleU32(artifact[cursor + 4 ..][0..4], @intCast(entry.path.len));
+        cursor += 8;
+        @memcpy(artifact[cursor .. cursor + entry.path.len], entry.path);
+        cursor += entry.path.len;
+    }
     const path = try std.fs.path.join(allocator, &.{ directory, "preview.scene" });
     defer allocator.free(path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &artifact });

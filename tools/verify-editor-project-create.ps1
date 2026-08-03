@@ -375,10 +375,15 @@ try {
 
     $sceneTemplate = @'
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
+  "textures": [
+    { "textureId": 1, "artifact": "assets/renderer2d/test.texture" },
+    { "textureId": 2, "artifact": "assets/renderer2d/goal.texture" },
+    { "textureId": 3, "artifact": "assets/renderer2d/goal.texture" }
+  ],
   "player": { "position": [312.0, 130.0], "size": [320.0, 240.0], "color": [1.0, 1.0, 1.0, 1.0], "moveSpeed": 180.0, "textureId": 1 },
   "goal": { "position": [700.0, 200.0], "size": [96.0, 96.0], "color": [1.0, 0.75, 0.1, 1.0], "textureId": 2 },
-  "hazard": { "position": [650.0, 280.0], "size": [96.0, 96.0], "color": [0.95, 0.2, 0.2, 1.0], "patrolMinY": 245.0, "patrolMaxY": 330.0, "patrolSpeed": 80.0, "textureId": 1 }
+  "hazard": { "position": [650.0, 280.0], "size": [96.0, 96.0], "color": [0.95, 0.2, 0.2, 1.0], "patrolMinY": 245.0, "patrolMaxY": 330.0, "patrolSpeed": 80.0, "textureId": 3 }
 }
 '@
     $scriptTemplate = @'

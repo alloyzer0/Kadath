@@ -130,14 +130,36 @@ function Assert-SceneSprite([object]$Sprite, [string]$Name) {
     $textureId = Get-RequiredProperty $Sprite 'textureId' $Name
     $integerTypes = @([sbyte], [byte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
     $isInteger = $null -ne ($integerTypes | Where-Object { $_.IsInstanceOfType($textureId) } | Select-Object -First 1)
-    if (-not $isInteger -or [uint64]$textureId -lt 1 -or [uint64]$textureId -gt 2) { throw "$Name.textureId must be 1 or 2" }
+    if (-not $isInteger -or [uint64]$textureId -lt 1 -or [uint64]$textureId -gt [uint32]::MaxValue) { throw "$Name.textureId must be a non-zero u32" }
+}
+
+function Test-TextureArtifactPath([string]$Artifact) {
+    if ([string]::IsNullOrEmpty($Artifact) -or [Text.Encoding]::UTF8.GetByteCount($Artifact) -gt 255) { return $false }
+    if (-not $Artifact.StartsWith('assets/renderer2d/', [StringComparison]::Ordinal) -or
+        -not $Artifact.EndsWith('.texture', [StringComparison]::Ordinal) -or
+        $Artifact.Contains('\')) { return $false }
+    foreach ($segment in $Artifact.Split('/')) {
+        if ($segment.Length -eq 0 -or $segment -eq '.' -or $segment -eq '..') { return $false }
+    }
+    return $true
 }
 
 function Validate-SceneDocument([object]$Scene) {
-    Assert-Properties $Scene @('schemaVersion', 'player', 'goal', 'hazard') 'Scene'
+    Assert-Properties $Scene @('schemaVersion', 'textures', 'player', 'goal', 'hazard') 'Scene'
     $schemaVersion = Get-RequiredProperty $Scene 'schemaVersion' 'Scene'
     if ($schemaVersion -isnot [int] -and $schemaVersion -isnot [long]) { throw 'Scene schemaVersion must be an integer' }
-    if ([int64]$schemaVersion -ne 2) { throw "Unsupported Scene schemaVersion: $schemaVersion" }
+    if ([int64]$schemaVersion -ne 3) { throw "Unsupported Scene schemaVersion: $schemaVersion" }
+
+    $textures = @(Get-RequiredProperty $Scene 'textures' 'Scene')
+    if ($textures.Count -lt 1 -or $textures.Count -gt 4) { throw 'Scene.textures must contain 1 to 4 entries' }
+    $textureIds = [Collections.Generic.HashSet[uint32]]::new()
+    foreach ($texture in $textures) {
+        Assert-Properties $texture @('textureId', 'artifact') 'Scene.textures[]'
+        $textureId = Get-RequiredProperty $texture 'textureId' 'Scene.textures[]'
+        if ([uint64]$textureId -lt 1 -or [uint64]$textureId -gt [uint32]::MaxValue -or -not $textureIds.Add([uint32]$textureId)) { throw 'Scene.textures textureId must be unique non-zero u32' }
+        $artifact = [string](Get-RequiredProperty $texture 'artifact' 'Scene.textures[]')
+        if (-not (Test-TextureArtifactPath $artifact)) { throw 'Scene.textures artifact path is invalid' }
+    }
 
     $player = Get-RequiredProperty $Scene 'player' 'Scene'
     $goal = Get-RequiredProperty $Scene 'goal' 'Scene'
@@ -149,6 +171,7 @@ function Validate-SceneDocument([object]$Scene) {
     Assert-SceneSprite $player 'Scene.player'
     Assert-SceneSprite $goal 'Scene.goal'
     Assert-SceneSprite $hazard 'Scene.hazard'
+    foreach ($sprite in @($player, $goal, $hazard)) { if (-not $textureIds.Contains([uint32]$sprite.textureId)) { throw 'Scene sprite textureId is not declared by Scene.textures' } }
 
     $moveSpeed = Assert-Finite (Get-RequiredProperty $player 'moveSpeed' 'Scene.player') 'Scene.player.moveSpeed'
     if ($moveSpeed -lt 0.0) { throw 'Scene.player.moveSpeed must be non-negative' }
@@ -435,7 +458,7 @@ switch ($Action) {
         if ((Test-ProvidedFloat $SceneGoalX) -xor (Test-ProvidedFloat $SceneGoalY)) { throw 'SceneGoalX and SceneGoalY must be supplied together' }
         if ((Test-ProvidedFloat $ScriptGoalX) -xor (Test-ProvidedFloat $ScriptGoalY)) { throw 'ScriptGoalX and ScriptGoalY must be supplied together' }
         if ((Test-ProvidedFloat $ScriptVelocityX) -xor (Test-ProvidedFloat $ScriptVelocityY)) { throw 'ScriptVelocityX and ScriptVelocityY must be supplied together' }
-        foreach ($textureId in @($ScenePlayerTextureId, $SceneGoalTextureId, $SceneHazardTextureId)) { if ($textureId -ne 0 -and $textureId -notin @(1, 2)) { throw 'Scene texture ids must be 1 or 2' } }
+        foreach ($textureId in @($ScenePlayerTextureId, $SceneGoalTextureId, $SceneHazardTextureId)) { if ($textureId -lt 0) { throw 'Scene texture ids must be non-negative u32 values' } }
         if (-not ($hasScene -or $hasSceneTexture -or $hasScriptGoal -or $hasScriptVelocity)) { throw 'Update requires at least one editable field' }
 
         $originalScene = [IO.File]::ReadAllText($files.Scene)

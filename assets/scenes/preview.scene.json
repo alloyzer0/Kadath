@@ -1,5 +1,10 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
+  "textures": [
+    { "textureId": 1, "artifact": "assets/renderer2d/test.texture" },
+    { "textureId": 2, "artifact": "assets/renderer2d/goal.texture" },
+    { "textureId": 3, "artifact": "assets/renderer2d/goal.texture" }
+  ],
   "player": {
     "position": [312.0, 130.0],
     "size": [320.0, 240.0],
@@ -20,6 +25,6 @@
     "patrolMinY": 245.0,
     "patrolMaxY": 330.0,
     "patrolSpeed": 80.0,
-    "textureId": 1
+    "textureId": 3
   }
 }

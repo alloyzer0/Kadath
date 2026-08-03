@@ -135,10 +135,10 @@ try {
     })
     $artifactLogs = @($events | Where-Object {
         $_.event -eq 'runtime_log' -and
-        [string]$_.message -match 'Loaded preview scene artifact: .*artifact_version=2'
+        [string]$_.message -match 'Loaded preview scene artifact: .*artifact_version=3'
     })
     if ($artifactLogs.Count -ne 1) {
-        throw "Expected one KSCN artifact load log with artifact_version=2, got $($artifactLogs.Count)"
+        throw "Expected one KSCN artifact load log with artifact_version=3, got $($artifactLogs.Count)"
     }
 
     $exitEvents = @($events | Where-Object {
