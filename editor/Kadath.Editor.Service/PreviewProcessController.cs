@@ -48,7 +48,8 @@ internal sealed class PreviewProcessController : IAsyncDisposable
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
-            RedirectStandardError = true
+            RedirectStandardError = true,
+            RedirectStandardInput = true
         };
         Add(startInfo, "-NoProfile"); Add(startInfo, "-File"); Add(startInfo, launcherPath);
         Add(startInfo, "-ConfigPath"); Add(startInfo, configPath);
@@ -87,9 +88,23 @@ internal sealed class PreviewProcessController : IAsyncDisposable
     {
         Process? process; int? runtimePid;
         lock (_gate) { process = _launcher; runtimePid = _runtimeProcessId; _stopRequested = true; }
+        if (process is not null && !process.HasExited)
+        {
+            try
+            {
+                await process.StandardInput.WriteLineAsync("{\"schemaVersion\":1,\"command\":\"shutdown\"}").ConfigureAwait(false);
+                await process.StandardInput.FlushAsync().ConfigureAwait(false);
+                process.StandardInput.Close();
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+            catch (InvalidOperationException) { }
+        }
         if (process is not null && !process.HasExited && runtimePid.HasValue && NativePreviewWindow.TryClose(runtimePid.Value))
         {
-            try { using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10)); await process.WaitForExitAsync(timeout.Token); }
+            try { using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2)); await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false); }
             catch (OperationCanceledException) { }
         }
         if (process is not null && !process.HasExited) { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(); }

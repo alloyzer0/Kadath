@@ -19,7 +19,7 @@ function Resolve-ExistingDirectory([string]$Path, [string]$Name) {
 function Resolve-PackageFile([string]$Root, [string]$RelativePath, [string]$Name) {
     if ([IO.Path]::IsPathRooted($RelativePath)) { throw "$Name must be relative to package root" }
     $fullPath = [IO.Path]::GetFullPath((Join-Path $Root $RelativePath))
-    $prefix = $Root.TrimEnd('\') + '\'
+    $prefix = $Root.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     # 关键安全边界：协议 smoke 只允许修改隔离分发包内的 Scene/Script。
     if (-not $fullPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw "$Name escapes package root" }
     if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "$Name does not exist: $RelativePath" }
@@ -73,12 +73,15 @@ try {
     if (-not $process.WaitForExit(15000)) { throw 'Preview did not exit after StopAfterMilliseconds' }
     $lines = @(Get-Content -LiteralPath $stdoutPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $events = @($lines | ForEach-Object { try { $_ | ConvertFrom-Json } catch { throw "Invalid JSONL output: $_" } })
-    $responses = @($events | Where-Object { $_.event -eq 'command_response' })
-    $requested = @($events | Where-Object { $_.event -eq 'command_requested' })
+    $responses = @($events | Where-Object { $_.event -eq 'command_response' -and $_.command -in @('reload_scene', 'reload_script') })
+    $requested = @($events | Where-Object { $_.event -eq 'command_requested' -and $_.command -in @('reload_scene', 'reload_script') })
+    $shutdownResponses = @($events | Where-Object { $_.event -eq 'command_response' -and $_.command -eq 'shutdown' })
     $runtimeReady = @($events | Where-Object { $_.event -eq 'runtime_ready' })
     $runtimeStopping = @($events | Where-Object { $_.event -eq 'runtime_stopping' })
     if ($runtimeReady.Count -ne 1) { throw "Expected one runtime_ready event, got $($runtimeReady.Count)" }
     if ($runtimeStopping.Count -ne 1) { throw "Expected one runtime_stopping event, got $($runtimeStopping.Count)" }
+    if ([string]$runtimeStopping[0].reason -cne 'control_shutdown') { throw "Expected control_shutdown stopping reason, got $($runtimeStopping[0].reason)" }
+    if ($shutdownResponses.Count -ne 1 -or [string]$shutdownResponses[0].result -cne 'succeeded') { throw 'Structured shutdown completion evidence missing' }
     if ($requested.Count -ne 4 -or $responses.Count -ne 4) { throw "Expected four requested/responses, got $($requested.Count)/$($responses.Count)" }
     if (($responses | Where-Object { $_.result -eq 'succeeded' }).Count -ne 2) { throw 'Expected two successful reload responses' }
     if (($responses | Where-Object { $_.result -eq 'rejected' }).Count -ne 2) { throw 'Expected two rejected reload responses' }

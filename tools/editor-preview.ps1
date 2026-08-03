@@ -35,8 +35,10 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 public static class KadathPreviewNative {
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -68,6 +70,26 @@ public static class KadathPreviewNative {
             return true;
         }, IntPtr.Zero);
         return result;
+    }
+}
+
+public static class KadathPreviewControlInput {
+    private static readonly ConcurrentQueue<string> Lines = new ConcurrentQueue<string>();
+    private static int started;
+
+    public static void Start() {
+        if (Interlocked.Exchange(ref started, 1) != 0) return;
+        Thread thread = new Thread(delegate() {
+            string line;
+            while ((line = Console.In.ReadLine()) != null) Lines.Enqueue(line);
+        });
+        thread.IsBackground = true;
+        thread.Name = "KadathPreviewControlInput";
+        thread.Start();
+    }
+
+    public static bool TryRead(out string line) {
+        return Lines.TryDequeue(out line);
     }
 }
 "@
@@ -137,6 +159,7 @@ function Start-RuntimeProcess([string]$Executable, [string]$WorkingDirectory, [s
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardInput = $true
     foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -151,6 +174,35 @@ function Get-RuntimeReloadTarget([string]$Command) {
     if ($Command -eq 'reload_scene') { return 'Scene' }
     if ($Command -eq 'reload_script') { return 'Script' }
     return $null
+}
+
+function Send-RuntimeControlCommand([Diagnostics.Process]$Process, [uint64]$RequestId, [string]$Command) {
+    if ($Process.HasExited) { throw "Runtime exited before $Command could be sent" }
+    $line = [ordered]@{ schemaVersion = 1; requestId = $RequestId; command = $Command } | ConvertTo-Json -Compress
+    $Process.StandardInput.WriteLine($line)
+    $Process.StandardInput.Flush()
+}
+
+function Test-LauncherShutdownRequested {
+    if (-not $script:structuredStatus) { return $false }
+    $line = $null
+    if (-not [KadathPreviewControlInput]::TryRead([ref]$line)) { return $false }
+    try { $request = $line | ConvertFrom-Json } catch {
+        Write-StructuredEvent ([ordered]@{ event = 'protocol_error'; message = 'Launcher received invalid control JSONL' })
+        return $false
+    }
+    try {
+        $schemaVersion = [int](Get-RequiredProperty $request 'schemaVersion' 'Launcher control')
+        $command = [string](Get-RequiredProperty $request 'command' 'Launcher control')
+    } catch {
+        Write-StructuredEvent ([ordered]@{ event = 'protocol_error'; message = 'Launcher received incomplete control command' })
+        return $false
+    }
+    if ($schemaVersion -ne 1 -or $command -cne 'shutdown') {
+        Write-StructuredEvent ([ordered]@{ event = 'protocol_error'; message = 'Launcher received unsupported control command' })
+        return $false
+    }
+    return $true
 }
 
 function New-RuntimeReloadEvent(
@@ -428,6 +480,22 @@ function Get-RuntimeWindow([Diagnostics.Process]$Process, [string]$Operation) {
 }
 function Request-RuntimeClose([Diagnostics.Process]$Process) {
     if ($Process.HasExited) { return }
+    if ($script:structuredStatus) {
+        $requestId = Get-NextRequestId
+        $script:pendingRequests[[string]$requestId] = [pscustomobject]@{
+            command = 'shutdown'; target = $null; source = 'lifecycle'; revision = $null
+            artifactRevision = $null; artifactBytes = $null; sentAt = [DateTime]::UtcNow
+        }
+        try {
+            Send-RuntimeControlCommand $Process $requestId 'shutdown'
+            Write-StructuredEvent ([ordered]@{ event = 'command_requested'; requestId = $requestId; command = 'shutdown'; source = 'lifecycle' })
+            $Process.StandardInput.Close()
+        } catch {
+            $script:pendingRequests.Remove([string]$requestId)
+            throw
+        }
+        return
+    }
     $windowHandle = Get-RuntimeWindow $Process "close"
     if ($windowHandle -eq [IntPtr]::Zero) { return }
 
@@ -448,10 +516,7 @@ function Request-RuntimeStructuredReload(
     if ($Process.HasExited) { return }
     $target = Get-RuntimeReloadTarget $Command
     if ($null -eq $target) { throw "Unsupported structured reload command: $Command" }
-    $windowHandle = Get-RuntimeWindow $Process "$Command command"
-    if ($windowHandle -eq [IntPtr]::Zero) { return }
     $requestId = Get-NextRequestId
-    $message = if ($Command -eq 'reload_scene') { 0x84D0 } else { 0x84D1 }
     $script:pendingRequests[[string]$requestId] = [pscustomobject]@{
         command = $Command
         target = $target
@@ -461,10 +526,12 @@ function Request-RuntimeStructuredReload(
         artifactBytes = if ($ArtifactBytes -gt 0) { $ArtifactBytes } else { $null }
         sentAt = [DateTime]::UtcNow
     }
-    # 关键关联边界：requestId 通过 WM_APP 进入 Runtime，并在 JSONL 终态响应中原样返回。
-    if (-not [KadathPreviewNative]::PostMessage($windowHandle, $message, [IntPtr][long]$requestId, [IntPtr]::Zero)) {
+    # 关键关联边界：requestId 通过跨平台 stdin JSONL 进入 Runtime，并在 stdout JSONL 终态响应中原样返回。
+    try {
+        Send-RuntimeControlCommand $Process $requestId $Command
+    } catch {
         $script:pendingRequests.Remove([string]$requestId)
-        throw "Failed to post structured $Command command"
+        throw
     }
     $event = [ordered]@{ event = 'command_requested'; requestId = $requestId; command = $Command; source = $Source }
     if (-not [string]::IsNullOrWhiteSpace($Revision)) { $event['revision'] = $Revision }
@@ -755,7 +822,10 @@ if ($LiveBake) {
 
 if ($StructuredStatus) {
     if ($arguments -contains '--preview-status') { throw 'Preview config must not supply --preview-status when StructuredStatus is enabled' }
+    if ($arguments -contains '--preview-control') { throw 'Preview config must not supply --preview-control when StructuredStatus is enabled' }
     $arguments += '--preview-status'
+    $arguments += 'jsonl-v1'
+    $arguments += '--preview-control'
     $arguments += 'jsonl-v1'
 }
 
@@ -799,6 +869,7 @@ $process = $null
 try {
     $process = Start-RuntimeProcess $executable $workingDirectory $arguments
     Write-PreviewOutput "runtime_pid=$($process.Id)"
+    if ($StructuredStatus) { [KadathPreviewControlInput]::Start() }
 
     $startedAt = [DateTime]::UtcNow
     $scriptReloadSent = $false
@@ -811,6 +882,11 @@ try {
     while (-not $process.HasExited) {
         Drain-RuntimeOutput
         Expire-PendingRequests
+        if (Test-LauncherShutdownRequested) {
+            Request-RuntimeClose $process
+            $closeRequested = $true
+            break
+        }
         $now = [DateTime]::UtcNow
         $elapsedMilliseconds = [int]($now - $startedAt).TotalMilliseconds
         if ($ReloadScriptAfterMilliseconds -gt 0 -and -not $scriptReloadSent -and $elapsedMilliseconds -ge $ReloadScriptAfterMilliseconds) {
@@ -827,7 +903,7 @@ try {
             $closeRequested = $true
             break
         }
-        if (-not $WatchChanges -and $StopAfterMilliseconds -eq 0 -and $ReloadScriptAfterMilliseconds -eq 0) {
+        if (-not $StructuredStatus -and -not $WatchChanges -and $StopAfterMilliseconds -eq 0 -and $ReloadScriptAfterMilliseconds -eq 0) {
             $process.WaitForExit()
             break
         }

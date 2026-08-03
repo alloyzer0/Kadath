@@ -1,44 +1,13 @@
 const std = @import("std");
 const Host = @import("host.zig").Host;
+const PreviewControl = @import("preview_control.zig").PreviewControl;
 const PreviewStatus = @import("preview_status").PreviewStatus;
-
-const RuntimeOptions = struct {
-    scene_path: ?[]const u8 = null,
-    script_path: ?[]const u8 = null,
-    preview_status_jsonl: bool = false,
-};
-
-fn parseRuntimeOptions(args: []const [:0]const u8) !RuntimeOptions {
-    var options = RuntimeOptions{};
-    var index: usize = 1;
-    while (index < args.len) : (index += 1) {
-        if (std.mem.eql(u8, args[index], "--scene")) {
-            if (options.scene_path != null) return error.DuplicateRuntimeArgument;
-            index += 1;
-            if (index >= args.len) return error.MissingRuntimeArgumentValue;
-            options.scene_path = args[index];
-        } else if (std.mem.eql(u8, args[index], "--script")) {
-            if (options.script_path != null) return error.DuplicateRuntimeArgument;
-            index += 1;
-            if (index >= args.len) return error.MissingRuntimeArgumentValue;
-            options.script_path = args[index];
-        } else if (std.mem.eql(u8, args[index], "--preview-status")) {
-            if (options.preview_status_jsonl) return error.DuplicateRuntimeArgument;
-            index += 1;
-            if (index >= args.len) return error.MissingRuntimeArgumentValue;
-            if (!std.mem.eql(u8, args[index], "jsonl-v1")) return error.UnsupportedPreviewStatus;
-            options.preview_status_jsonl = true;
-        } else {
-            return error.UnknownRuntimeArgument;
-        }
-    }
-    return options;
-}
+const runtime_options = @import("runtime_options.zig");
 pub fn main(init: std.process.Init) !void {
     std.log.info("Kadath runtime startup", .{});
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const options = parseRuntimeOptions(args) catch |err| {
+    const options = runtime_options.parse(args) catch |err| {
         std.log.err("Runtime argument parsing failed: {s}", .{@errorName(err)});
         return err;
     };
@@ -51,12 +20,24 @@ pub fn main(init: std.process.Init) !void {
     };
     defer host.deinit();
 
+    var preview_control = PreviewControl.init(init.io, options.preview_control_jsonl) catch |err| {
+        preview_status.runtimeFailed("preview_control", err);
+        std.log.err("Preview control startup failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    var wait_for_control_reader = false;
+    defer preview_control.deinit(wait_for_control_reader);
+
     // Host 完整初始化成功后才一次性发布两类内容身份；任一加载失败都不会留下半套 ready 数据。
     preview_status.runtimeReady(host.initialLoaded());
-    host.run() catch |err| {
+    const exit_reason = host.run(&preview_control) catch |err| {
         preview_status.runtimeFailed("runtime_loop", err);
         std.log.err("Runtime loop failed: {s}", .{@errorName(err)});
         return err;
     };
-    preview_status.runtimeStopping("window_close");
+    wait_for_control_reader = exit_reason == .control_shutdown;
+    preview_status.runtimeStopping(switch (exit_reason) {
+        .window_close => "window_close",
+        .control_shutdown => "control_shutdown",
+    });
 }

@@ -165,12 +165,12 @@ pub const Platform = struct {
                 self.restart_down = is_down;
             },
             c.VK_F5 => {
-                // F5 仍是手动 Scene reload；自动 watcher 使用独立 WM_APP requestId 命令，不与按键状态混淆。
+                // F5 仍是手动 Scene reload；WM_APP 只为旧 Windows Launcher 保留兼容。
                 if (is_down and !self.reload_down) self.reload_pressed = true;
                 self.reload_down = is_down;
             },
             c.VK_F6 => {
-                // F6 仍是手动 ScriptReload；结构化 Launcher 命令通过 WM_APP 携带 requestId。
+                // F6 仍是手动 Script reload；WM_APP 只为旧 Windows Launcher 保留兼容。
                 if (is_down and !self.script_reload_down) self.script_reload_pressed = true;
                 self.script_reload_down = is_down;
             },

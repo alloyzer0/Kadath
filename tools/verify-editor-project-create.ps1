@@ -393,7 +393,8 @@ try {
     # 48 KiB whitespace 在放大并发写入窗口的同时，保证完整 Scene 仍低于 Runtime 文档的 64 KiB 预算。
     [IO.File]::WriteAllText((Join-Path $sceneAssets 'preview.scene.json'), $sceneTemplate + (' ' * $SceneTemplatePaddingBytes), [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $scriptAssets 'preview.script.json'), $scriptTemplate, [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $fixtureRoot 'bin/kadath.exe'), 'verifier runtime placeholder', [Text.UTF8Encoding]::new($false))
+    $runtimeName = if ($IsWindows) { 'kadath.exe' } else { 'kadath' }
+    [IO.File]::WriteAllText((Join-Path $fixtureRoot "bin/$runtimeName"), 'verifier runtime placeholder', [Text.UTF8Encoding]::new($false))
 
     $projectsRoot = Join-Path $fixtureRoot 'bin/projects'
     for ($attempt = 1; $attempt -le $ConcurrentAttemptLimit; $attempt++) {
@@ -612,7 +613,7 @@ namespace Kadath.Editor.Verification
             project.ProjectName,
             new string('1', 64),
             new ProjectModelFiles(project.ProjectDirectory, project.ScenePath, project.ScriptPath, project.PreviewPath),
-            new ProjectModelScene(1, new[] { 0d, 0d }),
+            new ProjectModelScene(1, new[] { 0d, 0d }, 1, 2, 1),
             new ProjectModelScript(1, new[] { 0d, 0d }, new[] { 0d, 0d }),
             new ProjectModelPreview(1));
 

@@ -15,7 +15,7 @@ pub const InputSnapshot = extern struct {
     script_reload_pressed: u8 = 0,
 };
 
-// Preview 机器命令使用 WM_APP 私有区间；具体传输仅属于 Windows Platform 物理装配。
+// WM_APP 只保留为旧 Windows Launcher 的兼容 Adapter；新机器控制走 app PreviewControl stdin JSONL。
 pub const preview_reload_scene_message: u32 = 0x84D0;
 pub const preview_reload_script_message: u32 = 0x84D1;
 

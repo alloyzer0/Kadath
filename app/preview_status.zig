@@ -31,11 +31,13 @@ pub const InitialLoaded = struct {
 pub const Command = enum {
     reload_scene,
     reload_script,
+    shutdown,
 
     fn protocolName(self: Command) []const u8 {
         return switch (self) {
             .reload_scene => "reload_scene",
             .reload_script => "reload_script",
+            .shutdown => "shutdown",
         };
     }
 };
@@ -197,6 +199,7 @@ test "protocol error codes stay stable" {
 test "command names stay stable" {
     try std.testing.expectEqualStrings("reload_scene", Command.reload_scene.protocolName());
     try std.testing.expectEqualStrings("reload_script", Command.reload_script.protocolName());
+    try std.testing.expectEqualStrings("shutdown", Command.shutdown.protocolName());
 }
 
 test "disabled status channel is inert" {

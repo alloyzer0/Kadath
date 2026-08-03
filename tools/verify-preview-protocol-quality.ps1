@@ -19,7 +19,7 @@ function Resolve-ExistingDirectory([string]$Path, [string]$Name) {
 function Resolve-PackageFile([string]$Root, [string]$RelativePath, [string]$Name) {
     if ([IO.Path]::IsPathRooted($RelativePath)) { throw "$Name must be relative to package root" }
     $fullPath = [IO.Path]::GetFullPath((Join-Path $Root $RelativePath))
-    $prefix = $Root.TrimEnd('\') + '\'
+    $prefix = $Root.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     if (-not $fullPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw "$Name escapes package root" }
     if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "$Name does not exist: $RelativePath" }
     return $fullPath
@@ -89,7 +89,8 @@ try {
     $reloadStale = @($events | Where-Object { $_.event -eq 'runtime_reload_stale' })
     if ($runtimeReady.Count -ne 1) { throw "Expected one runtime_ready, got $($runtimeReady.Count)" }
     if ($runtimeStopping.Count -ne 1) { throw "Expected one runtime_stopping, got $($runtimeStopping.Count)" }
-    if ($received.Count -ne 4 -or $completed.Count -ne 4 -or $responses.Count -ne 4) { throw "Expected 4 received/completed/responses, got $($received.Count)/$($completed.Count)/$($responses.Count)" }
+    if ($received.Count -ne 5 -or $completed.Count -ne 5 -or $responses.Count -ne 5) { throw "Expected 5 received/completed/responses including shutdown, got $($received.Count)/$($completed.Count)/$($responses.Count)" }
+    if ([string]$runtimeStopping[0].reason -cne 'control_shutdown') { throw "Expected control_shutdown stopping reason, got $($runtimeStopping[0].reason)" }
     if ($reloadRequested.Count -ne 4 -or $reloadAcknowledged.Count -ne 2 -or $reloadFailed.Count -ne 2 -or $reloadStale.Count -ne 0) {
         throw "Expected reload requested/ack/failed/stale=4/2/2/0, got $($reloadRequested.Count)/$($reloadAcknowledged.Count)/$($reloadFailed.Count)/$($reloadStale.Count)"
     }
@@ -144,8 +145,9 @@ try {
         $responseId = [uint64]$response.requestId
         if (-not $receivedById.ContainsKey([string]$responseId)) { throw "Launcher response has no requestId: $responseId" }
     }
-    if (@($completed | Where-Object { $_.result -eq 'succeeded' }).Count -ne 2) { throw 'Expected two succeeded completions' }
+    if (@($completed | Where-Object { $_.result -eq 'succeeded' }).Count -ne 3) { throw 'Expected two reload successes and one shutdown success' }
     if (@($completed | Where-Object { $_.result -eq 'rejected' }).Count -ne 2) { throw 'Expected two rejected completions' }
+    if (@($completed | Where-Object { $_.command -eq 'shutdown' -and $_.result -eq 'succeeded' }).Count -ne 1) { throw 'Shutdown completion missing' }
     if (@($completed | Where-Object { $null -ne $_.PSObject.Properties['errorCode'] -and $_.errorCode -eq 'UnsupportedSceneSchema' }).Count -ne 1) { throw 'Scene rejection error code missing' }
     if (@($completed | Where-Object { $null -ne $_.PSObject.Properties['errorCode'] -and $_.errorCode -eq 'UnsupportedScriptSchema' }).Count -ne 1) { throw 'Script rejection error code missing' }
     if ($process.ExitCode -ne 0) { throw "Runtime exited with code $($process.ExitCode)" }

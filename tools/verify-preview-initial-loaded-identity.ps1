@@ -62,7 +62,7 @@ try {
     if ($null -ne $loaded.PSObject.Properties['requestId']) { throw 'Initial identity must not be disguised as requestId=0 reload' }
 
     $targets = @(
-        [pscustomobject]@{ Name = 'scene'; Path = Join-Path $root 'bin\assets\scenes\preview.scene'; Bytes = 128 },
+        [pscustomobject]@{ Name = 'scene'; Path = Join-Path $root 'bin\assets\scenes\preview.scene'; Bytes = 140 },
         [pscustomobject]@{ Name = 'script'; Path = Join-Path $root 'bin\assets\scripts\preview.script'; Bytes = 48 }
     )
     foreach ($target in $targets) {

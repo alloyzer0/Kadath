@@ -57,6 +57,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const preview_control_mod = b.createModule(.{
+        .root_source_file = b.path("app/preview_control.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const runtime_options_mod = b.createModule(.{
+        .root_source_file = b.path("app/runtime_options.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const world_mod = b.createModule(.{
         .root_source_file = b.path("modules/world/src/main.zig"),
@@ -244,8 +254,18 @@ pub fn build(b: *std.Build) void {
         .root_module = preview_status_mod,
     });
     const preview_status_test_run = b.addRunArtifact(preview_status_tests);
+    const preview_control_tests = b.addTest(.{
+        .root_module = preview_control_mod,
+    });
+    const preview_control_test_run = b.addRunArtifact(preview_control_tests);
+    const runtime_options_tests = b.addTest(.{
+        .root_module = runtime_options_mod,
+    });
+    const runtime_options_test_run = b.addRunArtifact(runtime_options_tests);
     const test_step = b.step("test", "Run Preview protocol unit tests");
     test_step.dependOn(&preview_status_test_run.step);
+    test_step.dependOn(&preview_control_test_run.step);
+    test_step.dependOn(&runtime_options_test_run.step);
 
     const null_rhi_mod = b.createModule(.{
         .root_source_file = b.path("modules/rhi/src/null.zig"),

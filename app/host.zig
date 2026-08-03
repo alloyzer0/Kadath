@@ -7,6 +7,7 @@ const runtime_texture_registry = @import("runtime_texture_registry.zig");
 const scene_api = @import("scene.zig");
 const script_api = @import("script.zig");
 const preview_status_api = @import("preview_status");
+const preview_control_api = @import("preview_control.zig");
 const Platform = @import("platform").Platform;
 const PlatformExtent = @import("platform").WindowExtent;
 const InputSnapshot = @import("platform").InputSnapshot;
@@ -272,19 +273,38 @@ pub const Host = struct {
                 std.log.err("Script reload rejected; keeping current program: {s}", .{@errorName(err)});
                 return;
             },
+            .shutdown => unreachable,
         }
         self.preview_status.commandSucceeded(command, request_id);
     }
 
-    pub fn run(self: *Host) !void {
+    pub const ExitReason = enum {
+        window_close,
+        control_shutdown,
+    };
+
+    pub fn run(self: *Host, preview_control: *preview_control_api.PreviewControl) !ExitReason {
         std.log.info("Runtime main loop entered", .{});
 
         while (!self.quit_requested) {
+            while (preview_control.poll()) |command| {
+                switch (command.kind) {
+                    .reload_scene => self.processReloadCommand(.reload_scene, command.request_id),
+                    .reload_script => self.processReloadCommand(.reload_script, command.request_id),
+                    .shutdown => {
+                        self.preview_status.commandReceived(.shutdown, command.request_id);
+                        self.preview_status.commandSucceeded(.shutdown, command.request_id);
+                        self.quit_requested = true;
+                        std.log.info("Runtime control shutdown requested", .{});
+                        return .control_shutdown;
+                    },
+                }
+            }
             const events = self.platform.pumpEvents();
             if (events.quit_requested) {
                 self.quit_requested = true;
                 std.log.info("Runtime exit requested", .{});
-                break;
+                return .window_close;
             }
             if (events.scene_reload_request_id) |request_id| {
                 self.processReloadCommand(.reload_scene, request_id);
@@ -315,6 +335,7 @@ pub const Host = struct {
             self.endFrame(now, delta);
             self.platform.sleepMilliseconds(1);
         }
+        return .window_close;
     }
 
     fn submitRender(self: *Host) !void {

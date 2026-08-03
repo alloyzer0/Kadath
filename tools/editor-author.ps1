@@ -378,10 +378,11 @@ switch ($Action) {
             [IO.File]::Copy($sceneTemplate, $files.Scene)
             [IO.File]::Copy($scriptTemplate, $files.Script)
             $projectRelative = "projects/$ProjectName"
+            $runtimeExecutable = if ($IsWindows) { 'bin/kadath.exe' } else { 'bin/kadath' }
             $preview = [ordered]@{
                 schemaVersion = 1
                 runtime = [ordered]@{
-                    executable = 'bin/kadath.exe'
+                    executable = $runtimeExecutable
                     workingDirectory = 'bin'
                     arguments = @('--scene', "$projectRelative/scene.json", '--script', "$projectRelative/script.json")
                 }

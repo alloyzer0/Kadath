@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "runtime": {
+    "executable": "bin/kadath",
+    "workingDirectory": "bin",
+    "arguments": ["--scene", "assets/scenes/preview.scene", "--script", "assets/scripts/preview.script"]
+  }
+}
