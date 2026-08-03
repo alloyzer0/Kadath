@@ -637,7 +637,8 @@ internal static class Program
         var project = await workspace.OpenProjectAsync(new ProjectOpenParameters("C:/package", "demo"));
         await workspace.RefreshSnapshotsAsync("demo");
         Assert(workspace.ProjectSnapshot.State == EditorSnapshotState.Ready && workspace.ProjectSnapshot.Value?.ModelVersion == 1, "project snapshot state mismatch");
-        Assert(workspace.HierarchySnapshot.Value?.Nodes.Length == 8, "hierarchy snapshot count mismatch");
+        var hierarchyNodeCount = workspace.HierarchySnapshot.Value?.Nodes.Length;
+        Assert(hierarchyNodeCount == 11, $"hierarchy snapshot count mismatch: expected=11 actual={hierarchyNodeCount?.ToString() ?? "null"}");
         Assert(workspace.AssetCatalogSnapshot.Value?.ItemCount == 12, "asset catalog snapshot count mismatch");
         Assert(workspace.Publication.State == EditorPublicationState.Current && workspace.Publication.RecommendedBakeTarget is null, "publication snapshot current state mismatch");
 
@@ -693,7 +694,7 @@ internal static class Program
 
         var baked = await workspace.BakeAsync(new BakeStartParameters("Both", "debug"));
         Assert(baked.State == "succeeded" && workspace.Bake.State == EditorBakeState.Succeeded, "bake state mismatch");
-        Assert(workspace.Bake.SceneArtifactBytes == 258, "scene artifact bytes were not retained");
+        Assert(workspace.Bake.SceneArtifactBytes == baked.SceneArtifactBytes && baked.SceneArtifactBytes == 128, "scene artifact bytes were not retained");
         var lastSuccessfulRevision = workspace.Bake.SceneArtifactRevision;
 
         var watched = await workspace.StartWatchAsync(new WatchStartParameters("Scene", "debug", 50, 100));

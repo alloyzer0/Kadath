@@ -819,6 +819,59 @@ namespace Kadath.Editor.Verification
             throw "RPC-created project Validate failed: exit=$rpcValidateExitCode diagnostics=$(@($rpcValidateDiagnostics | ForEach-Object { $_.ToString() }) -join ' | ')"
         }
 
+        $rpcProjectDirectory = Join-Path $fixtureRoot "bin/projects/$rpcProjectName"
+        $rpcScenePath = Join-Path $rpcProjectDirectory 'scene.json'
+        $rpcPreviewPath = Join-Path $rpcProjectDirectory 'preview.json'
+        $rpcSceneBytes = [IO.File]::ReadAllBytes($rpcScenePath)
+        [IO.File]::Delete($rpcScenePath)
+        $script:rpcStage = 'project_validate_missing_source_error'
+        Send-RpcJson $serviceProcess ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'validate-missing-source-1'; method = 'project_validate'; params = [ordered]@{} })
+        $missingSourceResponse = Read-RpcMessage $serviceProcess
+        [IO.File]::WriteAllBytes($rpcScenePath, $rpcSceneBytes)
+        if ([string]$missingSourceResponse.type -ne 'response' -or [string]$missingSourceResponse.id -ne 'validate-missing-source-1' -or
+            [bool]$missingSourceResponse.ok -or [string]$missingSourceResponse.error.code -ne 'project_validation_failed') {
+            throw "Missing source Validate error mapping mismatch: $($missingSourceResponse | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        $rpcPreviewBytes = [IO.File]::ReadAllBytes($rpcPreviewPath)
+        $rpcPreviewText = [Text.Encoding]::UTF8.GetString($rpcPreviewBytes)
+        $expectedSceneArgument = "projects/$rpcProjectName/scene.json"
+        $invalidPreviewText = $rpcPreviewText.Replace($expectedSceneArgument, '../../outside.json')
+        if ($invalidPreviewText -eq $rpcPreviewText) { throw 'RPC Preview fixture did not contain the expected Scene argument.' }
+        [IO.File]::WriteAllText($rpcPreviewPath, $invalidPreviewText, [Text.UTF8Encoding]::new($false))
+        $script:rpcStage = 'project_validate_preview_escape_error'
+        Send-RpcJson $serviceProcess ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'validate-preview-escape-1'; method = 'project_validate'; params = [ordered]@{} })
+        $previewEscapeResponse = Read-RpcMessage $serviceProcess
+        [IO.File]::WriteAllBytes($rpcPreviewPath, $rpcPreviewBytes)
+        if ([string]$previewEscapeResponse.type -ne 'response' -or [string]$previewEscapeResponse.id -ne 'validate-preview-escape-1' -or
+            [bool]$previewEscapeResponse.ok -or [string]$previewEscapeResponse.error.code -ne 'project_validation_failed') {
+            throw "Preview escape Validate error mapping mismatch: $($previewEscapeResponse | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        $script:rpcStage = 'failed_create_preserves_session'
+        Send-RpcJson $serviceProcess ([ordered]@{
+            schemaVersion = 1
+            type = 'request'
+            id = 'create-invalid-name-1'
+            method = 'project_create'
+            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = '../invalid' }
+        })
+        $failedCreate = Read-RpcMessage $serviceProcess
+        if ([string]$failedCreate.type -ne 'response' -or [string]$failedCreate.id -ne 'create-invalid-name-1' -or
+            [bool]$failedCreate.ok -or [string]$failedCreate.error.code -ne 'invalid_project_name') {
+            throw "Failed Create error mapping mismatch: $($failedCreate | ConvertTo-Json -Compress -Depth 6)"
+        }
+
+        Send-RpcJson $serviceProcess ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'validate-after-failed-create-1'; method = 'project_validate'; params = [ordered]@{} })
+        $validatedAfterFailureEvent = Read-RpcMessage $serviceProcess
+        $validatedAfterFailureResponse = Read-RpcMessage $serviceProcess
+        if ([string]$validatedAfterFailureEvent.event -ne 'project_validated' -or
+            [string]$validatedAfterFailureEvent.data.projectName -ne $rpcProjectName -or
+            -not [bool]$validatedAfterFailureResponse.ok -or
+            [string]$validatedAfterFailureResponse.result.projectName -ne $rpcProjectName) {
+            throw 'Failed Create replaced the current Service session.'
+        }
+
         $script:rpcStage = 'shutdown'
         Send-RpcJson $serviceProcess ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'create-shutdown-1'; method = 'shutdown'; params = $null })
         $shutdownResponse = Read-RpcMessage $serviceProcess
@@ -834,6 +887,8 @@ namespace Kadath.Editor.Verification
         Write-Output 'rpc_project_created_before_response=ok'
         Write-Output 'rpc_project_session_info=ok'
         Write-Output 'rpc_project_create_validate=ok'
+        Write-Output 'rpc_project_validate_error_mapping=ok'
+        Write-Output 'rpc_project_create_failure_preserves_session=ok'
     }
     finally {
         if ($null -ne $serviceProcess) {
@@ -856,501 +911,9 @@ namespace Kadath.Editor.Verification
         }
     }
 
-    $fakeKadathRoot = Join-Path $fixtureRoot 'fake-kadath-root'
-    $fakeToolsRoot = Join-Path $fakeKadathRoot 'tools'
-    New-Item -ItemType Directory -Path $fakeToolsRoot | Out-Null
-    $fakePreview = @'
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$ConfigPath,
+    Write-Output 'native_project_lifecycle_workspace_verifier=ok'
 
-    [Parameter(Mandatory = $true)]
-    [string]$PackageRoot,
-
-    [switch]$StructuredStatus,
-    [int]$StopAfterMilliseconds = 0,
-    [int]$ReloadScriptAfterMilliseconds = 0,
-    [switch]$WatchChanges,
-    [int]$PollIntervalMilliseconds = 100,
-    [int]$DebounceMilliseconds = 250,
-    [switch]$LiveBake,
-    [string]$BakeProfile = 'debug',
-    [string]$DerivedDirectory = ''
-)
-
-$fakeRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$runMarker = Join-Path $fakeRoot 'preview-run.marker'
-if (Test-Path -LiteralPath $runMarker -PathType Leaf) {
-    # 运行模式只在显式 preview_stop 杀死 Launcher 后退出，并产生一条可交错的 preview_status。
-    Write-Output '{"origin":"fake-preview","state":"running"}'
-    while ($true) { Start-Sleep -Milliseconds 50 }
-}
-
-# 失败模式同时产生 stdout/status 与 stderr/log，随后立即以非零退出触发 requested=false。
-Write-Output '{"origin":"fake-preview","state":"exiting"}'
-[Console]::Error.WriteLine('injected unrequested Preview exit')
-exit 23
-'@
-    [IO.File]::WriteAllText((Join-Path $fakeToolsRoot 'editor-preview.ps1'), $fakePreview, [Text.UTF8Encoding]::new($false))
-    $previewRunMarker = Join-Path $fakeKadathRoot 'preview-run.marker'
-    $missingLiveBakeAdapter = Join-Path $fakeToolsRoot 'editor-live-bake.ps1'
-    if (Test-Path -LiteralPath $missingLiveBakeAdapter) {
-        throw "Failed-watch fixture must omit the live-bake Adapter: $missingLiveBakeAdapter"
-    }
-    $fakeAuthor = @'
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory = $true)]
-    [ValidateSet('Create', 'Validate')]
-    [string]$Action,
-
-    [Parameter(Mandatory = $true)]
-    [string]$PackageRoot,
-
-    [Parameter(Mandatory = $true)]
-    [string]$ProjectName,
-
-    [string]$OwnershipToken
-)
-
-$projectDirectory = Join-Path $PackageRoot "bin/projects/$ProjectName"
-if ($Action -eq 'Create') {
-    if ($ProjectName -like 'adapter_duplicate_*') {
-        # 故意输出成功字样，证明 Backend 的 duplicate 分支只认精确退出码 17。
-        Write-Output 'validation=ok'
-        exit 17
-    }
-    New-Item -ItemType Directory -Path $projectDirectory -ErrorAction Stop | Out-Null
-    foreach ($name in @('scene.json', 'script.json', 'preview.json')) {
-        [IO.File]::WriteAllText((Join-Path $projectDirectory $name), '{"schemaVersion":1}', [Text.UTF8Encoding]::new($false))
-    }
-    if (-not [string]::IsNullOrWhiteSpace($OwnershipToken)) {
-        [IO.File]::WriteAllText((Join-Path $projectDirectory '.kadath-create-claim'), $OwnershipToken, [Text.UTF8Encoding]::new($false))
-    }
-    if ($ProjectName -like 'adapter_nonzero_*') {
-        # 模拟 Adapter 在取得 ownership 后异常退出；Service 必须以 token 兜底清理。
-        Write-Output 'validation=ok'
-        [Console]::Error.WriteLine('injected adapter non-zero after ownership claim')
-        exit 23
-    }
-    exit 0
-}
-
-if ($ProjectName -like 'foreign_claim_*') {
-    # 关键敌对边界：模拟 Validate 期间 ownership 被另一方接管，并留下必须保留的外部内容。
-    [IO.File]::WriteAllText((Join-Path $projectDirectory '.kadath-create-claim'), 'foreign-owner', [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText((Join-Path $projectDirectory 'foreign-owner-sentinel.txt'), 'preserve-foreign-owner', [Text.UTF8Encoding]::new($false))
-    [Console]::Error.WriteLine('injected validation failure after ownership transfer')
-    exit 1
-}
-
-if ($ProjectName -like 'rollback_*') {
-    [Console]::Error.WriteLine('injected post-create validation failure')
-    exit 1
-}
-Write-Output 'validation=ok'
-exit 0
-'@
-    [IO.File]::WriteAllText((Join-Path $fakeToolsRoot 'editor-author.ps1'), $fakeAuthor, [Text.UTF8Encoding]::new($false))
-
-    $rollbackProjectName = "rollback_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $rollbackProjectDirectory = Join-Path $projectsRoot $rollbackProjectName
-    $foreignProjectName = "foreign_claim_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $foreignProjectDirectory = Join-Path $projectsRoot $foreignProjectName
-    $foreignClaimPath = Join-Path $foreignProjectDirectory '.kadath-create-claim'
-    $foreignSentinelPath = Join-Path $foreignProjectDirectory 'foreign-owner-sentinel.txt'
-    $adapterDuplicateProjectName = "adapter_duplicate_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $adapterDuplicateProjectDirectory = Join-Path $projectsRoot $adapterDuplicateProjectName
-    $adapterNonzeroProjectName = "adapter_nonzero_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $adapterNonzeroProjectDirectory = Join-Path $projectsRoot $adapterNonzeroProjectName
-    $adapterMissingProjectName = "adapter_missing_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $adapterMissingProjectDirectory = Join-Path $projectsRoot $adapterMissingProjectName
-    $failedWatchProjectName = "watch_failed_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $failedWatchProjectDirectory = Join-Path $projectsRoot $failedWatchProjectName
-    $failedPreviewProjectName = "preview_failed_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $failedPreviewProjectDirectory = Join-Path $projectsRoot $failedPreviewProjectName
-    $runningPreviewProjectName = "preview_running_create_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $runningPreviewProjectDirectory = Join-Path $projectsRoot $runningPreviewProjectName
-    $rollbackService = $null
-    try {
-        # 关键 boundary fake：Create 成功但后续 Validate 失败，只观察真实 RPC 与最终文件系统回滚。
-        $rollbackStart = [Diagnostics.ProcessStartInfo]::new()
-        $rollbackStart.FileName = 'dotnet'
-        $rollbackStart.WorkingDirectory = Join-Path $worktreeRoot 'editor'
-        $rollbackStart.UseShellExecute = $false
-        $rollbackStart.CreateNoWindow = $true
-        $rollbackStart.RedirectStandardInput = $true
-        $rollbackStart.RedirectStandardOutput = $true
-        $rollbackStart.RedirectStandardError = $true
-        $rollbackStart.ArgumentList.Add($serviceDll)
-        $rollbackStart.ArgumentList.Add('--kadath-root')
-        $rollbackStart.ArgumentList.Add($fakeKadathRoot)
-        $rollbackService = [Diagnostics.Process]::new()
-        $rollbackService.StartInfo = $rollbackStart
-        if (-not $rollbackService.Start()) { throw 'Failed to start rollback Editor Service.' }
-
-        $script:rpcMessages.Clear()
-        $script:rpcSequence = 0L
-        $script:rpcStage = 'rollback_hello'
-        $rollbackHello = Read-RpcMessage $rollbackService
-        if ([string]$rollbackHello.type -ne 'hello') { throw 'Rollback Service hello mismatch.' }
-        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'hello_ack'; client = 'verify-editor-project-create-rollback'; clientVersion = '1' })
-
-        # 先建立已提交 session；失败 Create 后无参 Validate 必须仍指向该 session。
-        $script:rpcStage = 'rollback_baseline_open'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'rollback-open-1'; method = 'project_open'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $rpcProjectName }
-        })
-        $rollbackOpenedEvent = Read-RpcMessage $rollbackService
-        $rollbackOpenedResponse = Read-RpcMessage $rollbackService
-        if ([string]$rollbackOpenedEvent.event -ne 'project_opened' -or -not [bool]$rollbackOpenedResponse.ok) {
-            throw 'Rollback baseline project_open failed.'
-        }
-
-        $script:rpcStage = 'rollback_project_create'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'rollback-create-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $rollbackProjectName }
-        })
-        $rollbackFailure = Read-RpcMessage $rollbackService
-        if ([string]$rollbackFailure.type -ne 'response' -or [string]$rollbackFailure.id -ne 'rollback-create-1' -or
-            [bool]$rollbackFailure.ok -or [string]$rollbackFailure.error.code -ne 'project_validation_failed') {
-            throw "project_validation_failed response mismatch: $($rollbackFailure | ConvertTo-Json -Compress -Depth 6)"
-        }
-        if (Test-Path -LiteralPath $rollbackProjectDirectory) {
-            throw "Service retained a post-validation-failure project directory: $rollbackProjectDirectory"
-        }
-
-        $script:rpcStage = 'rollback_session_validate'
-        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-validate-1'; method = 'project_validate'; params = [ordered]@{} })
-        $rollbackValidatedEvent = Read-RpcMessage $rollbackService
-        $rollbackValidatedResponse = Read-RpcMessage $rollbackService
-        if ([string]$rollbackValidatedEvent.event -ne 'project_validated' -or -not [bool]$rollbackValidatedResponse.ok -or
-            [string]$rollbackValidatedResponse.result.projectName -ne $rpcProjectName) {
-            throw 'Failed Create replaced the previously committed session.'
-        }
-
-        # 第二个 Create 模拟 claim 在 Validate 中转移；Service 只能报错，绝不能清理 foreign owner 的目录。
-        $script:rpcStage = 'foreign_claim_project_create'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'foreign-claim-create-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $foreignProjectName }
-        })
-        $foreignFailure = Read-RpcMessage $rollbackService
-        if ([string]$foreignFailure.type -ne 'response' -or [string]$foreignFailure.id -ne 'foreign-claim-create-1' -or
-            [bool]$foreignFailure.ok -or [string]$foreignFailure.error.code -ne 'project_validation_failed') {
-            throw "foreign-claim project_validation_failed response mismatch: $($foreignFailure | ConvertTo-Json -Compress -Depth 6)"
-        }
-        if (-not (Test-Path -LiteralPath $foreignProjectDirectory -PathType Container) -or
-            -not (Test-Path -LiteralPath $foreignClaimPath -PathType Leaf) -or
-            -not (Test-Path -LiteralPath $foreignSentinelPath -PathType Leaf)) {
-            throw 'Service deleted foreign-owned project content after validation failure.'
-        }
-        $foreignClaim = [IO.File]::ReadAllText($foreignClaimPath, [Text.UTF8Encoding]::new($false))
-        $foreignSentinel = [IO.File]::ReadAllText($foreignSentinelPath, [Text.UTF8Encoding]::new($false))
-        if ($foreignClaim -ne 'foreign-owner' -or $foreignSentinel -ne 'preserve-foreign-owner') {
-            throw "Service changed foreign-owned project content: claim=$foreignClaim sentinel=$foreignSentinel"
-        }
-
-        $script:rpcStage = 'foreign_claim_session_validate'
-        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'foreign-claim-validate-1'; method = 'project_validate'; params = [ordered]@{} })
-        $foreignValidatedEvent = Read-RpcMessage $rollbackService
-        $foreignValidatedResponse = Read-RpcMessage $rollbackService
-        if ([string]$foreignValidatedEvent.event -ne 'project_validated' -or -not [bool]$foreignValidatedResponse.ok -or
-            [string]$foreignValidatedResponse.result.projectName -ne $rpcProjectName) {
-            throw 'Foreign-claim Create failure replaced the previously committed session.'
-        }
-        $foreignCreatedEvents = @($script:rpcMessages | Where-Object {
-            [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'foreign-claim-create-1'
-        })
-        if ($foreignCreatedEvents.Count -ne 0) { throw 'Foreign-claim Create failure emitted project_created.' }
-
-        $script:rpcStage = 'adapter_duplicate_exit_mapping'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'adapter-duplicate-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $adapterDuplicateProjectName }
-        })
-        $adapterDuplicateFailure = Read-RpcMessage $rollbackService
-        if ([bool]$adapterDuplicateFailure.ok -or [string]$adapterDuplicateFailure.error.code -ne 'project_already_exists' -or
-            (Test-Path -LiteralPath $adapterDuplicateProjectDirectory)) {
-            throw "Adapter exit 17 mapping mismatch: $($adapterDuplicateFailure | ConvertTo-Json -Compress -Depth 6)"
-        }
-
-        $script:rpcStage = 'adapter_nonzero_cleanup'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'adapter-nonzero-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $adapterNonzeroProjectName }
-        })
-        $adapterNonzeroFailure = Read-RpcMessage $rollbackService
-        if ([bool]$adapterNonzeroFailure.ok -or [string]$adapterNonzeroFailure.error.code -ne 'project_create_failed') {
-            throw "Adapter non-zero mapping mismatch: $($adapterNonzeroFailure | ConvertTo-Json -Compress -Depth 6)"
-        }
-        if (Test-Path -LiteralPath $adapterNonzeroProjectDirectory) {
-            throw "Service retained an owned Adapter non-zero half-project: $adapterNonzeroProjectDirectory"
-        }
-
-        $missingTemplatePackage = Join-Path $fixtureRoot 'missing-template-package'
-        New-Item -ItemType Directory -Path $missingTemplatePackage | Out-Null
-        $script:rpcStage = 'project_template_missing'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'template-missing-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $missingTemplatePackage; projectName = 'template_missing_project' }
-        })
-        $templateMissingFailure = Read-RpcMessage $rollbackService
-        if ([bool]$templateMissingFailure.ok -or [string]$templateMissingFailure.error.code -ne 'project_template_missing' -or
-            (Test-Path -LiteralPath (Join-Path $missingTemplatePackage 'bin/projects/template_missing_project'))) {
-            throw "Template-missing mapping mismatch: $($templateMissingFailure | ConvertTo-Json -Compress -Depth 6)"
-        }
-
-        $script:rpcStage = 'invalid_project_name'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'invalid-name-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = '../escape' }
-        })
-        $invalidNameFailure = Read-RpcMessage $rollbackService
-        if ([bool]$invalidNameFailure.ok -or [string]$invalidNameFailure.error.code -ne 'invalid_project_name' -or
-            (Test-Path -LiteralPath (Join-Path $fixtureRoot 'bin/escape'))) {
-            throw "Invalid-name mapping mismatch: $($invalidNameFailure | ConvertTo-Json -Compress -Depth 6)"
-        }
-
-        $fakeAuthorPath = Join-Path $fakeToolsRoot 'editor-author.ps1'
-        $fakeAuthorBackupPath = Join-Path $fakeToolsRoot 'editor-author.ps1.verifier-backup'
-        Move-Item -LiteralPath $fakeAuthorPath -Destination $fakeAuthorBackupPath
-        try {
-            $script:rpcStage = 'adapter_missing'
-            Send-RpcJson $rollbackService ([ordered]@{
-                schemaVersion = 1; type = 'request'; id = 'adapter-missing-1'; method = 'project_create'
-                params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $adapterMissingProjectName }
-            })
-            $adapterMissingFailure = Read-RpcMessage $rollbackService
-            if ([bool]$adapterMissingFailure.ok -or [string]$adapterMissingFailure.error.code -ne 'adapter_missing' -or
-                (Test-Path -LiteralPath $adapterMissingProjectDirectory)) {
-                throw "Adapter-missing mapping mismatch: $($adapterMissingFailure | ConvertTo-Json -Compress -Depth 6)"
-            }
-        }
-        finally {
-            Move-Item -LiteralPath $fakeAuthorBackupPath -Destination $fakeAuthorPath
-        }
-
-        # 关键 Failed/unknown 门禁：watch_start 在 Adapter 缺失后必须保持“未知是否仍占用”的忙状态，直到显式 watch_stop。
-        $script:rpcStage = 'failed_watch_start'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'failed-watch-start-1'; method = 'watch_start'
-            params = [ordered]@{ target = 'Both'; profile = 'debug'; pollIntervalMilliseconds = 50; debounceMilliseconds = 100 }
-        })
-        $failedWatchStart = Read-RpcMessage $rollbackService
-        if ([string]$failedWatchStart.type -ne 'response' -or [string]$failedWatchStart.id -ne 'failed-watch-start-1' -or
-            [bool]$failedWatchStart.ok -or [string]$failedWatchStart.error.code -ne 'adapter_missing') {
-            throw "Failed watch_start response mismatch: $($failedWatchStart | ConvertTo-Json -Compress -Depth 6)"
-        }
-        $failedWatchStartedEvents = @($script:rpcMessages | Where-Object {
-            [string]$_.type -eq 'event' -and [string]$_.event -eq 'watch_started' -and [string]$_.requestId -eq 'failed-watch-start-1'
-        })
-        if ($failedWatchStartedEvents.Count -ne 0) { throw 'Failed watch_start emitted watch_started.' }
-
-        $script:rpcStage = 'failed_watch_project_create_busy'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'failed-watch-create-busy-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $failedWatchProjectName }
-        })
-        $failedWatchBusy = Read-RpcMessage $rollbackService
-        if ([string]$failedWatchBusy.type -eq 'event' -and [string]$failedWatchBusy.event -eq 'project_created' -and
-            [string]$failedWatchBusy.requestId -eq 'failed-watch-create-busy-1') {
-            # 当前产品缺口的稳定 RED：消费紧随其后的 response，避免把未读 envelope 误报成 verifier 协议错误。
-            $unexpectedCreateResponse = Read-RpcMessage $rollbackService
-            $unexpectedDirectoryExists = Test-Path -LiteralPath $failedWatchProjectDirectory
-            throw "Watch Failed/unknown gate accepted project_create before watch_stop: response_ok=$([bool]$unexpectedCreateResponse.ok) directory_exists=$unexpectedDirectoryExists"
-        }
-        if ([string]$failedWatchBusy.type -ne 'response' -or [string]$failedWatchBusy.id -ne 'failed-watch-create-busy-1' -or
-            [bool]$failedWatchBusy.ok -or [string]$failedWatchBusy.error.code -ne 'project_create_busy') {
-            throw "Failed-watch project_create_busy response mismatch: $($failedWatchBusy | ConvertTo-Json -Compress -Depth 6)"
-        }
-        $failedWatchCreatedEvents = @($script:rpcMessages | Where-Object {
-            [string]$_.type -eq 'event' -and [string]$_.event -eq 'project_created' -and [string]$_.requestId -eq 'failed-watch-create-busy-1'
-        })
-        if ($failedWatchCreatedEvents.Count -ne 0) { throw 'Failed-watch busy Create emitted project_created.' }
-        if (Test-Path -LiteralPath $failedWatchProjectDirectory) { throw 'Failed-watch busy Create created its target directory.' }
-
-        $script:rpcStage = 'failed_watch_stop'
-        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'failed-watch-stop-1'; method = 'watch_stop'; params = $null })
-        $failedWatchStoppedEvent = Read-RpcMessage $rollbackService
-        $failedWatchStoppedResponse = Read-RpcMessage $rollbackService
-        if ([string]$failedWatchStoppedEvent.type -ne 'event' -or [string]$failedWatchStoppedEvent.event -ne 'watch_stopped' -or
-            [string]$failedWatchStoppedEvent.requestId -ne 'failed-watch-stop-1' -or [string]$failedWatchStoppedEvent.data.state -ne 'stopped') {
-            throw "watch_stopped must precede response from Failed state: $($failedWatchStoppedEvent | ConvertTo-Json -Compress -Depth 6)"
-        }
-        if ([string]$failedWatchStoppedResponse.type -ne 'response' -or [string]$failedWatchStoppedResponse.id -ne 'failed-watch-stop-1' -or
-            -not [bool]$failedWatchStoppedResponse.ok -or [string]$failedWatchStoppedResponse.result.state -ne 'stopped') {
-            throw "Failed-state watch_stop response mismatch: $($failedWatchStoppedResponse | ConvertTo-Json -Compress -Depth 6)"
-        }
-
-        $script:rpcStage = 'failed_watch_project_create_retry'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'failed-watch-create-retry-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $failedWatchProjectName }
-        })
-        $failedWatchRetryEvent = Read-RpcMessage $rollbackService
-        $failedWatchRetryResponse = Read-RpcMessage $rollbackService
-        if ([string]$failedWatchRetryEvent.type -ne 'event' -or [string]$failedWatchRetryEvent.event -ne 'project_created' -or
-            [string]$failedWatchRetryEvent.requestId -ne 'failed-watch-create-retry-1') {
-            throw "Retry project_created must precede response: $($failedWatchRetryEvent | ConvertTo-Json -Compress -Depth 6)"
-        }
-        if ([string]$failedWatchRetryResponse.type -ne 'response' -or [string]$failedWatchRetryResponse.id -ne 'failed-watch-create-retry-1' -or
-            -not [bool]$failedWatchRetryResponse.ok) {
-            throw "Post-watch_stop project_create retry mismatch: $($failedWatchRetryResponse | ConvertTo-Json -Compress -Depth 6)"
-        }
-        Assert-ProjectSessionInfo $failedWatchRetryEvent.data $fixtureRoot $failedWatchProjectName
-        Assert-ProjectSessionInfo $failedWatchRetryResponse.result $fixtureRoot $failedWatchProjectName
-
-        # A：Launcher 非请求退出后 Preview lifecycle 必须保持 Failed，直到显式 Stop 确认收敛为 Stopped。
-        $script:rpcStage = 'failed_preview_start'
-        Send-RpcJson $rollbackService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'failed-preview-start-1'; method = 'preview_start'
-            params = [ordered]@{ projectName = $failedWatchProjectName; pollIntervalMilliseconds = 50; debounceMilliseconds = 100 }
-        })
-        $failedPreviewStart = Read-PreviewStartExchange $rollbackService 'failed-preview-start-1' $true
-        if ([string]$failedPreviewStart.Response.type -ne 'response' -or -not [bool]$failedPreviewStart.Response.ok -or
-            [string]$failedPreviewStart.Response.result.state -ne 'starting' -or
-            [int]$failedPreviewStart.UnrequestedStop.data.exitCode -eq 0) {
-            throw "Unrequested Preview failure exchange mismatch: $($failedPreviewStart | ConvertTo-Json -Compress -Depth 8)"
-        }
-
-        $script:rpcStage = 'failed_preview_project_create_busy'
-        Assert-PreviewBlocksProjectCreate $rollbackService 'failed-preview-create-busy-1' $fixtureRoot $failedPreviewProjectName $failedPreviewProjectDirectory 'Failed Preview'
-
-        $script:rpcStage = 'failed_preview_stop'
-        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'failed-preview-stop-1'; method = 'preview_stop'; params = $null })
-        $failedPreviewStop = Read-RpcResponseWithPreviewInterleaving $rollbackService 'failed-preview-stop-1' $true
-        if (-not [bool]$failedPreviewStop.Response.ok -or [string]$failedPreviewStop.Response.result.state -ne 'stopped') {
-            throw "Failed-state preview_stop response mismatch: $($failedPreviewStop.Response | ConvertTo-Json -Compress -Depth 6)"
-        }
-
-        $script:rpcStage = 'failed_preview_project_create_retry'
-        Assert-PreviewCreateAfterStop $rollbackService 'failed-preview-create-retry-1' $fixtureRoot $failedPreviewProjectName $failedPreviewProjectDirectory 'Failed Preview'
-
-        # B：marker 让 Launcher 持续运行；Running 同样阻止 Create，Stop 的 requested=true 终态必须先于成功 response。
-        if (Test-Path -LiteralPath $previewRunMarker) { throw "Preview run marker unexpectedly exists: $previewRunMarker" }
-        [IO.File]::WriteAllText($previewRunMarker, 'run', [Text.UTF8Encoding]::new($false))
-        try {
-            $script:rpcStage = 'running_preview_start'
-            Send-RpcJson $rollbackService ([ordered]@{
-                schemaVersion = 1; type = 'request'; id = 'running-preview-start-1'; method = 'preview_start'
-                params = [ordered]@{ projectName = $failedPreviewProjectName; pollIntervalMilliseconds = 50; debounceMilliseconds = 100 }
-            })
-            $runningPreviewStart = Read-PreviewStartExchange $rollbackService 'running-preview-start-1' $false
-            if (-not [bool]$runningPreviewStart.Response.ok -or [string]$runningPreviewStart.Response.result.state -ne 'starting') {
-                throw "Running Preview start mismatch: $($runningPreviewStart.Response | ConvertTo-Json -Compress -Depth 6)"
-            }
-
-            $script:rpcStage = 'running_preview_project_create_busy'
-            Assert-PreviewBlocksProjectCreate $rollbackService 'running-preview-create-busy-1' $fixtureRoot $runningPreviewProjectName $runningPreviewProjectDirectory 'Running Preview'
-
-            $script:rpcStage = 'running_preview_stop'
-            Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'running-preview-stop-1'; method = 'preview_stop'; params = $null })
-            $runningPreviewStop = Read-RpcResponseWithPreviewInterleaving $rollbackService 'running-preview-stop-1' $true
-            if (-not [bool]$runningPreviewStop.Response.ok -or [string]$runningPreviewStop.Response.result.state -ne 'stopped' -or
-                $null -eq $runningPreviewStop.RequestedStop) {
-                throw "Running preview_stop did not confirm requested stop before response: $($runningPreviewStop | ConvertTo-Json -Compress -Depth 8)"
-            }
-
-            $script:rpcStage = 'running_preview_project_create_retry'
-            Assert-PreviewCreateAfterStop $rollbackService 'running-preview-create-retry-1' $fixtureRoot $runningPreviewProjectName $runningPreviewProjectDirectory 'Running Preview'
-        }
-        finally {
-            if (Test-Path -LiteralPath $previewRunMarker -PathType Leaf) { Remove-Item -LiteralPath $previewRunMarker -Force }
-        }
-
-        Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-shutdown-1'; method = 'shutdown'; params = $null })
-        [void](Read-RpcMessage $rollbackService)
-        [void](Read-RpcMessage $rollbackService)
-        if (-not $rollbackService.WaitForExit(10000)) { throw 'Rollback Service did not exit after shutdown.' }
-
-        Write-Output 'rpc_project_create_validation_rollback=ok'
-        Write-Output 'rpc_project_create_failure_preserves_session=ok'
-        Write-Output 'rpc_project_create_foreign_claim_preserved=ok'
-        Write-Output 'rpc_project_create_error_mapping=ok'
-        Write-Output 'rpc_project_create_adapter_nonzero_cleanup=ok'
-        Write-Output 'rpc_project_create_failed_watch_gate=ok'
-        Write-Output 'rpc_project_create_after_failed_watch_stop=ok'
-        Write-Output 'rpc_project_create_failed_preview_gate=ok'
-        Write-Output 'rpc_project_create_after_failed_preview_stop=ok'
-        Write-Output 'rpc_project_create_running_preview_gate=ok'
-        Write-Output 'rpc_project_create_after_running_preview_stop=ok'
-    }
-    finally {
-        if ($null -ne $rollbackService) {
-            if (-not $rollbackService.HasExited) {
-                try { Send-RpcJson $rollbackService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'rollback-cleanup'; method = 'shutdown'; params = $null }) } catch { }
-                if (-not $rollbackService.WaitForExit(5000)) {
-                    $rollbackService.Kill($true)
-                    [void]$rollbackService.WaitForExit(5000)
-                }
-            }
-            $rollbackService.Dispose()
-        }
-    }
-
-    $adapterStartService = $null
-    $adapterStartProjectName = "adapter_start_$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
-    $adapterStartProjectDirectory = Join-Path $projectsRoot $adapterStartProjectName
-    try {
-        # 独立 Service 继承一个不含 pwsh 的 PATH，稳定触发 Process.Start 失败而不修改主机环境。
-        $adapterStartInfo = [Diagnostics.ProcessStartInfo]::new()
-        $adapterStartInfo.FileName = (Get-Command dotnet -ErrorAction Stop).Source
-        $adapterStartInfo.WorkingDirectory = Join-Path $worktreeRoot 'editor'
-        $adapterStartInfo.UseShellExecute = $false
-        $adapterStartInfo.CreateNoWindow = $true
-        $adapterStartInfo.RedirectStandardInput = $true
-        $adapterStartInfo.RedirectStandardOutput = $true
-        $adapterStartInfo.RedirectStandardError = $true
-        $adapterStartInfo.Environment['PATH'] = $fakeToolsRoot
-        $adapterStartInfo.ArgumentList.Add($serviceDll)
-        $adapterStartInfo.ArgumentList.Add('--kadath-root')
-        $adapterStartInfo.ArgumentList.Add($fakeKadathRoot)
-        $adapterStartService = [Diagnostics.Process]::new()
-        $adapterStartService.StartInfo = $adapterStartInfo
-        if (-not $adapterStartService.Start()) { throw 'Failed to start adapter-start Editor Service.' }
-
-        $script:rpcMessages.Clear()
-        $script:rpcSequence = 0L
-        $script:rpcStage = 'adapter_start_hello'
-        $adapterStartHello = Read-RpcMessage $adapterStartService
-        if ([string]$adapterStartHello.type -ne 'hello') { throw 'Adapter-start Service hello mismatch.' }
-        Send-RpcJson $adapterStartService ([ordered]@{ schemaVersion = 1; type = 'hello_ack'; client = 'verify-editor-project-create-adapter-start'; clientVersion = '1' })
-
-        $script:rpcStage = 'adapter_start_failed'
-        Send-RpcJson $adapterStartService ([ordered]@{
-            schemaVersion = 1; type = 'request'; id = 'adapter-start-1'; method = 'project_create'
-            params = [ordered]@{ packageRoot = $fixtureRoot; projectName = $adapterStartProjectName }
-        })
-        $adapterStartFailure = Read-RpcMessage $adapterStartService
-        if ([bool]$adapterStartFailure.ok -or [string]$adapterStartFailure.error.code -ne 'adapter_start_failed' -or
-            (Test-Path -LiteralPath $adapterStartProjectDirectory)) {
-            throw "Adapter-start mapping mismatch: $($adapterStartFailure | ConvertTo-Json -Compress -Depth 6)"
-        }
-
-        Send-RpcJson $adapterStartService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'adapter-start-shutdown'; method = 'shutdown'; params = $null })
-        [void](Read-RpcMessage $adapterStartService)
-        [void](Read-RpcMessage $adapterStartService)
-        if (-not $adapterStartService.WaitForExit(10000)) { throw 'Adapter-start Service did not exit after shutdown.' }
-        Write-Output 'rpc_project_create_adapter_start_failed=ok'
-    }
-    finally {
-        if ($null -ne $adapterStartService) {
-            if (-not $adapterStartService.HasExited) {
-                try { Send-RpcJson $adapterStartService ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'adapter-start-cleanup'; method = 'shutdown'; params = $null }) } catch { }
-                if (-not $adapterStartService.WaitForExit(5000)) {
-                    $adapterStartService.Kill($true)
-                    [void]$adapterStartService.WaitForExit(5000)
-                }
-            }
-            $adapterStartService.Dispose()
-        }
-    }
-
-    # 既有 Adapter/RPC/rollback 全部通过后，最后执行 Core mutation serialization tracer。
+    # CLI oracle、真实 RPC 与原生 Workspace verifier 通过后，最后执行 Core mutation serialization tracer。
     try {
         [void]$projectMutationHarnessType::VerifyApplyBeforeCreateAsync().GetAwaiter().GetResult()
     }

@@ -32,6 +32,7 @@ internal static class Program
             Require(assets.Items.Any(item => item.AssetId == "asset://renderer2d/test.png" && item.Category == "Texture"), "texture catalog item missing");
 
             await VerifyAuthoringAsync(project, readModel);
+            await ProjectLifecycleVerifier.VerifyAsync();
 
             var missing = await readModel.ReadPublicationAsync(project, "debug", default);
             Require(missing.State == "missing" && !missing.ManifestPresent && missing.Scene.State == "missing" && missing.Script.State == "missing", "publication missing mismatch");
@@ -117,6 +118,7 @@ internal static class Program
             Console.WriteLine("asset_catalog_snapshot=ok");
             Console.WriteLine("publication_state_machine=ok");
             Console.WriteLine("authoring_transaction=ok");
+            Console.WriteLine("project_lifecycle=ok");
             Console.WriteLine("failure_boundaries=ok");
             Console.WriteLine("read_only=ok");
             Console.WriteLine("pwsh_dependency=none");
@@ -144,6 +146,12 @@ internal static class Program
         var derivedIdentity = TreeIdentity(derived);
         var initial = await readModel.ReadProjectAsync(project, default);
         var authoring = new WorkspaceAuthoringModel();
+        var strictScene = AddRootProperty(File.ReadAllText(project.ScenePath, Encoding.UTF8), "\"extension\":true");
+        File.WriteAllText(project.ScenePath, strictScene, Encoding.UTF8);
+        await ExpectAuthoringFailureAsync(
+            () => authoring.ApplyAsync(project, initial.AuthoringRevision, new AuthoringPatch(SceneGoalPosition: [705, 205]), default),
+            WorkspaceAuthoringFailureKind.Input);
+        File.WriteAllBytes(project.ScenePath, originalScene);
         var patch = new AuthoringPatch([710, 210], [690, 210], [2, -2], 2, 3, 1);
         var commit = await authoring.ApplyAsync(project, initial.AuthoringRevision, patch, default);
         var expectedFields = new[]
@@ -160,13 +168,6 @@ internal static class Program
             && commit.InversePatch.ScenePlayerTextureId == initial.Scene.PlayerTextureId
             && commit.InversePatch.SceneGoalTextureId == initial.Scene.GoalTextureId
             && commit.InversePatch.SceneHazardTextureId == initial.Scene.HazardTextureId, "authoring inverse patch mismatch");
-        using (var scene = JsonDocument.Parse(File.ReadAllBytes(project.ScenePath)))
-        using (var script = JsonDocument.Parse(File.ReadAllBytes(project.ScriptPath)))
-        {
-            Require(scene.RootElement.GetProperty("extension").GetProperty("owner").GetString() == "scene", "authoring dropped unknown Scene fields");
-            Require(script.RootElement.GetProperty("extension").GetProperty("owner").GetString() == "script", "authoring dropped unknown Script fields");
-        }
-
         var committedScene = File.ReadAllBytes(project.ScenePath);
         var committedScript = File.ReadAllBytes(project.ScriptPath);
         var noOp = await authoring.ApplyAsync(project, commit.Revision, patch, default);
@@ -237,6 +238,7 @@ internal static class Program
         Directory.CreateDirectory(Path.Combine(assets, "renderer2d"));
         Directory.CreateDirectory(Path.Combine(assets, "audio"));
         Directory.CreateDirectory(projectDirectory);
+        File.WriteAllBytes(Path.Combine(root, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), [0]);
         File.WriteAllBytes(Path.Combine(assets, "renderer2d", "test.png"), [1, 2, 3]);
         File.WriteAllBytes(Path.Combine(assets, "renderer2d", "goal.png"), [4, 5]);
         File.WriteAllBytes(Path.Combine(assets, "audio", "lost.wav"), [6]);
@@ -245,13 +247,13 @@ internal static class Program
         var scriptPath = Path.Combine(projectDirectory, "script.json");
         var previewPath = Path.Combine(projectDirectory, "preview.json");
         File.WriteAllText(scenePath, """
-        {"schemaVersion":3,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"},{"textureId":2,"artifact":"assets/renderer2d/goal.texture"},{"textureId":3,"artifact":"assets/renderer2d/goal.texture"}],"player":{"position":[312,130],"size":[320,240],"color":[1,1,1,1],"moveSpeed":180,"textureId":1},"goal":{"position":[700,200],"size":[96,96],"color":[1,0.75,0.1,1],"textureId":2},"hazard":{"position":[650,280],"size":[96,96],"color":[0.95,0.2,0.2,1],"patrolMinY":245,"patrolMaxY":330,"patrolSpeed":80,"textureId":3},"extension":{"owner":"scene"}}
+        {"schemaVersion":3,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"},{"textureId":2,"artifact":"assets/renderer2d/goal.texture"},{"textureId":3,"artifact":"assets/renderer2d/goal.texture"}],"player":{"position":[312,130],"size":[320,240],"color":[1,1,1,1],"moveSpeed":180,"textureId":1},"goal":{"position":[700,200],"size":[96,96],"color":[1,0.75,0.1,1],"textureId":2},"hazard":{"position":[650,280],"size":[96,96],"color":[0.95,0.2,0.2,1],"patrolMinY":245,"patrolMaxY":330,"patrolSpeed":80,"textureId":3}}
         """, Encoding.UTF8);
         File.WriteAllText(scriptPath, """
-        {"schemaVersion":1,"instructions":[{"hook":"on_start","op":"set_goal_position","value":[680,200]},{"hook":"fixed_update","op":"move_goal_velocity","value":[-12,0]}],"extension":{"owner":"script"}}
+        {"schemaVersion":1,"instructions":[{"hook":"on_start","op":"set_goal_position","value":[680,200]},{"hook":"fixed_update","op":"move_goal_velocity","value":[-12,0]}]}
         """, Encoding.UTF8);
         File.WriteAllText(previewPath, """
-        {"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","assets/scenes/preview.scene","--script","assets/scripts/preview.script"]}}
+        {"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","projects/demo/scene.json","--script","projects/demo/script.json"]}}
         """, Encoding.UTF8);
         return new ProjectSessionInfo(root, "demo", projectDirectory, scenePath, scriptPath, previewPath, 1);
     }
@@ -300,6 +302,12 @@ internal static class Program
     }
 
     private static string Hash(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+    private static string AddRootProperty(string json, string property)
+    {
+        var end = json.LastIndexOf('}');
+        if (end < 0) throw new InvalidOperationException("JSON fixture has no root closing brace.");
+        return json.Insert(end, $",{property}");
+    }
     private static string TreeIdentity(string root, bool ignoreDerived = false)
     {
         var files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)

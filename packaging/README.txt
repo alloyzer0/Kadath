@@ -83,6 +83,10 @@ Authoring mutation 只作用于 `bin\projects\<name>\scene.json` / `script.json`
 
 真实 Avalonia workflow smoke 额外覆盖 `workflow_authoring_apply=ok` 与 `workflow_authoring_undo=ok`。26D 稳定事务契约不因 26E 改变。
 
+P2 Editor Native Project Lifecycle
+----------------------------------
+Editor Service 的 `project_create`、`project_open` 与 `project_validate` 已由原生 `WorkspaceProjectLifecycleModel` 执行，不再为这三条产品路径启动 `editor-author.ps1`。Create 固定读取包内 `bin\assets\scenes\preview.scene.json` 与 `bin\assets\scripts\preview.script.json`，使用原子 claim、CreateNew 文件写入和 owned-only cleanup；Open、Validate 与 Authoring commit 共用严格 JSON、路径和 reparse-point 校验。旧 CLI 与 WinForms 入口仍可继续调用 `editor-author.ps1`。
+
 P2-M4-26E Publication State / Bake Changes
 ------------------------------------------
 `publication_snapshot` 只读比较 source JSON、`.kadath\derived` manifest 和 KSCN/KSCP artifact，返回 Scene/Script 的 `current`、`source_dirty`、`missing`、`artifact_invalid` 或 `profile_mismatch`。Avalonia 的 `Bake Changes` 使用共享 Workspace 选择最小 Scene/Script/Both target；Service Watch 或 Preview Live Bake + Watch 运行时，手动 bake 被禁用/拒绝，避免交错提交。

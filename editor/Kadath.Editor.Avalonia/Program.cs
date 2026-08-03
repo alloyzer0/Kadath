@@ -65,7 +65,9 @@ internal static class Program
         var avaloniaViewModel = new AvaloniaEditorViewModel(workspace, new InlineEditorViewDispatcher(), packageRoot);
         avaloniaViewModel.ProjectName = openProjectName;
         await avaloniaViewModel.RefreshSnapshotsForCurrentProjectAsync(cancellationToken);
-        Require(avaloniaViewModel.HierarchyItems.Count == 11 && avaloniaViewModel.AssetItems.Count == 12, "Avalonia should project real snapshot collections.");
+        var expectedAssetCount = Directory.EnumerateFiles(Path.Combine(packageRoot, "bin", "assets"), "*", SearchOption.AllDirectories).Count();
+        Require(avaloniaViewModel.HierarchyItems.Count == 11 && expectedAssetCount > 0 && avaloniaViewModel.AssetItems.Count == expectedAssetCount,
+            "Avalonia should project every asset from the current product package.");
         Require(avaloniaViewModel.InspectorText.Contains("scene.goal", StringComparison.Ordinal), "Avalonia hierarchy inspector did not use snapshot data");
         Console.WriteLine("workflow_snapshot_projection=ok");
         Console.WriteLine("workflow_project_open=ok");
@@ -116,7 +118,7 @@ internal static class Program
             && workspace.ProjectSnapshot.Value?.ProjectName == createdProjectName
             && workspace.HierarchySnapshot.Value?.ProjectName == createdProjectName
             && avaloniaViewModel.HierarchyItems.Count == 11
-            && avaloniaViewModel.AssetItems.Count == 12
+            && avaloniaViewModel.AssetItems.Count == expectedAssetCount
             && avaloniaViewModel.InspectorText.Contains("scene.goal", StringComparison.Ordinal),
             "Avalonia public Create did not project the new Session snapshots after atomic cache invalidation");
         Console.WriteLine("workflow_project_create=ok");

@@ -914,7 +914,11 @@ pub fn build(b: *std.Build) void {
     const install_lost_audio_artifact = b.addInstallFile(lost_audio_artifact, "bin/assets/audio/lost.audio.wav");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_lost_audio_artifact.step);
 
-    // Scene 源 JSON 只保留给 Editor authoring；安装包同时生成 Runtime 消费的 KSCN v1 artifact。
+    const install_scene_source_template = b.addInstallFile(b.path("assets/scenes/preview.scene.json"), "bin/assets/scenes/preview.scene.json");
+    if (target.result.os.tag == .windows) install_scene_source_template.step.dependOn(&install_assets.step);
+    b.getInstallStep().dependOn(&install_scene_source_template.step);
+
+    // Scene 源 JSON 作为 Editor Create 模板保留；安装包同时生成 Runtime 消费的 KSCN artifact。
     const scene_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     scene_import.addFileArg(b.path("tools/editor-scene-importer.ps1"));
     scene_import.addArg("-SourcePath");
@@ -924,7 +928,11 @@ pub fn build(b: *std.Build) void {
     const install_scene_artifact = b.addInstallFile(scene_artifact, "bin/assets/scenes/preview.scene");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_scene_artifact.step);
 
-    // Script 源 JSON 只保留给 Editor authoring；安装包同时生成 Runtime 消费的 KSCP v1 artifact。
+    const install_script_source_template = b.addInstallFile(b.path("assets/scripts/preview.script.json"), "bin/assets/scripts/preview.script.json");
+    if (target.result.os.tag == .windows) install_script_source_template.step.dependOn(&install_assets.step);
+    b.getInstallStep().dependOn(&install_script_source_template.step);
+
+    // Script 源 JSON 作为 Editor Create 模板保留；安装包同时生成 Runtime 消费的 KSCP v1 artifact。
     const script_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     script_import.addFileArg(b.path("tools/editor-script-importer.ps1"));
     script_import.addArg("-SourcePath");
@@ -1098,6 +1106,8 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.addFileInput(linux_lost_audio_artifact);
         package_manifest_command.addFileInput(linux_scene_artifact);
         package_manifest_command.addFileInput(linux_script_artifact);
+        package_manifest_command.addFileInput(b.path("assets/scenes/preview.scene.json"));
+        package_manifest_command.addFileInput(b.path("assets/scripts/preview.script.json"));
         package_manifest_command.addFileInput(b.path("packaging/README-linux.txt"));
         package_manifest_command.step.dependOn(&install_exe.step);
         package_manifest_command.step.dependOn(&install_linux_texture_artifact.step);
@@ -1106,6 +1116,8 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.step.dependOn(&install_linux_lost_audio_artifact.step);
         package_manifest_command.step.dependOn(&install_linux_scene_artifact.step);
         package_manifest_command.step.dependOn(&install_linux_script_artifact.step);
+        package_manifest_command.step.dependOn(&install_scene_source_template.step);
+        package_manifest_command.step.dependOn(&install_script_source_template.step);
         package_manifest_command.step.dependOn(&install_linux_package_readme.step);
         const install_package_manifest = b.addInstallFile(package_manifest, "SHA256SUMS");
         b.getInstallStep().dependOn(&install_package_manifest.step);

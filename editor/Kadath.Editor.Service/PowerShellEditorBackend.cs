@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Kadath.Editor.Core;
 using Kadath.Editor.Protocol;
 using Kadath.Editor.Workspace;
@@ -13,23 +12,27 @@ namespace Kadath.Editor.Service;
 internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 {
     private readonly string _kadathRoot;
+    private readonly WorkspaceProjectLifecycleModel _projectLifecycleModel;
     private readonly WorkspaceReadModel _readModel;
     private readonly WorkspaceAuthoringModel _authoringModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
     private readonly List<AuthoringUndoRecord> _authoringHistory = [];
-    private const int ProjectAlreadyExistsExitCode = 17;
-    private const string ProjectCreateClaimFileName = ".kadath-create-claim";
     private const int MaxAuthoringHistory = 32;
     private LiveBakeWatchController? _watch;
     private string _watchProjectName = string.Empty;
     private string _watchTarget = "Both";
     private string _watchProfile = "debug";
 
-    public PowerShellEditorBackend(string kadathRoot, WorkspaceReadModel readModel, WorkspaceAuthoringModel authoringModel)
+    public PowerShellEditorBackend(
+        string kadathRoot,
+        WorkspaceProjectLifecycleModel projectLifecycleModel,
+        WorkspaceReadModel readModel,
+        WorkspaceAuthoringModel authoringModel)
     {
         _kadathRoot = kadathRoot;
+        _projectLifecycleModel = projectLifecycleModel;
         _readModel = readModel;
         _authoringModel = authoringModel;
     }
@@ -38,156 +41,39 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 
     public async Task<ProjectSessionInfo> OpenProjectAsync(ProjectOpenParameters parameters, CancellationToken cancellationToken)
     {
-        if (!Regex.IsMatch(parameters.ProjectName, "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$", RegexOptions.CultureInvariant))
-        {
-            throw new EditorOperationException("invalid_project_name", "Project name contains unsupported characters.");
-        }
-
-        var packageRoot = Path.GetFullPath(parameters.PackageRoot);
-        if (!Directory.Exists(packageRoot)) { throw new EditorOperationException("package_not_found", $"Package root does not exist: {packageRoot}"); }
-        var projectsRoot = Path.GetFullPath(Path.Combine(packageRoot, "bin", "projects"));
-        var projectDirectory = Path.GetFullPath(Path.Combine(projectsRoot, parameters.ProjectName));
-        var prefix = projectsRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!projectDirectory.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) { throw new EditorOperationException("project_path_escape", "Project path escapes package/bin/projects."); }
-
-        var scenePath = Path.Combine(projectDirectory, "scene.json");
-        var scriptPath = Path.Combine(projectDirectory, "script.json");
-        var previewPath = Path.Combine(projectDirectory, "preview.json");
-        foreach (var path in new[] { scenePath, scriptPath, previewPath })
-        {
-            if (!File.Exists(path)) { throw new EditorOperationException("project_file_missing", $"Project file does not exist: {path}"); }
-        }
-
-        var project = new ProjectSessionInfo(packageRoot, parameters.ProjectName, projectDirectory, scenePath, scriptPath, previewPath, 1);
-        await ValidateProjectAsync(project, cancellationToken);
+        var project = await ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.OpenAsync(parameters, cancellationToken));
         _authoringHistory.Clear();
         return project;
     }
 
     public async Task<ProjectSessionInfo> CreateProjectAsync(ProjectCreateParameters parameters, CancellationToken cancellationToken)
     {
-        if (!Regex.IsMatch(parameters.ProjectName, "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$", RegexOptions.CultureInvariant))
-        {
-            throw new EditorOperationException("invalid_project_name", "Project name contains unsupported characters.");
-        }
-
-        var packageRoot = Path.GetFullPath(parameters.PackageRoot);
-        if (!Directory.Exists(packageRoot)) { throw new EditorOperationException("package_not_found", $"Package root does not exist: {packageRoot}"); }
-        var projectsRoot = Path.GetFullPath(Path.Combine(packageRoot, "bin", "projects"));
-        var projectDirectory = Path.GetFullPath(Path.Combine(projectsRoot, parameters.ProjectName));
-        var prefix = projectsRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!projectDirectory.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) { throw new EditorOperationException("project_path_escape", "Project path escapes package/bin/projects."); }
-
-        foreach (var template in new[]
-        {
-            Path.Combine(packageRoot, "bin", "assets", "scenes", "preview.scene.json"),
-            Path.Combine(packageRoot, "bin", "assets", "scripts", "preview.script.json")
-        })
-        {
-            if (!File.Exists(template)) { throw new EditorOperationException("project_template_missing", $"Project template does not exist: {template}"); }
-        }
-
-        var ownershipToken = Guid.NewGuid().ToString("N");
-        var project = new ProjectSessionInfo(
-            packageRoot,
-            parameters.ProjectName,
-            projectDirectory,
-            Path.Combine(projectDirectory, "scene.json"),
-            Path.Combine(projectDirectory, "script.json"),
-            Path.Combine(projectDirectory, "preview.json"),
-            1);
-        var output = await RunPowerShellAsync(
-            Path.Combine(_kadathRoot, "tools", "editor-author.ps1"),
-            ["-Action", "Create", "-PackageRoot", packageRoot, "-ProjectName", parameters.ProjectName, "-OwnershipToken", ownershipToken],
-            cancellationToken);
-        // 关键错误映射：业务分支只读取精确退出码；Adapter stdout/stderr 永远只是诊断文本。
-        if (output.ExitCode == ProjectAlreadyExistsExitCode)
-        {
-            throw new EditorOperationException("project_already_exists", JoinDiagnostics(output));
-        }
-        if (output.ExitCode != 0)
-        {
-            // Adapter 已可能取得 ownership 后失败；Service 只凭相同 token 做兜底清理，绝不触碰竞争方目录。
-            CleanupCreatedProjectIfOwned(project, ownershipToken);
-            throw new EditorOperationException("project_create_failed", JoinDiagnostics(output));
-        }
-
-        try
-        {
-            _ = ValidateProjectCreateOwnership(project, ownershipToken);
-            foreach (var path in new[] { project.ScenePath, project.ScriptPath, project.PreviewPath })
-            {
-                if (!File.Exists(path)) { throw new EditorOperationException("project_validation_failed", $"Project file does not exist: {path}"); }
-            }
-            await ValidateProjectAsync(project, cancellationToken);
-
-            // 关键提交前检查：Validate 期间 ownership 可能被替换；只有再次匹配才移除 claim 并移交给 Core。
-            var claimPath = ValidateProjectCreateOwnership(project, ownershipToken);
-            File.Delete(claimPath);
-        }
-        catch (Exception exception)
-        {
-            CleanupCreatedProjectIfOwned(project, ownershipToken);
-            throw new EditorOperationException("project_validation_failed", exception.Message);
-        }
-
+        var project = await ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.CreateAsync(parameters, cancellationToken));
         _authoringHistory.Clear();
         return project;
     }
 
-    private static string ValidateProjectCreateOwnership(ProjectSessionInfo project, string ownershipToken)
+    public Task<ProjectValidateResult> ValidateProjectAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
+        ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.ValidateAsync(project, cancellationToken));
+
+    private static async Task<T> ExecuteProjectLifecycleAsync<T>(Func<Task<T>> operation)
     {
-        var expectedDirectory = Path.GetFullPath(project.ProjectDirectory);
-        var directory = new DirectoryInfo(expectedDirectory);
-        if (!directory.Exists
-            || !Path.GetFullPath(directory.FullName).Equals(expectedDirectory, StringComparison.OrdinalIgnoreCase)
-            || (directory.Attributes & FileAttributes.ReparsePoint) != 0)
+        try { return await operation(); }
+        catch (WorkspaceProjectLifecycleException exception)
         {
-            throw new EditorOperationException("project_validation_failed", "Created project directory is missing, replaced, or a reparse point.");
+            var code = exception.Kind switch
+            {
+                WorkspaceProjectLifecycleFailureKind.InvalidProjectName => "invalid_project_name",
+                WorkspaceProjectLifecycleFailureKind.PackageNotFound => "package_not_found",
+                WorkspaceProjectLifecycleFailureKind.PathEscape => "project_path_escape",
+                WorkspaceProjectLifecycleFailureKind.ProjectFileMissing => "project_file_missing",
+                WorkspaceProjectLifecycleFailureKind.AlreadyExists => "project_already_exists",
+                WorkspaceProjectLifecycleFailureKind.Create => "project_create_failed",
+                WorkspaceProjectLifecycleFailureKind.Validation or WorkspaceProjectLifecycleFailureKind.Invariant => "project_validation_failed",
+                _ => "project_validation_failed"
+            };
+            throw new EditorOperationException(code, exception.Message);
         }
-
-        var claimPath = Path.GetFullPath(Path.Combine(expectedDirectory, ProjectCreateClaimFileName));
-        var directoryPrefix = expectedDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!claimPath.StartsWith(directoryPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(claimPath))
-        {
-            throw new EditorOperationException("project_validation_failed", "Project create ownership claim is missing or outside the expected directory.");
-        }
-
-        var claim = new FileInfo(claimPath);
-        if ((claim.Attributes & FileAttributes.ReparsePoint) != 0
-            || claim.Length != ownershipToken.Length
-            || !File.ReadAllText(claimPath).Equals(ownershipToken, StringComparison.Ordinal))
-        {
-            throw new EditorOperationException("project_validation_failed", "Project create ownership claim does not match this request.");
-        }
-        return claimPath;
-    }
-
-    private static void CleanupCreatedProjectIfOwned(ProjectSessionInfo project, string ownershipToken)
-    {
-        try
-        {
-            // 关键回滚边界：删除前复用完整 ownership 校验；缺失、不匹配或 reparse 时宁可保留也绝不误删。
-            _ = ValidateProjectCreateOwnership(project, ownershipToken);
-            Directory.Delete(project.ProjectDirectory, recursive: true);
-        }
-        catch
-        {
-            // 原始失败仍统一映射为 project_validation_failed；安全拒绝清理不能降级成无 token 的递归删除。
-        }
-    }
-
-    public async Task<ProjectValidateResult> ValidateProjectAsync(ProjectSessionInfo project, CancellationToken cancellationToken)
-    {
-        var result = await RunPowerShellAsync(
-            Path.Combine(_kadathRoot, "tools", "editor-author.ps1"),
-            ["-Action", "Validate", "-PackageRoot", project.PackageRoot, "-ProjectName", project.ProjectName],
-            cancellationToken);
-        if (result.ExitCode != 0)
-        {
-            throw new EditorOperationException("project_validation_failed", JoinDiagnostics(result));
-        }
-        return new ProjectValidateResult("valid", project.ProjectName, result.Stdout);
     }
 
     public Task<ProjectModelSnapshot> GetProjectSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>

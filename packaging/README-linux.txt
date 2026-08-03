@@ -26,7 +26,8 @@ Kadath Runtime Package (Linux x86_64)
 - `assets/renderer2d/goal.texture`：TextureId 2；
 - `assets/audio/won.audio.wav` 与 `lost.audio.wav`：规范 PCM WAV；
 - `assets/scenes/preview.scene`：KSCN v2（Runtime 兼容读取 v1）；
-- `assets/scripts/preview.script`：KSCP v1。
+- `assets/scripts/preview.script`：KSCP v1；
+- `assets/scenes/preview.scene.json` 与 `assets/scripts/preview.script.json`：Editor 原生 Project Create 使用的严格校验模板，不是 Runtime 启动输入。
 
 完整性
 ------

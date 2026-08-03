@@ -60,11 +60,7 @@ public sealed class WorkspaceAuthoringModel
         CancellationToken cancellationToken)
     {
         ValidateExpectedRevision(expectedRevision);
-        var original = WorkspaceReadModel.ReadProjectBytes(project, cancellationToken);
-        if (original.Scene.Length > 65536 || original.Script.Length > 65536)
-        {
-            throw Failure(WorkspaceAuthoringFailureKind.Input, "Authoring source exceeds the 64 KiB Runtime document budget.");
-        }
+        var original = WorkspaceProjectValidator.ReadAndValidate(project, cancellationToken);
         var current = WorkspaceReadModel.ProjectSnapshotsFromBytes(project, original);
         if (!expectedRevision.Equals(current.Project.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
         {
@@ -90,7 +86,15 @@ public sealed class WorkspaceAuthoringModel
         }
         var intended = original with { Scene = sceneBytes, Script = scriptBytes };
         WorkspaceProjectProjection committed;
-        try { committed = WorkspaceReadModel.ProjectSnapshotsFromBytes(project, intended); }
+        try
+        {
+            WorkspaceProjectValidator.ValidateBytes(project, intended, cancellationToken);
+            committed = WorkspaceReadModel.ProjectSnapshotsFromBytes(project, intended);
+        }
+        catch (WorkspaceProjectValidationException exception)
+        {
+            throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception);
+        }
         catch (WorkspaceReadException exception)
         {
             throw Failure(exception.Kind == WorkspaceReadFailureKind.Invariant ? WorkspaceAuthoringFailureKind.Invariant : WorkspaceAuthoringFailureKind.InvalidPatch,
@@ -112,6 +116,10 @@ public sealed class WorkspaceAuthoringModel
         {
             throw Failure(exception.Kind == WorkspaceReadFailureKind.Invariant ? WorkspaceAuthoringFailureKind.Invariant : WorkspaceAuthoringFailureKind.Input,
                 exception.Message, exception);
+        }
+        catch (WorkspaceProjectValidationException exception)
+        {
+            throw Failure(WorkspaceAuthoringFailureKind.Input, exception.Message, exception);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or FormatException or OverflowException)
         {

@@ -21,7 +21,7 @@ public sealed class EditorProjectIdentity
     public static EditorProjectIdentity? From(ProjectSessionInfo? session) => session is null
         ? null
         : new EditorProjectIdentity(
-            Path.TrimEndingDirectorySeparator(Path.GetFullPath(session.PackageRoot)),
+            NormalizePackageRoot(session.PackageRoot),
             session.ProjectName);
 
     public static bool Matches(ProjectSessionInfo? left, ProjectSessionInfo? right) =>
@@ -29,7 +29,7 @@ public sealed class EditorProjectIdentity
 
     public static bool Matches(ProjectSessionInfo? left, string packageRoot, string projectName) =>
         Matches(From(left), new EditorProjectIdentity(
-            Path.TrimEndingDirectorySeparator(Path.GetFullPath(packageRoot)),
+            NormalizePackageRoot(packageRoot),
             projectName));
 
     public static bool Matches(EditorProjectIdentity? left, EditorProjectIdentity? right)
@@ -39,6 +39,30 @@ public sealed class EditorProjectIdentity
         // Windows package identity 不区分路径大小写；项目名沿用现有 v1 session 的兼容规则。
         return string.Equals(left.PackageRoot, right.PackageRoot, StringComparison.OrdinalIgnoreCase)
             && string.Equals(left.ProjectName, right.ProjectName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizePackageRoot(string packageRoot)
+    {
+        if (packageRoot.Length >= 3
+            && char.IsAsciiLetter(packageRoot[0])
+            && packageRoot[1] == ':'
+            && packageRoot[2] is '/' or '\\')
+        {
+            var segments = new List<string>();
+            foreach (var segment in packageRoot[3..].Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (segment == ".") continue;
+                if (segment == "..")
+                {
+                    if (segments.Count > 0) segments.RemoveAt(segments.Count - 1);
+                    continue;
+                }
+                segments.Add(segment);
+            }
+            var drive = char.ToUpperInvariant(packageRoot[0]);
+            return segments.Count == 0 ? $"{drive}:/" : $"{drive}:/{string.Join('/', segments)}";
+        }
+        return Path.TrimEndingDirectorySeparator(Path.GetFullPath(packageRoot));
     }
 }
 
