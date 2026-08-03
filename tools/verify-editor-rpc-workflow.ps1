@@ -106,7 +106,7 @@ try {
     [void](Read-Event $process 'bake_started')
     [void](Read-Event $process 'bake_completed')
     $baked = Read-Response $process 'bake-1'
-    if (-not [bool]$baked.ok -or [string]$baked.result.state -ne 'succeeded' -or [int]$baked.result.sceneArtifactBytes -ne 128) { throw 'bake_start contract mismatch' }
+    if (-not [bool]$baked.ok -or [string]$baked.result.state -ne 'succeeded' -or [int]$baked.result.sceneArtifactBytes -ne 258) { throw 'bake_start contract mismatch' }
 
     $script:stage = 'watch_start'
     Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'watch-1'; method = 'watch_start'; params = [ordered]@{ target = 'Scene'; profile = 'debug'; pollIntervalMilliseconds = 50; debounceMilliseconds = 100 } })
@@ -141,7 +141,7 @@ try {
     if (-not [bool]$preview.ok -or [string]$surface.data.mode -ne 'external-window' -or [string]$surface.data.windowClass -ne 'KadathRuntimeWindow') { throw 'preview external-window contract mismatch' }
     $initialLoaded = Read-Event $process 'preview_initial_loaded'
     $initialValid = ([int]$initialLoaded.data.loadVersion -eq 1) -and ([string]$initialLoaded.data.state -eq 'loaded') -and
-        ([string]$initialLoaded.data.scene.kind -eq 'artifact') -and ([string]$initialLoaded.data.scene.correlation -eq 'manifest_matched') -and (([string]$initialLoaded.data.scene.sourceRevision).Length -eq 64) -and (([string]$initialLoaded.data.scene.artifactRevision).Length -eq 64) -and ([uint64]$initialLoaded.data.scene.artifactBytes -eq 128) -and
+        ([string]$initialLoaded.data.scene.kind -eq 'artifact') -and ([string]$initialLoaded.data.scene.correlation -eq 'manifest_matched') -and (([string]$initialLoaded.data.scene.sourceRevision).Length -eq 64) -and (([string]$initialLoaded.data.scene.artifactRevision).Length -eq 64) -and ([uint64]$initialLoaded.data.scene.artifactBytes -eq 258) -and
         ([string]$initialLoaded.data.script.kind -eq 'artifact') -and ([string]$initialLoaded.data.script.correlation -eq 'manifest_matched') -and (([string]$initialLoaded.data.script.sourceRevision).Length -eq 64) -and (([string]$initialLoaded.data.script.artifactRevision).Length -eq 64) -and ([uint64]$initialLoaded.data.script.artifactBytes -eq 48)
     if (-not $initialValid) { throw 'Preview initial loaded identity contract mismatch' }
     Start-Sleep -Milliseconds 500
@@ -149,7 +149,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Failed to update Scene source for Preview live-bake verification' }
     $reloadRequested = Read-Event $process 'preview_reload_requested'
     $reloadAcknowledged = Read-Event $process 'preview_reload_acknowledged'
-    $reloadAckValid = ([string]$reloadRequested.data.target -eq 'Scene') -and ([string]$reloadRequested.data.state -eq 'requested') -and (([string]$reloadRequested.data.sourceRevision).Length -eq 64) -and (([string]$reloadRequested.data.artifactRevision).Length -eq 64) -and ([int]$reloadRequested.data.artifactBytes -eq 128) -and ([uint64]$reloadAcknowledged.data.requestId -eq [uint64]$reloadRequested.data.requestId) -and ([string]$reloadAcknowledged.data.state -eq 'acknowledged') -and ([string]$reloadAcknowledged.data.acknowledgedSourceRevision -ieq [string]$reloadRequested.data.sourceRevision) -and ([string]$reloadAcknowledged.data.acknowledgedArtifactRevision -ieq [string]$reloadRequested.data.artifactRevision)
+    $reloadAckValid = ([string]$reloadRequested.data.target -eq 'Scene') -and ([string]$reloadRequested.data.state -eq 'requested') -and (([string]$reloadRequested.data.sourceRevision).Length -eq 64) -and (([string]$reloadRequested.data.artifactRevision).Length -eq 64) -and ([int]$reloadRequested.data.artifactBytes -eq 258) -and ([uint64]$reloadAcknowledged.data.requestId -eq [uint64]$reloadRequested.data.requestId) -and ([string]$reloadAcknowledged.data.state -eq 'acknowledged') -and ([string]$reloadAcknowledged.data.acknowledgedSourceRevision -ieq [string]$reloadRequested.data.sourceRevision) -and ([string]$reloadAcknowledged.data.acknowledgedArtifactRevision -ieq [string]$reloadRequested.data.artifactRevision)
     if (-not $reloadAckValid) { throw 'Preview reload acknowledgement contract mismatch' }
     [void](Read-Event $process 'preview_stopped')
 

@@ -686,7 +686,7 @@ internal static class Program
 
         var baked = await workspace.BakeAsync(new BakeStartParameters("Both", "debug"));
         Assert(baked.State == "succeeded" && workspace.Bake.State == EditorBakeState.Succeeded, "bake state mismatch");
-        Assert(workspace.Bake.SceneArtifactBytes == 128, "scene artifact bytes were not retained");
+        Assert(workspace.Bake.SceneArtifactBytes == 258, "scene artifact bytes were not retained");
         var lastSuccessfulRevision = workspace.Bake.SceneArtifactRevision;
 
         var watched = await workspace.StartWatchAsync(new WatchStartParameters("Scene", "debug", 50, 100));

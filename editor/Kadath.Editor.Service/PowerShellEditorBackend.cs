@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Kadath.Editor.Core;
 using Kadath.Editor.Protocol;
+using Kadath.Editor.Workspace;
 
 namespace Kadath.Editor.Service;
 
@@ -12,6 +13,7 @@ namespace Kadath.Editor.Service;
 internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 {
     private readonly string _kadathRoot;
+    private readonly WorkspaceReadModel _readModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
@@ -24,7 +26,11 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     private string _watchTarget = "Both";
     private string _watchProfile = "debug";
 
-    public PowerShellEditorBackend(string kadathRoot) => _kadathRoot = kadathRoot;
+    public PowerShellEditorBackend(string kadathRoot, WorkspaceReadModel readModel)
+    {
+        _kadathRoot = kadathRoot;
+        _readModel = readModel;
+    }
 
     public event Func<EditorSessionNotification, Task>? Notification;
 
@@ -183,61 +189,34 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     }
 
     public Task<ProjectModelSnapshot> GetProjectSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
-        ReadSnapshotAsync<ProjectModelSnapshot>(project, "Project", cancellationToken);
+        ReadWorkspaceSnapshotAsync(() => _readModel.ReadProjectAsync(project, cancellationToken), project, false);
 
     public Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
-        ReadSnapshotAsync<HierarchySnapshot>(project, "Hierarchy", cancellationToken);
+        ReadWorkspaceSnapshotAsync(() => _readModel.ReadHierarchyAsync(project, cancellationToken), project, false);
 
     public Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
-        ReadSnapshotAsync<AssetCatalogSnapshot>(project, "Assets", cancellationToken);
+        ReadWorkspaceSnapshotAsync(() => _readModel.ReadAssetsAsync(project, cancellationToken), project, false);
 
-    public async Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken)
-    {
-        var profile = NormalizeProfile(parameters.Profile);
-        var output = await RunPowerShellAsync(
-            Path.Combine(_kadathRoot, "tools", "editor-publication-snapshot.ps1"),
-            ["-PackageRoot", project.PackageRoot, "-ProjectName", project.ProjectName, "-Profile", profile],
-            cancellationToken);
-        if (output.ExitCode != 0)
-        {
-            throw new EditorOperationException("publication_snapshot_failed", JoinDiagnostics(output));
-        }
-
-        var line = output.Stdout.LastOrDefault(value => !string.IsNullOrWhiteSpace(value));
-        if (line is null)
-        {
-            throw new EditorOperationException("publication_snapshot_protocol_error", "Publication snapshot adapter emitted no JSON result.");
-        }
-        try
-        {
-            var snapshot = JsonSerializer.Deserialize<PublicationSnapshot>(line, EditorProtocol.JsonOptions)
-                ?? throw new EditorOperationException("publication_snapshot_protocol_error", "Publication snapshot adapter emitted an empty result.");
-            ValidateSnapshot(project, snapshot);
-            return snapshot;
-        }
-        catch (JsonException exception)
-        {
-            throw new EditorOperationException("publication_snapshot_protocol_error", $"Publication snapshot JSON is invalid: {exception.Message}");
-        }
-    }
+    public Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken) =>
+        ReadWorkspaceSnapshotAsync(() => _readModel.ReadPublicationAsync(project, NormalizeProfile(parameters.Profile), cancellationToken), project, true);
     public async Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken)
     {
         await _authoringGate.WaitAsync(cancellationToken);
         try
         {
-            var current = await ReadSnapshotAsync<ProjectModelSnapshot>(project, "Project", cancellationToken);
+            var current = await GetProjectSnapshotAsync(project, cancellationToken);
             ValidateExpectedRevision(parameters.ExpectedRevision, current.AuthoringRevision);
             var patch = NormalizePatch(current, parameters.Patch);
             var changedFields = GetChangedFields(patch);
             if (changedFields.Length == 0)
             {
-                var unchangedHierarchy = await ReadSnapshotAsync<HierarchySnapshot>(project, "Hierarchy", cancellationToken);
+                var unchangedHierarchy = await GetHierarchySnapshotAsync(project, cancellationToken);
                 return new AuthoringMutationResult("apply", "unchanged", project.ProjectName, current.AuthoringRevision, current.AuthoringRevision, [], _authoringHistory.Count, current, unchangedHierarchy);
             }
 
             await InvokeAuthoringAdapterAsync(project, parameters.ExpectedRevision, patch, cancellationToken);
-            var next = await ReadSnapshotAsync<ProjectModelSnapshot>(project, "Project", cancellationToken);
-            var hierarchy = await ReadSnapshotAsync<HierarchySnapshot>(project, "Hierarchy", cancellationToken);
+            var next = await GetProjectSnapshotAsync(project, cancellationToken);
+            var hierarchy = await GetHierarchySnapshotAsync(project, cancellationToken);
             if (_authoringHistory.Count > 0 && !string.Equals(_authoringHistory[^1].RevisionAfter, current.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
             {
                 // 外部编辑使旧 undo 链失去连续性；清理而不是把不相关内容覆盖回来。
@@ -261,7 +240,7 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         await _authoringGate.WaitAsync(cancellationToken);
         try
         {
-            var current = await ReadSnapshotAsync<ProjectModelSnapshot>(project, "Project", cancellationToken);
+            var current = await GetProjectSnapshotAsync(project, cancellationToken);
             ValidateExpectedRevision(parameters.ExpectedRevision, current.AuthoringRevision);
             if (_authoringHistory.Count == 0) { throw new EditorOperationException("authoring_undo_empty", "There is no authoring mutation to undo."); }
             var record = _authoringHistory[^1];
@@ -273,8 +252,8 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 
             await InvokeAuthoringAdapterAsync(project, parameters.ExpectedRevision,
                 new AuthoringPatch(record.SceneGoalPosition, record.ScriptGoalPosition, record.ScriptGoalVelocity, record.ScenePlayerTextureId, record.SceneGoalTextureId, record.SceneHazardTextureId), cancellationToken);
-            var next = await ReadSnapshotAsync<ProjectModelSnapshot>(project, "Project", cancellationToken);
-            var hierarchy = await ReadSnapshotAsync<HierarchySnapshot>(project, "Hierarchy", cancellationToken);
+            var next = await GetProjectSnapshotAsync(project, cancellationToken);
+            var hierarchy = await GetHierarchySnapshotAsync(project, cancellationToken);
             _authoringHistory.RemoveAt(_authoringHistory.Count - 1);
             return new AuthoringMutationResult("undo", "succeeded", project.ProjectName, current.AuthoringRevision, next.AuthoringRevision, record.ChangedFields, _authoringHistory.Count, next, hierarchy);
         }
@@ -374,30 +353,20 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         if (handler is not null) { await handler(notification); }
     }
 
-    private async Task<T> ReadSnapshotAsync<T>(ProjectSessionInfo project, string target, CancellationToken cancellationToken)
+    private static async Task<T> ReadWorkspaceSnapshotAsync<T>(Func<Task<T>> read, ProjectSessionInfo project, bool publication)
     {
-        var output = await RunPowerShellAsync(
-            Path.Combine(_kadathRoot, "tools", "editor-snapshot.ps1"),
-            ["-PackageRoot", project.PackageRoot, "-ProjectName", project.ProjectName, "-Target", target],
-            cancellationToken);
-        if (output.ExitCode != 0)
-        {
-            // Adapter 负责文件/reparse 边界；Service 再校验 DTO，避免不可信 JSON 穿透到前端。
-            throw new EditorOperationException("snapshot_failed", JoinDiagnostics(output));
-        }
-
-        var line = output.Stdout.LastOrDefault(value => !string.IsNullOrWhiteSpace(value));
-        if (line is null) { throw new EditorOperationException("snapshot_protocol_error", "Snapshot adapter emitted no JSON result."); }
         try
         {
-            var snapshot = JsonSerializer.Deserialize<T>(line, EditorProtocol.JsonOptions)
-                ?? throw new EditorOperationException("snapshot_protocol_error", "Snapshot adapter emitted an empty JSON result.");
+            var snapshot = await read();
             ValidateSnapshot(project, snapshot);
             return snapshot;
         }
-        catch (JsonException exception)
+        catch (WorkspaceReadException exception)
         {
-            throw new EditorOperationException("snapshot_protocol_error", $"Snapshot JSON is invalid: {exception.Message}");
+            var code = exception.Kind == WorkspaceReadFailureKind.Invariant
+                ? publication ? "publication_snapshot_protocol_error" : "snapshot_protocol_error"
+                : publication ? "publication_snapshot_failed" : "snapshot_failed";
+            throw new EditorOperationException(code, exception.Message);
         }
     }
 
@@ -775,5 +744,3 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 
     private sealed record PowerShellResult(int ExitCode, string[] Stdout, string[] Stderr);
 }
-
-

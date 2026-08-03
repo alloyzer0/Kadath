@@ -1,4 +1,5 @@
 using Kadath.Editor.Core;
+using Kadath.Editor.Workspace;
 
 namespace Kadath.Editor.Service;
 
@@ -9,7 +10,7 @@ internal static class Program
         try
         {
             var kadathRoot = ResolveKadathRoot(args);
-            await using var session = new EditorSession(new PowerShellEditorBackend(kadathRoot));
+            await using var session = new EditorSession(new PowerShellEditorBackend(kadathRoot, new WorkspaceReadModel()));
             await using var preview = new PreviewProcessController(kadathRoot);
             var host = new EditorRpcHost(session, preview, Console.In, Console.Out);
             return await host.RunAsync();

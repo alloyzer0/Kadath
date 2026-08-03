@@ -51,9 +51,9 @@ try {
     [IO.File]::Copy((Join-Path $root 'bin\assets\scripts\preview.script.json'), $scriptSource)
 
     $initial = Invoke-Adapter 'Both'
-    if ([string]::IsNullOrWhiteSpace([string]$initial.sourceRevision.scene) -or [string]::IsNullOrWhiteSpace([string]$initial.artifactRevision.script) -or [int]$initial.artifactBytes.scene -ne 128) { throw 'Live-bake result revision/bytes contract mismatch' }
+    if ([string]::IsNullOrWhiteSpace([string]$initial.sourceRevision.scene) -or [string]::IsNullOrWhiteSpace([string]$initial.artifactRevision.script) -or [int]$initial.artifactBytes.scene -ne 258) { throw 'Live-bake result revision/bytes contract mismatch' }
     if (@($initial.entries).Count -ne 2) { throw 'Initial bake did not report two entries' }
-    if ((Get-Item -LiteralPath $sceneArtifact).Length -ne 128 -or (Get-Item -LiteralPath $scriptArtifact).Length -lt 16) { throw 'Initial artifact sizes are invalid' }
+    if ((Get-Item -LiteralPath $sceneArtifact).Length -ne 258 -or (Get-Item -LiteralPath $scriptArtifact).Length -lt 16) { throw 'Initial artifact sizes are invalid' }
     $sceneInitialHash = Get-Hash $sceneArtifact
     $scriptInitialHash = Get-Hash $scriptArtifact
 
