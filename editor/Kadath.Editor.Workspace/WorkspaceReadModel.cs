@@ -17,6 +17,18 @@ public sealed class WorkspaceReadException : Exception
     public WorkspaceReadFailureKind Kind { get; }
 }
 
+internal sealed record WorkspaceProjectBytes(
+    string PackageRoot,
+    string ProjectDirectory,
+    string ScenePath,
+    string ScriptPath,
+    string PreviewPath,
+    byte[] Scene,
+    byte[] Script,
+    byte[] Preview);
+
+internal sealed record WorkspaceProjectProjection(ProjectModelSnapshot Project, HierarchySnapshot Hierarchy);
+
 public sealed class WorkspaceReadModel
 {
     private const int MaxAssetItems = 4096;
@@ -49,14 +61,18 @@ public sealed class WorkspaceReadModel
 
     private static ProjectModelSnapshot ReadProjectCore(ProjectSessionInfo project, CancellationToken cancellationToken)
     {
-        using var loaded = LoadProject(project, cancellationToken);
-        return BuildProjectSnapshot(project, loaded);
+        var bytes = ReadProjectBytes(project, cancellationToken);
+        return ProjectSnapshotFromBytes(project, bytes);
     }
 
     private static HierarchySnapshot ReadHierarchyCore(ProjectSessionInfo project, CancellationToken cancellationToken)
     {
-        using var loaded = LoadProject(project, cancellationToken);
-        var model = BuildProjectSnapshot(project, loaded);
+        var bytes = ReadProjectBytes(project, cancellationToken);
+        return ProjectSnapshotsFromBytes(project, bytes).Hierarchy;
+    }
+
+    private static HierarchySnapshot BuildHierarchySnapshot(ProjectSessionInfo project, LoadedProject loaded, ProjectModelSnapshot model)
+    {
         var nodes = new List<HierarchyNode>();
         var scene = loaded.Scene.RootElement;
         var script = loaded.Script.RootElement;
@@ -245,20 +261,37 @@ public sealed class WorkspaceReadModel
         var scriptVelocity = RequireVector(fixedUpdate[0], "value", 2, "Script fixed_update instruction");
         return new ProjectModelSnapshot(EditorSnapshotVersions.ProjectModel, project.ProjectName,
             AuthoringRevision(loaded.SceneBytes, loaded.ScriptBytes),
-            new ProjectModelFiles(loaded.Paths.ProjectDirectory, loaded.Paths.Scene, loaded.Paths.Script, loaded.Paths.Preview),
+            new ProjectModelFiles(loaded.Bytes.ProjectDirectory, loaded.Bytes.ScenePath, loaded.Bytes.ScriptPath, loaded.Bytes.PreviewPath),
             new ProjectModelScene(sceneVersion, sceneGoal, playerTexture, goalTexture, hazardTexture, textures),
             new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity), new ProjectModelPreview(previewVersion));
     }
 
-    private static LoadedProject LoadProject(ProjectSessionInfo project, CancellationToken cancellationToken)
+    internal static WorkspaceProjectBytes ReadProjectBytes(ProjectSessionInfo project, CancellationToken cancellationToken)
     {
         var paths = ResolveProjectPaths(project);
         var sceneBytes = ReadFileSnapshot(paths.Scene, "Scene", cancellationToken);
         var scriptBytes = ReadFileSnapshot(paths.Script, "Script", cancellationToken);
         var previewBytes = ReadFileSnapshot(paths.Preview, "Preview config", cancellationToken);
+        return new WorkspaceProjectBytes(paths.PackageRoot, paths.ProjectDirectory, paths.Scene, paths.Script, paths.Preview, sceneBytes, scriptBytes, previewBytes);
+    }
+
+    internal static WorkspaceProjectProjection ProjectSnapshotsFromBytes(ProjectSessionInfo project, WorkspaceProjectBytes bytes)
+    {
         try
         {
-            return new LoadedProject(paths, sceneBytes, scriptBytes, ParseJson(sceneBytes), ParseJson(scriptBytes), ParseJson(previewBytes));
+            using var loaded = new LoadedProject(bytes, ParseJson(bytes.Scene), ParseJson(bytes.Script), ParseJson(bytes.Preview));
+            var model = BuildProjectSnapshot(project, loaded);
+            return new WorkspaceProjectProjection(model, BuildHierarchySnapshot(project, loaded, model));
+        }
+        catch (JsonException exception) { throw Input($"Failed to parse project JSON: {exception.Message}", exception); }
+    }
+
+    private static ProjectModelSnapshot ProjectSnapshotFromBytes(ProjectSessionInfo project, WorkspaceProjectBytes bytes)
+    {
+        try
+        {
+            using var loaded = new LoadedProject(bytes, ParseJson(bytes.Scene), ParseJson(bytes.Script), ParseJson(bytes.Preview));
+            return BuildProjectSnapshot(project, loaded);
         }
         catch (JsonException exception) { throw Input($"Failed to parse project JSON: {exception.Message}", exception); }
     }
@@ -448,7 +481,7 @@ public sealed class WorkspaceReadModel
         return result;
     }
 
-    private static string AuthoringRevision(byte[] scene, byte[] script)
+    internal static string AuthoringRevision(byte[] scene, byte[] script)
     {
         var identity = $"kadath-authoring-v1\nscene:{Sha256(scene)}\nscript:{Sha256(script)}";
         return Sha256(Encoding.UTF8.GetBytes(identity));
@@ -495,11 +528,11 @@ public sealed class WorkspaceReadModel
 
     private sealed class LoadedProject : IDisposable
     {
-        public LoadedProject(ProjectPaths paths, byte[] sceneBytes, byte[] scriptBytes, JsonDocument scene, JsonDocument script, JsonDocument preview)
-        { Paths = paths; SceneBytes = sceneBytes; ScriptBytes = scriptBytes; Scene = scene; Script = script; Preview = preview; }
-        public ProjectPaths Paths { get; }
-        public byte[] SceneBytes { get; }
-        public byte[] ScriptBytes { get; }
+        public LoadedProject(WorkspaceProjectBytes bytes, JsonDocument scene, JsonDocument script, JsonDocument preview)
+        { Bytes = bytes; Scene = scene; Script = script; Preview = preview; }
+        public WorkspaceProjectBytes Bytes { get; }
+        public byte[] SceneBytes => Bytes.Scene;
+        public byte[] ScriptBytes => Bytes.Script;
         public JsonDocument Scene { get; }
         public JsonDocument Script { get; }
         public JsonDocument Preview { get; }

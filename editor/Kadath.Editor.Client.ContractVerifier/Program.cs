@@ -13,6 +13,13 @@ internal static class Program
     {
         try
         {
+            if (args.Length == 5 && args[0] == "--real-service-only")
+            {
+                await VerifyRealServiceAsync(args[1], args[2], args[3], args[4]);
+                Console.WriteLine("real_service_smoke=ok");
+                Console.WriteLine("verification=ok");
+                return 0;
+            }
             await VerifyProjectCreateClientContractAsync();
             await VerifyProjectCreateCapabilityProjectionAsync();
             await VerifyProjectCreateWorkspaceProjectionAsync();
@@ -24,7 +31,7 @@ internal static class Program
                 await VerifyRealServiceAsync(args[0], args[1], args[2], args[3]);
                 Console.WriteLine("real_service_smoke=ok");
             }
-            else if (args.Length != 0) { throw new ArgumentException("Usage: <serviceDll> <kadathRoot> <packageRoot> <projectName>"); }
+            else if (args.Length != 0) { throw new ArgumentException("Usage: [--real-service-only] <serviceDll> <kadathRoot> <packageRoot> <projectName>"); }
             Console.WriteLine("editor_rpc_client=ok");
             Console.WriteLine("request_correlation=ok");
             Console.WriteLine("event_ordering=ok");
@@ -570,7 +577,7 @@ internal static class Program
         try
         {
             _ = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(projectName, projectSnapshot.AuthoringRevision,
-                new AuthoringPatch(ScenePlayerTextureId: 3))).ConfigureAwait(false);
+                new AuthoringPatch(ScenePlayerTextureId: 4))).ConfigureAwait(false);
             throw new InvalidOperationException("invalid scene texture patch unexpectedly succeeded");
         }
         catch (EditorRpcException exception) when (exception.Code == "invalid_authoring_patch") { }

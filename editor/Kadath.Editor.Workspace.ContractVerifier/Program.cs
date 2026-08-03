@@ -31,6 +31,8 @@ internal static class Program
             Require(assets.Items.Select(item => item.RelativePath).SequenceEqual(assets.Items.Select(item => item.RelativePath).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ThenBy(value => value, StringComparer.Ordinal)), "asset ordering mismatch");
             Require(assets.Items.Any(item => item.AssetId == "asset://renderer2d/test.png" && item.Category == "Texture"), "texture catalog item missing");
 
+            await VerifyAuthoringAsync(project, readModel);
+
             var missing = await readModel.ReadPublicationAsync(project, "debug", default);
             Require(missing.State == "missing" && !missing.ManifestPresent && missing.Scene.State == "missing" && missing.Script.State == "missing", "publication missing mismatch");
 
@@ -114,6 +116,7 @@ internal static class Program
             Console.WriteLine("hierarchy_snapshot=ok");
             Console.WriteLine("asset_catalog_snapshot=ok");
             Console.WriteLine("publication_state_machine=ok");
+            Console.WriteLine("authoring_transaction=ok");
             Console.WriteLine("failure_boundaries=ok");
             Console.WriteLine("read_only=ok");
             Console.WriteLine("pwsh_dependency=none");
@@ -126,6 +129,105 @@ internal static class Program
             return 1;
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
+    private static async Task VerifyAuthoringAsync(ProjectSessionInfo project, WorkspaceReadModel readModel)
+    {
+        var originalScene = File.ReadAllBytes(project.ScenePath);
+        var originalScript = File.ReadAllBytes(project.ScriptPath);
+        var originalPreview = File.ReadAllBytes(project.PreviewPath);
+        var assetsRoot = Path.Combine(project.PackageRoot, "bin", "assets");
+        var assetsIdentity = TreeIdentity(assetsRoot);
+        var derived = Path.Combine(project.ProjectDirectory, ".kadath", "derived");
+        Directory.CreateDirectory(derived);
+        File.WriteAllBytes(Path.Combine(derived, "authoring-sentinel.bin"), [9, 8, 7]);
+        var derivedIdentity = TreeIdentity(derived);
+        var initial = await readModel.ReadProjectAsync(project, default);
+        var authoring = new WorkspaceAuthoringModel();
+        var patch = new AuthoringPatch([710, 210], [690, 210], [2, -2], 2, 3, 1);
+        var commit = await authoring.ApplyAsync(project, initial.AuthoringRevision, patch, default);
+        var expectedFields = new[]
+        {
+            "scene.goal.position", "script.goal.position", "script.goal.velocity",
+            "scene.player.textureId", "scene.goal.textureId", "scene.hazard.textureId"
+        };
+        Require(commit.State == "succeeded" && commit.PreviousRevision == initial.AuthoringRevision && commit.Revision != initial.AuthoringRevision, "authoring commit identity mismatch");
+        Require(commit.ChangedFields.SequenceEqual(expectedFields), "authoring changed fields ordering mismatch");
+        Require(commit.ProjectSnapshot.AuthoringRevision == commit.Revision && commit.HierarchySnapshot.ProjectName == project.ProjectName, "authoring committed snapshots mismatch");
+        Require(commit.InversePatch?.SceneGoalPosition?.SequenceEqual(initial.Scene.GoalPosition) == true
+            && commit.InversePatch.ScriptGoalPosition?.SequenceEqual(initial.Script.GoalPosition) == true
+            && commit.InversePatch.ScriptGoalVelocity?.SequenceEqual(initial.Script.GoalVelocity) == true
+            && commit.InversePatch.ScenePlayerTextureId == initial.Scene.PlayerTextureId
+            && commit.InversePatch.SceneGoalTextureId == initial.Scene.GoalTextureId
+            && commit.InversePatch.SceneHazardTextureId == initial.Scene.HazardTextureId, "authoring inverse patch mismatch");
+        using (var scene = JsonDocument.Parse(File.ReadAllBytes(project.ScenePath)))
+        using (var script = JsonDocument.Parse(File.ReadAllBytes(project.ScriptPath)))
+        {
+            Require(scene.RootElement.GetProperty("extension").GetProperty("owner").GetString() == "scene", "authoring dropped unknown Scene fields");
+            Require(script.RootElement.GetProperty("extension").GetProperty("owner").GetString() == "script", "authoring dropped unknown Script fields");
+        }
+
+        var committedScene = File.ReadAllBytes(project.ScenePath);
+        var committedScript = File.ReadAllBytes(project.ScriptPath);
+        var noOp = await authoring.ApplyAsync(project, commit.Revision, patch, default);
+        Require(noOp.State == "unchanged" && noOp.Revision == commit.Revision && noOp.ChangedFields.Length == 0 && noOp.InversePatch is null, "authoring no-op mismatch");
+        Require(committedScene.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScenePath)) && committedScript.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScriptPath)), "authoring no-op wrote sources");
+
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, initial.AuthoringRevision, new AuthoringPatch([711, 211]), default), WorkspaceAuthoringFailureKind.RevisionConflict);
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, "bad", new AuthoringPatch([711, 211]), default), WorkspaceAuthoringFailureKind.InvalidExpectedRevision);
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(), default), WorkspaceAuthoringFailureKind.InvalidPatch);
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [double.NaN, 1]), default), WorkspaceAuthoringFailureKind.InvalidPatch);
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(ScenePlayerTextureId: 0), default), WorkspaceAuthoringFailureKind.InvalidPatch);
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(ScenePlayerTextureId: 4), default), WorkspaceAuthoringFailureKind.InvalidPatch);
+        Require(committedScene.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScenePath)) && committedScript.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScriptPath)), "authoring rejection changed sources");
+
+        var racedScript = File.ReadAllBytes(project.ScriptPath);
+        var racing = new WorkspaceAuthoringModel(() => File.AppendAllText(project.ScriptPath, "\n", Encoding.UTF8), null);
+        await ExpectAuthoringFailureAsync(() => racing.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [712, 212]), default), WorkspaceAuthoringFailureKind.RevisionConflict);
+        Require(committedScene.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScenePath)), "authoring TOCTOU conflict changed Scene");
+        File.WriteAllBytes(project.ScriptPath, racedScript);
+
+        var rollbackScene = File.ReadAllBytes(project.ScenePath);
+        var rollbackScript = File.ReadAllBytes(project.ScriptPath);
+        var failing = new WorkspaceAuthoringModel(null, index => { if (index == 1) throw new IOException("injected second replace failure"); });
+        await ExpectAuthoringFailureAsync(() => failing.ApplyAsync(project, commit.Revision,
+            new AuthoringPatch(SceneGoalPosition: [713, 213], ScriptGoalVelocity: [3, -3]), default), WorkspaceAuthoringFailureKind.Commit);
+        Require(rollbackScene.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScenePath)) && rollbackScript.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScriptPath)), "authoring rollback did not restore the pair");
+        Require(!Directory.EnumerateFiles(project.ProjectDirectory, "*.authoring.*", SearchOption.AllDirectories).Any(), "authoring temporary files remain after rollback");
+
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        await ExpectAsync<OperationCanceledException>(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [714, 214]), cancelled.Token));
+
+        File.WriteAllText(project.ScenePath, "{", Encoding.UTF8);
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [715, 215]), default), WorkspaceAuthoringFailureKind.Input);
+        File.WriteAllBytes(project.ScenePath, committedScene);
+
+        var missingScript = project.ScriptPath + ".missing";
+        File.Move(project.ScriptPath, missingScript);
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [716, 216]), default), WorkspaceAuthoringFailureKind.Input);
+        File.Move(missingScript, project.ScriptPath);
+
+        var realScene = project.ScenePath + ".real";
+        File.Move(project.ScenePath, realScene);
+        File.CreateSymbolicLink(project.ScenePath, realScene);
+        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [717, 217]), default), WorkspaceAuthoringFailureKind.Input);
+        File.Delete(project.ScenePath);
+        File.Move(realScene, project.ScenePath);
+
+        var undone = await authoring.ApplyAsync(project, commit.Revision, commit.InversePatch, default);
+        Require(undone.State == "succeeded"
+            && undone.ProjectSnapshot.Scene.GoalPosition.SequenceEqual(initial.Scene.GoalPosition)
+            && undone.ProjectSnapshot.Script.GoalPosition.SequenceEqual(initial.Script.GoalPosition)
+            && undone.ProjectSnapshot.Script.GoalVelocity.SequenceEqual(initial.Script.GoalVelocity), "authoring inverse mutation mismatch");
+
+        File.WriteAllBytes(project.ScenePath, originalScene);
+        File.WriteAllBytes(project.ScriptPath, originalScript);
+        Require(originalPreview.AsSpan().SequenceEqual(File.ReadAllBytes(project.PreviewPath)), "authoring modified preview config");
+        Require(assetsIdentity == TreeIdentity(assetsRoot), "authoring modified package assets");
+        Require(derivedIdentity == TreeIdentity(derived), "authoring modified derived artifacts");
+        Require(!Directory.EnumerateFiles(project.ProjectDirectory, "*.authoring.*", SearchOption.AllDirectories).Any(), "authoring temporary files remain");
+        Directory.Delete(Path.Combine(project.ProjectDirectory, ".kadath"), true);
     }
 
     private static ProjectSessionInfo CreateFixture(string root)
@@ -143,10 +245,10 @@ internal static class Program
         var scriptPath = Path.Combine(projectDirectory, "script.json");
         var previewPath = Path.Combine(projectDirectory, "preview.json");
         File.WriteAllText(scenePath, """
-        {"schemaVersion":3,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"},{"textureId":2,"artifact":"assets/renderer2d/goal.texture"},{"textureId":3,"artifact":"assets/renderer2d/goal.texture"}],"player":{"position":[312,130],"size":[320,240],"color":[1,1,1,1],"moveSpeed":180,"textureId":1},"goal":{"position":[700,200],"size":[96,96],"color":[1,0.75,0.1,1],"textureId":2},"hazard":{"position":[650,280],"size":[96,96],"color":[0.95,0.2,0.2,1],"patrolMinY":245,"patrolMaxY":330,"patrolSpeed":80,"textureId":3}}
+        {"schemaVersion":3,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"},{"textureId":2,"artifact":"assets/renderer2d/goal.texture"},{"textureId":3,"artifact":"assets/renderer2d/goal.texture"}],"player":{"position":[312,130],"size":[320,240],"color":[1,1,1,1],"moveSpeed":180,"textureId":1},"goal":{"position":[700,200],"size":[96,96],"color":[1,0.75,0.1,1],"textureId":2},"hazard":{"position":[650,280],"size":[96,96],"color":[0.95,0.2,0.2,1],"patrolMinY":245,"patrolMaxY":330,"patrolSpeed":80,"textureId":3},"extension":{"owner":"scene"}}
         """, Encoding.UTF8);
         File.WriteAllText(scriptPath, """
-        {"schemaVersion":1,"instructions":[{"hook":"on_start","op":"set_goal_position","value":[680,200]},{"hook":"fixed_update","op":"move_goal_velocity","value":[-12,0]}]}
+        {"schemaVersion":1,"instructions":[{"hook":"on_start","op":"set_goal_position","value":[680,200]},{"hook":"fixed_update","op":"move_goal_velocity","value":[-12,0]}],"extension":{"owner":"script"}}
         """, Encoding.UTF8);
         File.WriteAllText(previewPath, """
         {"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","assets/scenes/preview.scene","--script","assets/scripts/preview.script"]}}
@@ -219,6 +321,13 @@ internal static class Program
         try { await action(); }
         catch (WorkspaceReadException exception) when (exception.Kind == kind) { return; }
         throw new InvalidOperationException($"Expected WorkspaceReadException with kind {kind}.");
+    }
+
+    private static async Task ExpectAuthoringFailureAsync(Func<Task> action, WorkspaceAuthoringFailureKind kind)
+    {
+        try { await action(); }
+        catch (WorkspaceAuthoringException exception) when (exception.Kind == kind) { return; }
+        throw new InvalidOperationException($"Expected WorkspaceAuthoringException with kind {kind}.");
     }
 
     private static void Require(bool condition, string message)

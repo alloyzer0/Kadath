@@ -8,12 +8,13 @@ using Kadath.Editor.Workspace;
 namespace Kadath.Editor.Service;
 
 /// <summary>
-/// 把现有 PowerShell authoring/importer 工具收进深模块 Adapter，RPC/UI 不感知脚本参数与派生路径。
+/// 把现有 PowerShell project/bake/importer 工具与原生 Workspace Module 收进 Backend，RPC/UI 不感知实现细节。
 /// </summary>
 internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 {
     private readonly string _kadathRoot;
     private readonly WorkspaceReadModel _readModel;
+    private readonly WorkspaceAuthoringModel _authoringModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
@@ -26,10 +27,11 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     private string _watchTarget = "Both";
     private string _watchProfile = "debug";
 
-    public PowerShellEditorBackend(string kadathRoot, WorkspaceReadModel readModel)
+    public PowerShellEditorBackend(string kadathRoot, WorkspaceReadModel readModel, WorkspaceAuthoringModel authoringModel)
     {
         _kadathRoot = kadathRoot;
         _readModel = readModel;
+        _authoringModel = authoringModel;
     }
 
     public event Func<EditorSessionNotification, Task>? Notification;
@@ -204,33 +206,23 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         await _authoringGate.WaitAsync(cancellationToken);
         try
         {
-            var current = await GetProjectSnapshotAsync(project, cancellationToken);
-            ValidateExpectedRevision(parameters.ExpectedRevision, current.AuthoringRevision);
-            var patch = NormalizePatch(current, parameters.Patch);
-            var changedFields = GetChangedFields(patch);
-            if (changedFields.Length == 0)
+            var commit = await ApplyWorkspaceAuthoringAsync(project, parameters.ExpectedRevision, parameters.Patch, cancellationToken);
+            if (commit.State == "unchanged")
             {
-                var unchangedHierarchy = await GetHierarchySnapshotAsync(project, cancellationToken);
-                return new AuthoringMutationResult("apply", "unchanged", project.ProjectName, current.AuthoringRevision, current.AuthoringRevision, [], _authoringHistory.Count, current, unchangedHierarchy);
+                return new AuthoringMutationResult("apply", "unchanged", project.ProjectName, commit.PreviousRevision, commit.Revision,
+                    [], _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
             }
 
-            await InvokeAuthoringAdapterAsync(project, parameters.ExpectedRevision, patch, cancellationToken);
-            var next = await GetProjectSnapshotAsync(project, cancellationToken);
-            var hierarchy = await GetHierarchySnapshotAsync(project, cancellationToken);
-            if (_authoringHistory.Count > 0 && !string.Equals(_authoringHistory[^1].RevisionAfter, current.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
+            if (commit.InversePatch is null) { throw new EditorOperationException("authoring_protocol_error", "Native authoring commit emitted no inverse patch."); }
+            if (_authoringHistory.Count > 0 && !string.Equals(_authoringHistory[^1].RevisionAfter, commit.PreviousRevision, StringComparison.OrdinalIgnoreCase))
             {
                 // 外部编辑使旧 undo 链失去连续性；清理而不是把不相关内容覆盖回来。
                 _authoringHistory.Clear();
             }
-            _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, next.AuthoringRevision, changedFields,
-                patch.SceneGoalPosition is null ? null : current.Scene.GoalPosition,
-                patch.ScriptGoalPosition is null ? null : current.Script.GoalPosition,
-                patch.ScriptGoalVelocity is null ? null : current.Script.GoalVelocity,
-                patch.ScenePlayerTextureId is null ? null : current.Scene.PlayerTextureId,
-                patch.SceneGoalTextureId is null ? null : current.Scene.GoalTextureId,
-                patch.SceneHazardTextureId is null ? null : current.Scene.HazardTextureId));
+            _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.InversePatch));
             if (_authoringHistory.Count > MaxAuthoringHistory) { _authoringHistory.RemoveAt(0); }
-            return new AuthoringMutationResult("apply", "succeeded", project.ProjectName, current.AuthoringRevision, next.AuthoringRevision, changedFields, _authoringHistory.Count, next, hierarchy);
+            return new AuthoringMutationResult("apply", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
+                commit.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
         }
         finally { _authoringGate.Release(); }
     }
@@ -250,12 +242,11 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
                 throw new EditorOperationException("authoring_history_diverged", "Authoring history no longer matches the current revision.");
             }
 
-            await InvokeAuthoringAdapterAsync(project, parameters.ExpectedRevision,
-                new AuthoringPatch(record.SceneGoalPosition, record.ScriptGoalPosition, record.ScriptGoalVelocity, record.ScenePlayerTextureId, record.SceneGoalTextureId, record.SceneHazardTextureId), cancellationToken);
-            var next = await GetProjectSnapshotAsync(project, cancellationToken);
-            var hierarchy = await GetHierarchySnapshotAsync(project, cancellationToken);
+            var commit = await ApplyWorkspaceAuthoringAsync(project, parameters.ExpectedRevision, record.InversePatch, cancellationToken);
+            if (commit.State != "succeeded") { throw new EditorOperationException("authoring_protocol_error", "Native authoring undo did not restore a changed state."); }
             _authoringHistory.RemoveAt(_authoringHistory.Count - 1);
-            return new AuthoringMutationResult("undo", "succeeded", project.ProjectName, current.AuthoringRevision, next.AuthoringRevision, record.ChangedFields, _authoringHistory.Count, next, hierarchy);
+            return new AuthoringMutationResult("undo", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
+                record.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
         }
         finally { _authoringGate.Release(); }
     }
@@ -366,6 +357,28 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
             var code = exception.Kind == WorkspaceReadFailureKind.Invariant
                 ? publication ? "publication_snapshot_protocol_error" : "snapshot_protocol_error"
                 : publication ? "publication_snapshot_failed" : "snapshot_failed";
+            throw new EditorOperationException(code, exception.Message);
+        }
+    }
+
+    private async Task<WorkspaceAuthoringCommit> ApplyWorkspaceAuthoringAsync(
+        ProjectSessionInfo project,
+        string expectedRevision,
+        AuthoringPatch? patch,
+        CancellationToken cancellationToken)
+    {
+        try { return await _authoringModel.ApplyAsync(project, expectedRevision, patch, cancellationToken); }
+        catch (WorkspaceAuthoringException exception)
+        {
+            var code = exception.Kind switch
+            {
+                WorkspaceAuthoringFailureKind.InvalidExpectedRevision => "invalid_expected_revision",
+                WorkspaceAuthoringFailureKind.RevisionConflict => "authoring_revision_conflict",
+                WorkspaceAuthoringFailureKind.InvalidPatch => "invalid_authoring_patch",
+                WorkspaceAuthoringFailureKind.Input or WorkspaceAuthoringFailureKind.Commit => "authoring_update_failed",
+                WorkspaceAuthoringFailureKind.Invariant => "authoring_protocol_error",
+                _ => "authoring_update_failed"
+            };
             throw new EditorOperationException(code, exception.Message);
         }
     }
@@ -530,107 +543,6 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
             throw new EditorOperationException("publication_snapshot_protocol_error", $"{label} escapes the project derived directory.");
         }
     }
-    private async Task InvokeAuthoringAdapterAsync(ProjectSessionInfo project, string expectedRevision, AuthoringPatch patch, CancellationToken cancellationToken)
-    {
-        var arguments = new List<string>
-        {
-            "-Action", "Update",
-            "-PackageRoot", project.PackageRoot,
-            "-ProjectName", project.ProjectName,
-            "-ExpectedRevision", expectedRevision
-        };
-        AppendVector(arguments, "SceneGoal", patch.SceneGoalPosition);
-        AppendVector(arguments, "ScriptGoal", patch.ScriptGoalPosition);
-        AppendVector(arguments, "ScriptVelocity", patch.ScriptGoalVelocity);
-        AppendScalar(arguments, "ScenePlayerTextureId", patch.ScenePlayerTextureId);
-        AppendScalar(arguments, "SceneGoalTextureId", patch.SceneGoalTextureId);
-        AppendScalar(arguments, "SceneHazardTextureId", patch.SceneHazardTextureId);
-        var output = await RunPowerShellAsync(Path.Combine(_kadathRoot, "tools", "editor-author.ps1"), arguments.ToArray(), cancellationToken);
-        if (output.ExitCode != 0)
-        {
-            var diagnostics = JoinDiagnostics(output);
-            var code = diagnostics.Contains("[authoring_revision_conflict]", StringComparison.Ordinal)
-                ? "authoring_revision_conflict"
-                : diagnostics.Contains("[invalid_expected_revision]", StringComparison.Ordinal)
-                    ? "invalid_expected_revision"
-                    : "authoring_update_failed";
-            throw new EditorOperationException(code, diagnostics);
-        }
-        if (!output.Stdout.Any(line => line.StartsWith("authoring_revision=", StringComparison.Ordinal)))
-        {
-            throw new EditorOperationException("authoring_protocol_error", "Authoring adapter emitted no revision result.");
-        }
-    }
-
-    private static void AppendVector(List<string> arguments, string prefix, double[]? vector)
-    {
-        if (vector is null) { return; }
-        arguments.Add($"-{prefix}X");
-        arguments.Add(vector[0].ToString("R", System.Globalization.CultureInfo.InvariantCulture));
-        arguments.Add($"-{prefix}Y");
-        arguments.Add(vector[1].ToString("R", System.Globalization.CultureInfo.InvariantCulture));
-    }
-
-    private static void AppendScalar(List<string> arguments, string name, uint? value)
-    {
-        if (value is null) { return; }
-        arguments.Add($"-{name}");
-        arguments.Add(value.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
-    }
-
-    private static AuthoringPatch NormalizePatch(ProjectModelSnapshot current, AuthoringPatch? patch)
-    {
-        if (patch is null) { throw new EditorOperationException("invalid_authoring_patch", "Authoring patch is required."); }
-        ValidateVector(patch.SceneGoalPosition, "scene.goal.position");
-        ValidateVector(patch.ScriptGoalPosition, "script.goal.position");
-        ValidateVector(patch.ScriptGoalVelocity, "script.goal.velocity");
-        ValidateTextureId(current.Scene, patch.ScenePlayerTextureId, "scene.player.textureId");
-        ValidateTextureId(current.Scene, patch.SceneGoalTextureId, "scene.goal.textureId");
-        ValidateTextureId(current.Scene, patch.SceneHazardTextureId, "scene.hazard.textureId");
-        var scene = patch.SceneGoalPosition is not null && !patch.SceneGoalPosition.SequenceEqual(current.Scene.GoalPosition) ? patch.SceneGoalPosition : null;
-        var scriptGoal = patch.ScriptGoalPosition is not null && !patch.ScriptGoalPosition.SequenceEqual(current.Script.GoalPosition) ? patch.ScriptGoalPosition : null;
-        var velocity = patch.ScriptGoalVelocity is not null && !patch.ScriptGoalVelocity.SequenceEqual(current.Script.GoalVelocity) ? patch.ScriptGoalVelocity : null;
-        var playerTexture = patch.ScenePlayerTextureId is not null && patch.ScenePlayerTextureId != current.Scene.PlayerTextureId ? patch.ScenePlayerTextureId : null;
-        var goalTexture = patch.SceneGoalTextureId is not null && patch.SceneGoalTextureId != current.Scene.GoalTextureId ? patch.SceneGoalTextureId : null;
-        var hazardTexture = patch.SceneHazardTextureId is not null && patch.SceneHazardTextureId != current.Scene.HazardTextureId ? patch.SceneHazardTextureId : null;
-        if (scene is null && scriptGoal is null && velocity is null && playerTexture is null && goalTexture is null && hazardTexture is null
-            && patch.SceneGoalPosition is null && patch.ScriptGoalPosition is null && patch.ScriptGoalVelocity is null
-            && patch.ScenePlayerTextureId is null && patch.SceneGoalTextureId is null && patch.SceneHazardTextureId is null)
-        {
-            throw new EditorOperationException("invalid_authoring_patch", "At least one authoring field is required.");
-        }
-        return new AuthoringPatch(scene, scriptGoal, velocity, playerTexture, goalTexture, hazardTexture);
-    }
-
-    private static void ValidateVector(double[]? vector, string field)
-    {
-        if (vector is not null && (vector.Length != 2 || vector.Any(value => !double.IsFinite(value))))
-        {
-            throw new EditorOperationException("invalid_authoring_patch", $"{field} must contain two finite values.");
-        }
-    }
-
-    private static void ValidateTextureId(ProjectModelScene scene, uint? value, string field)
-    {
-        if (value is not null && value <= 0) { throw new EditorOperationException("invalid_authoring_patch", $"{field} must be a non-zero TextureId."); }
-        if (value is not null && scene.Textures is { Count: > 0 } && !scene.Textures.Any(texture => texture.TextureId == value))
-        {
-            throw new EditorOperationException("invalid_authoring_patch", $"{field} must reference a TextureId declared by the Scene texture set.");
-        }
-    }
-
-    private static string[] GetChangedFields(AuthoringPatch patch)
-    {
-        var fields = new List<string>();
-        if (patch.SceneGoalPosition is not null) { fields.Add("scene.goal.position"); }
-        if (patch.ScriptGoalPosition is not null) { fields.Add("script.goal.position"); }
-        if (patch.ScriptGoalVelocity is not null) { fields.Add("script.goal.velocity"); }
-        if (patch.ScenePlayerTextureId is not null) { fields.Add("scene.player.textureId"); }
-        if (patch.SceneGoalTextureId is not null) { fields.Add("scene.goal.textureId"); }
-        if (patch.SceneHazardTextureId is not null) { fields.Add("scene.hazard.textureId"); }
-        return fields.ToArray();
-    }
-
     private static void ValidateExpectedRevision(string expected, string current)
     {
         if (string.IsNullOrWhiteSpace(expected) || expected.Length != 64 || expected.Any(value => !Uri.IsHexDigit(value)))
@@ -647,12 +559,7 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         string ProjectName,
         string RevisionAfter,
         string[] ChangedFields,
-        double[]? SceneGoalPosition,
-        double[]? ScriptGoalPosition,
-        double[]? ScriptGoalVelocity,
-        uint? ScenePlayerTextureId,
-        uint? SceneGoalTextureId,
-        uint? SceneHazardTextureId);
+        AuthoringPatch InversePatch);
     private static string NormalizeTarget(string target) => target.ToLowerInvariant() switch
     {
         "scene" => "Scene",

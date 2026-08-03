@@ -5,7 +5,9 @@ param(
 
     [string]$ProjectName = "editor_client_service_smoke_$PID",
     [string]$ServiceDll = '',
-    [string]$KadathRoot = ''
+    [string]$KadathRoot = '',
+
+    [switch]$RealServiceOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,7 +45,9 @@ try {
     $created = $true
 
     # 该入口跨越真实 stdio transport，不使用 fake server；它会验证 handshake、capabilities、open、validate、shutdown。
-    & dotnet run --project $verifier --no-build -- $service $kadath $package $ProjectName
+    $verifierArguments = @($service, $kadath, $package, $ProjectName)
+    if ($RealServiceOnly) { $verifierArguments = @('--real-service-only') + $verifierArguments }
+    & dotnet run --project $verifier --no-build -- @verifierArguments
     if ($LASTEXITCODE -ne 0) { throw "Editor client service smoke failed with exit code $LASTEXITCODE" }
 }
 finally {
