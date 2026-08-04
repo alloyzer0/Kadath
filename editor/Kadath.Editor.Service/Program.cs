@@ -11,10 +11,10 @@ internal static class Program
         {
             var kadathRoot = ResolveKadathRoot(args);
             await using var session = new EditorSession(new PowerShellEditorBackend(
-                kadathRoot,
                 new WorkspaceProjectLifecycleModel(),
                 new WorkspaceReadModel(),
-                new WorkspaceAuthoringModel()));
+                new WorkspaceAuthoringModel(),
+                new WorkspacePublicationModel()));
             await using var preview = new PreviewProcessController(kadathRoot);
             var host = new EditorRpcHost(session, preview, Console.In, Console.Out);
             return await host.RunAsync();

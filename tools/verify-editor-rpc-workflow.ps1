@@ -108,6 +108,21 @@ try {
     $baked = Read-Response $process 'bake-1'
     if (-not [bool]$baked.ok -or [string]$baked.result.state -ne 'succeeded' -or [int]$baked.result.sceneArtifactBytes -ne 258) { throw 'bake_start contract mismatch' }
 
+    foreach ($invalidBake in @(
+        [ordered]@{ id = 'bake-invalid-target'; target = 'Texture'; profile = 'debug'; errorCode = 'invalid_bake_target' },
+        [ordered]@{ id = 'bake-invalid-profile'; target = 'Both'; profile = 'shipping'; errorCode = 'invalid_bake_profile' }
+    )) {
+        $script:stage = $invalidBake.id
+        Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = $invalidBake.id; method = 'bake_start'; params = [ordered]@{ target = $invalidBake.target; profile = $invalidBake.profile } })
+        [void](Read-Event $process 'bake_started')
+        $failedBake = Read-Event $process 'bake_failed'
+        $failedBakeResponse = Read-Response $process $invalidBake.id
+        if ([string]$failedBake.requestId -ne $invalidBake.id -or [string]$failedBake.data.errorCode -ne $invalidBake.errorCode -or
+            [bool]$failedBakeResponse.ok -or [string]$failedBakeResponse.error.code -ne $invalidBake.errorCode) {
+            throw "Bake error mapping contract mismatch: $($invalidBake.id)"
+        }
+    }
+
     $script:stage = 'watch_start'
     Send-Json $process ([ordered]@{ schemaVersion = 1; type = 'request'; id = 'watch-1'; method = 'watch_start'; params = [ordered]@{ target = 'Scene'; profile = 'debug'; pollIntervalMilliseconds = 50; debounceMilliseconds = 100 } })
     [void](Read-Event $process 'watch_started')
@@ -188,6 +203,7 @@ try {
     Write-Output 'editor_rpc_workflow=ok'
     Write-Output 'project_open_validate=ok'
     Write-Output 'bake_start=ok'
+    Write-Output 'bake_error_mapping=ok'
     Write-Output 'watch_incremental_bake=ok'
     Write-Output 'watch_failure_retention=ok'
     Write-Output 'preview_external_window=ok'

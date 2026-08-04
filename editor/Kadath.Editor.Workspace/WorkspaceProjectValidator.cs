@@ -102,8 +102,8 @@ internal static class WorkspaceProjectValidator
     internal static void ValidateBytes(ProjectSessionInfo project, WorkspaceProjectBytes bytes, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        ValidateScene(bytes.Scene);
-        ValidateScript(bytes.Script);
+        ValidateSceneSource(bytes.Scene);
+        ValidateScriptSource(bytes.Script);
         ValidatePreview(bytes.Preview, bytes.PackageRoot, bytes.ScenePath, bytes.ScriptPath, allowMissingProjectSources: false);
         cancellationToken.ThrowIfCancellationRequested();
     }
@@ -119,8 +119,8 @@ internal static class WorkspaceProjectValidator
         ValidateDocumentBudget(scene, "Scene template");
         ValidateDocumentBudget(script, "Script template");
         ValidateDocumentBudget(preview, "Preview config");
-        ValidateScene(scene);
-        ValidateScript(script);
+        ValidateSceneSource(scene);
+        ValidateScriptSource(script);
         ValidatePreview(preview, paths.PackageRoot, paths.ScenePath, paths.ScriptPath, allowMissingProjectSources: true);
         cancellationToken.ThrowIfCancellationRequested();
     }
@@ -147,7 +147,7 @@ internal static class WorkspaceProjectValidator
         return path;
     }
 
-    private static void ValidateScene(byte[] bytes)
+    internal static void ValidateSceneSource(byte[] bytes)
     {
         ValidateDocumentBudget(bytes, "Scene");
         using var document = Parse(bytes, "Scene");
@@ -188,7 +188,7 @@ internal static class WorkspaceProjectValidator
         if (hazardPosition[1] < patrolMinY || hazardPosition[1] > patrolMaxY) throw Failure("Scene.hazard.position[1] must be inside the patrol range.");
     }
 
-    private static void ValidateScript(byte[] bytes)
+    internal static void ValidateScriptSource(byte[] bytes)
     {
         ValidateDocumentBudget(bytes, "Script");
         using var document = Parse(bytes, "Script");
@@ -336,7 +336,8 @@ internal static class WorkspaceProjectValidator
 
     private static double RequireFiniteDouble(JsonElement owner, string name, string context)
     {
-        if (!owner.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Number || !value.TryGetDouble(out var result) || !double.IsFinite(result)) throw Failure($"{context}.{name} must be finite.");
+        if (!owner.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Number || !value.TryGetDouble(out var result)
+            || !double.IsFinite(result) || !float.IsFinite((float)result)) throw Failure($"{context}.{name} must fit the finite f32 range.");
         return result;
     }
 
@@ -348,7 +349,8 @@ internal static class WorkspaceProjectValidator
         var index = 0;
         foreach (var value in values.EnumerateArray())
         {
-            if (value.ValueKind != JsonValueKind.Number || !value.TryGetDouble(out result[index]) || !double.IsFinite(result[index])) throw Failure($"{context}.{name}[{index}] must be finite.");
+            if (value.ValueKind != JsonValueKind.Number || !value.TryGetDouble(out result[index]) || !double.IsFinite(result[index])
+                || !float.IsFinite((float)result[index])) throw Failure($"{context}.{name}[{index}] must fit the finite f32 range.");
             index++;
         }
         return result;
@@ -440,7 +442,7 @@ internal static class WorkspaceProjectValidator
         if (bytes.Length > MaxDocumentBytes) throw Failure($"{name} exceeds the 64 KiB Runtime document budget.");
     }
 
-    private static bool IsTextureArtifactPath(string artifact) => Encoding.UTF8.GetByteCount(artifact) <= 255
+    internal static bool IsTextureArtifactPath(string artifact) => Encoding.UTF8.GetByteCount(artifact) <= 255
         && artifact.StartsWith("assets/renderer2d/", StringComparison.Ordinal)
         && artifact.EndsWith(".texture", StringComparison.Ordinal)
         && !artifact.Contains('\\')

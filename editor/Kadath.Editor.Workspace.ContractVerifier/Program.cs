@@ -33,13 +33,14 @@ internal static class Program
 
             await VerifyAuthoringAsync(project, readModel);
             await ProjectLifecycleVerifier.VerifyAsync();
+            await PublicationVerifier.VerifyAsync();
 
             var missing = await readModel.ReadPublicationAsync(project, "debug", default);
             Require(missing.State == "missing" && !missing.ManifestPresent && missing.Scene.State == "missing" && missing.Script.State == "missing", "publication missing mismatch");
 
             WriteArtifactsAndManifest(project);
             var current = await readModel.ReadPublicationAsync(project, "debug", default);
-            Require(current.State == "current" && current.ManifestPresent && current.Scene.ArtifactBytes == 144 && current.Script.ArtifactBytes == 48, "publication current mismatch");
+            Require(current.State == "current" && current.ManifestPresent && current.Scene.ArtifactBytes == 258 && current.Script.ArtifactBytes == 48, "publication current mismatch");
 
             var originalScene = File.ReadAllBytes(project.ScenePath);
             var manifestPath = Path.Combine(project.ProjectDirectory, ".kadath", "derived", ".live-bake.manifest.json");
@@ -79,7 +80,7 @@ internal static class Program
             Require(escaped.State == "artifact_invalid" && escaped.Scene.State == "artifact_invalid", "manifest path boundary mismatch");
             File.WriteAllBytes(manifestPath, originalManifest);
 
-            var invalidManifestType = Encoding.UTF8.GetString(originalManifest).Replace("\"artifactBytes\":144", "\"artifactBytes\":\"144\"", StringComparison.Ordinal);
+            var invalidManifestType = Encoding.UTF8.GetString(originalManifest).Replace("\"artifactBytes\":258", "\"artifactBytes\":\"258\"", StringComparison.Ordinal);
             File.WriteAllText(manifestPath, invalidManifestType, Encoding.UTF8);
             var invalidManifest = await readModel.ReadPublicationAsync(project, "debug", default);
             Require(invalidManifest.State == "artifact_invalid" && invalidManifest.ManifestPresent, "manifest type validation mismatch");
@@ -118,6 +119,7 @@ internal static class Program
             Console.WriteLine("asset_catalog_snapshot=ok");
             Console.WriteLine("publication_state_machine=ok");
             Console.WriteLine("authoring_transaction=ok");
+            Console.WriteLine("native_publication=ok");
             Console.WriteLine("project_lifecycle=ok");
             Console.WriteLine("failure_boundaries=ok");
             Console.WriteLine("read_only=ok");
@@ -262,16 +264,8 @@ internal static class Program
     {
         var derived = Path.Combine(project.ProjectDirectory, ".kadath", "derived");
         Directory.CreateDirectory(derived);
-        var sceneArtifact = new byte[144];
-        Encoding.ASCII.GetBytes("KSCN").CopyTo(sceneArtifact, 0);
-        BitConverter.GetBytes(3u).CopyTo(sceneArtifact, 4);
-        BitConverter.GetBytes(3u).CopyTo(sceneArtifact, 8);
-        BitConverter.GetBytes(128u).CopyTo(sceneArtifact, 12);
-        var scriptArtifact = new byte[48];
-        Encoding.ASCII.GetBytes("KSCP").CopyTo(scriptArtifact, 0);
-        BitConverter.GetBytes(1u).CopyTo(scriptArtifact, 4);
-        BitConverter.GetBytes(1u).CopyTo(scriptArtifact, 8);
-        BitConverter.GetBytes(2u).CopyTo(scriptArtifact, 12);
+        var sceneArtifact = WorkspaceSceneCodec.EncodeSource(File.ReadAllBytes(project.ScenePath));
+        var scriptArtifact = WorkspaceScriptCodec.EncodeSource(File.ReadAllBytes(project.ScriptPath));
         var sceneArtifactPath = Path.Combine(derived, "scene.scene");
         var scriptArtifactPath = Path.Combine(derived, "script.script");
         File.WriteAllBytes(sceneArtifactPath, sceneArtifact);

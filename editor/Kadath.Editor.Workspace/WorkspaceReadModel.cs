@@ -31,6 +31,9 @@ internal sealed record WorkspaceProjectProjection(ProjectModelSnapshot Project, 
 
 public sealed class WorkspaceReadModel
 {
+    private static readonly StringComparison PathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
     private const int MaxAssetItems = 4096;
     private const int MaxHierarchyNodes = 4096;
     private static readonly Regex ProjectNamePattern = new("^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$", RegexOptions.CultureInvariant);
@@ -381,16 +384,11 @@ public sealed class WorkspaceReadModel
         var bytes = ReadFileSnapshot(path, $"{kind} artifact", cancellationToken);
         if (kind == "Scene")
         {
-            if (bytes.Length < 144 || Encoding.ASCII.GetString(bytes, 0, 4) != "KSCN") throw Input("Scene artifact layout mismatch.");
-            if (BitConverter.ToUInt32(bytes, 4) != 3 || BitConverter.ToUInt32(bytes, 8) != 3 || BitConverter.ToUInt32(bytes, 12) != bytes.Length - 16)
-                throw Input("Scene artifact header mismatch.");
+            _ = WorkspaceSceneCodec.ValidateArtifact(bytes);
         }
         else
         {
-            if (bytes.Length < 16 || Encoding.ASCII.GetString(bytes, 0, 4) != "KSCP") throw Input("Script artifact layout mismatch.");
-            var count = BitConverter.ToUInt32(bytes, 12);
-            if (BitConverter.ToUInt32(bytes, 4) != 1 || BitConverter.ToUInt32(bytes, 8) != 1 || count > 16 || bytes.Length != 16 + count * 16)
-                throw Input("Script artifact header mismatch.");
+            _ = WorkspaceScriptCodec.ValidateArtifact(bytes);
         }
         return new ArtifactInfo(Sha256(bytes), bytes.LongLength);
     }
@@ -417,7 +415,7 @@ public sealed class WorkspaceReadModel
         var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var full = Path.GetFullPath(path);
         var prefix = fullRoot + Path.DirectorySeparatorChar;
-        if (!full.Equals(fullRoot, StringComparison.OrdinalIgnoreCase) && !full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        if (!full.Equals(fullRoot, PathComparison) && !full.StartsWith(prefix, PathComparison))
             throw Input($"{name} escapes root: {path}.");
         return full;
     }

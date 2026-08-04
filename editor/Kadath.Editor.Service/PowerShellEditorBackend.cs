@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using System.Text.Json;
 using Kadath.Editor.Core;
 using Kadath.Editor.Protocol;
 using Kadath.Editor.Workspace;
@@ -7,14 +5,14 @@ using Kadath.Editor.Workspace;
 namespace Kadath.Editor.Service;
 
 /// <summary>
-/// 把现有 PowerShell project/bake/importer 工具与原生 Workspace Module 收进 Backend，RPC/UI 不感知实现细节。
+/// 把原生 Workspace Module 与仍待迁移的 Preview 兼容路径收进 Backend，RPC/UI 不感知实现细节。
 /// </summary>
 internal sealed class PowerShellEditorBackend : IEditorSessionBackend
 {
-    private readonly string _kadathRoot;
     private readonly WorkspaceProjectLifecycleModel _projectLifecycleModel;
     private readonly WorkspaceReadModel _readModel;
     private readonly WorkspaceAuthoringModel _authoringModel;
+    private readonly WorkspacePublicationModel _publicationModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
@@ -26,15 +24,15 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     private string _watchProfile = "debug";
 
     public PowerShellEditorBackend(
-        string kadathRoot,
         WorkspaceProjectLifecycleModel projectLifecycleModel,
         WorkspaceReadModel readModel,
-        WorkspaceAuthoringModel authoringModel)
+        WorkspaceAuthoringModel authoringModel,
+        WorkspacePublicationModel publicationModel)
     {
-        _kadathRoot = kadathRoot;
         _projectLifecycleModel = projectLifecycleModel;
         _readModel = readModel;
         _authoringModel = authoringModel;
+        _publicationModel = publicationModel;
     }
 
     public event Func<EditorSessionNotification, Task>? Notification;
@@ -138,51 +136,24 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     }
     public async Task<EditorBakeResult> BakeAsync(ProjectSessionInfo project, BakeStartParameters parameters, CancellationToken cancellationToken)
     {
-        var target = NormalizeTarget(parameters.Target);
-        var profile = NormalizeProfile(parameters.Profile);
         await _bakeGate.WaitAsync(cancellationToken);
         try
         {
-            var derived = Path.Combine(project.ProjectDirectory, ".kadath", "derived");
-            var manifest = Path.Combine(derived, ".live-bake.manifest.json");
-            var output = await RunPowerShellAsync(
-                Path.Combine(_kadathRoot, "tools", "editor-live-bake.ps1"),
-                [
-                    "-PackageRoot", project.PackageRoot,
-                    "-SceneSourcePath", project.ScenePath,
-                    "-ScriptSourcePath", project.ScriptPath,
-                    "-SceneArtifactPath", Path.Combine(derived, "scene.scene"),
-                    "-ScriptArtifactPath", Path.Combine(derived, "script.script"),
-                    "-ManifestPath", manifest,
-                    "-Target", target,
-                    "-Profile", profile
-                ],
-                cancellationToken);
-
-            var terminal = ParseTerminalResult(output.Stdout);
-            var state = terminal.TryGetProperty("result", out var resultValue) ? resultValue.GetString() : null;
-            if (output.ExitCode != 0 || state != "succeeded")
+            try { return await _publicationModel.BakeAsync(project, parameters, cancellationToken); }
+            catch (WorkspacePublicationException exception)
             {
-                var errorCode = terminal.TryGetProperty("errorCode", out var code) ? code.GetString() : "bake_failed";
-                var message = terminal.TryGetProperty("message", out var text) ? text.GetString() : JoinDiagnostics(output);
-                throw new EditorOperationException(errorCode ?? "bake_failed", message ?? "Live bake failed.");
+                var code = exception.Kind switch
+                {
+                    WorkspacePublicationFailureKind.InvalidTarget => "invalid_bake_target",
+                    WorkspacePublicationFailureKind.InvalidProfile => "invalid_bake_profile",
+                    WorkspacePublicationFailureKind.Validation => "bake_validation_failed",
+                    WorkspacePublicationFailureKind.SourceChanged => "source_changed_during_bake",
+                    WorkspacePublicationFailureKind.Promote => "artifact_promote_failed",
+                    WorkspacePublicationFailureKind.Invariant => "live_bake_failed",
+                    _ => "live_bake_failed"
+                };
+                throw new EditorOperationException(code, exception.Message);
             }
-
-            var sourceRevision = terminal.GetProperty("sourceRevision");
-            var artifactRevision = terminal.GetProperty("artifactRevision");
-            var artifactBytes = terminal.GetProperty("artifactBytes");
-            return new EditorBakeResult(
-                "succeeded",
-                target,
-                profile,
-                derived,
-                manifest,
-                TryGetString(sourceRevision, "scene"),
-                TryGetString(sourceRevision, "script"),
-                TryGetString(artifactRevision, "scene"),
-                TryGetString(artifactRevision, "script"),
-                TryGetInt32(artifactBytes, "scene"),
-                TryGetInt32(artifactBytes, "script"));
         }
         finally { _bakeGate.Release(); }
     }
@@ -461,72 +432,6 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         _ => throw new EditorOperationException("invalid_bake_profile", $"Unsupported bake profile: {profile}")
     };
 
-    private static JsonElement ParseTerminalResult(string[] lines)
-    {
-        for (var index = lines.Length - 1; index >= 0; index--)
-        {
-            try
-            {
-                using var document = JsonDocument.Parse(lines[index]);
-                var root = document.RootElement;
-                if (root.TryGetProperty("event", out var eventName) && eventName.GetString() == "live_bake_result") { return root.Clone(); }
-            }
-            catch (JsonException) { }
-        }
-        throw new EditorOperationException("adapter_protocol_error", "Live-bake adapter emitted no terminal JSONL result.");
-    }
-
-    private static string? TryGetString(JsonElement parent, string name) => parent.TryGetProperty(name, out var value) ? value.GetString() : null;
-    private static int? TryGetInt32(JsonElement parent, string name) => parent.TryGetProperty(name, out var value) && value.TryGetInt32(out var number) ? number : null;
-
-    private static string JoinDiagnostics(PowerShellResult result)
-    {
-        var lines = result.Stderr.Length > 0 ? result.Stderr : result.Stdout;
-        return lines.Length == 0 ? $"PowerShell exited with code {result.ExitCode}." : string.Join(" | ", lines);
-    }
-
-    private static async Task<PowerShellResult> RunPowerShellAsync(string scriptPath, string[] arguments, CancellationToken cancellationToken)
-    {
-        if (!File.Exists(scriptPath)) { throw new EditorOperationException("adapter_missing", $"Editor adapter does not exist: {scriptPath}"); }
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = "pwsh",
-            WorkingDirectory = Path.GetDirectoryName(scriptPath)!,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-        startInfo.ArgumentList.Add("-NoProfile");
-        startInfo.ArgumentList.Add("-File");
-        startInfo.ArgumentList.Add(scriptPath);
-        foreach (var argument in arguments) { startInfo.ArgumentList.Add(argument); }
-
-        using var process = new Process { StartInfo = startInfo };
-        try
-        {
-            if (!process.Start()) { throw new EditorOperationException("adapter_start_failed", $"Failed to start adapter: {scriptPath}"); }
-        }
-        catch (EditorOperationException) { throw; }
-        catch (Exception exception)
-        {
-            // Process.Start 在可执行文件缺失等 Windows 错误上会抛异常；统一收敛为稳定 Adapter 错误码。
-            throw new EditorOperationException("adapter_start_failed", $"Failed to start adapter: {scriptPath}; {exception.Message}");
-        }
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        try { await process.WaitForExitAsync(cancellationToken); }
-        catch (OperationCanceledException)
-        {
-            if (!process.HasExited) { process.Kill(entireProcessTree: true); }
-            throw;
-        }
-
-        var stdout = (await stdoutTask).Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-        var stderr = (await stderrTask).Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-        return new PowerShellResult(process.ExitCode, stdout, stderr);
-    }
-
     public async ValueTask DisposeAsync()
     {
         await StopWatchAsync(CancellationToken.None);
@@ -535,5 +440,4 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
         _authoringGate.Dispose();
     }
 
-    private sealed record PowerShellResult(int ExitCode, string[] Stdout, string[] Stderr);
 }
