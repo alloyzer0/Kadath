@@ -12,7 +12,9 @@ bin/assets/audio/won.audio.wav
 bin/assets/renderer2d/goal.texture
 bin/assets/renderer2d/test.texture
 bin/assets/scenes/preview.scene
+bin/assets/scenes/preview.scene.json
 bin/assets/scripts/preview.script
+bin/assets/scripts/preview.script.json
 bin/kadath'
 
 test -f "$package_root/SHA256SUMS"

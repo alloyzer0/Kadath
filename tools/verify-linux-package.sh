@@ -15,7 +15,9 @@ bin/assets/audio/won.audio.wav
 bin/assets/renderer2d/goal.texture
 bin/assets/renderer2d/test.texture
 bin/assets/scenes/preview.scene
+bin/assets/scenes/preview.scene.json
 bin/assets/scripts/preview.script
+bin/assets/scripts/preview.script.json
 bin/kadath'
 expected_archive_entries='kadath-linux-x86_64/
 kadath-linux-x86_64/README.txt
@@ -30,8 +32,10 @@ kadath-linux-x86_64/bin/assets/renderer2d/goal.texture
 kadath-linux-x86_64/bin/assets/renderer2d/test.texture
 kadath-linux-x86_64/bin/assets/scenes/
 kadath-linux-x86_64/bin/assets/scenes/preview.scene
+kadath-linux-x86_64/bin/assets/scenes/preview.scene.json
 kadath-linux-x86_64/bin/assets/scripts/
 kadath-linux-x86_64/bin/assets/scripts/preview.script
+kadath-linux-x86_64/bin/assets/scripts/preview.script.json
 kadath-linux-x86_64/bin/kadath'
 
 test -f "$archive_path"
