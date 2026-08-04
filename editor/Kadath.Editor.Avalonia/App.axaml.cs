@@ -22,7 +22,7 @@ public sealed partial class App : Application
             // Avalonia 只组装 shared Client + shared WorkspaceViewModel，不重新实现 RPC 协议。
             var transport = new StdioEditorRpcTransport(new EditorRpcProcessOptions(
                 options.DotNetExecutable,
-                [options.ServiceAssemblyPath, "--kadath-root", options.KadathRoot],
+                [options.ServiceAssemblyPath],
                 options.KadathRoot));
             var client = new EditorRpcClient(transport, "kadath-editor-avalonia", "1");
             var workspace = new EditorWorkspaceViewModel(client, new AvaloniaEditorViewDispatcher());

@@ -36,7 +36,8 @@ public sealed record EditorRpcClientOptions(
         var candidate = new DirectoryInfo(Path.GetFullPath(startPath));
         while (candidate is not null)
         {
-            if (File.Exists(Path.Combine(candidate.FullName, "tools", "editor-preview.ps1")))
+            if (File.Exists(Path.Combine(candidate.FullName, "build.zig"))
+                && File.Exists(Path.Combine(candidate.FullName, "editor", "Kadath.Editor.sln")))
             {
                 return candidate.FullName;
             }

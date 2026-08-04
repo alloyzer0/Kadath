@@ -34,6 +34,7 @@ internal static class Program
             await VerifyAuthoringAsync(project, readModel);
             await ProjectLifecycleVerifier.VerifyAsync();
             await PublicationVerifier.VerifyAsync();
+            await VerifyPreviewModelAsync(project);
 
             var missing = await readModel.ReadPublicationAsync(project, "debug", default);
             Require(missing.State == "missing" && !missing.ManifestPresent && missing.Scene.State == "missing" && missing.Script.State == "missing", "publication missing mismatch");
@@ -258,6 +259,51 @@ internal static class Program
         {"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","projects/demo/scene.json","--script","projects/demo/script.json"]}}
         """, Encoding.UTF8);
         return new ProjectSessionInfo(root, "demo", projectDirectory, scenePath, scriptPath, previewPath, 1);
+    }
+
+    private static async Task VerifyPreviewModelAsync(ProjectSessionInfo project)
+    {
+        var model = new WorkspacePreviewModel(new WorkspacePublicationModel());
+        var direct = await model.PrepareAsync(new PreviewStartParameters(project.PreviewPath, project.PackageRoot), default);
+        Require(direct.ExecutablePath == Path.Combine(project.PackageRoot, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), "preview executable mismatch");
+        Require(direct.RuntimeArguments[^4..].SequenceEqual(["--preview-status", "jsonl-v1", "--preview-control", "jsonl-v1"]), "preview protocol arguments mismatch");
+        Require(direct.SceneInputPath == project.ScenePath && direct.ScriptInputPath == project.ScriptPath && direct.InitialBake is null, "direct preview inputs mismatch");
+
+        var live = await model.PrepareAsync(new PreviewStartParameters(
+            project.PreviewPath,
+            project.PackageRoot,
+            LiveBake: true,
+            DerivedDirectory: "bin/projects/demo/.kadath/preview-derived"), default);
+        Require(live.InitialBake is { State: "succeeded", Target: "Both" }, "preview initial publication mismatch");
+        var derivedDirectory = live.DerivedDirectory ?? throw new InvalidOperationException("preview derived directory missing");
+        var manifestPath = live.ManifestPath ?? throw new InvalidOperationException("preview manifest path missing");
+        Require(derivedDirectory == Path.Combine(project.PackageRoot, "bin", "projects", "demo", ".kadath", "preview-derived"), "relative preview derived directory mismatch");
+        Require(File.Exists(Path.Combine(derivedDirectory, "scene.scene"))
+            && File.Exists(Path.Combine(derivedDirectory, "script.script"))
+            && File.Exists(manifestPath), "preview derived artifacts missing");
+        Require(live.RuntimeArguments.Contains("projects/demo/.kadath/preview-derived/scene.scene", StringComparer.Ordinal)
+            && live.RuntimeArguments.Contains("projects/demo/.kadath/preview-derived/script.script", StringComparer.Ordinal), "preview live arguments mismatch");
+
+        await ExpectAsync<WorkspaceProjectValidationException>(() => model.PrepareAsync(new PreviewStartParameters(
+            project.PreviewPath,
+            project.PackageRoot,
+            LiveBake: true,
+            DerivedDirectory: "bin/assets"), default));
+        await ExpectAsync<WorkspaceProjectValidationException>(() => model.PrepareAsync(new PreviewStartParameters(
+            project.PreviewPath,
+            project.PackageRoot,
+            LiveBake: true,
+            DerivedDirectory: ".kadath/derived"), default));
+
+        var original = File.ReadAllText(project.PreviewPath, Encoding.UTF8);
+        try
+        {
+            File.WriteAllText(project.PreviewPath, AddRootProperty(original, "\"unknown\":true"), Encoding.UTF8);
+            await ExpectAsync<WorkspaceProjectValidationException>(() => model.PrepareAsync(new PreviewStartParameters(project.PreviewPath, project.PackageRoot), default));
+            File.WriteAllText(project.PreviewPath, original.Replace("\"--script\"", "\"--scene\",\"projects/demo/scene.json\",\"--script\"", StringComparison.Ordinal), Encoding.UTF8);
+            await ExpectAsync<WorkspaceProjectValidationException>(() => model.PrepareAsync(new PreviewStartParameters(project.PreviewPath, project.PackageRoot), default));
+        }
+        finally { File.WriteAllText(project.PreviewPath, original, Encoding.UTF8); }
     }
 
     private static void WriteArtifactsAndManifest(ProjectSessionInfo project)

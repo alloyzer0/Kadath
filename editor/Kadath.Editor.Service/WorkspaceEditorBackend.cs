@@ -4,10 +4,7 @@ using Kadath.Editor.Workspace;
 
 namespace Kadath.Editor.Service;
 
-/// <summary>
-/// 把原生 Workspace Module 与仍待迁移的 Preview 兼容路径收进 Backend，RPC/UI 不感知实现细节。
-/// </summary>
-internal sealed class PowerShellEditorBackend : IEditorSessionBackend
+internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
 {
     private readonly WorkspaceProjectLifecycleModel _projectLifecycleModel;
     private readonly WorkspaceReadModel _readModel;
@@ -23,7 +20,7 @@ internal sealed class PowerShellEditorBackend : IEditorSessionBackend
     private string _watchTarget = "Both";
     private string _watchProfile = "debug";
 
-    public PowerShellEditorBackend(
+    public WorkspaceEditorBackend(
         WorkspaceProjectLifecycleModel projectLifecycleModel,
         WorkspaceReadModel readModel,
         WorkspaceAuthoringModel authoringModel,

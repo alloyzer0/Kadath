@@ -31,6 +31,11 @@ internal sealed record WorkspaceProjectPaths(
     string ScriptPath,
     string PreviewPath);
 
+internal sealed record WorkspacePreviewConfig(
+    string Executable,
+    string WorkingDirectory,
+    string[] Arguments);
+
 internal static class WorkspaceProjectValidator
 {
     internal const int MaxDocumentBytes = 64 * 1024;
@@ -231,32 +236,20 @@ internal static class WorkspaceProjectValidator
 
     private static void ValidatePreview(byte[] bytes, string packageRoot, string scenePath, string scriptPath, bool allowMissingProjectSources)
     {
-        ValidateDocumentBudget(bytes, "Preview config");
-        using var document = Parse(bytes, "Preview config");
-        var config = RequireRootObject(document.RootElement, "Preview config");
-        AssertProperties(config, ["schemaVersion", "runtime"], "Preview config");
-        if (RequireInt32(config, "schemaVersion", "Preview config") != 1) throw Failure("Unsupported Preview config schemaVersion.");
-        var runtime = RequireObject(config, "runtime", "Preview config");
-        AssertProperties(runtime, ["executable", "workingDirectory", "arguments"], "Preview config.runtime");
-
-        var executable = RequireString(runtime, "executable", "Preview config.runtime");
-        var workingDirectory = RequireString(runtime, "workingDirectory", "Preview config.runtime");
-        var executablePath = ResolvePackagePath(packageRoot, executable, "Preview executable");
-        var workingDirectoryPath = ResolvePackagePath(packageRoot, workingDirectory, "Preview working directory");
+        var config = ParsePreviewConfig(bytes);
+        var executablePath = ResolvePackagePath(packageRoot, config.Executable, "Preview executable");
+        var workingDirectoryPath = ResolvePackagePath(packageRoot, config.WorkingDirectory, "Preview working directory");
         RequireFile(executablePath, "Preview executable");
         RequireDirectory(workingDirectoryPath, "Preview working directory");
 
-        var arguments = RequireArray(runtime, "arguments", "Preview config.runtime");
         var sceneArgumentCount = 0;
         var scriptArgumentCount = 0;
-        var values = arguments.EnumerateArray().ToArray();
-        for (var index = 0; index < values.Length; index++)
+        for (var index = 0; index < config.Arguments.Length; index++)
         {
-            if (values[index].ValueKind != JsonValueKind.String) throw Failure("Preview config.runtime.arguments must contain only strings.");
-            var argument = values[index].GetString()!;
+            var argument = config.Arguments[index];
             if (argument is not ("--scene" or "--script")) continue;
-            if (index + 1 >= values.Length || values[index + 1].ValueKind != JsonValueKind.String) throw Failure($"Preview {argument} requires a following path.");
-            var relativePath = values[++index].GetString()!;
+            if (index + 1 >= config.Arguments.Length) throw Failure($"Preview {argument} requires a following path.");
+            var relativePath = config.Arguments[++index];
             if (string.IsNullOrWhiteSpace(relativePath) || Path.IsPathRooted(relativePath)) throw Failure($"Preview {argument} path must be relative to workingDirectory.");
             var resolved = EnsureInside(packageRoot, Path.Combine(workingDirectoryPath, relativePath), $"Preview {argument} path");
             RejectExistingPathChain(packageRoot, resolved, $"Preview {argument} path");
@@ -266,6 +259,27 @@ internal static class WorkspaceProjectValidator
             else scriptArgumentCount++;
         }
         if (sceneArgumentCount != 1 || scriptArgumentCount != 1) throw Failure("Preview config must contain exactly one --scene and one --script argument.");
+    }
+
+    internal static WorkspacePreviewConfig ParsePreviewConfig(byte[] bytes)
+    {
+        ValidateDocumentBudget(bytes, "Preview config");
+        using var document = Parse(bytes, "Preview config");
+        var config = RequireRootObject(document.RootElement, "Preview config");
+        AssertProperties(config, ["schemaVersion", "runtime"], "Preview config");
+        if (RequireInt32(config, "schemaVersion", "Preview config") != 1) throw Failure("Unsupported Preview config schemaVersion.");
+        var runtime = RequireObject(config, "runtime", "Preview config");
+        AssertProperties(runtime, ["executable", "workingDirectory", "arguments"], "Preview config.runtime");
+        var arguments = RequireArray(runtime, "arguments", "Preview config.runtime")
+            .EnumerateArray()
+            .Select(value => value.ValueKind == JsonValueKind.String
+                ? value.GetString()!
+                : throw Failure("Preview config.runtime.arguments must contain only strings."))
+            .ToArray();
+        return new WorkspacePreviewConfig(
+            RequireString(runtime, "executable", "Preview config.runtime"),
+            RequireString(runtime, "workingDirectory", "Preview config.runtime"),
+            arguments);
     }
 
     private static void ValidateSprite(JsonElement sprite, string name, HashSet<uint> textureIds)

@@ -49,7 +49,7 @@ internal static class Program
 
         var transport = new StdioEditorRpcTransport(new EditorRpcProcessOptions(
             "dotnet",
-            [serviceDll, "--kadath-root", kadathRoot],
+            [serviceDll],
             kadathRoot));
         await using var client = new EditorRpcClient(transport, "kadath-editor-avalonia-workflow", "1");
         await using var workspace = new EditorWorkspaceViewModel(client, new InlineEditorViewDispatcher());

@@ -51,11 +51,28 @@ public sealed class WorkspacePublicationModel
 
     private EditorBakeResult BakeCore(ProjectSessionInfo project, BakeStartParameters parameters, CancellationToken cancellationToken)
     {
+        var paths = WorkspaceProjectValidator.ResolveOpenPaths(project);
+        return BakeResolvedCore(
+            paths.PackageRoot,
+            paths.ScenePath,
+            paths.ScriptPath,
+            Path.Combine(paths.ProjectDirectory, ".kadath", "derived"),
+            parameters,
+            cancellationToken);
+    }
+
+    internal EditorBakeResult BakeResolvedCore(
+        string packageRoot,
+        string sceneSourcePath,
+        string scriptSourcePath,
+        string derivedDirectory,
+        BakeStartParameters parameters,
+        CancellationToken cancellationToken)
+    {
         var target = NormalizeTarget(parameters.Target);
         var profile = NormalizeProfile(parameters.Profile);
-        var paths = WorkspaceProjectValidator.ResolveOpenPaths(project);
-        var kadathDirectory = Path.Combine(paths.ProjectDirectory, ".kadath");
-        var derivedDirectory = Path.Combine(kadathDirectory, "derived");
+        var kadathDirectory = Path.GetDirectoryName(derivedDirectory)
+            ?? throw Failure(WorkspacePublicationFailureKind.Validation, $"Derived directory has no parent: {derivedDirectory}.");
         ValidateOutputDirectory(kadathDirectory, "Project metadata directory");
         ValidateOutputDirectory(derivedDirectory, "Derived directory");
         var sceneArtifactPath = Path.Combine(derivedDirectory, "scene.scene");
@@ -73,26 +90,26 @@ public sealed class WorkspacePublicationModel
 
         if (bakeScene)
         {
-            sceneSource = WorkspaceProjectValidator.ReadDocument(paths.ScenePath, "Scene", cancellationToken);
+            sceneSource = WorkspaceProjectValidator.ReadDocument(sceneSourcePath, "Scene", cancellationToken);
             sceneArtifact = WorkspaceSceneCodec.EncodeSource(sceneSource);
             var info = WorkspaceSceneCodec.ValidateArtifact(sceneArtifact);
-            sceneEntry = Entry("Scene", paths.PackageRoot, paths.ScenePath, sceneSource, sceneArtifactPath, info);
+            sceneEntry = Entry("Scene", packageRoot, sceneSourcePath, sceneSource, sceneArtifactPath, info);
         }
         else
         {
-            sceneEntry = ReadRetainedEntry(manifestPath, "scene", "Scene", paths.PackageRoot, paths.ScenePath, sceneArtifactPath);
+            sceneEntry = ReadRetainedEntry(manifestPath, "scene", "Scene", packageRoot, sceneSourcePath, sceneArtifactPath);
         }
 
         if (bakeScript)
         {
-            scriptSource = WorkspaceProjectValidator.ReadDocument(paths.ScriptPath, "Script", cancellationToken);
+            scriptSource = WorkspaceProjectValidator.ReadDocument(scriptSourcePath, "Script", cancellationToken);
             scriptArtifact = WorkspaceScriptCodec.EncodeSource(scriptSource);
             var info = WorkspaceScriptCodec.ValidateArtifact(scriptArtifact);
-            scriptEntry = Entry("Script", paths.PackageRoot, paths.ScriptPath, scriptSource, scriptArtifactPath, info);
+            scriptEntry = Entry("Script", packageRoot, scriptSourcePath, scriptSource, scriptArtifactPath, info);
         }
         else
         {
-            scriptEntry = ReadRetainedEntry(manifestPath, "script", "Script", paths.PackageRoot, paths.ScriptPath, scriptArtifactPath);
+            scriptEntry = ReadRetainedEntry(manifestPath, "script", "Script", packageRoot, scriptSourcePath, scriptArtifactPath);
         }
 
         EnsureOutputDirectory(kadathDirectory, "Project metadata directory");
@@ -106,9 +123,9 @@ public sealed class WorkspacePublicationModel
             transactions.Add(Stage(manifestPath, manifestBytes, WorkspacePublicationPhase.BeforeManifestPromote));
             _phase?.Invoke(WorkspacePublicationPhase.AfterStaging);
             cancellationToken.ThrowIfCancellationRequested();
-            if (bakeScene && !Sha256(sceneSource!).Equals(Sha256(WorkspaceProjectValidator.ReadDocument(paths.ScenePath, "Scene", cancellationToken)), StringComparison.Ordinal))
+            if (bakeScene && !Sha256(sceneSource!).Equals(Sha256(WorkspaceProjectValidator.ReadDocument(sceneSourcePath, "Scene", cancellationToken)), StringComparison.Ordinal))
                 throw Failure(WorkspacePublicationFailureKind.SourceChanged, "Scene source changed during bake.");
-            if (bakeScript && !Sha256(scriptSource!).Equals(Sha256(WorkspaceProjectValidator.ReadDocument(paths.ScriptPath, "Script", cancellationToken)), StringComparison.Ordinal))
+            if (bakeScript && !Sha256(scriptSource!).Equals(Sha256(WorkspaceProjectValidator.ReadDocument(scriptSourcePath, "Script", cancellationToken)), StringComparison.Ordinal))
                 throw Failure(WorkspacePublicationFailureKind.SourceChanged, "Script source changed during bake.");
             cancellationToken.ThrowIfCancellationRequested();
             Commit(transactions);

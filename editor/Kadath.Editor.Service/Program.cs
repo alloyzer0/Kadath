@@ -9,13 +9,14 @@ internal static class Program
     {
         try
         {
-            var kadathRoot = ResolveKadathRoot(args);
-            await using var session = new EditorSession(new PowerShellEditorBackend(
+            _ = args;
+            var publicationModel = new WorkspacePublicationModel();
+            await using var session = new EditorSession(new WorkspaceEditorBackend(
                 new WorkspaceProjectLifecycleModel(),
                 new WorkspaceReadModel(),
                 new WorkspaceAuthoringModel(),
-                new WorkspacePublicationModel()));
-            await using var preview = new PreviewProcessController(kadathRoot);
+                publicationModel));
+            await using var preview = new PreviewProcessController(new WorkspacePreviewModel(publicationModel));
             var host = new EditorRpcHost(session, preview, Console.In, Console.Out);
             return await host.RunAsync();
         }
@@ -26,38 +27,4 @@ internal static class Program
         }
     }
 
-    private static string ResolveKadathRoot(string[] args)
-    {
-        for (var index = 0; index < args.Length; index++)
-        {
-            if (args[index] == "--kadath-root" && index + 1 < args.Length)
-            {
-                return ValidateKadathRoot(args[index + 1]);
-            }
-        }
-
-        var candidate = new DirectoryInfo(Environment.CurrentDirectory);
-        while (candidate is not null)
-        {
-            if (File.Exists(Path.Combine(candidate.FullName, "tools", "editor-preview.ps1")))
-            {
-                return candidate.FullName;
-            }
-
-            candidate = candidate.Parent;
-        }
-
-        throw new InvalidOperationException("Kadath root was not found; pass --kadath-root <path>.");
-    }
-
-    private static string ValidateKadathRoot(string path)
-    {
-        var fullPath = Path.GetFullPath(path);
-        if (!File.Exists(Path.Combine(fullPath, "tools", "editor-preview.ps1")))
-        {
-            throw new DirectoryNotFoundException($"Kadath root does not contain tools/editor-preview.ps1: {fullPath}");
-        }
-
-        return fullPath;
-    }
 }
