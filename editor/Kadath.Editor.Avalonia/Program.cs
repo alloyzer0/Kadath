@@ -68,6 +68,10 @@ internal static class Program
         var expectedAssetCount = Directory.EnumerateFiles(Path.Combine(packageRoot, "bin", "assets"), "*", SearchOption.AllDirectories).Count();
         Require(avaloniaViewModel.HierarchyItems.Count == 11 && expectedAssetCount > 0 && avaloniaViewModel.AssetItems.Count == expectedAssetCount,
             "Avalonia should project every asset from the current product package.");
+        Require(avaloniaViewModel.SceneTextureAssignments.Count == 4
+            && avaloniaViewModel.SceneTextureAssignments[0].TextureIdText == "1"
+            && !string.IsNullOrWhiteSpace(avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem),
+            "Avalonia did not project the current Scene texture set into the authoring slots");
         Require(avaloniaViewModel.InspectorText.Contains("scene.goal", StringComparison.Ordinal), "Avalonia hierarchy inspector did not use snapshot data");
         Console.WriteLine("workflow_snapshot_projection=ok");
         Console.WriteLine("workflow_project_open=ok");
@@ -91,7 +95,8 @@ internal static class Program
                 && avaloniaViewModel.ScriptGoalX.Length == 0
                 && avaloniaViewModel.ScriptGoalY.Length == 0
                 && avaloniaViewModel.ScriptVelocityX.Length == 0
-                && avaloniaViewModel.ScriptVelocityY.Length == 0,
+                && avaloniaViewModel.ScriptVelocityY.Length == 0
+                && avaloniaViewModel.SceneTextureAssignments.All(slot => slot.IsEmpty),
                 "Avalonia retained old UI projection when the Workspace Session identity changed");
 
             // 通过公开选择属性探测字典；旧 label 不得再恢复旧 Inspector。
@@ -128,20 +133,29 @@ internal static class Program
         // 工作流 smoke 覆盖真实 authoring transaction：Apply 更新文件并建立撤销记录，Undo 恢复原值。
         var originalSceneGoalX = avaloniaViewModel.SceneGoalX;
         var originalPlayerTextureId = avaloniaViewModel.ScenePlayerTextureId;
+        var originalSceneTextureAsset = avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem;
+        var alternateSceneTextureAsset = avaloniaViewModel.AssetItems.FirstOrDefault(label => label.Contains("goal.texture", StringComparison.Ordinal) && label != originalSceneTextureAsset)
+            ?? avaloniaViewModel.AssetItems.FirstOrDefault(label => label.Contains("test.texture", StringComparison.Ordinal) && label != originalSceneTextureAsset);
+        Require(!string.IsNullOrWhiteSpace(alternateSceneTextureAsset), "workflow fixture did not expose an alternate renderer2d texture asset");
         var originalSceneGoal = double.Parse(originalSceneGoalX, CultureInfo.InvariantCulture);
         avaloniaViewModel.SceneGoalX = (originalSceneGoal + 11d).ToString("R", CultureInfo.InvariantCulture);
         avaloniaViewModel.ScenePlayerTextureId = originalPlayerTextureId == "1" ? "2" : "1";
+        avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem = alternateSceneTextureAsset;
         var appliedAuthoring = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(appliedAuthoring.State, "succeeded", StringComparison.OrdinalIgnoreCase)
             && workspace.Authoring.UndoDepth == 1
-            && appliedAuthoring.ChangedFields.Contains("scene.player.textureId"), "authoring apply did not create a successful texture-aware undo record");
+            && appliedAuthoring.ChangedFields.Contains("scene.player.textureId")
+            && appliedAuthoring.ChangedFields.Contains("scene.textures"), "authoring apply did not create a successful texture-aware undo record");
+        Require(avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem == alternateSceneTextureAsset,
+            "authoring apply did not keep the editable texture assignment in sync");
         Console.WriteLine("workflow_authoring_apply=ok");
 
         var undoneAuthoring = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(undoneAuthoring.Operation, "undo", StringComparison.OrdinalIgnoreCase)
             && workspace.Authoring.UndoDepth == 0
             && avaloniaViewModel.SceneGoalX == originalSceneGoalX
-            && avaloniaViewModel.ScenePlayerTextureId == originalPlayerTextureId, "authoring undo did not restore the prior values");
+            && avaloniaViewModel.ScenePlayerTextureId == originalPlayerTextureId
+            && avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem == originalSceneTextureAsset, "authoring undo did not restore the prior values");
         Console.WriteLine("workflow_authoring_undo=ok");
 
         var validation = await workspace.ValidateProjectAsync(createdProjectName, cancellationToken);

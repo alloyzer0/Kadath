@@ -20,6 +20,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private readonly List<AsyncUiCommand> _commands = [];
     private readonly Dictionary<string, HierarchyNode> _hierarchyItemsByLabel = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AssetCatalogItem> _assetItemsByLabel = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _assetLabelsByRelativePath = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _lifetime = new();
     private EditorProjectIdentity? _projectIdentity;
     private int _disposed;
@@ -42,6 +43,12 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _scriptGoalY = string.Empty;
     private string _scriptVelocityX = string.Empty;
     private string _scriptVelocityY = string.Empty;
+    public ObservableCollection<TextureAssignmentSlotViewModel> SceneTextureAssignments { get; } = [
+        new TextureAssignmentSlotViewModel("Texture 1"),
+        new TextureAssignmentSlotViewModel("Texture 2"),
+        new TextureAssignmentSlotViewModel("Texture 3"),
+        new TextureAssignmentSlotViewModel("Texture 4")
+    ];
 
     public AvaloniaEditorViewModel(EditorWorkspaceViewModel workspace, IEditorViewDispatcher dispatcher, string defaultPackageRoot, TimeSpan? connectionTimeout = null)
     {
@@ -61,6 +68,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace.Watch.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Preview.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Client.EventReceived += OnEditorEventAsync;
+        foreach (var slot in SceneTextureAssignments) { slot.AssetItems = AssetItems; }
 
         ConnectCommand = AddCommand(new AsyncUiCommand(InitializeAsync, () => !IsBusy, HandleCommandError));
         OpenProjectCommand = AddCommand(new AsyncUiCommand(OpenProjectAsync, () => CanProjectCommand && !IsBusy, HandleCommandError));
@@ -108,7 +116,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool WatchChanges { get => _watchChanges; set { if (SetProperty(ref _watchChanges, value)) { RaiseAll(); } } }
     public string? SelectedHierarchyItem { get => _selectedHierarchyItem; set { if (SetProperty(ref _selectedHierarchyItem, value) && value is not null && _hierarchyItemsByLabel.TryGetValue(value, out var node)) { InspectorText = FormatHierarchyInspector(node); } } }
     public string? SelectedAssetItem { get => _selectedAssetItem; set { if (SetProperty(ref _selectedAssetItem, value) && value is not null && _assetItemsByLabel.TryGetValue(value, out var item)) { InspectorText = FormatAssetInspector(item); } } }
-    public string InspectorText { get => _inspectorText; private set => SetProperty(ref _inspectorText, value); }    public string SceneGoalX { get => _sceneGoalX; set => SetProperty(ref _sceneGoalX, value); }
+    public string InspectorText { get => _inspectorText; private set => SetProperty(ref _inspectorText, value); }
+    public string SceneGoalX { get => _sceneGoalX; set => SetProperty(ref _sceneGoalX, value); }
     public string SceneGoalY { get => _sceneGoalY; set => SetProperty(ref _sceneGoalY, value); }
     public string ScenePlayerTextureId { get => _scenePlayerTextureId; set => SetProperty(ref _scenePlayerTextureId, value); }
     public string SceneGoalTextureId { get => _sceneGoalTextureId; set => SetProperty(ref _sceneGoalTextureId, value); }
@@ -321,7 +330,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity"),
             ParseTextureId(ScenePlayerTextureId, "scene.player.textureId"),
             ParseTextureId(SceneGoalTextureId, "scene.goal.textureId"),
-            ParseTextureId(SceneHazardTextureId, "scene.hazard.textureId"));
+            ParseTextureId(SceneHazardTextureId, "scene.hazard.textureId"),
+            ParseSceneTextureAssignments());
         var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
         ApplySnapshotProjection(session);
         RaiseAll();
@@ -363,6 +373,52 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         }
         return [parsedX, parsedY];
     }
+
+    private IReadOnlyList<SceneTextureAssignment>? ParseSceneTextureAssignments()
+    {
+        var assignments = new List<SceneTextureAssignment>();
+        if (SceneTextureAssignments.All(slot => slot.IsEmpty)) { return null; }
+        if (SceneTextureAssignments[0].IsEmpty)
+        {
+            throw new EditorRpcException("invalid_authoring_patch", "Scene texture assignments must begin with the first slot.");
+        }
+
+        for (var index = 0; index < SceneTextureAssignments.Count; index++)
+        {
+            var slot = SceneTextureAssignments[index];
+            var textureIdText = slot.TextureIdText.Trim();
+            var selectedAssetItem = slot.SelectedAssetItem?.Trim();
+            var hasTextureId = textureIdText.Length > 0;
+            var hasAsset = !string.IsNullOrWhiteSpace(selectedAssetItem);
+            if (!hasTextureId && !hasAsset)
+            {
+                if (assignments.Count > 0)
+                {
+                    for (var trailing = index + 1; trailing < SceneTextureAssignments.Count; trailing++)
+                    {
+                        if (!SceneTextureAssignments[trailing].IsEmpty)
+                        {
+                            throw new EditorRpcException("invalid_authoring_patch", "Scene texture assignments must remain contiguous from the first slot.");
+                        }
+                    }
+                    break;
+                }
+                continue;
+            }
+
+            if (!hasTextureId || !hasAsset)
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.textures[{index + 1}] requires both TextureId and Asset selection.");
+            }
+            if (!_assetItemsByLabel.TryGetValue(selectedAssetItem!, out var asset))
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.textures[{index + 1}] must select an asset from the current catalog.");
+            }
+            assignments.Add(new SceneTextureAssignment(ParseTextureId(textureIdText, $"scene.textures[{index + 1}].textureId"), asset.AssetId));
+        }
+
+        return assignments.Count == 0 ? null : assignments;
+    }
     private void ApplySnapshotProjection(ProjectSessionInfo session)
     {
         var project = _workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Project snapshot is missing.");
@@ -382,11 +438,13 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
         AssetItems.Clear();
         _assetItemsByLabel.Clear();
+        _assetLabelsByRelativePath.Clear();
         foreach (var item in assets.Items)
         {
             var label = $"{item.Category} · {item.RelativePath}";
             AssetItems.Add(label);
             _assetItemsByLabel.Add(label, item);
+            _assetLabelsByRelativePath[item.RelativePath] = label;
         }
 
         SelectedHierarchyItem = null;
@@ -405,6 +463,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _hierarchyItemsByLabel.Clear();
         AssetItems.Clear();
         _assetItemsByLabel.Clear();
+        _assetLabelsByRelativePath.Clear();
         SelectedHierarchyItem = null;
         SelectedAssetItem = null;
         InspectorText = string.Empty;
@@ -414,6 +473,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         ScriptGoalY = string.Empty;
         ScriptVelocityX = string.Empty;
         ScriptVelocityY = string.Empty;
+        ClearSceneTextureAssignments();
     }
 
     private void ReconcileProjectIdentity()
@@ -435,6 +495,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         ScriptGoalY = project.Script.GoalPosition[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         ScriptVelocityX = project.Script.GoalVelocity[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         ScriptVelocityY = project.Script.GoalVelocity[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        SetSceneTextureAssignments(project);
     }
     private void ApplySessionProjection(ProjectSessionInfo session)
     {
@@ -444,10 +505,12 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         HierarchyItems.Add($"Project / {session.ProjectName}");
         AssetItems.Clear();
         _assetItemsByLabel.Clear();
+        _assetLabelsByRelativePath.Clear();
         AssetItems.Add(Path.GetFileName(session.ScenePath));
         AssetItems.Add(Path.GetFileName(session.ScriptPath));
         AssetItems.Add(Path.GetFileName(session.PreviewPath));
         InspectorText = $"Project\n{session.ProjectName}\n\nSnapshot commands unavailable.";
+        ClearSceneTextureAssignments();
     }
 
     private static int GetHierarchyDepth(HierarchyNode node, IReadOnlyDictionary<string, HierarchyNode> nodesById)
@@ -493,6 +556,29 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
     private static string ShortRevision(string? revision) => revision is { Length: >= 12 } ? $"{revision[..12]}…" : "—";
 
+    private void SetSceneTextureAssignments(ProjectModelSnapshot project)
+    {
+        var textures = project.Scene.Textures ?? [];
+        for (var index = 0; index < SceneTextureAssignments.Count; index++)
+        {
+            if (index < textures.Count)
+            {
+                var texture = textures[index];
+                _assetLabelsByRelativePath.TryGetValue(texture.Artifact, out var label);
+                SceneTextureAssignments[index].SetValue(texture.TextureId.ToString(System.Globalization.CultureInfo.InvariantCulture), label);
+            }
+            else
+            {
+                SceneTextureAssignments[index].Clear();
+            }
+        }
+    }
+
+    private void ClearSceneTextureAssignments()
+    {
+        foreach (var slot in SceneTextureAssignments) { slot.Clear(); }
+    }
+
     private async Task EnsureConnectedAsync()
     {
         if (!IsConnected) { await InitializeAsync(); }
@@ -537,6 +623,33 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
 public sealed record EditorEventLogItem(long Sequence, string Event, string Summary, string? RequestId, DateTimeOffset Timestamp);
 
+public sealed class TextureAssignmentSlotViewModel : ObservableObject
+{
+    private ObservableCollection<string> _assetItems = [];
+    private string _textureIdText = string.Empty;
+    private string? _selectedAssetItem;
+
+    public TextureAssignmentSlotViewModel(string slotLabel) => SlotLabel = slotLabel;
+
+    public string SlotLabel { get; }
+    public ObservableCollection<string> AssetItems { get => _assetItems; set => SetProperty(ref _assetItems, value); }
+    public string TextureIdText { get => _textureIdText; set => SetProperty(ref _textureIdText, value); }
+    public string? SelectedAssetItem { get => _selectedAssetItem; set => SetProperty(ref _selectedAssetItem, value); }
+    public bool IsEmpty => string.IsNullOrWhiteSpace(TextureIdText) && string.IsNullOrWhiteSpace(SelectedAssetItem);
+
+    public void SetValue(string textureIdText, string? selectedAssetItem)
+    {
+        TextureIdText = textureIdText;
+        SelectedAssetItem = selectedAssetItem;
+    }
+
+    public void Clear()
+    {
+        TextureIdText = string.Empty;
+        SelectedAssetItem = null;
+    }
+}
+
 public sealed class AsyncUiCommand : ICommand
 {
     private readonly Func<Task> _execute;
@@ -558,9 +671,6 @@ public sealed class DelegateUiCommand : ICommand
     public bool CanExecute(object? parameter) => true;
     public void Execute(object? parameter) => _execute();
 }
-
-
-
 
 
 

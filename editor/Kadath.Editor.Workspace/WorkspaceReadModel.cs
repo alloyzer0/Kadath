@@ -149,7 +149,7 @@ public sealed class WorkspaceReadModel
         return new HierarchySnapshot(EditorSnapshotVersions.Hierarchy, EditorSnapshotVersions.ProjectModel, project.ProjectName, nodes.ToArray());
     }
 
-    private static AssetCatalogSnapshot ReadAssetsCore(ProjectSessionInfo project, CancellationToken cancellationToken)
+    internal static AssetCatalogSnapshot ReadAssetsCore(ProjectSessionInfo project, CancellationToken cancellationToken)
     {
         var packageRoot = ResolveExistingDirectory(project.PackageRoot, "Package root");
         var binRoot = EnsureInside(packageRoot, Path.Combine(packageRoot, "bin"), "Bin root");

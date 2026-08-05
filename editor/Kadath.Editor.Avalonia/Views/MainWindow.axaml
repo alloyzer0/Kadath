@@ -99,6 +99,21 @@
           <Border Grid.Row="3" Padding="8" Background="#252D37" CornerRadius="4">
             <StackPanel Spacing="4">
               <TextBlock FontWeight="SemiBold" Text="Authoring · optimistic revision" />
+              <StackPanel Spacing="4">
+                <TextBlock FontSize="11" Foreground="#8F9CAB" Text="Scene texture set" />
+                <ItemsControl ItemsSource="{Binding SceneTextureAssignments}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                      <Grid ColumnDefinitions="Auto,78,Auto,*" ColumnSpacing="4" Margin="0,0,0,4">
+                        <TextBlock VerticalAlignment="Center" Text="{Binding SlotLabel}" />
+                        <TextBox Grid.Column="1" Text="{Binding TextureIdText}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Asset" />
+                        <ComboBox Grid.Column="3" ItemsSource="{Binding AssetItems}" SelectedItem="{Binding SelectedAssetItem}" />
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </StackPanel>
               <Grid ColumnDefinitions="Auto,60,Auto,60,Auto,60" ColumnSpacing="4">
                 <TextBlock VerticalAlignment="Center" Text="Player Tex" />
                 <TextBox Grid.Column="1" Text="{Binding ScenePlayerTextureId}" />

@@ -611,6 +611,27 @@ internal static class Program
             throw new InvalidOperationException("empty authoring undo unexpectedly succeeded");
         }
         catch (EditorRpcException exception) when (exception.Code == "authoring_undo_empty") { }
+
+        var originalTextureArtifact = projectSnapshot.Scene.Textures!.First(texture => texture.TextureId == 1).Artifact;
+        var goalTextureAssetId = assetSnapshot.Items.First(item => item.RelativePath == "assets/renderer2d/goal.texture").AssetId;
+        var testTextureAssetId = assetSnapshot.Items.First(item => item.RelativePath == "assets/renderer2d/test.texture").AssetId;
+        var textureApplied = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(projectName, undone.Revision,
+            new AuthoringPatch(SceneTextures: [
+                new SceneTextureAssignment(1, goalTextureAssetId),
+                new SceneTextureAssignment(2, goalTextureAssetId),
+                new SceneTextureAssignment(3, testTextureAssetId)
+            ]))).ConfigureAwait(false);
+        var appliedTextures = textureApplied.ProjectSnapshot.Scene.Textures ?? throw new InvalidOperationException("real service texture assignment snapshot missing");
+        Assert(textureApplied.ChangedFields.Contains("scene.textures")
+            && appliedTextures.Count == 3
+            && appliedTextures[0].Artifact == "assets/renderer2d/goal.texture",
+            "real service scene texture assignment failed");
+        var textureUndone = await client.UndoAuthoringAsync(new AuthoringUndoParameters(projectName, textureApplied.Revision)).ConfigureAwait(false);
+        var undoneTextures = textureUndone.ProjectSnapshot.Scene.Textures ?? throw new InvalidOperationException("real service texture assignment undo snapshot missing");
+        Assert(textureUndone.Operation == "undo"
+            && undoneTextures.Count == 3
+            && undoneTextures[0].Artifact == originalTextureArtifact,
+            "real service texture assignment undo failed");
         Console.WriteLine("authoring_service_smoke=ok");
         await client.ShutdownAsync().ConfigureAwait(false);
     }
@@ -664,13 +685,35 @@ internal static class Program
         await WaitUntilAsync(() => workspace.Publication.State == EditorPublicationState.Current);
 
         var scriptedRevision = workspace.ProjectSnapshot.Value?.AuthoringRevision ?? throw new InvalidOperationException("scripted revision missing");
-        var scriptedApplied = await workspace.ApplyAuthoringAsync(new AuthoringApplyParameters("demo", scriptedRevision, new AuthoringPatch(SceneGoalPosition: [8d, 9d])));
+        var scriptedGoalTextureAssetId = workspace.AssetCatalogSnapshot.Value?.Items.First(item => item.RelativePath == "assets/renderer2d/goal.texture").AssetId
+            ?? throw new InvalidOperationException("scripted goal texture asset missing");
+        var scriptedTestTextureAssetId = workspace.AssetCatalogSnapshot.Value?.Items.First(item => item.RelativePath == "assets/renderer2d/test.texture").AssetId
+            ?? throw new InvalidOperationException("scripted test texture asset missing");
+        var scriptedApplied = await workspace.ApplyAuthoringAsync(new AuthoringApplyParameters("demo", scriptedRevision,
+            new AuthoringPatch(
+                SceneGoalPosition: [8d, 9d],
+                SceneTextures: [
+                    new SceneTextureAssignment(1, scriptedGoalTextureAssetId),
+                    new SceneTextureAssignment(2, scriptedGoalTextureAssetId),
+                    new SceneTextureAssignment(3, scriptedTestTextureAssetId)
+                ])));
         Assert(workspace.Authoring.State == EditorAuthoringState.Succeeded && scriptedApplied.UndoDepth == 1, "authoring apply state mismatch");
+        var scriptedApplyRequest = transport.LastAuthoringApplyRequest ?? throw new InvalidOperationException("authoring_apply request was not observed by the transport Adapter");
+        var scriptedPatch = scriptedApplyRequest.GetProperty("params").GetProperty("patch");
+        var scriptedSceneTextures = scriptedPatch.GetProperty("sceneTextures");
+        Assert(scriptedSceneTextures.GetArrayLength() == 3
+            && scriptedSceneTextures[0].GetProperty("textureId").GetUInt32() == 1
+            && scriptedSceneTextures[0].GetProperty("assetId").GetString() == scriptedGoalTextureAssetId,
+            "authoring_apply request did not serialize sceneTextures");
         Assert(workspace.Publication.State == EditorPublicationState.SourceDirty && workspace.Publication.RecommendedBakeTarget == "Scene", "authoring apply did not expose Scene publication dirtiness");
         var incrementalBake = await workspace.BakeChangesAsync("debug");
         Assert(incrementalBake?.Target == "Scene" && workspace.Publication.State == EditorPublicationState.Current, "Bake Changes did not select the minimum Scene target");
         var scriptedUndone = await workspace.UndoAuthoringAsync(new AuthoringUndoParameters("demo", scriptedApplied.Revision));
         Assert(workspace.Authoring.State == EditorAuthoringState.Succeeded && scriptedUndone.Operation == "undo", "authoring undo state mismatch");
+        var restoredTextures = workspace.ProjectSnapshot.Value?.Scene.Textures ?? throw new InvalidOperationException("restored project snapshot missing");
+        Assert(restoredTextures.Count == 3
+            && restoredTextures[0].Artifact == "assets/renderer2d/test.texture",
+            "authoring undo did not restore the scene texture set");
         Assert(workspace.Project.State == EditorProjectState.Opened, "project state was not opened");
         Assert(project.ProjectName == "demo", "project response correlation failed");
 
@@ -1027,6 +1070,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     public bool DelayedCreatePending => _delayedCreateRelease is not null;
     public bool DelayedOperationPending => _delayedOperationRelease is not null;
     public JsonElement? LastProjectCreateRequest { get; private set; }
+    public JsonElement? LastAuthoringApplyRequest { get; private set; }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -1169,6 +1213,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 break;
             case "authoring_apply":
                 _publicationDirty = true;
+                LastAuthoringApplyRequest = request.Clone();
                 var applied = NewAuthoringMutationResult("apply", "0000000000000000000000000000000000000000000000000000000000000002", 1);
                 await EmitEventAsync("authoring_apply_started", new { projectName = "demo" }, id).ConfigureAwait(false);
                 await EmitEventAsync("authoring_apply_completed", applied, id).ConfigureAwait(false);

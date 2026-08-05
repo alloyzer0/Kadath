@@ -210,13 +210,18 @@ public sealed record AssetCatalogSnapshot(
     int ItemCount,
     AssetCatalogItem[] Items);
 
+public sealed record SceneTextureAssignment(
+    uint TextureId,
+    string AssetId);
+
 public sealed record AuthoringPatch(
     double[]? SceneGoalPosition = null,
     double[]? ScriptGoalPosition = null,
     double[]? ScriptGoalVelocity = null,
     uint? ScenePlayerTextureId = null,
     uint? SceneGoalTextureId = null,
-    uint? SceneHazardTextureId = null);
+    uint? SceneHazardTextureId = null,
+    IReadOnlyList<SceneTextureAssignment>? SceneTextures = null);
 
 public sealed record AuthoringApplyParameters(
     string? ProjectName,

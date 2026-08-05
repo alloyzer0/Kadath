@@ -29,7 +29,7 @@ internal static class Program
             var assets = await readModel.ReadAssetsAsync(project, default);
             Require(assets.Root == "bin/assets" && assets.ItemCount == 4, "asset catalog mismatch");
             Require(assets.Items.Select(item => item.RelativePath).SequenceEqual(assets.Items.Select(item => item.RelativePath).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ThenBy(value => value, StringComparer.Ordinal)), "asset ordering mismatch");
-            Require(assets.Items.Any(item => item.AssetId == "asset://renderer2d/test.png" && item.Category == "Texture"), "texture catalog item missing");
+            Require(assets.Items.Any(item => item.AssetId == "asset://renderer2d/test.texture" && item.Category == "Texture"), "texture catalog item missing");
 
             await VerifyAuthoringAsync(project, readModel);
             await ProjectLifecycleVerifier.VerifyAsync();
@@ -225,6 +225,29 @@ internal static class Program
             && undone.ProjectSnapshot.Script.GoalPosition.SequenceEqual(initial.Script.GoalPosition)
             && undone.ProjectSnapshot.Script.GoalVelocity.SequenceEqual(initial.Script.GoalVelocity), "authoring inverse mutation mismatch");
 
+        var texturePatch = new AuthoringPatch(SceneTextures: [
+            new SceneTextureAssignment(1, "asset://renderer2d/goal.texture"),
+            new SceneTextureAssignment(2, "asset://renderer2d/goal.texture"),
+            new SceneTextureAssignment(3, "asset://renderer2d/test.texture")
+        ]);
+        var textureCommit = await authoring.ApplyAsync(project, undone.Revision, texturePatch, default);
+        Require(textureCommit.ChangedFields.SequenceEqual(new[] { "scene.textures" }), "scene texture change did not report the expected field");
+        var committedTextures = textureCommit.ProjectSnapshot.Scene.Textures ?? throw new InvalidOperationException("scene texture assignment snapshot missing");
+        Require(committedTextures.Count == 3
+            && committedTextures[0].Artifact == "assets/renderer2d/goal.texture"
+            && committedTextures[2].Artifact == "assets/renderer2d/test.texture",
+            "scene texture assignment commit mismatch");
+        var inverseTextures = textureCommit.InversePatch?.SceneTextures ?? throw new InvalidOperationException("scene texture inverse patch missing");
+        Require(inverseTextures.Count == 3
+            && inverseTextures[0].AssetId == "asset://renderer2d/test.texture"
+            && inverseTextures[2].AssetId == "asset://renderer2d/goal.texture",
+            "scene texture assignment inverse patch mismatch");
+        var textureUndone = await authoring.ApplyAsync(project, textureCommit.Revision, textureCommit.InversePatch, default);
+        var undoneTextures = textureUndone.ProjectSnapshot.Scene.Textures ?? throw new InvalidOperationException("scene texture undo snapshot missing");
+        Require(undoneTextures.Count == 3
+            && undoneTextures[0].Artifact == initial.Scene.Textures![0].Artifact,
+            "scene texture assignment undo mismatch");
+
         File.WriteAllBytes(project.ScenePath, originalScene);
         File.WriteAllBytes(project.ScriptPath, originalScript);
         Require(originalPreview.AsSpan().SequenceEqual(File.ReadAllBytes(project.PreviewPath)), "authoring modified preview config");
@@ -242,8 +265,8 @@ internal static class Program
         Directory.CreateDirectory(Path.Combine(assets, "audio"));
         Directory.CreateDirectory(projectDirectory);
         File.WriteAllBytes(Path.Combine(root, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), [0]);
-        File.WriteAllBytes(Path.Combine(assets, "renderer2d", "test.png"), [1, 2, 3]);
-        File.WriteAllBytes(Path.Combine(assets, "renderer2d", "goal.png"), [4, 5]);
+        File.WriteAllBytes(Path.Combine(assets, "renderer2d", "test.texture"), [1, 2, 3]);
+        File.WriteAllBytes(Path.Combine(assets, "renderer2d", "goal.texture"), [4, 5]);
         File.WriteAllBytes(Path.Combine(assets, "audio", "lost.wav"), [6]);
         File.WriteAllBytes(Path.Combine(assets, "audio", "won.wav"), [7]);
         var scenePath = Path.Combine(projectDirectory, "scene.json");
