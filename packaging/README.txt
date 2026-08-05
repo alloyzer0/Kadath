@@ -67,7 +67,7 @@ P2-M4-26B—P2-M4-27A 的共享组件：
   pwsh -NoProfile -File tools\verify-editor-avalonia-workflow.ps1 -PackageRoot <package>
   pwsh -NoProfile -File editor\verify-editor-client-service.ps1 -PackageRoot <package>
 
-真实 Avalonia workflow smoke 跨越共享 Client/Workspace 和 Editor Service，验证 open、snapshot/publication、authoring、Bake Changes、watch start/stop、带 Live Bake/Watch 的 Preview external-window、Runtime source/artifact revision acknowledgement 和 shutdown。26A wire workflow 仍可独立验证：
+真实 Avalonia workflow smoke 跨越共享 Client/Workspace 和 Editor Service，验证 open、snapshot/publication、authoring、Bake Changes、watch start/stop、带 Live Bake/Watch 的 Preview external-window、Runtime source/artifact revision acknowledgement、texture import 和 shutdown。26A wire workflow 仍可独立验证：
   pwsh -NoProfile -File tools\verify-editor-rpc-workflow.ps1 -PackageRoot <package>
 
 各命令/事件的外部 wire contract 与共享 module seam 独立记录在工作区 docs\superpowers\contracts\p2-m4-26\README.md；Runtime reload acknowledgement 扩展单独记录在 docs\superpowers\contracts\p2-m4-27\README.md。变更字段、事件、错误码、关闭/retention/stale 语义或兼容策略时必须同步对应契约和 verifier。
@@ -96,6 +96,11 @@ Bake Changes 只执行 source → derived，不隐式 Runtime reload；失败保
 Editor Service 的手动 Bake 与 Watch 自动 Bake 已由原生 `WorkspacePublicationModel` 执行：共享严格 Scene/Script codec，写入 KSCN v3/KSCP v1，并按 Scene → Script → manifest 顺序提交和失败回滚。Service 不再为这些产品路径启动 `editor-live-bake.ps1`；该脚本与两个 importer 脚本继续作为旧 CLI/WinForms/Preview Launcher 兼容入口及 byte-parity oracle 保留。
 
 真实 Avalonia workflow 额外覆盖 `workflow_publication_missing=ok`、`workflow_publication_dirty=ok` 与 `workflow_bake_changes=ok`。外部 wire/module 契约见 `..\docs\superpowers\contracts\p2-m4-26\publication-snapshot-v1.md` 和 `publication-state-seam-v1.md`。
+P2 Editor Texture Import
+------------------------
+Avalonia 的 Assets 标签页提供“导入纹理”面板，输入外部 `.png` / `.ppm` 源路径、目标 asset name 和 debug/release profile 后，通过 typed Client 调用 Editor Service 的 `texture_import`；GUI 不直接串联 Asset Tool、Promotion、Build Contract 或目录清理脚本。成功后 Workspace 返回新的 `AssetCatalogSnapshot`，Avalonia 立即刷新 Assets 投影并选中新导入的 `assets\renderer2d\*.texture`，可继续用于 Scene texture assignment。
+
+真实 Avalonia workflow 额外覆盖 `workflow_texture_import=ok`，并在验证后清理本次 owned imported artifact，避免污染 package fixture。外部行为与失败边界见工作区 `docs\superpowers\specs\2026-08-05-p2-editor-texture-import-01-contract-discovery.md`。
 P2-M4-27A Preview Runtime Reload Acknowledgement
 ------------------------------------------------
 Preview Launcher 为 Scene/Script 独立关联 Runtime requestId、source SHA-256、live-bake artifact SHA-256/bytes 与 completion。Editor Service 在保留 preview_status 的同时，对外发布 preview_reload_requested、preview_reload_acknowledged、preview_reload_failed、preview_reload_stale。只有 acknowledged 推进 Runtime loaded revision；rejected/timeout 保留最近 acknowledged identity；旧 requestId 的迟到响应只记 stale。

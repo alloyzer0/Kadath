@@ -218,6 +218,32 @@ internal static class Program
         await WaitUntilAsync(() => workspace.Preview.State == EditorPreviewState.Stopped, cancellationToken, "preview stopped event");
         Console.WriteLine("workflow_preview_stop=ok");
 
+        var importAssetName = $"workflow_imported_{Guid.NewGuid():N}"[..26];
+        var importedRelativePath = $"assets/renderer2d/{importAssetName}.texture";
+        var importedAssetPath = Path.Combine(packageRoot, "bin", "assets", "renderer2d", $"{importAssetName}.texture");
+        try
+        {
+            avaloniaViewModel.TextureImportSourcePath = Path.Combine(kadathRoot, "assets", "renderer2d", "test.png");
+            avaloniaViewModel.TextureImportAssetName = importAssetName;
+            avaloniaViewModel.TextureImportProfile = "debug";
+            var imported = await avaloniaViewModel.ImportTextureForCurrentProjectAsync(cancellationToken);
+            var importedLabel = avaloniaViewModel.AssetItems.FirstOrDefault(label => label.Contains($"{importAssetName}.texture", StringComparison.Ordinal));
+            Require(string.Equals(imported.State, "succeeded", StringComparison.OrdinalIgnoreCase)
+                && imported.RelativePath == importedRelativePath
+                && workspace.TextureImport.State == EditorTextureImportState.Succeeded
+                && workspace.AssetCatalogSnapshot.Value?.ItemCount == expectedAssetCount + 1
+                && imported.AssetCatalog.ItemCount == expectedAssetCount + 1
+                && importedLabel is not null
+                && avaloniaViewModel.SelectedAssetItem == importedLabel
+                && avaloniaViewModel.TextureImportStatus.Contains("成功", StringComparison.Ordinal),
+                "Avalonia texture import did not refresh and select the imported asset projection");
+            Console.WriteLine("workflow_texture_import=ok");
+        }
+        finally
+        {
+            if (File.Exists(importedAssetPath)) { File.Delete(importedAssetPath); }
+        }
+
         await workspace.ShutdownAsync(cancellationToken);
         await avaloniaViewModel.DisposeAsync();
         Console.WriteLine("workflow_shutdown=ok");
@@ -260,6 +286,13 @@ internal static class Program
         // Live Bake/Watch 保持 opt-in，打开编辑器本身不能隐式启动派生构建。
         if (viewModel.LiveBakeEnabled || viewModel.WatchChanges) { throw new InvalidOperationException("Live Bake/Watch must be disabled by default."); }
         Console.WriteLine("live_bake_opt_in=ok");
+        Require(!viewModel.CanImportTexture
+            && !viewModel.ImportTextureCommand.CanExecute(null)
+            && viewModel.TextureImportSourcePath.Length == 0
+            && viewModel.TextureImportAssetName == "imported"
+            && viewModel.TextureImportProfile == "debug",
+            "Avalonia texture import controls were not initialized behind project/capability gating");
+        Console.WriteLine("texture_import_controls=ok");
         if (!viewModel.SupportsExternalWindow || viewModel.SupportsSharedTexture || viewModel.SupportsFrameStream)
         {
             throw new InvalidOperationException("Preview capability gating does not match the v1 external-window contract.");
@@ -313,6 +346,22 @@ internal static class Program
             && createParameters.GetProperty("projectName").GetString() == "smoke_created",
             "Avalonia Create added parameters outside PackageRoot/ProjectName");
         Console.WriteLine("project_create_gating=ok");
+
+        viewModel.TextureImportSourcePath = "C:/source/smoke.ppm";
+        viewModel.TextureImportAssetName = "smoke_imported";
+        viewModel.TextureImportProfile = "debug";
+        Require(viewModel.CanImportTexture && viewModel.ImportTextureCommand.CanExecute(null),
+            "texture_import capability did not enable the Avalonia import command for an open project");
+        var imported = await viewModel.ImportTextureForCurrentProjectAsync(createTimeout.Token);
+        var importedLabel = viewModel.AssetItems.FirstOrDefault(label => label.Contains("smoke_imported.texture", StringComparison.Ordinal));
+        Require(imported.RelativePath == "assets/renderer2d/smoke_imported.texture"
+            && workspace.TextureImport.State == EditorTextureImportState.Succeeded
+            && workspace.AssetCatalogSnapshot.Value?.ItemCount == 2
+            && viewModel.AssetItems.Count == 2
+            && importedLabel is not null
+            && viewModel.SelectedAssetItem == importedLabel,
+            "Avalonia texture import did not refresh and select the new Asset Catalog item");
+        Console.WriteLine("texture_import_projection=ok");
 
         transport.FailNextWatchStart();
         try
@@ -369,6 +418,7 @@ internal static class Program
         private long _sequence;
         private string _activePackageRoot = "C:/smoke-package";
         private string _activeProjectName = "smoke_created";
+        private string? _importedRelativePath;
         private bool _delayNextCreate;
         private bool _failNextWatchStart;
         private bool _failNextPreviewStart;
@@ -440,6 +490,31 @@ internal static class Program
                     await EmitEventAsync("asset_catalog_snapshot_created", assets, id).ConfigureAwait(false);
                     await SendResponseAsync(id, assets).ConfigureAwait(false);
                     break;
+                case "texture_import":
+                    var importParameters = root.GetProperty("params");
+                    var assetName = importParameters.GetProperty("assetName").GetString()!;
+                    var normalizedAssetName = assetName.EndsWith(".texture", StringComparison.Ordinal) ? assetName : $"{assetName}.texture";
+                    _importedRelativePath = $"assets/renderer2d/{normalizedAssetName}";
+                    var importedCatalog = NewAssetCatalogSnapshot();
+                    var importResult = new TextureImportResult(
+                        "succeeded",
+                        _activeProjectName,
+                        importParameters.GetProperty("sourcePath").GetString()!,
+                        "asset://" + _importedRelativePath["assets/".Length..],
+                        _importedRelativePath,
+                        importParameters.TryGetProperty("profile", out var profile) ? profile.GetString() ?? "debug" : "debug",
+                        "P3-PPM",
+                        "KDAT-TEXTURE-V1",
+                        1,
+                        1,
+                        1,
+                        "smoke-import",
+                        64,
+                        new string('a', 64),
+                        importedCatalog);
+                    await EmitEventAsync("texture_import_completed", importResult, id).ConfigureAwait(false);
+                    await SendResponseAsync(id, importResult).ConfigureAwait(false);
+                    break;
                 case "watch_start":
                     if (_failNextWatchStart)
                     {
@@ -489,7 +564,7 @@ internal static class Program
             var commands = new List<string>
             {
                 "get_capabilities", "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot",
-                "asset_catalog_snapshot", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
+                "asset_catalog_snapshot", "texture_import", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
             };
             if (_advertiseProjectCreate) { commands.Insert(2, "project_create"); }
             return commands.ToArray();
@@ -559,11 +634,25 @@ internal static class Program
             _activeProjectName,
             [new HierarchyNode("scene.goal", null, "Goal", "Sprite", [])]);
 
-        private static AssetCatalogSnapshot NewAssetCatalogSnapshot() => new(
-            1,
-            "bin/assets",
-            1,
-            [new AssetCatalogItem("asset://scenes/smoke.scene", "smoke.scene", "assets/scenes/smoke.scene", "Scene", "scene", 64, [])]);
+        private AssetCatalogSnapshot NewAssetCatalogSnapshot()
+        {
+            var items = new List<AssetCatalogItem>
+            {
+                new("asset://scenes/smoke.scene", "smoke.scene", "assets/scenes/smoke.scene", "Scene", "scene", 64, [])
+            };
+            if (_importedRelativePath is not null)
+            {
+                items.Add(new AssetCatalogItem(
+                    "asset://" + _importedRelativePath["assets/".Length..],
+                    Path.GetFileName(_importedRelativePath),
+                    _importedRelativePath,
+                    "Texture",
+                    "texture",
+                    64,
+                    []));
+            }
+            return new AssetCatalogSnapshot(1, "bin/assets", items.Count, items.ToArray());
+        }
 
         private Task EmitEventAsync(string eventName, object data, string? requestId = null) =>
             WriteAsync(new EditorEvent(

@@ -31,6 +31,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _bakeProfile = "debug";
     private bool _liveBakeEnabled;
     private bool _watchChanges;
+    private string _textureImportSourcePath = string.Empty;
+    private string _textureImportAssetName = "imported";
+    private string _textureImportProfile = "debug";
     private string? _selectedHierarchyItem;
     private string? _selectedAssetItem;
     private string _inspectorText = "选择项目、场景或资产查看其会话信息。";
@@ -83,6 +86,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         StopWatchCommand = AddCommand(new AsyncUiCommand(StopWatchAsync, () => CanRequestWatchStop && !IsBusy, HandleCommandError));
         StartPreviewCommand = AddCommand(new AsyncUiCommand(StartPreviewAsync, () => IsProjectOpen && CanStartPreview && !IsPreviewRunning && !IsBusy, HandleCommandError));
         StopPreviewCommand = AddCommand(new AsyncUiCommand(StopPreviewAsync, () => CanRequestPreviewStop && !IsBusy, HandleCommandError));
+        ImportTextureCommand = AddCommand(new AsyncUiCommand(ImportTextureAsync, () => CanImportTexture, HandleCommandError));
         ClearEventLogCommand = new DelegateUiCommand(() => EventLog.Clear());
     }
 
@@ -92,6 +96,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ObservableCollection<EditorEventLogItem> EventLog { get; } = [];
     public IReadOnlyList<string> BakeTargets { get; } = ["Both", "Scene", "Script"];
     public IReadOnlyList<string> BakeProfiles { get; } = ["debug", "release"];
+    public IReadOnlyList<string> TextureImportProfiles { get; } = ["debug", "release"];
 
     public ICommand ConnectCommand { get; }
     public ICommand OpenProjectCommand { get; }
@@ -106,6 +111,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand StopWatchCommand { get; }
     public ICommand StartPreviewCommand { get; }
     public ICommand StopPreviewCommand { get; }
+    public ICommand ImportTextureCommand { get; }
     public ICommand ClearEventLogCommand { get; }
 
     public string PackageRoot { get => _packageRoot; set => SetProperty(ref _packageRoot, value); }
@@ -114,6 +120,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public string BakeProfile { get => _bakeProfile; set => SetProperty(ref _bakeProfile, value); }
     public bool LiveBakeEnabled { get => _liveBakeEnabled; set { if (SetProperty(ref _liveBakeEnabled, value)) { RaiseAll(); } } }
     public bool WatchChanges { get => _watchChanges; set { if (SetProperty(ref _watchChanges, value)) { RaiseAll(); } } }
+    public string TextureImportSourcePath { get => _textureImportSourcePath; set { if (SetProperty(ref _textureImportSourcePath, value)) { RaiseAll(); } } }
+    public string TextureImportAssetName { get => _textureImportAssetName; set { if (SetProperty(ref _textureImportAssetName, value)) { RaiseAll(); } } }
+    public string TextureImportProfile { get => _textureImportProfile; set { if (SetProperty(ref _textureImportProfile, value)) { RaiseAll(); } } }
     public string? SelectedHierarchyItem { get => _selectedHierarchyItem; set { if (SetProperty(ref _selectedHierarchyItem, value) && value is not null && _hierarchyItemsByLabel.TryGetValue(value, out var node)) { InspectorText = FormatHierarchyInspector(node); } } }
     public string? SelectedAssetItem { get => _selectedAssetItem; set { if (SetProperty(ref _selectedAssetItem, value) && value is not null && _assetItemsByLabel.TryGetValue(value, out var item)) { InspectorText = FormatAssetInspector(item); } } }
     public string InspectorText { get => _inspectorText; private set => SetProperty(ref _inspectorText, value); }
@@ -179,6 +188,31 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             return $"{loaded.Target} loaded · source={ShortRevision(loaded.SourceRevision)} · artifact={ShortRevision(loaded.ArtifactRevision)} · sync={loaded.Consistency}{stale}";
         }
     }
+    public string TextureImportStatus => _workspace.TextureImport.State switch
+    {
+        EditorTextureImportState.Running => "纹理导入中…",
+        EditorTextureImportState.Succeeded => $"纹理导入成功 · {_workspace.TextureImport.RelativePath ?? "unknown"}",
+        EditorTextureImportState.Failed => $"纹理导入失败 · {_workspace.TextureImport.ErrorCode ?? "unknown"}",
+        _ => "纹理导入空闲"
+    };
+    public string TextureImportDetails
+    {
+        get
+        {
+            var result = _workspace.TextureImport.LastSuccessfulResult;
+            if (_workspace.TextureImport.State == EditorTextureImportState.Succeeded && result is not null)
+            {
+                return $"source={result.SourcePath}; asset={result.AssetId}; format={result.ArtifactFormat}; bytes={result.ArtifactBytes}";
+            }
+
+            if (_workspace.TextureImport.State == EditorTextureImportState.Failed)
+            {
+                return _workspace.TextureImport.ErrorMessage ?? "导入失败";
+            }
+
+            return "从 Assets 面板导入外部纹理文件。";
+        }
+    }
     public string SurfaceMode => _workspace.Preview.SurfaceMode ?? "external-window（独立 Runtime 窗口）";
     public string SurfaceDetails => _workspace.Preview.Surface is { } surface
         ? $"class={surface.WindowClass}; pid={surface.ProcessId?.ToString() ?? "pending"}"
@@ -215,6 +249,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         || _workspace.HierarchySnapshot.State == EditorSnapshotState.Loading
         || _workspace.AssetCatalogSnapshot.State == EditorSnapshotState.Loading
         || _workspace.Publication.State == EditorPublicationState.Loading
+        || _workspace.TextureImport.State == EditorTextureImportState.Running
         || _workspace.Authoring.State is EditorAuthoringState.Applying or EditorAuthoringState.Undoing
         || _workspace.Bake.State == EditorBakeState.Running
         || _workspace.Watch.State is EditorWatchState.Starting or EditorWatchState.Stopping
@@ -237,6 +272,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && _workspace.Capabilities.CanReadHierarchySnapshot
         && _workspace.Capabilities.CanReadAssetCatalogSnapshot;
     public bool CanBake => _workspace.Capabilities.CanBake;
+    public bool CanImportTexture => IsProjectOpen
+        && _workspace.Capabilities.CanImportTexture
+        && !IsBusy
+        && !string.IsNullOrWhiteSpace(TextureImportSourcePath)
+        && !string.IsNullOrWhiteSpace(TextureImportAssetName);
     public bool CanBakeChanges => IsProjectOpen && CanBake && _workspace.Capabilities.CanReadPublicationSnapshot && _workspace.Publication.RecommendedBakeTarget is not null && !IsWatching && !IsPreviewAutoSync && !IsBusy;
     public bool CanStartWatch => _workspace.Capabilities.CanStartWatch && !IsPreviewAutoSync;
     public bool CanStopWatch => _workspace.Capabilities.CanStopWatch;
@@ -354,6 +394,21 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         return result;
     }
 
+    public async Task<TextureImportResult> ImportTextureForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureConnectedAsync();
+        var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
+        var result = await _workspace.ImportTextureAsync(new TextureImportParameters(session.ProjectName, TextureImportSourcePath, TextureImportAssetName, TextureImportProfile), cancellationToken == default ? _lifetime.Token : cancellationToken);
+        RefreshAssetProjection();
+        if (_assetLabelsByRelativePath.TryGetValue(result.RelativePath, out var label))
+        {
+            SelectedAssetItem = label;
+        }
+        AddLog("texture_import", $"{result.RelativePath}; profile={result.Profile}; format={result.ArtifactFormat}", null, 0);
+        RaiseAll();
+        return result;
+    }
+
     private static uint ParseTextureId(string value, string field)
     {
         if (!uint.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var textureId) || textureId == 0)
@@ -436,16 +491,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             _hierarchyItemsByLabel.Add(label, node);
         }
 
-        AssetItems.Clear();
-        _assetItemsByLabel.Clear();
-        _assetLabelsByRelativePath.Clear();
-        foreach (var item in assets.Items)
-        {
-            var label = $"{item.Category} · {item.RelativePath}";
-            AssetItems.Add(label);
-            _assetItemsByLabel.Add(label, item);
-            _assetLabelsByRelativePath[item.RelativePath] = label;
-        }
+        PopulateAssetProjection(assets);
 
         SelectedHierarchyItem = null;
         SelectedAssetItem = null;
@@ -553,6 +599,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         RaiseAll();
     }
     private async Task StopPreviewAsync() { await _workspace.StopPreviewAsync(_lifetime.Token); RaiseAll(); }
+    private async Task ImportTextureAsync() { await ImportTextureForCurrentProjectAsync(_lifetime.Token); }
 
     private static string ShortRevision(string? revision) => revision is { Length: >= 12 } ? $"{revision[..12]}…" : "—";
 
@@ -577,6 +624,31 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private void ClearSceneTextureAssignments()
     {
         foreach (var slot in SceneTextureAssignments) { slot.Clear(); }
+    }
+
+    private void RefreshAssetProjection()
+    {
+        var assets = _workspace.AssetCatalogSnapshot.Value;
+        if (assets is null) { return; }
+        PopulateAssetProjection(assets);
+        if (SelectedAssetItem is not null && !_assetItemsByLabel.ContainsKey(SelectedAssetItem))
+        {
+            SelectedAssetItem = null;
+        }
+    }
+
+    private void PopulateAssetProjection(AssetCatalogSnapshot assets)
+    {
+        AssetItems.Clear();
+        _assetItemsByLabel.Clear();
+        _assetLabelsByRelativePath.Clear();
+        foreach (var item in assets.Items)
+        {
+            var label = $"{item.Category} · {item.RelativePath}";
+            AssetItems.Add(label);
+            _assetItemsByLabel.Add(label, item);
+            _assetLabelsByRelativePath[item.RelativePath] = label;
+        }
     }
 
     private async Task EnsureConnectedAsync()
@@ -606,7 +678,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private void AddLog(string eventName, string summary, string? requestId, long sequence) { EventLog.Add(new EditorEventLogItem(sequence, eventName, summary, requestId, DateTimeOffset.Now)); while (EventLog.Count > 200) { EventLog.RemoveAt(0); } }
     private AsyncUiCommand AddCommand(AsyncUiCommand command) { _commands.Add(command); return command; }
     private void OnPropertyChanged(string propertyName) => RaisePropertyChanged(propertyName);
-    private void RaiseAll() { foreach (var command in _commands) { command.RaiseCanExecuteChanged(); } OnPropertyChanged(nameof(ConnectionStatus)); OnPropertyChanged(nameof(ValidationStatus)); OnPropertyChanged(nameof(ValidationDiagnostics)); OnPropertyChanged(nameof(BakeStatus)); OnPropertyChanged(nameof(PublicationStatus)); OnPropertyChanged(nameof(PreviewStatus)); OnPropertyChanged(nameof(RuntimeSyncStatus)); OnPropertyChanged(nameof(SurfaceMode)); OnPropertyChanged(nameof(SurfaceDetails)); OnPropertyChanged(nameof(SnapshotStatus)); OnPropertyChanged(nameof(AuthoringStatus)); OnPropertyChanged(nameof(AuthoringRevisionStatus)); OnPropertyChanged(nameof(CapabilitySummary)); OnPropertyChanged(nameof(IsBusy)); OnPropertyChanged(nameof(IsConnected)); OnPropertyChanged(nameof(IsProjectOpen)); OnPropertyChanged(nameof(IsWatching)); OnPropertyChanged(nameof(IsPreviewRunning)); OnPropertyChanged(nameof(IsPreviewAutoSync)); OnPropertyChanged(nameof(CanProjectCommand)); OnPropertyChanged(nameof(CanCreateProject)); OnPropertyChanged(nameof(CanApplyAuthoring)); OnPropertyChanged(nameof(CanUndoAuthoring)); OnPropertyChanged(nameof(CanRefreshSnapshots)); OnPropertyChanged(nameof(CanBake)); OnPropertyChanged(nameof(CanBakeChanges)); OnPropertyChanged(nameof(CanStartWatch)); OnPropertyChanged(nameof(CanStopWatch)); OnPropertyChanged(nameof(CanRequestWatchStop)); OnPropertyChanged(nameof(CanStopPreview)); OnPropertyChanged(nameof(CanRequestPreviewStop)); OnPropertyChanged(nameof(CanStartPreview)); OnPropertyChanged(nameof(SupportsExternalWindow)); OnPropertyChanged(nameof(SupportsSharedTexture)); OnPropertyChanged(nameof(SupportsFrameStream)); }
+    private void RaiseAll() { foreach (var command in _commands) { command.RaiseCanExecuteChanged(); } OnPropertyChanged(nameof(ConnectionStatus)); OnPropertyChanged(nameof(ValidationStatus)); OnPropertyChanged(nameof(ValidationDiagnostics)); OnPropertyChanged(nameof(BakeStatus)); OnPropertyChanged(nameof(PublicationStatus)); OnPropertyChanged(nameof(PreviewStatus)); OnPropertyChanged(nameof(RuntimeSyncStatus)); OnPropertyChanged(nameof(TextureImportStatus)); OnPropertyChanged(nameof(TextureImportDetails)); OnPropertyChanged(nameof(SurfaceMode)); OnPropertyChanged(nameof(SurfaceDetails)); OnPropertyChanged(nameof(SnapshotStatus)); OnPropertyChanged(nameof(AuthoringStatus)); OnPropertyChanged(nameof(AuthoringRevisionStatus)); OnPropertyChanged(nameof(CapabilitySummary)); OnPropertyChanged(nameof(IsBusy)); OnPropertyChanged(nameof(IsConnected)); OnPropertyChanged(nameof(IsProjectOpen)); OnPropertyChanged(nameof(IsWatching)); OnPropertyChanged(nameof(IsPreviewRunning)); OnPropertyChanged(nameof(IsPreviewAutoSync)); OnPropertyChanged(nameof(CanProjectCommand)); OnPropertyChanged(nameof(CanCreateProject)); OnPropertyChanged(nameof(CanApplyAuthoring)); OnPropertyChanged(nameof(CanUndoAuthoring)); OnPropertyChanged(nameof(CanRefreshSnapshots)); OnPropertyChanged(nameof(CanBake)); OnPropertyChanged(nameof(CanImportTexture)); OnPropertyChanged(nameof(CanBakeChanges)); OnPropertyChanged(nameof(CanStartWatch)); OnPropertyChanged(nameof(CanStopWatch)); OnPropertyChanged(nameof(CanRequestWatchStop)); OnPropertyChanged(nameof(CanStopPreview)); OnPropertyChanged(nameof(CanRequestPreviewStop)); OnPropertyChanged(nameof(CanStartPreview)); OnPropertyChanged(nameof(SupportsExternalWindow)); OnPropertyChanged(nameof(SupportsSharedTexture)); OnPropertyChanged(nameof(SupportsFrameStream)); }
 
     public async ValueTask DisposeAsync()
     {
@@ -671,7 +743,5 @@ public sealed class DelegateUiCommand : ICommand
     public bool CanExecute(object? parameter) => true;
     public void Execute(object? parameter) => _execute();
 }
-
-
 
 

@@ -54,6 +54,7 @@ try {
         'workflow_preview_initial_loaded=ok',
         'workflow_preview_reload_ack=ok',
         'workflow_preview_stop=ok',
+        'workflow_texture_import=ok',
         'workflow_shutdown=ok',
         'verification=ok'
     )

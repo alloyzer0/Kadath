@@ -35,7 +35,22 @@
               <ListBox ItemsSource="{Binding HierarchyItems}" SelectedItem="{Binding SelectedHierarchyItem}" />
             </TabItem>
             <TabItem Header="Assets">
-              <ListBox ItemsSource="{Binding AssetItems}" SelectedItem="{Binding SelectedAssetItem}" />
+              <Grid RowDefinitions="*,Auto" RowSpacing="8">
+                <ListBox ItemsSource="{Binding AssetItems}" SelectedItem="{Binding SelectedAssetItem}" />
+                <Border Grid.Row="1" Padding="8" Background="#252D37" CornerRadius="4">
+                  <StackPanel Spacing="5">
+                    <TextBlock FontWeight="SemiBold" Text="导入纹理" />
+                    <TextBox Text="{Binding TextureImportSourcePath}" PlaceholderText="外部 .png / .ppm 源路径" />
+                    <TextBox Text="{Binding TextureImportAssetName}" PlaceholderText="资产名，例如 imported.texture" />
+                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                      <ComboBox ItemsSource="{Binding TextureImportProfiles}" SelectedItem="{Binding TextureImportProfile}" />
+                      <Button Grid.Column="1" Command="{Binding ImportTextureCommand}" Content="导入" />
+                    </Grid>
+                    <TextBlock FontSize="11" Foreground="#9FE3B1" Text="{Binding TextureImportStatus}" TextWrapping="Wrap" />
+                    <TextBlock FontSize="11" Foreground="#AEBAC8" Text="{Binding TextureImportDetails}" TextWrapping="Wrap" />
+                  </StackPanel>
+                </Border>
+              </Grid>
             </TabItem>
           </TabControl>
           <Border Grid.Row="3" Padding="8" Background="#252D37" CornerRadius="4">
