@@ -55,7 +55,7 @@ const ReaderState = struct {
             const line = file_reader.interface.takeDelimiter('\n') catch |err| {
                 if (err == error.StreamTooLong) {
                     _ = file_reader.interface.discardDelimiterInclusive('\n') catch return;
-                    std.log.warn("Preview control command rejected: PreviewControlLineTooLong", .{});
+                    std.log.warn("Preview control command rejected: {s}", .{controlErrorCode(error.PreviewControlLineTooLong)});
                     continue;
                 }
                 std.log.warn("Preview control input stopped: {s}", .{@errorName(err)});
@@ -64,7 +64,7 @@ const ReaderState = struct {
             const trimmed = std.mem.trimEnd(u8, line, "\r");
             if (trimmed.len == 0) continue;
             const command = parseCommand(std.heap.page_allocator, trimmed) catch |err| {
-                std.log.warn("Preview control command rejected: {s}", .{@errorName(err)});
+                std.log.warn("Preview control command rejected: {s}", .{controlErrorCode(err)});
                 continue;
             };
             self.queue.submit(command);
@@ -113,6 +113,17 @@ fn parseCommand(allocator: std.mem.Allocator, line: []const u8) !Command {
     return .{ .request_id = parsed.value.requestId, .kind = parsed.value.command };
 }
 
+fn controlErrorCode(err: anyerror) []const u8 {
+    if (err == error.UnsupportedPreviewControlSchema) return "UnsupportedPreviewControlSchema";
+    if (err == error.InvalidPreviewControlRequestId) return "InvalidPreviewControlRequestId";
+    if (err == error.PreviewControlLineTooLong) return "PreviewControlLineTooLong";
+    if (err == error.MissingField) return "MissingField";
+    if (err == error.UnknownField) return "UnknownField";
+    if (err == error.InvalidEnumTag) return "InvalidEnumTag";
+    if (err == error.InvalidCharacter or err == error.SyntaxError) return "InvalidPreviewControlJson";
+    return "PreviewControlRejected";
+}
+
 test "preview control parses the frozen command schema" {
     try std.testing.expectEqual(
         Command{ .request_id = 41, .kind = .reload_scene },
@@ -134,6 +145,22 @@ test "preview control rejects invalid envelopes" {
         parseCommand(std.testing.allocator, "{\"schemaVersion\":2,\"requestId\":1,\"command\":\"shutdown\"}"),
     );
     try std.testing.expectError(
+        error.MissingField,
+        parseCommand(std.testing.allocator, "{\"schemaVersion\":1,\"command\":\"shutdown\"}"),
+    );
+    try std.testing.expectError(
+        error.MissingField,
+        parseCommand(std.testing.allocator, "{\"schemaVersion\":1,\"requestId\":1}"),
+    );
+    try std.testing.expectError(
+        error.InvalidCharacter,
+        parseCommand(std.testing.allocator, "{\"schemaVersion\":1,\"requestId\":\"x\",\"command\":\"shutdown\"}"),
+    );
+    try std.testing.expectError(
+        error.SyntaxError,
+        parseCommand(std.testing.allocator, "{not json}"),
+    );
+    try std.testing.expectError(
         error.InvalidPreviewControlRequestId,
         parseCommand(std.testing.allocator, "{\"schemaVersion\":1,\"requestId\":0,\"command\":\"shutdown\"}"),
     );
@@ -147,6 +174,17 @@ test "preview control rejects invalid envelopes" {
     );
     var overlong: [max_line_bytes + 1]u8 = @splat(' ');
     try std.testing.expectError(error.PreviewControlLineTooLong, parseCommand(std.testing.allocator, &overlong));
+}
+
+test "preview control rejection codes stay stable" {
+    try std.testing.expectEqualStrings("UnsupportedPreviewControlSchema", controlErrorCode(error.UnsupportedPreviewControlSchema));
+    try std.testing.expectEqualStrings("InvalidPreviewControlRequestId", controlErrorCode(error.InvalidPreviewControlRequestId));
+    try std.testing.expectEqualStrings("PreviewControlLineTooLong", controlErrorCode(error.PreviewControlLineTooLong));
+    try std.testing.expectEqualStrings("MissingField", controlErrorCode(error.MissingField));
+    try std.testing.expectEqualStrings("UnknownField", controlErrorCode(error.UnknownField));
+    try std.testing.expectEqualStrings("InvalidEnumTag", controlErrorCode(error.InvalidEnumTag));
+    try std.testing.expectEqualStrings("InvalidPreviewControlJson", controlErrorCode(error.InvalidCharacter));
+    try std.testing.expectEqualStrings("InvalidPreviewControlJson", controlErrorCode(error.SyntaxError));
 }
 
 test "preview control queue preserves FIFO order" {
