@@ -1,4 +1,6 @@
 using System.Security.Cryptography;
+using System.Buffers.Binary;
+using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
 using Kadath.Editor.Protocol;
@@ -115,11 +117,13 @@ internal static class Program
             await ExpectAsync<OperationCanceledException>(() => readModel.ReadProjectAsync(project, cancelled.Token));
 
             Require(before == TreeIdentity(root, ignoreDerived: true), "read model modified source assets");
+            await VerifyTextureImportAsync(project);
             Console.WriteLine("project_snapshot=ok");
             Console.WriteLine("hierarchy_snapshot=ok");
             Console.WriteLine("asset_catalog_snapshot=ok");
             Console.WriteLine("publication_state_machine=ok");
             Console.WriteLine("authoring_transaction=ok");
+            Console.WriteLine("texture_import=ok");
             Console.WriteLine("native_publication=ok");
             Console.WriteLine("project_lifecycle=ok");
             Console.WriteLine("failure_boundaries=ok");
@@ -329,6 +333,118 @@ internal static class Program
         finally { File.WriteAllText(project.PreviewPath, original, Encoding.UTF8); }
     }
 
+    private static async Task VerifyTextureImportAsync(ProjectSessionInfo project)
+    {
+        var importer = new WorkspaceTextureImportModel();
+        var assetsRoot = Path.Combine(project.PackageRoot, "bin", "assets");
+        var before = TreeIdentity(assetsRoot);
+        var source = Path.Combine(project.PackageRoot, "external-source.ppm");
+        File.WriteAllText(source, """
+        P3
+        # comment line
+        2 1
+        255
+        255 0 16   0 128 255
+        """, Encoding.UTF8);
+
+        var imported = await importer.ImportAsync(project, new TextureImportParameters(null, source, "imported", "debug"), default);
+        var importedPath = Path.Combine(project.PackageRoot, "bin", "assets", "renderer2d", "imported.texture");
+        Require(imported.State == "succeeded"
+            && imported.AssetId == "asset://renderer2d/imported.texture"
+            && imported.RelativePath == "assets/renderer2d/imported.texture"
+            && imported.SourceFormat == "P3-PPM"
+            && imported.ArtifactFormat == "KDAT-TEXTURE-V1"
+            && imported.Width == 2
+            && imported.Height == 1
+            && imported.MipLevelCount == 1
+            && imported.ArtifactBytes == 28
+            && imported.AssetCatalog.Items.Any(item => item.AssetId == "asset://renderer2d/imported.texture" && item.Category == "Texture"),
+            "texture import result mismatch");
+        var bytes = File.ReadAllBytes(importedPath);
+        Require(Encoding.ASCII.GetString(bytes, 0, 4) == "KDAT"
+            && BitConverter.ToUInt32(bytes, 4) == 1
+            && bytes.AsSpan(20).SequenceEqual(new byte[] { 255, 0, 16, 255, 0, 128, 255, 255 }),
+            "texture import artifact payload mismatch");
+
+        var pngSource = Path.Combine(project.PackageRoot, "external-source.png");
+        WritePngRgbaFixture(pngSource, [9, 8, 7, 255]);
+        var pngImported = await importer.ImportAsync(project, new TextureImportParameters(null, pngSource, "imported-png", "debug"), default);
+        Require(pngImported.SourceFormat == "PNG-RGBA8"
+            && pngImported.ArtifactBytes == 24
+            && File.ReadAllBytes(Path.Combine(project.PackageRoot, "bin", "assets", "renderer2d", "imported-png.texture")).AsSpan(20).SequenceEqual(new byte[] { 9, 8, 7, 255 }),
+            "texture import PNG fixture mismatch");
+
+        await ExpectTextureImportFailureAsync(
+            () => importer.ImportAsync(project, new TextureImportParameters(null, source, "imported", "debug"), default),
+            WorkspaceTextureImportFailureKind.Conflict);
+
+        var afterConflict = TreeIdentity(assetsRoot);
+        await ExpectTextureImportFailureAsync(
+            () => importer.ImportAsync(project, new TextureImportParameters(null, source, "../escape", "debug"), default),
+            WorkspaceTextureImportFailureKind.InvalidAssetName);
+        await ExpectTextureImportFailureAsync(
+            () => importer.ImportAsync(project, new TextureImportParameters(null, source + ".missing", "missing-source", "debug"), default),
+            WorkspaceTextureImportFailureKind.InvalidSource);
+        await ExpectTextureImportFailureAsync(
+            () => importer.ImportAsync(project, new TextureImportParameters(null, source, "bad-profile", "shipping"), default),
+            WorkspaceTextureImportFailureKind.InvalidProfile);
+        Require(afterConflict == TreeIdentity(assetsRoot), "texture import failure modified package assets");
+
+        var foreignPath = Path.Combine(project.PackageRoot, "bin", "assets", "renderer2d", "foreign.texture");
+        var racing = new WorkspaceTextureImportModel(phase =>
+        {
+            if (phase == WorkspaceTextureImportPhase.BeforePromote) File.WriteAllBytes(foreignPath, [9, 9, 9]);
+        });
+        await ExpectTextureImportFailureAsync(
+            () => racing.ImportAsync(project, new TextureImportParameters(null, source, "foreign", "debug"), default),
+            WorkspaceTextureImportFailureKind.Conflict);
+        Require(File.ReadAllBytes(foreignPath).AsSpan().SequenceEqual(new byte[] { 9, 9, 9 })
+            && !Directory.EnumerateFiles(Path.GetDirectoryName(foreignPath)!, ".kadath-texture-import-*.tmp").Any(),
+            "texture import ownership race overwrote foreign asset or leaked temp");
+
+        var release = await importer.ImportAsync(project, new TextureImportParameters(null, source, "imported-release", "release"), default);
+        Require(release.ArtifactFormat == "KDAT-TEXTURE-V2-MIPMAP"
+            && release.MipLevelCount == 2
+            && release.ArtifactBytes == 36,
+            "texture import release profile mismatch");
+    }
+
+    private static void WritePngRgbaFixture(string path, byte[] rgba)
+    {
+        using var output = new MemoryStream();
+        output.Write([137, 80, 78, 71, 13, 10, 26, 10]);
+        WritePngChunk(output, "IHDR", BuildIhdr(1, 1));
+        using var compressed = new MemoryStream();
+        using (var zlib = new ZLibStream(compressed, CompressionLevel.Optimal, leaveOpen: true))
+        {
+            zlib.WriteByte(0);
+            zlib.Write(rgba);
+        }
+        WritePngChunk(output, "IDAT", compressed.ToArray());
+        WritePngChunk(output, "IEND", []);
+        File.WriteAllBytes(path, output.ToArray());
+    }
+
+    private static byte[] BuildIhdr(int width, int height)
+    {
+        var data = new byte[13];
+        BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(0, 4), (uint)width);
+        BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(4, 4), (uint)height);
+        data[8] = 8;
+        data[9] = 6;
+        return data;
+    }
+
+    private static void WritePngChunk(Stream output, string type, byte[] data)
+    {
+        Span<byte> length = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(length, (uint)data.Length);
+        output.Write(length);
+        output.Write(Encoding.ASCII.GetBytes(type));
+        output.Write(data);
+        output.Write(new byte[4]);
+    }
+
     private static void WriteArtifactsAndManifest(ProjectSessionInfo project)
     {
         var derived = Path.Combine(project.ProjectDirectory, ".kadath", "derived");
@@ -399,6 +515,13 @@ internal static class Program
         try { await action(); }
         catch (WorkspaceAuthoringException exception) when (exception.Kind == kind) { return; }
         throw new InvalidOperationException($"Expected WorkspaceAuthoringException with kind {kind}.");
+    }
+
+    private static async Task ExpectTextureImportFailureAsync(Func<Task> action, WorkspaceTextureImportFailureKind kind)
+    {
+        try { await action(); }
+        catch (WorkspaceTextureImportException exception) when (exception.Kind == kind) { return; }
+        throw new InvalidOperationException($"Expected WorkspaceTextureImportException with kind {kind}.");
     }
 
     private static void Require(bool condition, string message)

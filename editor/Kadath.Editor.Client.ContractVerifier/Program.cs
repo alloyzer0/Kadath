@@ -651,6 +651,7 @@ internal static class Program
         await workspace.ConnectAsync().ConfigureAwait(false);
         Assert(workspace.ConnectionState == EditorConnectionState.Ready, "workspace did not become ready");
         Assert(workspace.Capabilities.CanBake, "bake capability was not exposed");
+        Assert(workspace.Capabilities.CanImportTexture, "texture_import capability was not exposed");
         Assert(workspace.Capabilities.CanStartPreview, "external-window preview capability was not exposed");
         Assert(!workspace.Capabilities.CanUseSharedTexture, "unimplemented shared texture capability was enabled");
         Assert(!workspace.Capabilities.CanUseFrameStream, "unimplemented frame stream capability was enabled");
@@ -662,6 +663,13 @@ internal static class Program
         Assert(hierarchyNodeCount == 11, $"hierarchy snapshot count mismatch: expected=11 actual={hierarchyNodeCount?.ToString() ?? "null"}");
         Assert(workspace.AssetCatalogSnapshot.Value?.ItemCount == 12, "asset catalog snapshot count mismatch");
         Assert(workspace.Publication.State == EditorPublicationState.Current && workspace.Publication.RecommendedBakeTarget is null, "publication snapshot current state mismatch");
+
+        var importedTexture = await workspace.ImportTextureAsync(new TextureImportParameters("demo", "C:/external/imported.ppm", "imported"));
+        Assert(importedTexture.AssetId == "asset://renderer2d/imported.texture"
+            && workspace.TextureImport.State == EditorTextureImportState.Succeeded
+            && workspace.TextureImport.AssetId == importedTexture.AssetId
+            && workspace.AssetCatalogSnapshot.Value?.Items.Any(item => item.AssetId == importedTexture.AssetId) == true,
+            "texture_import did not refresh workspace asset catalog projection");
 
         // 任一侧缺失都代表 pair 不完整，前端必须选择 Both，避免只修复表面上 dirty 的一侧。
         var currentPublication = workspace.Publication.Snapshot ?? throw new InvalidOperationException("publication snapshot missing");
@@ -1054,6 +1062,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private string _activePackageRoot = "C:/package";
     private string _activeProjectName = "demo";
     private bool _publicationDirty;
+    private bool _textureImported;
     private bool _failNextPreviewStop;
     private readonly bool _advertiseProjectCreate;
     private TaskCompletionSource<bool>? _delayedValidationRelease;
@@ -1071,6 +1080,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     public bool DelayedOperationPending => _delayedOperationRelease is not null;
     public JsonElement? LastProjectCreateRequest { get; private set; }
     public JsonElement? LastAuthoringApplyRequest { get; private set; }
+    public JsonElement? LastTextureImportRequest { get; private set; }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -1210,6 +1220,30 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 var assetSnapshot = NewAssetCatalogSnapshot();
                 await EmitEventAsync("asset_catalog_snapshot_created", assetSnapshot, id).ConfigureAwait(false);
                 await SendResponseAsync(id, assetSnapshot).ConfigureAwait(false);
+                break;
+            case "texture_import":
+                LastTextureImportRequest = request.Clone();
+                _textureImported = true;
+                var importedCatalog = NewAssetCatalogSnapshot();
+                var imported = new TextureImportResult(
+                    "succeeded",
+                    _activeProjectName,
+                    request.GetProperty("params").GetProperty("sourcePath").GetString() ?? "C:/external/imported.ppm",
+                    "asset://renderer2d/imported.texture",
+                    "assets/renderer2d/imported.texture",
+                    "debug",
+                    "P3-PPM",
+                    "KDAT-TEXTURE-V1",
+                    2,
+                    1,
+                    1,
+                    "ppm-to-rgba8-artifact-v1",
+                    28,
+                    new string('a', 64),
+                    importedCatalog);
+                await EmitEventAsync("texture_import_started", new { projectName = _activeProjectName }, id).ConfigureAwait(false);
+                await EmitEventAsync("texture_import_completed", imported, id).ConfigureAwait(false);
+                await SendResponseAsync(id, imported).ConfigureAwait(false);
                 break;
             case "authoring_apply":
                 _publicationDirty = true;
@@ -1351,7 +1385,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         var commands = new List<string>
         {
             "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot",
-            "publication_snapshot", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop",
+            "publication_snapshot", "texture_import", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop",
             "preview_start", "preview_stop", "shutdown"
         };
         if (_advertiseProjectCreate) { commands.Insert(1, "project_create"); }
@@ -1535,7 +1569,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
             new HierarchyNode("preview", null, "Preview Config", "PreviewConfig", Props(("SchemaVersion", 1)))
         ]);
 
-    private static AssetCatalogSnapshot NewAssetCatalogSnapshot()
+    private AssetCatalogSnapshot NewAssetCatalogSnapshot()
     {
         var paths = new[]
         {
@@ -1544,7 +1578,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
             "assets/renderer2d/test.png", "assets/renderer2d/test.texture",
             "assets/scenes/preview.scene", "assets/scenes/preview.scene.json",
             "assets/scripts/preview.script", "assets/scripts/preview.script.json"
-        };
+        }.Concat(_textureImported ? ["assets/renderer2d/imported.texture"] : Array.Empty<string>());
         var items = paths.Select(path =>
         {
             var category = path.Contains("/audio/", StringComparison.Ordinal) ? "Audio"

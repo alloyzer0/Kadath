@@ -20,6 +20,7 @@ public interface IEditorSessionBackend : IAsyncDisposable
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken);
+    Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> UndoAuthoringAsync(ProjectSessionInfo project, AuthoringUndoParameters parameters, CancellationToken cancellationToken);
     Task<EditorBakeResult> BakeAsync(ProjectSessionInfo project, BakeStartParameters parameters, CancellationToken cancellationToken);
@@ -43,6 +44,7 @@ public interface IEditorSession : IAsyncDisposable
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<EditorBakeResult> BakeAsync(BakeStartParameters parameters, string? requestId, CancellationToken cancellationToken = default);
@@ -63,6 +65,7 @@ public sealed class EditorSession : IEditorSession
         "hierarchy_snapshot",
         "asset_catalog_snapshot",
         "publication_snapshot",
+        "texture_import",
         "authoring_apply",
         "authoring_undo",
         "bake_start",
@@ -161,6 +164,28 @@ public sealed class EditorSession : IEditorSession
         var result = await _backend.GetPublicationSnapshotAsync(project, parameters, cancellationToken);
         await EmitAsync("publication_snapshot_created", result, requestId);
         return result;
+    }
+
+    public async Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, string? requestId, CancellationToken cancellationToken = default)
+    {
+        await _projectMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var project = RequireProject(parameters.ProjectName);
+            await EmitAsync("texture_import_started", new { projectName = project.ProjectName, sourcePath = parameters.SourcePath, assetName = parameters.AssetName, profile = parameters.Profile }, requestId);
+            try
+            {
+                var result = await _backend.ImportTextureAsync(project, parameters, cancellationToken);
+                await EmitAsync("texture_import_completed", result, requestId);
+                return result;
+            }
+            catch (EditorOperationException exception)
+            {
+                await EmitAsync("texture_import_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+                throw;
+            }
+        }
+        finally { _projectMutationGate.Release(); }
     }
 
     public async Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default)

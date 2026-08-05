@@ -4,6 +4,7 @@ namespace Kadath.Editor.ViewModels;
 
 public enum EditorProjectState { Closed, Opening, Opened, Validating, Valid, Invalid, Failed, Creating, OutcomeUnknown }
 public enum EditorBakeState { Idle, Running, Succeeded, Failed }
+public enum EditorTextureImportState { Idle, Running, Succeeded, Failed }
 public enum EditorWatchState { Stopped, Starting, Watching, Stopping, Failed }
 public enum EditorPreviewState { Stopped, Starting, Running, Stopping, Failed }
 
@@ -235,6 +236,47 @@ public sealed class EditorBakeViewModel : ObservableObject
         RaisePropertyChanged(nameof(ScriptArtifactRevision));
         RaisePropertyChanged(nameof(SceneArtifactBytes));
         RaisePropertyChanged(nameof(ScriptArtifactBytes));
+    }
+}
+
+public sealed class EditorTextureImportViewModel : ObservableObject
+{
+    private EditorTextureImportState _state;
+    private TextureImportResult? _lastSuccessfulResult;
+    private string? _assetId;
+    private string? _relativePath;
+    private string? _errorCode;
+    private string? _errorMessage;
+
+    public EditorTextureImportState State { get => _state; private set => SetProperty(ref _state, value); }
+    public TextureImportResult? LastSuccessfulResult { get => _lastSuccessfulResult; private set => SetProperty(ref _lastSuccessfulResult, value); }
+    public string? AssetId { get => _assetId; private set => SetProperty(ref _assetId, value); }
+    public string? RelativePath { get => _relativePath; private set => SetProperty(ref _relativePath, value); }
+    public string? ErrorCode { get => _errorCode; private set => SetProperty(ref _errorCode, value); }
+    public string? ErrorMessage { get => _errorMessage; private set => SetProperty(ref _errorMessage, value); }
+
+    internal void Begin()
+    {
+        ErrorCode = null;
+        ErrorMessage = null;
+        State = EditorTextureImportState.Running;
+    }
+
+    internal void ApplyCompleted(TextureImportResult result)
+    {
+        LastSuccessfulResult = result;
+        AssetId = result.AssetId;
+        RelativePath = result.RelativePath;
+        ErrorCode = null;
+        ErrorMessage = null;
+        State = EditorTextureImportState.Succeeded;
+    }
+
+    internal void ApplyFailed(string code, string message)
+    {
+        ErrorCode = code;
+        ErrorMessage = message;
+        State = EditorTextureImportState.Failed;
     }
 }
 

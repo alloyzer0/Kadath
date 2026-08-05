@@ -15,7 +15,8 @@ internal static class Program
                 new WorkspaceProjectLifecycleModel(),
                 new WorkspaceReadModel(),
                 new WorkspaceAuthoringModel(),
-                publicationModel));
+                publicationModel,
+                new WorkspaceTextureImportModel()));
             await using var preview = new PreviewProcessController(new WorkspacePreviewModel(publicationModel));
             var host = new EditorRpcHost(session, preview, Console.In, Console.Out);
             return await host.RunAsync();

@@ -36,6 +36,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public EditorSnapshotViewModel<HierarchySnapshot> HierarchySnapshot { get; } = new();
     public EditorSnapshotViewModel<AssetCatalogSnapshot> AssetCatalogSnapshot { get; } = new();
     public EditorPublicationViewModel Publication { get; } = new();
+    public EditorTextureImportViewModel TextureImport { get; } = new();
     public EditorAuthoringViewModel Authoring { get; } = new();
     public EditorBakeViewModel Bake { get; } = new();
     public EditorWatchViewModel Watch { get; } = new();
@@ -241,6 +242,27 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         catch (Exception exception)
         {
             await ApplyAuthoringExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanImportTexture, "texture_import");
+        await _dispatcher.InvokeAsync(TextureImport.Begin).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.ImportTextureAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() =>
+            {
+                TextureImport.ApplyCompleted(result);
+                AssetCatalogSnapshot.Apply(result.AssetCatalog);
+            }).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyTextureImportExceptionAsync(exception).ConfigureAwait(false);
             throw;
         }
     }
@@ -740,6 +762,9 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
 
     private async Task ApplyPublicationExceptionAsync(Exception exception) =>
         await ApplyExceptionAsync(exception, "publication_snapshot_failed", Publication.ApplyFailure).ConfigureAwait(false);
+
+    private async Task ApplyTextureImportExceptionAsync(Exception exception) =>
+        await ApplyExceptionAsync(exception, "texture_import_failed", TextureImport.ApplyFailed).ConfigureAwait(false);
 
     private async Task RefreshPublicationAfterOperationAsync(string? projectName, string profile, CancellationToken cancellationToken)
     {

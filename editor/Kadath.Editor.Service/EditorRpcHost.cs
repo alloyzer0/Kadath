@@ -134,6 +134,9 @@ internal sealed class EditorRpcHost
                 case "publication_snapshot":
                     await WriteResponseAsync(request.Id, true, await _session.GetPublicationSnapshotAsync(DeserializeParams<PublicationSnapshotQueryParameters>(request), request.Id), null);
                     break;
+                case "texture_import":
+                    await WriteResponseAsync(request.Id, true, await _session.ImportTextureAsync(DeserializeParams<TextureImportParameters>(request), request.Id), null);
+                    break;
                 case "authoring_apply":
                     await WriteResponseAsync(request.Id, true, await _session.ApplyAuthoringAsync(DeserializeParams<AuthoringApplyParameters>(request), request.Id), null);
                     break;
@@ -390,4 +393,3 @@ internal sealed class EditorRpcHost
         Failed
     }
 }
-

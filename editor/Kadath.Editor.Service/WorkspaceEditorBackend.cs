@@ -10,6 +10,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private readonly WorkspaceReadModel _readModel;
     private readonly WorkspaceAuthoringModel _authoringModel;
     private readonly WorkspacePublicationModel _publicationModel;
+    private readonly WorkspaceTextureImportModel _textureImportModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
@@ -24,12 +25,14 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         WorkspaceProjectLifecycleModel projectLifecycleModel,
         WorkspaceReadModel readModel,
         WorkspaceAuthoringModel authoringModel,
-        WorkspacePublicationModel publicationModel)
+        WorkspacePublicationModel publicationModel,
+        WorkspaceTextureImportModel textureImportModel)
     {
         _projectLifecycleModel = projectLifecycleModel;
         _readModel = readModel;
         _authoringModel = authoringModel;
         _publicationModel = publicationModel;
+        _textureImportModel = textureImportModel;
     }
 
     public event Func<EditorSessionNotification, Task>? Notification;
@@ -82,6 +85,32 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
 
     public Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken) =>
         ReadWorkspaceSnapshotAsync(() => _readModel.ReadPublicationAsync(project, NormalizeProfile(parameters.Profile), cancellationToken), project, true);
+
+    public async Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var result = await _textureImportModel.ImportAsync(project, parameters, cancellationToken);
+            ValidateSnapshot(project, result.AssetCatalog);
+            return result;
+        }
+        catch (WorkspaceTextureImportException exception)
+        {
+            var code = exception.Kind switch
+            {
+                WorkspaceTextureImportFailureKind.InvalidSource => "invalid_texture_source",
+                WorkspaceTextureImportFailureKind.InvalidAssetName => "invalid_texture_asset_name",
+                WorkspaceTextureImportFailureKind.InvalidProfile => "invalid_texture_import_profile",
+                WorkspaceTextureImportFailureKind.Conflict => "texture_asset_conflict",
+                WorkspaceTextureImportFailureKind.Validation => "texture_import_validation_failed",
+                WorkspaceTextureImportFailureKind.Promote => "texture_import_promote_failed",
+                WorkspaceTextureImportFailureKind.Invariant => "texture_import_protocol_error",
+                _ => "texture_import_failed"
+            };
+            throw new EditorOperationException(code, exception.Message);
+        }
+    }
+
     public async Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken)
     {
         await _authoringGate.WaitAsync(cancellationToken);

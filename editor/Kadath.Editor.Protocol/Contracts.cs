@@ -210,6 +210,29 @@ public sealed record AssetCatalogSnapshot(
     int ItemCount,
     AssetCatalogItem[] Items);
 
+public sealed record TextureImportParameters(
+    string? ProjectName,
+    string SourcePath,
+    string AssetName,
+    string Profile = "debug");
+
+public sealed record TextureImportResult(
+    string State,
+    string ProjectName,
+    string SourcePath,
+    string AssetId,
+    string RelativePath,
+    string Profile,
+    string SourceFormat,
+    string ArtifactFormat,
+    int Width,
+    int Height,
+    int MipLevelCount,
+    string Transform,
+    int ArtifactBytes,
+    string Sha256,
+    AssetCatalogSnapshot AssetCatalog);
+
 public sealed record SceneTextureAssignment(
     uint TextureId,
     string AssetId);
