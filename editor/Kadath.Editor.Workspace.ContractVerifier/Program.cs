@@ -20,12 +20,13 @@ internal static class Program
             var before = TreeIdentity(root);
 
             var model = await readModel.ReadProjectAsync(project, default);
-            Require(model.ModelVersion == 1 && model.Scene.SchemaVersion == 3 && model.Scene.Textures?.Count == 3, "project snapshot mismatch");
+            Require(model.ModelVersion == 1 && model.Scene.SchemaVersion == 3 && model.Scene.Textures?.Count == 3 && model.Scene.Objects?.Count == 3, "project snapshot mismatch");
             Require(model.Scene.PlayerTextureId == 1 && model.Scene.GoalTextureId == 2 && model.Scene.HazardTextureId == 3, "texture bindings mismatch");
             Require(model.AuthoringRevision == ExpectedAuthoringRevision(project.ScenePath, project.ScriptPath), "authoring revision mismatch");
 
             var hierarchy = await readModel.ReadHierarchyAsync(project, default);
-            Require(hierarchy.Nodes.Length == 11 && hierarchy.Nodes[0].Id == "scene" && hierarchy.Nodes[1].Id == "scene.textures[1]", "hierarchy ordering mismatch");
+            Require(hierarchy.SnapshotVersion == 2 && hierarchy.Nodes.Length == 11 && hierarchy.Nodes[0].Id == "scene"
+                && hierarchy.Nodes[1].Id == "scene.textures[1]" && hierarchy.Nodes[4].Id == "scene.objects[player]", "hierarchy ordering mismatch");
             Require(hierarchy.Nodes.Count(node => node.ParentId is null) == 3, "hierarchy roots mismatch");
 
             var assets = await readModel.ReadAssetsAsync(project, default);
@@ -43,7 +44,9 @@ internal static class Program
 
             WriteArtifactsAndManifest(project);
             var current = await readModel.ReadPublicationAsync(project, "debug", default);
-            Require(current.State == "current" && current.ManifestPresent && current.Scene.ArtifactBytes == 258 && current.Script.ArtifactBytes == 48, "publication current mismatch");
+            Require(current.State == "current" && current.ManifestPresent
+                && current.Scene.ArtifactBytes == WorkspaceSceneCodec.EncodeSource(File.ReadAllBytes(project.ScenePath)).Length
+                && current.Script.ArtifactBytes == 48, "publication current mismatch");
 
             var originalScene = File.ReadAllBytes(project.ScenePath);
             var manifestPath = Path.Combine(project.ProjectDirectory, ".kadath", "derived", ".live-bake.manifest.json");
@@ -169,16 +172,11 @@ internal static class Program
         Require(commit.State == "succeeded" && commit.PreviousRevision == initial.AuthoringRevision && commit.Revision != initial.AuthoringRevision, "authoring commit identity mismatch");
         Require(commit.ChangedFields.SequenceEqual(expectedFields), "authoring changed fields ordering mismatch");
         Require(commit.ProjectSnapshot.AuthoringRevision == commit.Revision && commit.HierarchySnapshot.ProjectName == project.ProjectName, "authoring committed snapshots mismatch");
-        Require(commit.InversePatch?.SceneGoalPosition?.SequenceEqual(initial.Scene.GoalPosition) == true
-            && commit.InversePatch.ScriptGoalPosition?.SequenceEqual(initial.Script.GoalPosition) == true
-            && commit.InversePatch.ScriptGoalVelocity?.SequenceEqual(initial.Script.GoalVelocity) == true
-            && commit.InversePatch.ScenePlayerTextureId == initial.Scene.PlayerTextureId
-            && commit.InversePatch.SceneGoalTextureId == initial.Scene.GoalTextureId
-            && commit.InversePatch.SceneHazardTextureId == initial.Scene.HazardTextureId, "authoring inverse patch mismatch");
+        Require(commit.UndoToken is not null, "authoring undo token missing");
         var committedScene = File.ReadAllBytes(project.ScenePath);
         var committedScript = File.ReadAllBytes(project.ScriptPath);
         var noOp = await authoring.ApplyAsync(project, commit.Revision, patch, default);
-        Require(noOp.State == "unchanged" && noOp.Revision == commit.Revision && noOp.ChangedFields.Length == 0 && noOp.InversePatch is null, "authoring no-op mismatch");
+        Require(noOp.State == "unchanged" && noOp.Revision == commit.Revision && noOp.ChangedFields.Length == 0 && noOp.UndoToken is null, "authoring no-op mismatch");
         Require(committedScene.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScenePath)) && committedScript.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScriptPath)), "authoring no-op wrote sources");
 
         await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, initial.AuthoringRevision, new AuthoringPatch([711, 211]), default), WorkspaceAuthoringFailureKind.RevisionConflict);
@@ -223,34 +221,70 @@ internal static class Program
         File.Delete(project.ScenePath);
         File.Move(realScene, project.ScenePath);
 
-        var undone = await authoring.ApplyAsync(project, commit.Revision, commit.InversePatch, default);
+        var undone = await authoring.UndoAsync(project, commit.Revision, commit.UndoToken!, default);
         Require(undone.State == "succeeded"
             && undone.ProjectSnapshot.Scene.GoalPosition.SequenceEqual(initial.Scene.GoalPosition)
             && undone.ProjectSnapshot.Script.GoalPosition.SequenceEqual(initial.Script.GoalPosition)
-            && undone.ProjectSnapshot.Script.GoalVelocity.SequenceEqual(initial.Script.GoalVelocity), "authoring inverse mutation mismatch");
+            && undone.ProjectSnapshot.Script.GoalVelocity.SequenceEqual(initial.Script.GoalVelocity)
+            && originalScene.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScenePath))
+            && originalScript.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScriptPath)), "authoring exact undo mismatch");
+
+        var initialObjects = initial.Scene.Objects ?? throw new InvalidOperationException("initial Scene object snapshot missing");
+        var objectPatch = new AuthoringPatch(SceneObjects: initialObjects.Select(value => new SceneObjectDefinition(
+            value.ObjectId, value.Kind, value.Position, value.Size, value.Color, value.TextureId,
+            value.MoveSpeed, value.PatrolMinY, value.PatrolMaxY, value.PatrolSpeed)).Concat([
+                new SceneObjectDefinition("decoration-1", "sprite", [100, 420], [80, 80], [0.45, 0.65, 1, 0.8], 2),
+                new SceneObjectDefinition("hazard-2", "patrol_hazard", [500, 360], [72, 72], [1, 0.35, 0.2, 1], 3,
+                    PatrolMinY: 260, PatrolMaxY: 460, PatrolSpeed: 55)
+            ]).ToArray());
+        var objectCommit = await authoring.ApplyAsync(project, undone.Revision, objectPatch, default);
+        Require(objectCommit.ChangedFields.SequenceEqual(new[] { "scene.objects" })
+            && objectCommit.ProjectSnapshot.Scene.SchemaVersion == 4
+            && objectCommit.ProjectSnapshot.Scene.Objects?.Count == 5,
+            "scene object replacement did not upgrade v3 to v4");
+        var objectUndone = await authoring.UndoAsync(project, objectCommit.Revision, objectCommit.UndoToken!, default);
+        Require(objectUndone.ProjectSnapshot.Scene.SchemaVersion == 3
+            && originalScene.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScenePath)), "scene object undo did not restore exact v3 bytes");
 
         var texturePatch = new AuthoringPatch(SceneTextures: [
             new SceneTextureAssignment(1, "asset://renderer2d/goal.texture"),
             new SceneTextureAssignment(2, "asset://renderer2d/goal.texture"),
             new SceneTextureAssignment(3, "asset://renderer2d/test.texture")
         ]);
-        var textureCommit = await authoring.ApplyAsync(project, undone.Revision, texturePatch, default);
+        var textureCommit = await authoring.ApplyAsync(project, objectUndone.Revision, texturePatch, default);
         Require(textureCommit.ChangedFields.SequenceEqual(new[] { "scene.textures" }), "scene texture change did not report the expected field");
         var committedTextures = textureCommit.ProjectSnapshot.Scene.Textures ?? throw new InvalidOperationException("scene texture assignment snapshot missing");
         Require(committedTextures.Count == 3
             && committedTextures[0].Artifact == "assets/renderer2d/goal.texture"
             && committedTextures[2].Artifact == "assets/renderer2d/test.texture",
             "scene texture assignment commit mismatch");
-        var inverseTextures = textureCommit.InversePatch?.SceneTextures ?? throw new InvalidOperationException("scene texture inverse patch missing");
-        Require(inverseTextures.Count == 3
-            && inverseTextures[0].AssetId == "asset://renderer2d/test.texture"
-            && inverseTextures[2].AssetId == "asset://renderer2d/goal.texture",
-            "scene texture assignment inverse patch mismatch");
-        var textureUndone = await authoring.ApplyAsync(project, textureCommit.Revision, textureCommit.InversePatch, default);
+        var textureUndone = await authoring.UndoAsync(project, textureCommit.Revision, textureCommit.UndoToken!, default);
         var undoneTextures = textureUndone.ProjectSnapshot.Scene.Textures ?? throw new InvalidOperationException("scene texture undo snapshot missing");
         Require(undoneTextures.Count == 3
             && undoneTextures[0].Artifact == initial.Scene.Textures![0].Artifact,
             "scene texture assignment undo mismatch");
+
+        var combinedPatch = new AuthoringPatch(
+            ScriptGoalPosition: [701, 211],
+            ScriptGoalVelocity: [3, -1],
+            SceneTextures: texturePatch.SceneTextures,
+            SceneObjects: objectPatch.SceneObjects);
+        var combinedCommit = await authoring.ApplyAsync(project, textureUndone.Revision, combinedPatch, default);
+        Require(combinedCommit.ChangedFields.SequenceEqual(new[]
+            {
+                "script.goal.position", "script.goal.velocity", "scene.textures", "scene.objects"
+            })
+            && combinedCommit.ProjectSnapshot.Scene.SchemaVersion == 4
+            && combinedCommit.ProjectSnapshot.Scene.Objects?.Count == 5
+            && combinedCommit.ProjectSnapshot.Scene.Textures?[0].Artifact == "assets/renderer2d/goal.texture"
+            && combinedCommit.ProjectSnapshot.Script.GoalPosition.SequenceEqual(new[] { 701d, 211d })
+            && combinedCommit.ProjectSnapshot.Script.GoalVelocity.SequenceEqual(new[] { 3d, -1d }),
+            "combined scene objects, textures, and Script transaction mismatch");
+        var combinedUndone = await authoring.UndoAsync(project, combinedCommit.Revision, combinedCommit.UndoToken!, default);
+        Require(combinedUndone.ProjectSnapshot.Scene.SchemaVersion == 3
+            && originalScene.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScenePath))
+            && originalScript.AsSpan().SequenceEqual(File.ReadAllBytes(project.ScriptPath)),
+            "combined authoring undo did not restore exact source bytes");
 
         File.WriteAllBytes(project.ScenePath, originalScene);
         File.WriteAllBytes(project.ScriptPath, originalScript);

@@ -554,7 +554,7 @@ internal static class Program
         var hierarchySnapshot = await client.GetHierarchySnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var assetSnapshot = await client.GetAssetCatalogSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var publicationSnapshot = await client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, "debug")).ConfigureAwait(false);
-        Assert(projectSnapshot.ModelVersion == 1 && hierarchySnapshot.SnapshotVersion == 1, "real service snapshot version mismatch");
+        Assert(projectSnapshot.ModelVersion == 1 && hierarchySnapshot.SnapshotVersion == 2, "real service snapshot version mismatch");
         Assert(projectSnapshot.Scene.SchemaVersion == 3
             && projectSnapshot.Scene.Textures is { Count: 3 }
             && projectSnapshot.Scene.Textures.Any(texture => texture.TextureId == 3)

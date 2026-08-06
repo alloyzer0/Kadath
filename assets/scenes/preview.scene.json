@@ -1,30 +1,63 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "textures": [
     { "textureId": 1, "artifact": "assets/renderer2d/test.texture" },
     { "textureId": 2, "artifact": "assets/renderer2d/goal.texture" },
     { "textureId": 3, "artifact": "assets/renderer2d/goal.texture" }
   ],
-  "player": {
-    "position": [312.0, 130.0],
-    "size": [320.0, 240.0],
-    "color": [1.0, 1.0, 1.0, 1.0],
-    "moveSpeed": 180.0,
-    "textureId": 1
-  },
-  "goal": {
-    "position": [700.0, 200.0],
-    "size": [96.0, 96.0],
-    "color": [1.0, 0.75, 0.1, 1.0],
-    "textureId": 2
-  },
-  "hazard": {
-    "position": [650.0, 280.0],
-    "size": [96.0, 96.0],
-    "color": [0.95, 0.2, 0.2, 1.0],
-    "patrolMinY": 245.0,
-    "patrolMaxY": 330.0,
-    "patrolSpeed": 80.0,
-    "textureId": 3
-  }
+  "objects": [
+    {
+      "objectId": "decoration-1",
+      "kind": "sprite",
+      "transform": { "position": [100.0, 420.0] },
+      "sprite": {
+        "size": [80.0, 80.0],
+        "color": [0.45, 0.65, 1.0, 0.8],
+        "textureId": 2
+      }
+    },
+    {
+      "objectId": "goal",
+      "kind": "goal",
+      "transform": { "position": [700.0, 200.0] },
+      "sprite": {
+        "size": [96.0, 96.0],
+        "color": [1.0, 0.75, 0.1, 1.0],
+        "textureId": 2
+      }
+    },
+    {
+      "objectId": "hazard-1",
+      "kind": "patrol_hazard",
+      "transform": { "position": [650.0, 280.0] },
+      "sprite": {
+        "size": [96.0, 96.0],
+        "color": [0.95, 0.2, 0.2, 1.0],
+        "textureId": 3
+      },
+      "patrol": { "minY": 245.0, "maxY": 330.0, "speed": 80.0 }
+    },
+    {
+      "objectId": "hazard-2",
+      "kind": "patrol_hazard",
+      "transform": { "position": [500.0, 420.0] },
+      "sprite": {
+        "size": [72.0, 72.0],
+        "color": [1.0, 0.35, 0.2, 1.0],
+        "textureId": 3
+      },
+      "patrol": { "minY": 380.0, "maxY": 460.0, "speed": 55.0 }
+    },
+    {
+      "objectId": "player",
+      "kind": "player",
+      "transform": { "position": [312.0, 130.0] },
+      "sprite": {
+        "size": [320.0, 240.0],
+        "color": [1.0, 1.0, 1.0, 1.0],
+        "textureId": 1
+      },
+      "player": { "moveSpeed": 180.0 }
+    }
+  ]
 }

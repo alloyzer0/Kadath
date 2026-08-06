@@ -1,10 +1,10 @@
 const std = @import("std");
 const content_identity = @import("content_identity.zig");
 const audio_api = @import("audio");
-const collision = @import("collision.zig");
 const game = @import("game.zig");
 const runtime_texture_registry = @import("runtime_texture_registry.zig");
 const scene_api = @import("scene.zig");
+const scene_generation_api = @import("scene_generation.zig");
 const script_api = @import("script.zig");
 const preview_status_api = @import("preview_status");
 const preview_control_api = @import("preview_control.zig");
@@ -14,80 +14,14 @@ const InputSnapshot = @import("platform").InputSnapshot;
 const rhi = @import("rhi");
 const Rhi = rhi.Rhi;
 const world_api = @import("world");
-const World = world_api.World;
 const Renderer2D = @import("renderer2d").Renderer2D;
 const SpriteInstance = @import("renderer2d").SpriteInstance;
-const SpawnedScene = struct {
-    world: World,
-    player_entity: world_api.EntityId,
-    goal_entity: world_api.EntityId,
-    hazard_entity: world_api.EntityId,
-};
-
-fn clampPosition(position: [2]f32, size: [2]f32, extent: PlatformExtent) [2]f32 {
-    const max_x = @max(0.0, @as(f32, @floatFromInt(extent.width)) - size[0]);
-    const max_y = @max(0.0, @as(f32, @floatFromInt(extent.height)) - size[1]);
-    return .{
-        @min(@max(position[0], 0.0), max_x),
-        @min(@max(position[1], 0.0), max_y),
-    };
-}
-
-fn spawnSceneWorld(scene: *const scene_api.Scene, extent: PlatformExtent) !SpawnedScene {
-    var runtime_world = try World.init();
-    errdefer runtime_world.deinit();
-    try runtime_world.setBounds(.{
-        .min = .{ 0.0, 0.0 },
-        .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
-    });
-    const player_entity = try runtime_world.spawnSprite(playerSpawnDesc(scene));
-    const goal_entity = try runtime_world.spawnSprite(goalSpawnDesc(scene));
-    const hazard_entity = try runtime_world.spawnSprite(hazardSpawnDesc(scene));
-    return .{
-        .world = runtime_world,
-        .player_entity = player_entity,
-        .goal_entity = goal_entity,
-        .hazard_entity = hazard_entity,
-    };
-}
 
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
 
-fn playerSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
-    return .{
-        .position = scene.player.position,
-        .size = scene.player.size,
-        .color = scene.player.color,
-        .texture_id = scene.player.textureId,
-        .move_speed = scene.player.moveSpeed,
-    };
-}
-
-fn goalSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
-    return .{
-        .position = scene.goal.position,
-        .size = scene.goal.size,
-        .color = scene.goal.color,
-        .texture_id = scene.goal.textureId,
-        .move_speed = 0.0,
-    };
-}
-
-fn hazardSpawnDesc(scene: *const scene_api.Scene) world_api.SpriteSpawnDesc {
-    return .{
-        .position = scene.hazard.position,
-        .size = scene.hazard.size,
-        .color = scene.hazard.color,
-        .texture_id = scene.hazard.textureId,
-        .move_speed = 0.0,
-    };
-}
-
 fn validateSceneTextureBindings(registry: *const runtime_texture_registry.RuntimeTextureRegistry, scene: *const scene_api.Scene) !void {
-    _ = try registry.resolve(scene.player.textureId);
-    _ = try registry.resolve(scene.goal.textureId);
-    _ = try registry.resolve(scene.hazard.textureId);
+    for (scene.objects.slice()) |object| _ = try registry.resolve(object.sprite.textureId);
 }
 
 fn initialLoadedTarget(identity: ?content_identity.ContentIdentity) preview_status_api.InitialLoadedTarget {
@@ -114,21 +48,15 @@ pub const Host = struct {
     script_program: script_api.Program,
     script_enabled: bool,
     script_tick: u64,
-    goal_position: [2]f32,
     platform: Platform,
     rhi: Rhi,
     renderer2d: Renderer2D,
     audio: audio_api.Audio,
     texture_registry: runtime_texture_registry.RuntimeTextureRegistry,
-    world: World,
-    sprite_entity: world_api.EntityId,
-    goal_entity: world_api.EntityId,
-    hazard_entity: world_api.EntityId,
-    hazard_y: f32,
-    hazard_direction: f32,
+    generation: scene_generation_api.SceneGeneration,
     world_extent: PlatformExtent,
     session: game.GameSession = .{},
-    render_sprites: [3]world_api.RenderSprite = undefined,
+    render_sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined,
     render_count: usize = 0,
     quit_requested: bool = false,
     last_time_seconds: f64 = 0.0,
@@ -191,9 +119,8 @@ pub const Host = struct {
         errdefer texture_registry.deinit(&backend);
         try validateSceneTextureBindings(&texture_registry, &scene);
 
-        const spawned = try spawnSceneWorld(&scene, extent);
-        var runtime_world = spawned.world;
-        errdefer runtime_world.deinit();
+        var generation = try scene_generation_api.SceneGeneration.prepare(scene, extent);
+        errdefer generation.deinit();
 
         var self = Host{
             .io = io,
@@ -208,18 +135,12 @@ pub const Host = struct {
             .script_program = script_program,
             .script_enabled = script_program.hasInstructions(),
             .script_tick = 0,
-            .goal_position = clampPosition(scene.goal.position, scene.goal.size, extent),
             .platform = platform,
             .rhi = backend,
             .renderer2d = renderer2d,
             .audio = audio_api.Audio.init(io, std.heap.page_allocator),
             .texture_registry = undefined,
-            .world = runtime_world,
-            .sprite_entity = spawned.player_entity,
-            .goal_entity = spawned.goal_entity,
-            .hazard_entity = spawned.hazard_entity,
-            .hazard_y = scene.hazard.position[1],
-            .hazard_direction = 1.0,
+            .generation = generation,
             .world_extent = extent,
             .session = .{},
         };
@@ -228,10 +149,10 @@ pub const Host = struct {
         self.last_heartbeat_seconds = now;
         try self.resetScript();
         self.texture_registry = texture_registry.take();
-        std.log.info("Runtime host initialized with Vulkan RHI entities: player={d}, goal={d}, hazard={d}", .{
-            spawned.player_entity,
-            spawned.goal_entity,
-            spawned.hazard_entity,
+        std.log.info("Runtime host initialized with Vulkan RHI scene objects={d}, player={d}, goal={d}", .{
+            scene.objects.count,
+            self.generation.playerEntity(),
+            self.generation.goalEntity(),
         });
         return self;
     }
@@ -242,16 +163,7 @@ pub const Host = struct {
     pub fn deinit(self: *Host) void {
         self.texture_registry.deinit(&self.rhi);
         self.audio.deinit();
-        self.world.despawn(self.sprite_entity) catch |err| {
-            std.log.err("World sprite despawn failed: {s}", .{@errorName(err)});
-        };
-        self.world.despawn(self.goal_entity) catch |err| {
-            std.log.err("World goal despawn failed: {s}", .{@errorName(err)});
-        };
-        self.world.despawn(self.hazard_entity) catch |err| {
-            std.log.err("World hazard despawn failed: {s}", .{@errorName(err)});
-        };
-        self.world.deinit();
+        self.generation.deinit();
         self.renderer2d.deinit(&self.rhi);
         self.rhi.deinit();
         self.platform.deinit();
@@ -341,41 +253,24 @@ pub const Host = struct {
     fn submitRender(self: *Host) !void {
         if (self.render_count == 0) return error.WorldProducedNoRenderSprite;
         const extent: PlatformExtent = self.platform.clientExtent();
-        const goal = self.renderSprite(self.goal_entity) orelse return error.WorldProducedNoGoalSprite;
-        const hazard = self.renderSprite(self.hazard_entity) orelse return error.WorldProducedNoHazardSprite;
-        const player = self.renderSprite(self.sprite_entity) orelse return error.WorldProducedNoPlayerSprite;
-        const goal_texture = try self.texture_registry.resolve(goal.texture_id);
-        const hazard_texture = try self.texture_registry.resolve(hazard.texture_id);
-        const player_texture = try self.texture_registry.resolve(player.texture_id);
-        // 固定目标、Hazard 先画，玩家后画，避免重开后的 slot 顺序改变可见层级。
-        const instances = [_]SpriteInstance{
-            .{
-                .position = goal.position,
-                .size = goal.size,
-                .color = goal.color,
-                .texture = goal_texture,
-            },
-            .{
-                .position = hazard.position,
-                .size = hazard.size,
-                .color = hazard.color,
-                .texture = hazard_texture,
-            },
-            .{
-                .position = player.position,
-                .size = player.size,
-                .color = switch (self.session.phase) {
+        var instances: [scene_api.max_scene_object_count]SpriteInstance = undefined;
+        const player_entity = self.generation.playerEntity();
+        for (self.render_sprites[0..self.render_count], 0..) |sprite, index| {
+            instances[index] = .{
+                .position = sprite.position,
+                .size = sprite.size,
+                .color = if (sprite.entity_id == player_entity) switch (self.session.phase) {
                     .won => .{ 0.20, 0.95, 0.35, 1.0 },
                     .lost => .{ 0.95, 0.20, 0.20, 1.0 },
-                    .playing => player.color,
-                },
-                .texture = player_texture,
-            },
-        };
+                    .playing => sprite.color,
+                } else sprite.color,
+                .texture = try self.texture_registry.resolve(sprite.texture_id),
+            };
+        }
         const outcome = try self.renderer2d.renderSprites(
             &self.rhi,
             .{ .width = extent.width, .height = extent.height },
-            instances[0..],
+            instances[0..self.render_count],
         );
         if (outcome == .recreated) {
             std.log.debug("Renderer2D swapchain recreation completed", .{});
@@ -406,7 +301,7 @@ pub const Host = struct {
     fn resetScript(self: *Host) !void {
         self.script_tick = 0;
         self.script_enabled = self.script_program.hasInstructions();
-        try self.setGoalPosition(self.scene.goal.position);
+        try self.setGoalPosition(self.scene.goal().sprite.position);
         if (!self.script_enabled) return;
 
         var command_buffer: script_api.CommandBuffer = undefined;
@@ -442,17 +337,15 @@ pub const Host = struct {
             switch (command) {
                 .set_goal_position => |position| try self.setGoalPosition(position),
                 .translate_goal => |delta| try self.setGoalPosition(.{
-                    self.goal_position[0] + delta[0],
-                    self.goal_position[1] + delta[1],
+                    self.generation.goalPosition()[0] + delta[0],
+                    self.generation.goalPosition()[1] + delta[1],
                 }),
             }
         }
     }
 
     fn setGoalPosition(self: *Host, position: [2]f32) !void {
-        const clamped = clampPosition(position, self.scene.goal.size, self.world_extent);
-        try self.world.setSpritePosition(self.goal_entity, clamped);
-        self.goal_position = clamped;
+        try self.generation.setGoalPosition(position);
     }
 
     fn reloadScript(self: *Host) !void {
@@ -464,7 +357,7 @@ pub const Host = struct {
         const previous_program = self.script_program;
         const previous_enabled = self.script_enabled;
         const previous_tick = self.script_tick;
-        const previous_goal_position = self.goal_position;
+        const previous_goal_position = self.generation.goalPosition();
 
         // 关键事务边界：候选 Program 解析成功后再激活；激活失败恢复旧 Program 与 Goal 状态。
         self.script_program = candidate;
@@ -497,53 +390,37 @@ pub const Host = struct {
         );
         errdefer candidate_registry.deinit(&self.rhi);
         try validateSceneTextureBindings(&candidate_registry, &candidate);
-        // 关键事务边界：候选纹理集合与完整新 World 都成功后，才同时替换旧 Registry/Scene/World。
-        const replacement = try spawnSceneWorld(&candidate, self.world_extent);
-        var previous_world = self.world;
+        var replacement = try scene_generation_api.SceneGeneration.prepare(candidate, self.world_extent);
+        errdefer replacement.deinit();
+        var previous_generation = self.generation;
         var previous_registry = self.texture_registry;
-        self.world = replacement.world;
+        self.generation = replacement;
         self.texture_registry = candidate_registry.take();
         self.scene = candidate;
-        self.sprite_entity = replacement.player_entity;
-        self.goal_entity = replacement.goal_entity;
-        self.hazard_entity = replacement.hazard_entity;
-        self.goal_position = clampPosition(candidate.goal.position, candidate.goal.size, self.world_extent);
-        self.hazard_y = candidate.hazard.position[1];
-        self.hazard_direction = 1.0;
         self.session = .{};
         self.accumulator_seconds = 0.0;
         self.render_count = 0;
-        previous_world.deinit();
+        previous_generation.deinit();
         previous_registry.deinit(&self.rhi);
         self.resetScript() catch |err| self.disableScript(err);
-        std.log.info("Scene reloaded explicitly: player={d}, goal={d}, hazard={d}", .{
-            self.sprite_entity,
-            self.goal_entity,
-            self.hazard_entity,
+        std.log.info("Scene reloaded explicitly: objects={d}, player={d}, goal={d}", .{
+            candidate.objects.count,
+            self.generation.playerEntity(),
+            self.generation.goalEntity(),
         });
     }
 
     fn restartGame(self: *Host) !void {
         if (self.session.phase == .playing) return;
-
-        // World 在一次 ABI 调用内完成实体替换；失败时旧身份和 live 集合保持不变。
-        const replacement_entity = try self.world.replaceSprite(
-            self.sprite_entity,
-            playerSpawnDesc(&self.scene),
-        );
-
-        self.sprite_entity = replacement_entity;
-        self.hazard_y = self.scene.hazard.position[1];
-        self.hazard_direction = 1.0;
-        try self.world.setSpritePosition(self.hazard_entity, self.scene.hazard.position);
+        try self.generation.reset();
         std.debug.assert(self.session.restart());
         self.accumulator_seconds = 0.0;
         self.render_count = 0;
         self.resetScript() catch |err| self.disableScript(err);
         std.log.info("Game session restarted: entity={d}, position=({d:.2},{d:.2})", .{
-            replacement_entity,
-            self.scene.player.position[0],
-            self.scene.player.position[1],
+            self.generation.playerEntity(),
+            self.scene.player().sprite.position[0],
+            self.scene.player().sprite.position[1],
         });
     }
 
@@ -555,12 +432,8 @@ pub const Host = struct {
         {
             return;
         }
-        try self.world.setBounds(.{
-            .min = .{ 0.0, 0.0 },
-            .max = .{ @floatFromInt(extent.width), @floatFromInt(extent.height) },
-        });
+        try self.generation.setExtent(extent);
         self.world_extent = extent;
-        try self.setGoalPosition(self.goal_position);
     }
 
     fn runFixedUpdates(self: *Host, delta_seconds: f64, input: InputSnapshot) !void {
@@ -572,9 +445,8 @@ pub const Host = struct {
                 self.audio.play(.lost);
                 std.log.info("Game session lost: timer expired", .{});
             }
-            if (self.session.acceptsInput()) try self.stepHazard(@floatCast(fixed_dt_seconds));
             const step_input = if (self.session.acceptsInput()) input else InputSnapshot{};
-            try self.world.stepFixed(@floatCast(fixed_dt_seconds), .{
+            try self.generation.stepFixed(@floatCast(fixed_dt_seconds), .{
                 .move_x = step_input.move_x,
                 .move_y = step_input.move_y,
             });
@@ -586,37 +458,25 @@ pub const Host = struct {
         }
     }
 
-    fn stepHazard(self: *Host, dt_seconds: f32) !void {
-        self.hazard_y += self.hazard_direction * self.scene.hazard.patrolSpeed * dt_seconds;
-        if (self.hazard_y > self.scene.hazard.patrolMaxY) {
-            self.hazard_y = self.scene.hazard.patrolMaxY - (self.hazard_y - self.scene.hazard.patrolMaxY);
-            self.hazard_direction = -1.0;
-        } else if (self.hazard_y < self.scene.hazard.patrolMinY) {
-            self.hazard_y = self.scene.hazard.patrolMinY + (self.scene.hazard.patrolMinY - self.hazard_y);
-            self.hazard_direction = 1.0;
-        }
-        // 巡逻状态由 Host 驱动，最终位置仍通过 World 受控 setter 提交。
-        try self.world.setSpritePosition(self.hazard_entity, .{ self.scene.hazard.position[0], self.hazard_y });
-    }
-
     fn extractRender(self: *Host) !void {
-        // World 只写入稳定 POD 快照；渲染提交阶段不读取 World 内部存储。
-        const sprites = try self.world.extractSprites(&self.render_sprites);
+        const sprites = try self.generation.extractSprites(&self.render_sprites);
         self.render_count = sprites.len;
-
-        const player = self.collisionBody(self.sprite_entity) orelse return error.WorldProducedNoPlayerSprite;
-        const hazard = self.collisionBody(self.hazard_entity) orelse return error.WorldProducedNoHazardSprite;
-        // 失败判定优先，避免同帧同时接触 Hazard/Goal 时被误判为成功。
-        if (self.session.observeHazard(player, hazard)) {
+        const contacts = try self.generation.observeContacts();
+        if (self.session.observeHazardContact(contacts.hazard != null)) {
             self.audio.play(.lost);
-            std.log.info("Game session lost: player={d} hit hazard={d}", .{ self.sprite_entity, self.hazard_entity });
+            const hazard = contacts.hazard.?;
+            std.log.info("Game session lost: player={d} hit object={s}, entity={d}", .{
+                contacts.player_entity,
+                hazard.object_id.slice(),
+                hazard.entity,
+            });
         }
-        if (self.session.phase == .playing) {
-            const goal = self.collisionBody(self.goal_entity) orelse return error.WorldProducedNoGoalSprite;
-            if (self.session.observeGoal(player, goal)) {
-                self.audio.play(.won);
-                std.log.info("Game session won: player={d} overlapped goal={d}", .{ self.sprite_entity, self.goal_entity });
-            }
+        if (self.session.observeGoalContact(contacts.goal != null)) {
+            self.audio.play(.won);
+            std.log.info("Game session won: player={d} overlapped goal={d}", .{
+                contacts.player_entity,
+                contacts.goal.?.entity,
+            });
         }
     }
 
@@ -626,30 +486,18 @@ pub const Host = struct {
         }
         return null;
     }
-    fn collisionBody(self: *const Host, entity: world_api.EntityId) ?collision.Body {
-        const sprite = self.renderSprite(entity) orelse return null;
-        // 关键映射：玩法碰撞只消费 World 快照值，不持有 World 或 Renderer2D 内部状态。
-        return .{
-            .entity_id = entity,
-            .aabb = .{
-                .position = sprite.position,
-                .size = sprite.size,
-            },
-        };
-    }
-
     fn endFrame(self: *Host, now_seconds: f64, delta_seconds: f64) void {
         self.frame_count += 1;
         if (now_seconds - self.last_heartbeat_seconds >= 1.0) {
             if (self.render_count > 0) {
-                const sprite = self.renderSprite(self.sprite_entity) orelse return;
+                const sprite = self.renderSprite(self.generation.playerEntity()) orelse return;
                 std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, phase={s}, position=({d:.2},{d:.2}), hazard_y={d:.2}", .{
                     self.frame_count,
                     delta_seconds,
                     @tagName(self.session.phase),
                     sprite.position[0],
                     sprite.position[1],
-                    self.hazard_y,
+                    self.generation.primaryHazardY(),
                 });
             } else {
                 std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s", .{
@@ -671,6 +519,6 @@ test "scene texture bindings must resolve before world replacement" {
     };
     var scene = scene_api.default_scene;
     try validateSceneTextureBindings(&registry, &scene);
-    scene.hazard.textureId = 4;
+    scene.objects.entries[0].sprite.textureId = 4;
     try std.testing.expectError(error.UnknownWorldTexture, validateSceneTextureBindings(&registry, &scene));
 }

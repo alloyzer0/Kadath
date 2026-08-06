@@ -78,10 +78,11 @@ function Get-WorkingDirectoryArgument([object]$Config) {
 }
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $PSScriptRoot 'editor-preview.example.json'
+    $configName = if ($IsWindows) { 'editor-preview.example.json' } else { 'editor-preview.linux.example.json' }
+    $ConfigPath = Join-Path $PSScriptRoot $configName
 }
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
-    $OutputDirectory = Join-Path $env:TEMP ("kadath-m4-22-scene-runtime-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+    $OutputDirectory = Join-Path ([IO.Path]::GetTempPath()) ("kadath-m4-22-scene-runtime-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 }
 if (Test-Path -LiteralPath $OutputDirectory) {
     throw "Output directory already exists; refusing to overwrite: $OutputDirectory"
@@ -135,10 +136,10 @@ try {
     })
     $artifactLogs = @($events | Where-Object {
         $_.event -eq 'runtime_log' -and
-        [string]$_.message -match 'Loaded preview scene artifact: .*artifact_version=3'
+        [string]$_.message -match 'Loaded preview scene artifact: .*artifact_version=4'
     })
     if ($artifactLogs.Count -ne 1) {
-        throw "Expected one KSCN artifact load log with artifact_version=3, got $($artifactLogs.Count)"
+        throw "Expected one KSCN artifact load log with artifact_version=4, got $($artifactLogs.Count)"
     }
 
     $exitEvents = @($events | Where-Object {

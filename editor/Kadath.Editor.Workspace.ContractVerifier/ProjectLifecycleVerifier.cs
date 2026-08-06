@@ -18,6 +18,9 @@ internal static class ProjectLifecycleVerifier
             Require(File.ReadAllBytes(created.ScenePath).AsSpan().SequenceEqual(templates.Scene), "Create did not preserve Scene template bytes.");
             Require(File.ReadAllBytes(created.ScriptPath).AsSpan().SequenceEqual(templates.Script), "Create did not preserve Script template bytes.");
             Require(!File.Exists(Path.Combine(created.ProjectDirectory, ".kadath-create-claim")), "Successful Create left an ownership claim.");
+            var createdSnapshot = await new WorkspaceReadModel().ReadProjectAsync(created, default);
+            Require(createdSnapshot.Scene.SchemaVersion == 4 && createdSnapshot.Scene.Objects?.Count == 5,
+                "Create did not project the Scene v4 object template.");
             using (var preview = JsonDocument.Parse(File.ReadAllBytes(created.PreviewPath)))
             {
                 var runtime = preview.RootElement.GetProperty("runtime");
@@ -501,7 +504,7 @@ internal static class ProjectLifecycleVerifier
     private static TemplateBytes CreatePackage(string root)
     {
         var scene = Encoding.UTF8.GetBytes("""
-        {"schemaVersion":3,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"},{"textureId":2,"artifact":"assets/renderer2d/goal.texture"},{"textureId":3,"artifact":"assets/renderer2d/goal.texture"}],"player":{"position":[312,130],"size":[320,240],"color":[1,1,1,1],"moveSpeed":180,"textureId":1},"goal":{"position":[700,200],"size":[96,96],"color":[1,0.75,0.1,1],"textureId":2},"hazard":{"position":[650,280],"size":[96,96],"color":[0.95,0.2,0.2,1],"patrolMinY":245,"patrolMaxY":330,"patrolSpeed":80,"textureId":3}}
+        {"schemaVersion":4,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"},{"textureId":2,"artifact":"assets/renderer2d/goal.texture"},{"textureId":3,"artifact":"assets/renderer2d/goal.texture"}],"objects":[{"objectId":"decoration-1","kind":"sprite","transform":{"position":[100,420]},"sprite":{"size":[80,80],"color":[0.45,0.65,1,0.8],"textureId":2}},{"objectId":"goal","kind":"goal","transform":{"position":[700,200]},"sprite":{"size":[96,96],"color":[1,0.75,0.1,1],"textureId":2}},{"objectId":"hazard-1","kind":"patrol_hazard","transform":{"position":[650,280]},"sprite":{"size":[96,96],"color":[0.95,0.2,0.2,1],"textureId":3},"patrol":{"minY":245,"maxY":330,"speed":80}},{"objectId":"hazard-2","kind":"patrol_hazard","transform":{"position":[500,420]},"sprite":{"size":[72,72],"color":[1,0.35,0.2,1],"textureId":3},"patrol":{"minY":380,"maxY":460,"speed":55}},{"objectId":"player","kind":"player","transform":{"position":[312,130]},"sprite":{"size":[320,240],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":180}}]}
         """);
         var script = Encoding.UTF8.GetBytes("""
         {"schemaVersion":1,"instructions":[{"hook":"on_start","op":"set_goal_position","value":[680,200]},{"hook":"fixed_update","op":"move_goal_velocity","value":[-12,0]}]}

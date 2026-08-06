@@ -66,13 +66,16 @@ internal static class Program
         avaloniaViewModel.ProjectName = openProjectName;
         await avaloniaViewModel.RefreshSnapshotsForCurrentProjectAsync(cancellationToken);
         var expectedAssetCount = Directory.EnumerateFiles(Path.Combine(packageRoot, "bin", "assets"), "*", SearchOption.AllDirectories).Count();
-        Require(avaloniaViewModel.HierarchyItems.Count == 11 && expectedAssetCount > 0 && avaloniaViewModel.AssetItems.Count == expectedAssetCount,
+        Require(avaloniaViewModel.HierarchyItems.Count == 13 && expectedAssetCount > 0 && avaloniaViewModel.AssetItems.Count == expectedAssetCount,
             "Avalonia should project every asset from the current product package.");
         Require(avaloniaViewModel.SceneTextureAssignments.Count == 4
             && avaloniaViewModel.SceneTextureAssignments[0].TextureIdText == "1"
             && !string.IsNullOrWhiteSpace(avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem),
             "Avalonia did not project the current Scene texture set into the authoring slots");
-        Require(avaloniaViewModel.InspectorText.Contains("scene.goal", StringComparison.Ordinal), "Avalonia hierarchy inspector did not use snapshot data");
+        Require(avaloniaViewModel.SceneObjectDrafts.Count == 5
+            && avaloniaViewModel.SelectedSceneObject?.ObjectId == "goal"
+            && avaloniaViewModel.InspectorText.Contains("scene.objects[goal]", StringComparison.Ordinal),
+            "Avalonia hierarchy selection did not project the typed Scene Object inspector");
         Console.WriteLine("workflow_snapshot_projection=ok");
         Console.WriteLine("workflow_project_open=ok");
 
@@ -89,6 +92,8 @@ internal static class Program
                 && avaloniaViewModel.AssetItems.Count == 0
                 && avaloniaViewModel.SelectedHierarchyItem is null
                 && avaloniaViewModel.SelectedAssetItem is null
+                && avaloniaViewModel.SelectedSceneObject is null
+                && avaloniaViewModel.SceneObjectDrafts.Count == 0
                 && avaloniaViewModel.InspectorText.Length == 0
                 && avaloniaViewModel.SceneGoalX.Length == 0
                 && avaloniaViewModel.SceneGoalY.Length == 0
@@ -122,30 +127,46 @@ internal static class Program
             && created.ProjectName == createdProjectName
             && workspace.ProjectSnapshot.Value?.ProjectName == createdProjectName
             && workspace.HierarchySnapshot.Value?.ProjectName == createdProjectName
-            && avaloniaViewModel.HierarchyItems.Count == 11
+            && avaloniaViewModel.HierarchyItems.Count == 13
             && avaloniaViewModel.AssetItems.Count == expectedAssetCount
-            && avaloniaViewModel.InspectorText.Contains("scene.goal", StringComparison.Ordinal),
+            && avaloniaViewModel.SceneObjectDrafts.Count == 5
+            && avaloniaViewModel.InspectorText.Contains("scene.objects[goal]", StringComparison.Ordinal),
             "Avalonia public Create did not project the new Session snapshots after atomic cache invalidation");
         Console.WriteLine("workflow_project_create=ok");
         Require(workspace.Publication.State == EditorPublicationState.Missing, "fresh project should expose missing publication artifacts");
         Console.WriteLine("workflow_publication_missing=ok");
 
         // 工作流 smoke 覆盖真实 authoring transaction：Apply 更新文件并建立撤销记录，Undo 恢复原值。
-        var originalSceneGoalX = avaloniaViewModel.SceneGoalX;
-        var originalPlayerTextureId = avaloniaViewModel.ScenePlayerTextureId;
+        var originalObjectIds = avaloniaViewModel.SceneObjectDrafts.Select(draft => draft.ObjectId).ToArray();
+        var originalGoalX = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal").PositionX;
+        var originalPlayerTextureId = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "player").TextureIdText;
         var originalSceneTextureAsset = avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem;
         var alternateSceneTextureAsset = avaloniaViewModel.AssetItems.FirstOrDefault(label => label.Contains("goal.texture", StringComparison.Ordinal) && label != originalSceneTextureAsset)
             ?? avaloniaViewModel.AssetItems.FirstOrDefault(label => label.Contains("test.texture", StringComparison.Ordinal) && label != originalSceneTextureAsset);
         Require(!string.IsNullOrWhiteSpace(alternateSceneTextureAsset), "workflow fixture did not expose an alternate renderer2d texture asset");
-        var originalSceneGoal = double.Parse(originalSceneGoalX, CultureInfo.InvariantCulture);
-        avaloniaViewModel.SceneGoalX = (originalSceneGoal + 11d).ToString("R", CultureInfo.InvariantCulture);
-        avaloniaViewModel.ScenePlayerTextureId = originalPlayerTextureId == "1" ? "2" : "1";
+        var playerDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "player");
+        avaloniaViewModel.SelectedSceneObject = playerDraft;
+        Require(!avaloniaViewModel.CanDeleteSelectedSceneObject && !avaloniaViewModel.DeleteSceneObjectCommand.CanExecute(null),
+            "Avalonia allowed deletion of the unique Player");
+        avaloniaViewModel.AddDecorativeSpriteDraft();
+        var addedSpriteId = avaloniaViewModel.SelectedSceneObject?.ObjectId;
+        avaloniaViewModel.AddPatrolHazardDraft();
+        var addedHazard = avaloniaViewModel.SelectedSceneObject ?? throw new InvalidOperationException("Avalonia did not select the new Patrol Hazard draft");
+        avaloniaViewModel.MoveSelectedSceneObjectUp();
+        var goalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
+        goalDraft.PositionX = (double.Parse(goalDraft.PositionX, CultureInfo.InvariantCulture) + 11d).ToString("R", CultureInfo.InvariantCulture);
+        playerDraft.TextureIdText = originalPlayerTextureId == "1" ? "2" : "1";
         avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem = alternateSceneTextureAsset;
         var appliedAuthoring = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(appliedAuthoring.State, "succeeded", StringComparison.OrdinalIgnoreCase)
             && workspace.Authoring.UndoDepth == 1
-            && appliedAuthoring.ChangedFields.Contains("scene.player.textureId")
-            && appliedAuthoring.ChangedFields.Contains("scene.textures"), "authoring apply did not create a successful texture-aware undo record");
+            && appliedAuthoring.ChangedFields.Contains("scene.objects")
+            && appliedAuthoring.ChangedFields.Contains("scene.textures")
+            && appliedAuthoring.ProjectSnapshot.Scene.SchemaVersion == 4
+            && appliedAuthoring.ProjectSnapshot.Scene.Objects?.Count == 7
+            && appliedAuthoring.ProjectSnapshot.Scene.Objects.Any(item => item.ObjectId == addedSpriteId)
+            && appliedAuthoring.ProjectSnapshot.Scene.Objects.Any(item => item.ObjectId == addedHazard.ObjectId),
+            "authoring apply did not commit the complete Scene Object replacement");
         Require(avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem == alternateSceneTextureAsset,
             "authoring apply did not keep the editable texture assignment in sync");
         Console.WriteLine("workflow_authoring_apply=ok");
@@ -153,8 +174,9 @@ internal static class Program
         var undoneAuthoring = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(undoneAuthoring.Operation, "undo", StringComparison.OrdinalIgnoreCase)
             && workspace.Authoring.UndoDepth == 0
-            && avaloniaViewModel.SceneGoalX == originalSceneGoalX
-            && avaloniaViewModel.ScenePlayerTextureId == originalPlayerTextureId
+            && avaloniaViewModel.SceneObjectDrafts.Select(draft => draft.ObjectId).SequenceEqual(originalObjectIds)
+            && avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal").PositionX == originalGoalX
+            && avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "player").TextureIdText == originalPlayerTextureId
             && avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem == originalSceneTextureAsset, "authoring undo did not restore the prior values");
         Console.WriteLine("workflow_authoring_undo=ok");
 
@@ -166,7 +188,8 @@ internal static class Program
         Require(string.Equals(baked.State, "succeeded", StringComparison.OrdinalIgnoreCase), "bake did not succeed");
         Console.WriteLine("workflow_bake=ok");
         Require(workspace.Publication.State == EditorPublicationState.Current, "full bake did not publish a current snapshot");
-        avaloniaViewModel.SceneGoalX = (double.Parse(avaloniaViewModel.SceneGoalX, CultureInfo.InvariantCulture) + 5d).ToString("R", CultureInfo.InvariantCulture);
+        var publishedGoalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
+        publishedGoalDraft.PositionX = (double.Parse(publishedGoalDraft.PositionX, CultureInfo.InvariantCulture) + 5d).ToString("R", CultureInfo.InvariantCulture);
         var changedAfterPublish = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(changedAfterPublish.State, "succeeded", StringComparison.OrdinalIgnoreCase) && workspace.Publication.State == EditorPublicationState.SourceDirty, "published source edit did not become dirty");
         Console.WriteLine("workflow_publication_dirty=ok");
@@ -203,7 +226,8 @@ internal static class Program
             "Avalonia did not project the atomic Runtime initial identity");
         Console.WriteLine("workflow_preview_initial_loaded=ok");
 
-        avaloniaViewModel.SceneGoalX = (double.Parse(avaloniaViewModel.SceneGoalX, CultureInfo.InvariantCulture) + 3d).ToString("R", CultureInfo.InvariantCulture);
+        var liveGoalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
+        liveGoalDraft.PositionX = (double.Parse(liveGoalDraft.PositionX, CultureInfo.InvariantCulture) + 3d).ToString("R", CultureInfo.InvariantCulture);
         var liveEdited = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(liveEdited.State, "succeeded", StringComparison.OrdinalIgnoreCase), "live Preview authoring update failed");
         await WaitUntilAsync(() => workspace.Preview.Reload.Scene.State == EditorPreviewReloadState.Acknowledged, cancellationToken, "Scene Runtime reload acknowledgement");
@@ -314,8 +338,10 @@ internal static class Program
         await transport.ReleaseDelayedCreateAsync();
         var created = await createTask.WaitAsync(createTimeout.Token);
         Require(created.ProjectName == "smoke_created"
-            && viewModel.HierarchyItems.Count == 1
-            && viewModel.AssetItems.Count == 1,
+            && viewModel.HierarchyItems.Count == 4
+            && viewModel.AssetItems.Count == 1
+            && viewModel.SceneObjectDrafts.Count == 3
+            && viewModel.SelectedSceneObject?.ObjectId == "goal",
             "public Avalonia Create workflow did not project the created snapshots");
 
         var retainedSceneGoalX = viewModel.SceneGoalX;
@@ -329,10 +355,33 @@ internal static class Program
             () => viewModel.EventLog.LastOrDefault()?.Event == "headless_project_replay_barrier",
             createTimeout.Token,
             "same-identity project_created replay");
-        Require(viewModel.HierarchyItems.Count == 1
+        Require(viewModel.HierarchyItems.Count == 4
             && viewModel.AssetItems.Count == 1
+            && viewModel.SceneObjectDrafts.Count == 3
             && viewModel.SceneGoalX == retainedSceneGoalX,
             "normalized same-identity project_created replay cleared the Avalonia projection");
+
+        viewModel.SelectedSceneObject = viewModel.SceneObjectDrafts.Single(draft => draft.Kind == "player");
+        Require(!viewModel.DeleteSceneObjectCommand.CanExecute(null), "unique Player delete command was enabled");
+        viewModel.AddDecorativeSpriteCommand.Execute(null);
+        var addedSprite = viewModel.SelectedSceneObject;
+        viewModel.AddPatrolHazardCommand.Execute(null);
+        var addedHazard = viewModel.SelectedSceneObject;
+        Require(viewModel.SceneObjectDrafts.Count == 5
+            && addedSprite?.Kind == "sprite"
+            && addedHazard?.Kind == "patrol_hazard"
+            && viewModel.DeleteSceneObjectCommand.CanExecute(null),
+            "Scene Object add/delete command gating mismatch");
+        var hazardIndex = viewModel.SceneObjectDrafts.IndexOf(addedHazard!);
+        viewModel.MoveSceneObjectUpCommand.Execute(null);
+        Require(viewModel.SceneObjectDrafts.IndexOf(addedHazard!) == hazardIndex - 1, "Scene Object move-up did not change source order");
+        viewModel.DeleteSceneObjectCommand.Execute(null);
+        viewModel.SelectedSceneObject = viewModel.SceneObjectDrafts.Single(draft => draft.Kind == "patrol_hazard");
+        Require(!viewModel.DeleteSceneObjectCommand.CanExecute(null), "last Patrol Hazard delete command was enabled");
+        viewModel.SelectedSceneObject = addedSprite;
+        viewModel.DeleteSceneObjectCommand.Execute(null);
+        Require(viewModel.SceneObjectDrafts.Count == 3, "Scene Object draft cleanup did not restore the baseline count");
+        Console.WriteLine("scene_object_draft_commands=ok");
 
         var createEnvelope = transport.LastProjectCreateRequest
             ?? throw new InvalidOperationException("Avalonia Create did not cross the typed Client transport seam");
@@ -564,7 +613,7 @@ internal static class Program
             var commands = new List<string>
             {
                 "get_capabilities", "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot",
-                "asset_catalog_snapshot", "texture_import", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
+                "asset_catalog_snapshot", "texture_import", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
             };
             if (_advertiseProjectCreate) { commands.Insert(2, "project_create"); }
             return commands.ToArray();
@@ -624,15 +673,31 @@ internal static class Program
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/scene.json",
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/script.json",
                 $"{_activePackageRoot}/bin/projects/{_activeProjectName}/preview.json"),
-            new ProjectModelScene(3, [3d, 4d], 1, 2, 3, [new ProjectModelTexture(1, "assets/renderer2d/test.texture"), new ProjectModelTexture(2, "assets/renderer2d/goal.texture"), new ProjectModelTexture(3, "assets/renderer2d/goal.texture")]),
+            new ProjectModelScene(
+                4,
+                [3d, 4d],
+                1,
+                2,
+                3,
+                [new ProjectModelTexture(1, "assets/renderer2d/test.texture"), new ProjectModelTexture(2, "assets/renderer2d/goal.texture"), new ProjectModelTexture(3, "assets/renderer2d/goal.texture")],
+                [
+                    new ProjectModelSceneObject("player", "player", [1d, 2d], [32d, 32d], [1d, 1d, 1d, 1d], 1, MoveSpeed: 180d),
+                    new ProjectModelSceneObject("goal", "goal", [3d, 4d], [24d, 24d], [1d, 0.75d, 0.1d, 1d], 2),
+                    new ProjectModelSceneObject("hazard", "patrol_hazard", [5d, 6d], [24d, 24d], [1d, 0.2d, 0.2d, 1d], 3, PatrolMinY: 0d, PatrolMaxY: 10d, PatrolSpeed: 2d)
+                ]),
             new ProjectModelScript(1, [3d, 4d], [1d, 0d]),
             new ProjectModelPreview(1));
 
         private HierarchySnapshot NewHierarchySnapshot() => new(
-            1,
+            2,
             1,
             _activeProjectName,
-            [new HierarchyNode("scene.goal", null, "Goal", "Sprite", [])]);
+            [
+                new HierarchyNode("scene", null, "Scene", "SceneDocument", []),
+                new HierarchyNode("scene.objects[player]", "scene", "player", "SceneObject", []),
+                new HierarchyNode("scene.objects[goal]", "scene", "goal", "SceneObject", []),
+                new HierarchyNode("scene.objects[hazard]", "scene", "hazard", "SceneObject", [])
+            ]);
 
         private AssetCatalogSnapshot NewAssetCatalogSnapshot()
         {

@@ -77,46 +77,36 @@ public sealed class WorkspaceReadModel
     private static HierarchySnapshot BuildHierarchySnapshot(ProjectSessionInfo project, LoadedProject loaded, ProjectModelSnapshot model)
     {
         var nodes = new List<HierarchyNode>();
-        var scene = loaded.Scene.RootElement;
+        var scene = WorkspaceSceneDocumentCodec.Parse(loaded.SceneBytes);
         var script = loaded.Script.RootElement;
         var preview = loaded.Preview.RootElement;
-        var textures = RequireArray(scene, "textures", "Scene");
 
         nodes.Add(Node("scene", null, "Scene", "SceneDocument", Properties(
-            ("SchemaVersion", model.Scene.SchemaVersion), ("TextureCount", textures.GetArrayLength()), ("File", model.Files.Scene))));
-        foreach (var texture in textures.EnumerateArray())
+            ("SchemaVersion", model.Scene.SchemaVersion), ("TextureCount", scene.Textures.Length), ("ObjectCount", scene.Objects.Length), ("File", model.Files.Scene))));
+        foreach (var texture in scene.Textures)
         {
-            var textureId = RequireUInt32(texture, "textureId", "Scene.textures[]");
-            var artifact = RequireString(texture, "artifact", "Scene.textures[]");
-            nodes.Add(Node($"scene.textures[{textureId}]", "scene", $"Texture {textureId}", "TextureReference", Properties(
-                ("TextureId", textureId), ("Artifact", artifact))));
+            nodes.Add(Node($"scene.textures[{texture.TextureId}]", "scene", $"Texture {texture.TextureId}", "TextureReference", Properties(
+                ("TextureId", texture.TextureId), ("Artifact", texture.Artifact))));
         }
-
-        var player = RequireObject(scene, "player", "Scene");
-        nodes.Add(Node("scene.player", "scene", "Player", "Sprite", Properties(
-            ("Position", FormatVector(RequireVector(player, "position", 2, "Scene.player"))),
-            ("Size", FormatVector(RequireVector(player, "size", 2, "Scene.player"))),
-            ("Color", FormatVector(RequireVector(player, "color", 4, "Scene.player"))),
-            ("MoveSpeed", FormatNumber(RequireFiniteDouble(player, "moveSpeed", "Scene.player"))),
-            ("TextureId", RequireUInt32(player, "textureId", "Scene.player")))));
-
-        var goal = RequireObject(scene, "goal", "Scene");
-        nodes.Add(Node("scene.goal", "scene", "Goal", "Sprite", Properties(
-            ("Position", FormatVector(RequireVector(goal, "position", 2, "Scene.goal"))),
-            ("Size", FormatVector(RequireVector(goal, "size", 2, "Scene.goal"))),
-            ("Color", FormatVector(RequireVector(goal, "color", 4, "Scene.goal"))),
-            ("TextureId", RequireUInt32(goal, "textureId", "Scene.goal")))));
-
-        var hazard = RequireObject(scene, "hazard", "Scene");
-        var patrolMin = RequireFiniteDouble(hazard, "patrolMinY", "Scene.hazard");
-        var patrolMax = RequireFiniteDouble(hazard, "patrolMaxY", "Scene.hazard");
-        nodes.Add(Node("scene.hazard", "scene", "Hazard", "Sprite", Properties(
-            ("Position", FormatVector(RequireVector(hazard, "position", 2, "Scene.hazard"))),
-            ("Size", FormatVector(RequireVector(hazard, "size", 2, "Scene.hazard"))),
-            ("Color", FormatVector(RequireVector(hazard, "color", 4, "Scene.hazard"))),
-            ("TextureId", RequireUInt32(hazard, "textureId", "Scene.hazard")),
-            ("PatrolRange", $"{FormatNumber(patrolMin)} - {FormatNumber(patrolMax)}"),
-            ("PatrolSpeed", FormatNumber(RequireFiniteDouble(hazard, "patrolSpeed", "Scene.hazard"))))));
+        foreach (var sceneObject in scene.Objects)
+        {
+            var properties = new List<(string Name, object? Value)>
+            {
+                ("objectKind", sceneObject.Kind),
+                ("position", FormatVector(sceneObject.Position)),
+                ("size", FormatVector(sceneObject.Size)),
+                ("color", FormatVector(sceneObject.Color)),
+                ("textureId", sceneObject.TextureId)
+            };
+            if (sceneObject.MoveSpeed is not null) properties.Add(("moveSpeed", FormatNumber(sceneObject.MoveSpeed.Value)));
+            if (sceneObject.PatrolMinY is not null)
+            {
+                properties.Add(("patrolMinY", FormatNumber(sceneObject.PatrolMinY.Value)));
+                properties.Add(("patrolMaxY", FormatNumber(sceneObject.PatrolMaxY!.Value)));
+                properties.Add(("patrolSpeed", FormatNumber(sceneObject.PatrolSpeed!.Value)));
+            }
+            nodes.Add(Node($"scene.objects[{sceneObject.ObjectId}]", "scene", sceneObject.ObjectId, "SceneObject", Properties(properties.ToArray())));
+        }
 
         var instructions = RequireArray(script, "instructions", "Script");
         nodes.Add(Node("script", null, "Script", "ScriptDocument", Properties(
@@ -227,45 +217,29 @@ public sealed class WorkspaceReadModel
 
     private static ProjectModelSnapshot BuildProjectSnapshot(ProjectSessionInfo project, LoadedProject loaded)
     {
-        var scene = loaded.Scene.RootElement;
+        var scene = WorkspaceSceneDocumentCodec.Parse(loaded.SceneBytes);
         var script = loaded.Script.RootElement;
         var preview = loaded.Preview.RootElement;
-        var sceneVersion = RequireInt32(scene, "schemaVersion", "Scene");
         var scriptVersion = RequireInt32(script, "schemaVersion", "Script");
         var previewVersion = RequireInt32(preview, "schemaVersion", "Preview");
-        if (sceneVersion != 3 || scriptVersion != 1 || previewVersion != 1) throw Input("Snapshot project/model schema version is unsupported.");
-
-        var texturesElement = RequireArray(scene, "textures", "Scene");
-        if (texturesElement.GetArrayLength() is < 1 or > 4) throw Input("Snapshot Scene texture set is invalid.");
-        var textures = new List<ProjectModelTexture>();
-        var textureIds = new HashSet<uint>();
-        foreach (var texture in texturesElement.EnumerateArray())
-        {
-            var textureId = RequireUInt32(texture, "textureId", "Scene.textures[]");
-            var artifact = RequireString(texture, "artifact", "Scene.textures[]");
-            if (textureId == 0 || !textureIds.Add(textureId) || !IsTextureArtifactPath(artifact)) throw Input("Snapshot Scene texture set is invalid.");
-            textures.Add(new ProjectModelTexture(textureId, artifact));
-        }
-        var player = RequireObject(scene, "player", "Scene");
-        var goal = RequireObject(scene, "goal", "Scene");
-        var hazard = RequireObject(scene, "hazard", "Scene");
-        var playerTexture = RequireUInt32(player, "textureId", "Scene.player");
-        var goalTexture = RequireUInt32(goal, "textureId", "Scene.goal");
-        var hazardTexture = RequireUInt32(hazard, "textureId", "Scene.hazard");
-        if (!textureIds.Contains(playerTexture) || !textureIds.Contains(goalTexture) || !textureIds.Contains(hazardTexture)) throw Input("Scene texture binding is not declared by the texture set.");
+        if (scriptVersion != 1 || previewVersion != 1) throw Input("Snapshot project/model schema version is unsupported.");
+        var textures = scene.Textures.Select(value => new ProjectModelTexture(value.TextureId, value.Artifact)).ToArray();
+        var objects = scene.Objects.Select(value => value.ToProjectModel()).ToArray();
+        var player = scene.Player;
+        var goal = scene.Goal;
+        var hazard = scene.PrimaryHazard;
 
         var instructions = RequireArray(script, "instructions", "Script").EnumerateArray().ToArray();
         var onStart = instructions.Where(value => OptionalString(value, "hook") == "on_start" && OptionalString(value, "op") == "set_goal_position").ToArray();
         var fixedUpdate = instructions.Where(value => OptionalString(value, "hook") == "fixed_update" && OptionalString(value, "op") == "move_goal_velocity").ToArray();
         if (onStart.Length != 1 || fixedUpdate.Length != 1) throw Input("Project script does not contain the editable Hook v1 instructions.");
 
-        var sceneGoal = RequireVector(goal, "position", 2, "Scene.goal");
         var scriptGoal = RequireVector(onStart[0], "value", 2, "Script on_start instruction");
         var scriptVelocity = RequireVector(fixedUpdate[0], "value", 2, "Script fixed_update instruction");
         return new ProjectModelSnapshot(EditorSnapshotVersions.ProjectModel, project.ProjectName,
             AuthoringRevision(loaded.SceneBytes, loaded.ScriptBytes),
             new ProjectModelFiles(loaded.Bytes.ProjectDirectory, loaded.Bytes.ScenePath, loaded.Bytes.ScriptPath, loaded.Bytes.PreviewPath),
-            new ProjectModelScene(sceneVersion, sceneGoal, playerTexture, goalTexture, hazardTexture, textures),
+            new ProjectModelScene(scene.SourceSchemaVersion, goal.Position.ToArray(), player.TextureId, goal.TextureId, hazard.TextureId, textures, objects),
             new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity), new ProjectModelPreview(previewVersion));
     }
 

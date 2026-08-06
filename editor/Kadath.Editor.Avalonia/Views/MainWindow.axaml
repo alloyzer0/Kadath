@@ -5,12 +5,12 @@
         Height="900"
         MinWidth="1100"
         MinHeight="680"
-        Title="Kadath Editor · Avalonia 27A">
+        Title="Kadath Editor · Scene Object Model">
   <Grid RowDefinitions="Auto,*,220" Background="#15191F">
     <Border Grid.Row="0" Padding="12,8" Background="#20262E" BorderBrush="#3C4652" BorderThickness="0,0,0,1">
       <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="10">
         <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="Kadath Editor" />
-        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#AEBAC8" Text="P2-M4-27A · Preview Runtime Reload Ack" />
+        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#AEBAC8" Text="P2-Scene-Object-Model-01 · Scene v4" />
         <TextBlock Grid.Column="2" VerticalAlignment="Center" Foreground="#AEBAC8" Text="{Binding ConnectionStatus}" />
         <Button Grid.Column="3" Padding="14,5" Command="{Binding ConnectCommand}" Content="连接 Service" />
         <Button Grid.Column="4" Padding="14,5" Command="{Binding OpenProjectCommand}" Content="打开项目" />
@@ -20,7 +20,7 @@
       </Grid>
     </Border>
 
-    <Grid Grid.Row="1" ColumnDefinitions="270,*,330" ColumnSpacing="1">
+    <Grid Grid.Row="1" ColumnDefinitions="270,*,390" ColumnSpacing="1">
       <Border Grid.Column="0" Padding="12" Background="#1C222A" BorderBrush="#323B46" BorderThickness="0,0,1,0">
         <Grid RowDefinitions="Auto,Auto,*,Auto" RowSpacing="8">
           <TextBlock FontWeight="SemiBold" Text="Project" />
@@ -89,76 +89,156 @@
       </Border>
 
       <Border Grid.Column="2" Padding="12" Background="#1C222A" BorderBrush="#323B46" BorderThickness="1,0,0,0">
-        <Grid RowDefinitions="Auto,*,Auto,Auto" RowSpacing="8">
-          <TextBlock FontSize="16" FontWeight="SemiBold" Text="Inspector" />
+        <Grid RowDefinitions="Auto,*" RowSpacing="8">
+          <TextBlock FontSize="16" FontWeight="SemiBold" Text="Inspector / Authoring" />
           <ScrollViewer Grid.Row="1">
-            <TextBlock TextWrapping="Wrap" Foreground="#C3CEDA" Text="{Binding InspectorText}" />
-          </ScrollViewer>
-          <Border Grid.Row="2" Padding="8" Background="#252D37" CornerRadius="4">
-            <StackPanel Spacing="5">
-              <TextBlock FontWeight="SemiBold" Text="Capability gating" />
-              <Grid ColumnDefinitions="*,Auto">
-                <TextBlock FontSize="11" Text="external-window" />
-                <TextBlock Grid.Column="1" FontSize="11" Text="{Binding SupportsExternalWindow}" />
-              </Grid>
-              <Grid ColumnDefinitions="*,Auto">
-                <TextBlock FontSize="11" Text="shared-texture" />
-                <TextBlock Grid.Column="1" FontSize="11" Text="{Binding SupportsSharedTexture}" />
-              </Grid>
-              <Grid ColumnDefinitions="*,Auto">
-                <TextBlock FontSize="11" Text="frame-stream" />
-                <TextBlock Grid.Column="1" FontSize="11" Text="{Binding SupportsFrameStream}" />
-              </Grid>
-            </StackPanel>
-          </Border>
-          <Border Grid.Row="3" Padding="8" Background="#252D37" CornerRadius="4">
-            <StackPanel Spacing="4">
-              <TextBlock FontWeight="SemiBold" Text="Authoring · optimistic revision" />
-              <StackPanel Spacing="4">
-                <TextBlock FontSize="11" Foreground="#8F9CAB" Text="Scene texture set" />
-                <ItemsControl ItemsSource="{Binding SceneTextureAssignments}">
-                  <ItemsControl.ItemTemplate>
-                    <DataTemplate>
-                      <Grid ColumnDefinitions="Auto,78,Auto,*" ColumnSpacing="4" Margin="0,0,0,4">
-                        <TextBlock VerticalAlignment="Center" Text="{Binding SlotLabel}" />
-                        <TextBox Grid.Column="1" Text="{Binding TextureIdText}" />
-                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Asset" />
-                        <ComboBox Grid.Column="3" ItemsSource="{Binding AssetItems}" SelectedItem="{Binding SelectedAssetItem}" />
+            <StackPanel Spacing="8">
+              <Border Padding="8" Background="#20262E" CornerRadius="4">
+                <TextBlock TextWrapping="Wrap" Foreground="#C3CEDA" Text="{Binding InspectorText}" />
+              </Border>
+
+              <Border Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="6">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock FontWeight="SemiBold" Text="Scene Objects" />
+                    <TextBlock Grid.Column="1" FontSize="11" Foreground="#AEBAC8" Text="{Binding SceneObjectCountStatus}" />
+                  </Grid>
+                  <ComboBox ItemsSource="{Binding SceneObjectDrafts}" SelectedItem="{Binding SelectedSceneObject}">
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate>
+                        <TextBlock Text="{Binding DisplayName}" />
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
+                  <StackPanel Orientation="Horizontal" Spacing="5">
+                    <Button Command="{Binding AddDecorativeSpriteCommand}" Content="+ Sprite" />
+                    <Button Command="{Binding AddPatrolHazardCommand}" Content="+ Hazard" />
+                    <Button Command="{Binding DeleteSceneObjectCommand}" Content="删除" />
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Spacing="5">
+                    <Button Command="{Binding MoveSceneObjectUpCommand}" Content="上移" />
+                    <Button Command="{Binding MoveSceneObjectDownCommand}" Content="下移" />
+                    <TextBlock VerticalAlignment="Center" FontSize="11" Foreground="#8F9CAB" Text="source order = draw order" />
+                  </StackPanel>
+
+                  <Border IsVisible="{Binding HasSelectedSceneObject}" Padding="7" Background="#1C222A" CornerRadius="4">
+                    <StackPanel Spacing="5">
+                      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                        <TextBlock VerticalAlignment="Center" Text="ObjectId" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedSceneObject.ObjectId}" />
                       </Grid>
-                    </DataTemplate>
-                  </ItemsControl.ItemTemplate>
-                </ItemsControl>
-              </StackPanel>
-              <Grid ColumnDefinitions="Auto,60,Auto,60,Auto,60" ColumnSpacing="4">
-                <TextBlock VerticalAlignment="Center" Text="Player Tex" />
-                <TextBox Grid.Column="1" Text="{Binding ScenePlayerTextureId}" />
-                <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Goal Tex" />
-                <TextBox Grid.Column="3" Text="{Binding SceneGoalTextureId}" />
-                <TextBlock Grid.Column="4" VerticalAlignment="Center" Text="Hazard Tex" />
-                <TextBox Grid.Column="5" Text="{Binding SceneHazardTextureId}" />
-              </Grid>
-              <Grid ColumnDefinitions="Auto,*,Auto,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="4" RowSpacing="3">
-                <TextBlock VerticalAlignment="Center" Text="Scene X" />
-                <TextBox Grid.Column="1" Text="{Binding SceneGoalX}" />
-                <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Scene Y" />
-                <TextBox Grid.Column="3" Text="{Binding SceneGoalY}" />
-                <TextBlock Grid.Row="1" VerticalAlignment="Center" Text="Script X" />
-                <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding ScriptGoalX}" />
-                <TextBlock Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Text="Script Y" />
-                <TextBox Grid.Row="1" Grid.Column="3" Text="{Binding ScriptGoalY}" />
-                <TextBlock Grid.Row="2" VerticalAlignment="Center" Text="Vel X" />
-                <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding ScriptVelocityX}" />
-                <TextBlock Grid.Row="2" Grid.Column="2" VerticalAlignment="Center" Text="Vel Y" />
-                <TextBox Grid.Row="2" Grid.Column="3" Text="{Binding ScriptVelocityY}" />
-              </Grid>
-              <StackPanel Orientation="Horizontal" Spacing="6">
-                <Button Command="{Binding ApplyAuthoringCommand}" Content="Apply" />
-                <Button Command="{Binding UndoAuthoringCommand}" Content="Undo" />
-                <TextBlock VerticalAlignment="Center" Foreground="#AEBAC8" Text="{Binding AuthoringStatus}" />
-                <TextBlock VerticalAlignment="Center" Foreground="#AEBAC8" Text="{Binding AuthoringRevisionStatus}" />
-              </StackPanel>
+                      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                        <TextBlock VerticalAlignment="Center" Text="Kind" />
+                        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#9FE3B1" Text="{Binding SelectedSceneObject.Kind}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*" ColumnSpacing="4">
+                        <TextBlock VerticalAlignment="Center" Text="Pos X" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedSceneObject.PositionX}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Y" />
+                        <TextBox Grid.Column="3" Text="{Binding SelectedSceneObject.PositionY}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*" ColumnSpacing="4">
+                        <TextBlock VerticalAlignment="Center" Text="Size X" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedSceneObject.SizeX}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Y" />
+                        <TextBox Grid.Column="3" Text="{Binding SelectedSceneObject.SizeY}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*,Auto,*,Auto,*" ColumnSpacing="3">
+                        <TextBlock VerticalAlignment="Center" Text="R" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedSceneObject.ColorR}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="G" />
+                        <TextBox Grid.Column="3" Text="{Binding SelectedSceneObject.ColorG}" />
+                        <TextBlock Grid.Column="4" VerticalAlignment="Center" Text="B" />
+                        <TextBox Grid.Column="5" Text="{Binding SelectedSceneObject.ColorB}" />
+                        <TextBlock Grid.Column="6" VerticalAlignment="Center" Text="A" />
+                        <TextBox Grid.Column="7" Text="{Binding SelectedSceneObject.ColorA}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                        <TextBlock VerticalAlignment="Center" Text="TextureId" />
+                        <ComboBox Grid.Column="1" ItemsSource="{Binding SelectedSceneObject.TextureIds}" SelectedItem="{Binding SelectedSceneObject.TextureIdText}" />
+                      </Grid>
+                      <Grid IsVisible="{Binding SelectedSceneObject.IsPlayer}" ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                        <TextBlock VerticalAlignment="Center" Text="Move speed" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedSceneObject.MoveSpeed}" />
+                      </Grid>
+                      <Grid IsVisible="{Binding SelectedSceneObject.IsPatrolHazard}" ColumnDefinitions="Auto,*,Auto,*" RowDefinitions="Auto,Auto" ColumnSpacing="4" RowSpacing="3">
+                        <TextBlock VerticalAlignment="Center" Text="Min Y" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedSceneObject.PatrolMinY}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Max Y" />
+                        <TextBox Grid.Column="3" Text="{Binding SelectedSceneObject.PatrolMaxY}" />
+                        <TextBlock Grid.Row="1" VerticalAlignment="Center" Text="Speed" />
+                        <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding SelectedSceneObject.PatrolSpeed}" />
+                      </Grid>
+                    </StackPanel>
+                  </Border>
+                </StackPanel>
+              </Border>
+
+              <Border Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="4">
+                  <TextBlock FontWeight="SemiBold" Text="Scene texture set" />
+                  <ItemsControl ItemsSource="{Binding SceneTextureAssignments}">
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate>
+                        <Grid ColumnDefinitions="Auto,68,Auto,*" ColumnSpacing="4" Margin="0,0,0,4">
+                          <TextBlock VerticalAlignment="Center" Text="{Binding SlotLabel}" />
+                          <TextBox Grid.Column="1" Text="{Binding TextureIdText}" />
+                          <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Asset" />
+                          <ComboBox Grid.Column="3" ItemsSource="{Binding AssetItems}" SelectedItem="{Binding SelectedAssetItem}" />
+                        </Grid>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </StackPanel>
+              </Border>
+
+              <Border Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="4">
+                  <TextBlock FontWeight="SemiBold" Text="Script Goal" />
+                  <Grid ColumnDefinitions="Auto,*,Auto,*" RowDefinitions="Auto,Auto" ColumnSpacing="4" RowSpacing="3">
+                    <TextBlock VerticalAlignment="Center" Text="Pos X" />
+                    <TextBox Grid.Column="1" Text="{Binding ScriptGoalX}" />
+                    <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Y" />
+                    <TextBox Grid.Column="3" Text="{Binding ScriptGoalY}" />
+                    <TextBlock Grid.Row="1" VerticalAlignment="Center" Text="Vel X" />
+                    <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding ScriptVelocityX}" />
+                    <TextBlock Grid.Row="1" Grid.Column="2" VerticalAlignment="Center" Text="Y" />
+                    <TextBox Grid.Row="1" Grid.Column="3" Text="{Binding ScriptVelocityY}" />
+                  </Grid>
+                </StackPanel>
+              </Border>
+
+              <Border Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="5">
+                  <TextBlock FontWeight="SemiBold" Text="Authoring · optimistic revision" />
+                  <StackPanel Orientation="Horizontal" Spacing="6">
+                    <Button Command="{Binding ApplyAuthoringCommand}" Content="Apply Objects" />
+                    <Button Command="{Binding UndoAuthoringCommand}" Content="Undo" />
+                  </StackPanel>
+                  <TextBlock Foreground="#AEBAC8" Text="{Binding AuthoringStatus}" TextWrapping="Wrap" />
+                  <TextBlock FontSize="11" Foreground="#AEBAC8" Text="{Binding AuthoringRevisionStatus}" />
+                </StackPanel>
+              </Border>
+
+              <Border Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="5">
+                  <TextBlock FontWeight="SemiBold" Text="Capability gating" />
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock FontSize="11" Text="external-window" />
+                    <TextBlock Grid.Column="1" FontSize="11" Text="{Binding SupportsExternalWindow}" />
+                  </Grid>
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock FontSize="11" Text="shared-texture" />
+                    <TextBlock Grid.Column="1" FontSize="11" Text="{Binding SupportsSharedTexture}" />
+                  </Grid>
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock FontSize="11" Text="frame-stream" />
+                    <TextBlock Grid.Column="1" FontSize="11" Text="{Binding SupportsFrameStream}" />
+                  </Grid>
+                </StackPanel>
+              </Border>
             </StackPanel>
-          </Border>
+          </ScrollViewer>
         </Grid>
       </Border>
     </Grid>

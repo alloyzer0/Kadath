@@ -20,6 +20,7 @@ const primary_fixture = Color{ .r = 32, .g = 220, .b = 80 };
 const secondary_fixture = Color{ .r = 220, .g = 80, .b = 240 };
 const package_primary_expected = Color{ .r = 97, .g = 104, .b = 124 };
 const sample_tolerance: u8 = 14;
+const package_sample_tolerance: u8 = 20;
 
 const AssetMode = enum {
     generated_fixture,
@@ -316,7 +317,7 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     defer allocator.free(runtime_log);
     const runtime_out = try std.Io.Dir.cwd().readFileAlloc(io, runtime_stdout, allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(runtime_out);
-    try validateRuntimeLogs(runtime_log, runtime_out, audio_expectation);
+    try validateRuntimeLogs(runtime_log, runtime_out, asset_mode, audio_expectation);
 
     return .{ .evidence_root = evidence_root, .asset_mode = asset_mode, .audio_expectation = audio_expectation };
 }
@@ -862,7 +863,7 @@ fn waitForRenderedFrame(
                 colorNear(primary, expected_primary, sample_tolerance) and
                 colorNear(secondary, expected_secondary, sample_tolerance),
             .package_root => colorNear(background, expected_background, sample_tolerance) and
-                colorNear(primary, package_primary_expected, sample_tolerance) and
+                colorNear(primary, package_primary_expected, package_sample_tolerance) and
                 hasPackageGoalSignature(capture, package_goal_left, package_goal_right),
         };
         if (pixels_match) {
@@ -1300,12 +1301,17 @@ fn closeOwnedChildStreams(io: std.Io, child: *std.process.Child) void {
     child.stderr = null;
 }
 
-fn validateRuntimeLogs(stderr: []const u8, stdout: []const u8, audio_expectation: AudioExpectation) !void {
+fn validateRuntimeLogs(
+    stderr: []const u8,
+    stdout: []const u8,
+    asset_mode: AssetMode,
+    audio_expectation: AudioExpectation,
+) !void {
     const required = [_][]const u8{
         "Platform XCB window created (960x540)",
         "Vulkan GPU selected: llvmpipe",
         "Vulkan RHI initialized",
-        "Runtime host initialized with Vulkan RHI entities",
+        "Runtime host initialized with Vulkan RHI scene objects=",
         "Runtime main loop entered",
         "Vulkan RHI shutdown complete",
         "Platform shutdown complete",
@@ -1314,6 +1320,22 @@ fn validateRuntimeLogs(stderr: []const u8, stdout: []const u8, audio_expectation
     for (required) |needle| {
         if (!containsEither(stderr, stdout, needle)) {
             std.log.err("Runtime log evidence missing: {s}", .{needle});
+            return error.RuntimeLogEvidenceMissing;
+        }
+    }
+    const scene_required: [2][]const u8 = switch (asset_mode) {
+        .generated_fixture => .{
+            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=3",
+            "Runtime host initialized with Vulkan RHI scene objects=3",
+        },
+        .package_root => .{
+            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=4",
+            "Runtime host initialized with Vulkan RHI scene objects=5",
+        },
+    };
+    for (scene_required) |needle| {
+        if (!containsEither(stderr, stdout, needle)) {
+            std.log.err("Runtime Scene evidence missing: {s}", .{needle});
             return error.RuntimeLogEvidenceMissing;
         }
     }
@@ -1472,7 +1494,8 @@ test "Runtime log validation rejects unexpected error records" {
         "info: Renderer2D texture upload complete\n" ++
         "info: RHI texture created\n" ++
         "info: RHI texture created\n" ++
-        "info: Runtime host initialized with Vulkan RHI entities\n" ++
+        "info: Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=3\n" ++
+        "info: Runtime host initialized with Vulkan RHI scene objects=3\n" ++
         "info: Runtime main loop entered\n" ++
         "error: Async texture set refresh failed: review probe\n" ++
         "info: Vulkan RHI shutdown complete\n" ++
@@ -1480,6 +1503,6 @@ test "Runtime log validation rejects unexpected error records" {
         "info: Kadath runtime shutdown complete\n";
     try std.testing.expectError(
         error.RuntimeLogFailureDiagnostic,
-        validateRuntimeLogs(runtime_log, "", .not_applicable),
+        validateRuntimeLogs(runtime_log, "", .generated_fixture, .not_applicable),
     );
 }

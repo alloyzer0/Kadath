@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Windows.Input;
 using Kadath.Editor.Avalonia.Client;
 using Kadath.Editor.Client;
@@ -18,6 +19,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private readonly EditorWorkspaceViewModel _workspace;
     private readonly IEditorViewDispatcher _dispatcher;
     private readonly List<AsyncUiCommand> _commands = [];
+    private readonly List<DelegateUiCommand> _localCommands = [];
     private readonly Dictionary<string, HierarchyNode> _hierarchyItemsByLabel = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AssetCatalogItem> _assetItemsByLabel = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _assetLabelsByRelativePath = new(StringComparer.Ordinal);
@@ -36,6 +38,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _textureImportProfile = "debug";
     private string? _selectedHierarchyItem;
     private string? _selectedAssetItem;
+    private SceneObjectDraftViewModel? _selectedSceneObject;
     private string _inspectorText = "选择项目、场景或资产查看其会话信息。";
     private string _sceneGoalX = string.Empty;
     private string _sceneGoalY = string.Empty;
@@ -52,6 +55,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         new TextureAssignmentSlotViewModel("Texture 3"),
         new TextureAssignmentSlotViewModel("Texture 4")
     ];
+    public ObservableCollection<string> SceneTextureIds { get; } = [];
+    public ObservableCollection<SceneObjectDraftViewModel> SceneObjectDrafts { get; } = [];
 
     public AvaloniaEditorViewModel(EditorWorkspaceViewModel workspace, IEditorViewDispatcher dispatcher, string defaultPackageRoot, TimeSpan? connectionTimeout = null)
     {
@@ -71,7 +76,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace.Watch.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Preview.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Client.EventReceived += OnEditorEventAsync;
-        foreach (var slot in SceneTextureAssignments) { slot.AssetItems = AssetItems; }
+        foreach (var slot in SceneTextureAssignments)
+        {
+            slot.AssetItems = AssetItems;
+            slot.PropertyChanged += OnTextureAssignmentPropertyChanged;
+        }
 
         ConnectCommand = AddCommand(new AsyncUiCommand(InitializeAsync, () => !IsBusy, HandleCommandError));
         OpenProjectCommand = AddCommand(new AsyncUiCommand(OpenProjectAsync, () => CanProjectCommand && !IsBusy, HandleCommandError));
@@ -87,6 +96,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         StartPreviewCommand = AddCommand(new AsyncUiCommand(StartPreviewAsync, () => IsProjectOpen && CanStartPreview && !IsPreviewRunning && !IsBusy, HandleCommandError));
         StopPreviewCommand = AddCommand(new AsyncUiCommand(StopPreviewAsync, () => CanRequestPreviewStop && !IsBusy, HandleCommandError));
         ImportTextureCommand = AddCommand(new AsyncUiCommand(ImportTextureAsync, () => CanImportTexture, HandleCommandError));
+        AddDecorativeSpriteCommand = AddCommand(new DelegateUiCommand(AddDecorativeSpriteDraft, () => CanAddSceneObject));
+        AddPatrolHazardCommand = AddCommand(new DelegateUiCommand(AddPatrolHazardDraft, () => CanAddSceneObject));
+        DeleteSceneObjectCommand = AddCommand(new DelegateUiCommand(DeleteSelectedSceneObjectDraft, () => CanDeleteSelectedSceneObject));
+        MoveSceneObjectUpCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectUp, () => CanMoveSelectedSceneObjectUp));
+        MoveSceneObjectDownCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectDown, () => CanMoveSelectedSceneObjectDown));
         ClearEventLogCommand = new DelegateUiCommand(() => EventLog.Clear());
     }
 
@@ -112,6 +126,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand StartPreviewCommand { get; }
     public ICommand StopPreviewCommand { get; }
     public ICommand ImportTextureCommand { get; }
+    public ICommand AddDecorativeSpriteCommand { get; }
+    public ICommand AddPatrolHazardCommand { get; }
+    public ICommand DeleteSceneObjectCommand { get; }
+    public ICommand MoveSceneObjectUpCommand { get; }
+    public ICommand MoveSceneObjectDownCommand { get; }
     public ICommand ClearEventLogCommand { get; }
 
     public string PackageRoot { get => _packageRoot; set => SetProperty(ref _packageRoot, value); }
@@ -123,8 +142,35 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public string TextureImportSourcePath { get => _textureImportSourcePath; set { if (SetProperty(ref _textureImportSourcePath, value)) { RaiseAll(); } } }
     public string TextureImportAssetName { get => _textureImportAssetName; set { if (SetProperty(ref _textureImportAssetName, value)) { RaiseAll(); } } }
     public string TextureImportProfile { get => _textureImportProfile; set { if (SetProperty(ref _textureImportProfile, value)) { RaiseAll(); } } }
-    public string? SelectedHierarchyItem { get => _selectedHierarchyItem; set { if (SetProperty(ref _selectedHierarchyItem, value) && value is not null && _hierarchyItemsByLabel.TryGetValue(value, out var node)) { InspectorText = FormatHierarchyInspector(node); } } }
+    public string? SelectedHierarchyItem
+    {
+        get => _selectedHierarchyItem;
+        set
+        {
+            if (!SetProperty(ref _selectedHierarchyItem, value)) { return; }
+            if (value is not null && _hierarchyItemsByLabel.TryGetValue(value, out var node))
+            {
+                InspectorText = FormatHierarchyInspector(node);
+                SelectedSceneObject = node.Kind == "SceneObject"
+                    ? SceneObjectDrafts.FirstOrDefault(draft => draft.OriginalObjectId == node.DisplayName || draft.ObjectId == node.DisplayName)
+                    : null;
+            }
+            else
+            {
+                SelectedSceneObject = null;
+            }
+        }
+    }
     public string? SelectedAssetItem { get => _selectedAssetItem; set { if (SetProperty(ref _selectedAssetItem, value) && value is not null && _assetItemsByLabel.TryGetValue(value, out var item)) { InspectorText = FormatAssetInspector(item); } } }
+    public SceneObjectDraftViewModel? SelectedSceneObject
+    {
+        get => _selectedSceneObject;
+        set
+        {
+            if (!SetProperty(ref _selectedSceneObject, value)) { return; }
+            RaiseAll();
+        }
+    }
     public string InspectorText { get => _inspectorText; private set => SetProperty(ref _inspectorText, value); }
     public string SceneGoalX { get => _sceneGoalX; set => SetProperty(ref _sceneGoalX, value); }
     public string SceneGoalY { get => _sceneGoalY; set => SetProperty(ref _sceneGoalY, value); }
@@ -227,7 +273,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             if (failed is not null) { return $"snapshot failed · {failed}"; }
             if (_workspace.HierarchySnapshot.Value is { } hierarchy && _workspace.AssetCatalogSnapshot.Value is { } assets)
             {
-                return $"snapshot v1 · hierarchy={hierarchy.Nodes.Length} · assets={assets.ItemCount}";
+                return $"project v1 · hierarchy v{hierarchy.SnapshotVersion}={hierarchy.Nodes.Length} · assets={assets.ItemCount}";
             }
             return "snapshot 未加载";
         }
@@ -267,6 +313,15 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && !IsBusy;
     public bool CanApplyAuthoring => IsProjectOpen && _workspace.Capabilities.CanApplyAuthoring;
     public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0;
+    public bool HasSelectedSceneObject => SelectedSceneObject is not null;
+    public bool CanAddSceneObject => CanApplyAuthoring && SceneObjectDrafts.Count < 64 && SceneTextureIds.Count > 0 && !IsBusy;
+    public bool CanDeleteSelectedSceneObject => SelectedSceneObject is { } selected
+        && !IsBusy
+        && (selected.Kind == "sprite" || selected.Kind == "patrol_hazard" && SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard") > 1);
+    public bool CanMoveSelectedSceneObjectUp => SelectedSceneObject is { } selected && !IsBusy && SceneObjectDrafts.IndexOf(selected) > 0;
+    public bool CanMoveSelectedSceneObjectDown => SelectedSceneObject is { } selected && !IsBusy
+        && SceneObjectDrafts.IndexOf(selected) is var index && index >= 0 && index < SceneObjectDrafts.Count - 1;
+    public string SceneObjectCountStatus => $"对象 {SceneObjectDrafts.Count}/64 · Hazard {SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard")}";
     public bool CanRefreshSnapshots => IsProjectOpen
         && _workspace.Capabilities.CanReadProjectSnapshot
         && _workspace.Capabilities.CanReadHierarchySnapshot
@@ -364,18 +419,28 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         await EnsureConnectedAsync();
         var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
         var project = _workspace.ProjectSnapshot.Value ?? throw new EditorRpcException("snapshot_missing", "Project snapshot is not loaded.");
+        var sceneTextures = ParseSceneTextureAssignments();
+        var allowedTextureIds = sceneTextures?.Select(texture => texture.TextureId).ToHashSet()
+            ?? (project.Scene.Textures ?? []).Select(texture => texture.TextureId).ToHashSet();
         var patch = new AuthoringPatch(
-            ParseVector(SceneGoalX, SceneGoalY, "scene.goal.position"),
-            ParseVector(ScriptGoalX, ScriptGoalY, "script.goal.position"),
-            ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity"),
-            ParseTextureId(ScenePlayerTextureId, "scene.player.textureId"),
-            ParseTextureId(SceneGoalTextureId, "scene.goal.textureId"),
-            ParseTextureId(SceneHazardTextureId, "scene.hazard.textureId"),
-            ParseSceneTextureAssignments());
-        var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
-        ApplySnapshotProjection(session);
-        RaiseAll();
-        return result;
+            ScriptGoalPosition: ParseVector(ScriptGoalX, ScriptGoalY, "script.goal.position"),
+            ScriptGoalVelocity: ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity"),
+            SceneTextures: sceneTextures,
+            SceneObjects: ParseSceneObjectDrafts(allowedTextureIds));
+        try
+        {
+            var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
+            ApplySnapshotProjection(session);
+            RaiseAll();
+            return result;
+        }
+        catch (EditorRpcException exception) when (exception.Code == "authoring_revision_conflict")
+        {
+            await _workspace.RefreshSnapshotsAsync(session.ProjectName, cancellationToken == default ? _lifetime.Token : cancellationToken);
+            ApplySnapshotProjection(session);
+            RaiseAll();
+            throw;
+        }
     }
 
     private async Task UndoAuthoringAsync()
@@ -419,15 +484,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     }
 
     private static double[] ParseVector(string x, string y, string field)
-    {
-        if (!double.TryParse(x, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsedX)
-            || !double.TryParse(y, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsedY)
-            || !double.IsFinite(parsedX) || !double.IsFinite(parsedY))
-        {
-            throw new EditorRpcException("invalid_authoring_patch", $"{field} requires two finite numbers.");
-        }
-        return [parsedX, parsedY];
-    }
+        => [ParseFiniteNumber(x, $"{field}[0]"), ParseFiniteNumber(y, $"{field}[1]")];
 
     private IReadOnlyList<SceneTextureAssignment>? ParseSceneTextureAssignments()
     {
@@ -474,11 +531,183 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
         return assignments.Count == 0 ? null : assignments;
     }
+
+    private IReadOnlyList<SceneObjectDefinition> ParseSceneObjectDrafts(IReadOnlySet<uint> allowedTextureIds)
+    {
+        if (SceneObjectDrafts.Count is < 3 or > 64)
+        {
+            throw new EditorRpcException("invalid_authoring_patch", "scene.objects 必须包含 3 到 64 个对象。");
+        }
+        if (allowedTextureIds.Count is < 1 or > 4)
+        {
+            throw new EditorRpcException("invalid_authoring_patch", "Scene texture set 必须包含 1 到 4 个 TextureId。");
+        }
+
+        var objectIds = new HashSet<string>(StringComparer.Ordinal);
+        var definitions = new List<SceneObjectDefinition>(SceneObjectDrafts.Count);
+        var playerCount = 0;
+        var goalCount = 0;
+        var hazardCount = 0;
+        foreach (var draft in SceneObjectDrafts)
+        {
+            var objectId = draft.ObjectId.Trim();
+            if (!Regex.IsMatch(objectId, "^[a-z][a-z0-9_-]{0,62}$", RegexOptions.CultureInvariant))
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"无效 ObjectId：{objectId}。");
+            }
+            if (!objectIds.Add(objectId))
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"ObjectId 重复：{objectId}。");
+            }
+
+            var position = ParseVector(draft.PositionX, draft.PositionY, $"scene.objects[{objectId}].position");
+            var size = ParseVector(draft.SizeX, draft.SizeY, $"scene.objects[{objectId}].size");
+            if (size.Any(value => value <= 0))
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}].size 必须大于零。");
+            }
+            var color = new[]
+            {
+                ParseFiniteNumber(draft.ColorR, $"scene.objects[{objectId}].color[0]"),
+                ParseFiniteNumber(draft.ColorG, $"scene.objects[{objectId}].color[1]"),
+                ParseFiniteNumber(draft.ColorB, $"scene.objects[{objectId}].color[2]"),
+                ParseFiniteNumber(draft.ColorA, $"scene.objects[{objectId}].color[3]")
+            };
+            if (color.Any(value => value is < 0 or > 1))
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}].color 必须位于 [0, 1]。");
+            }
+            var textureId = ParseTextureId(draft.TextureIdText, $"scene.objects[{objectId}].textureId");
+            if (!allowedTextureIds.Contains(textureId))
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}].textureId 不在当前 Scene texture set 中。");
+            }
+
+            double? moveSpeed = null;
+            double? patrolMinY = null;
+            double? patrolMaxY = null;
+            double? patrolSpeed = null;
+            switch (draft.Kind)
+            {
+                case "sprite":
+                    break;
+                case "player":
+                    playerCount++;
+                    moveSpeed = ParseNonNegativeNumber(draft.MoveSpeed, $"scene.objects[{objectId}].moveSpeed");
+                    break;
+                case "goal":
+                    goalCount++;
+                    break;
+                case "patrol_hazard":
+                    hazardCount++;
+                    patrolMinY = ParseFiniteNumber(draft.PatrolMinY, $"scene.objects[{objectId}].patrol.minY");
+                    patrolMaxY = ParseFiniteNumber(draft.PatrolMaxY, $"scene.objects[{objectId}].patrol.maxY");
+                    patrolSpeed = ParseNonNegativeNumber(draft.PatrolSpeed, $"scene.objects[{objectId}].patrol.speed");
+                    if (patrolMinY >= patrolMaxY || position[1] < patrolMinY || position[1] > patrolMaxY)
+                    {
+                        throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}] 的 Patrol 范围或初始 Y 无效。");
+                    }
+                    break;
+                default:
+                    throw new EditorRpcException("invalid_authoring_patch", $"不支持的 Object Kind：{draft.Kind}。");
+            }
+
+            definitions.Add(new SceneObjectDefinition(objectId, draft.Kind, position, size, color, textureId, moveSpeed, patrolMinY, patrolMaxY, patrolSpeed));
+        }
+        if (playerCount != 1 || goalCount != 1 || hazardCount < 1)
+        {
+            throw new EditorRpcException("invalid_authoring_patch", "scene.objects 必须恰好包含一个 Player、一个 Goal，并至少包含一个 Patrol Hazard。");
+        }
+        return definitions;
+    }
+
+    public void AddDecorativeSpriteDraft()
+    {
+        if (!CanAddSceneObject) { return; }
+        AddSceneObjectDraft(SceneObjectDraftViewModel.NewSprite(NextObjectId("decoration"), SceneTextureIds[0], SceneTextureIds));
+    }
+
+    public void AddPatrolHazardDraft()
+    {
+        if (!CanAddSceneObject) { return; }
+        AddSceneObjectDraft(SceneObjectDraftViewModel.NewPatrolHazard(NextObjectId("hazard"), SceneTextureIds[0], SceneTextureIds));
+    }
+
+    public void DeleteSelectedSceneObjectDraft()
+    {
+        if (!CanDeleteSelectedSceneObject || SelectedSceneObject is not { } selected) { return; }
+        var index = SceneObjectDrafts.IndexOf(selected);
+        selected.PropertyChanged -= OnSceneObjectDraftPropertyChanged;
+        SceneObjectDrafts.RemoveAt(index);
+        SelectedSceneObject = SceneObjectDrafts.Count == 0 ? null : SceneObjectDrafts[Math.Min(index, SceneObjectDrafts.Count - 1)];
+        RaiseAll();
+    }
+
+    public void MoveSelectedSceneObjectUp()
+    {
+        if (!CanMoveSelectedSceneObjectUp || SelectedSceneObject is not { } selected) { return; }
+        var index = SceneObjectDrafts.IndexOf(selected);
+        SceneObjectDrafts.Move(index, index - 1);
+        RaiseAll();
+    }
+
+    public void MoveSelectedSceneObjectDown()
+    {
+        if (!CanMoveSelectedSceneObjectDown || SelectedSceneObject is not { } selected) { return; }
+        var index = SceneObjectDrafts.IndexOf(selected);
+        SceneObjectDrafts.Move(index, index + 1);
+        RaiseAll();
+    }
+
+    private void AddSceneObjectDraft(SceneObjectDraftViewModel draft)
+    {
+        draft.PropertyChanged += OnSceneObjectDraftPropertyChanged;
+        SceneObjectDrafts.Add(draft);
+        SelectedSceneObject = draft;
+        RaiseAll();
+    }
+
+    private string NextObjectId(string prefix)
+    {
+        var existing = SceneObjectDrafts.Select(draft => draft.ObjectId).ToHashSet(StringComparer.Ordinal);
+        for (var suffix = 1; suffix < 10000; suffix++)
+        {
+            var candidate = $"{prefix}-{suffix}";
+            if (!existing.Contains(candidate)) { return candidate; }
+        }
+        throw new InvalidOperationException($"无法为 {prefix} 分配新的 ObjectId。");
+    }
+
+    private static double ParseFiniteNumber(string value, string field)
+    {
+        if (!double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            || !double.IsFinite(parsed) || !float.IsFinite((float)parsed))
+        {
+            throw new EditorRpcException("invalid_authoring_patch", $"{field} 必须是有限 f32 数值。");
+        }
+        return parsed;
+    }
+
+    private static double ParseNonNegativeNumber(string value, string field)
+    {
+        var parsed = ParseFiniteNumber(value, field);
+        if (parsed < 0) { throw new EditorRpcException("invalid_authoring_patch", $"{field} 不能为负数。"); }
+        return parsed;
+    }
+
     private void ApplySnapshotProjection(ProjectSessionInfo session)
     {
         var project = _workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Project snapshot is missing.");
         var hierarchy = _workspace.HierarchySnapshot.Value ?? throw new InvalidOperationException("Hierarchy snapshot is missing.");
         var assets = _workspace.AssetCatalogSnapshot.Value ?? throw new InvalidOperationException("Asset Catalog snapshot is missing.");
+        if (hierarchy.SnapshotVersion != EditorSnapshotVersions.Hierarchy)
+        {
+            throw new InvalidOperationException($"Unsupported Hierarchy Snapshot version: {hierarchy.SnapshotVersion}.");
+        }
+        if (project.Scene.Objects is null)
+        {
+            throw new InvalidOperationException("Project snapshot does not expose Scene Objects.");
+        }
 
         HierarchyItems.Clear();
         _hierarchyItemsByLabel.Clear();
@@ -497,7 +726,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         SelectedAssetItem = null;
         InspectorText = $"Project\n{project.ProjectName}\n\nModelVersion: {project.ModelVersion}\nPackage root: {session.PackageRoot}";
         SetAuthoringFields(project);
-        var defaultHierarchy = _hierarchyItemsByLabel.FirstOrDefault(pair => pair.Value.Id == "scene.goal").Key
+        var defaultHierarchy = _hierarchyItemsByLabel.FirstOrDefault(pair => pair.Value.Id == "scene.objects[goal]").Key
             ?? _hierarchyItemsByLabel.Keys.FirstOrDefault();
         if (defaultHierarchy is not null) { SelectedHierarchyItem = defaultHierarchy; }
     }
@@ -512,6 +741,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _assetLabelsByRelativePath.Clear();
         SelectedHierarchyItem = null;
         SelectedAssetItem = null;
+        ClearSceneObjectDrafts();
+        SceneTextureIds.Clear();
         InspectorText = string.Empty;
         SceneGoalX = string.Empty;
         SceneGoalY = string.Empty;
@@ -542,6 +773,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         ScriptVelocityX = project.Script.GoalVelocity[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         ScriptVelocityY = project.Script.GoalVelocity[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         SetSceneTextureAssignments(project);
+        SetSceneObjectDrafts(project.Scene.Objects ?? throw new InvalidOperationException("Project snapshot does not expose Scene Objects."));
     }
     private void ApplySessionProjection(ProjectSessionInfo session)
     {
@@ -556,6 +788,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         AssetItems.Add(Path.GetFileName(session.ScriptPath));
         AssetItems.Add(Path.GetFileName(session.PreviewPath));
         InspectorText = $"Project\n{session.ProjectName}\n\nSnapshot commands unavailable.";
+        ClearSceneObjectDrafts();
+        SceneTextureIds.Clear();
         ClearSceneTextureAssignments();
     }
 
@@ -619,11 +853,51 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                 SceneTextureAssignments[index].Clear();
             }
         }
+        RefreshSceneTextureChoicesFromSlots();
     }
 
     private void ClearSceneTextureAssignments()
     {
         foreach (var slot in SceneTextureAssignments) { slot.Clear(); }
+        SceneTextureIds.Clear();
+    }
+
+    private void SetSceneObjectDrafts(IReadOnlyList<ProjectModelSceneObject> objects)
+    {
+        ClearSceneObjectDrafts();
+        foreach (var sceneObject in objects)
+        {
+            var draft = SceneObjectDraftViewModel.FromSnapshot(sceneObject, SceneTextureIds);
+            draft.PropertyChanged += OnSceneObjectDraftPropertyChanged;
+            SceneObjectDrafts.Add(draft);
+        }
+        SelectedSceneObject = null;
+        RaiseAll();
+    }
+
+    private void ClearSceneObjectDrafts()
+    {
+        foreach (var draft in SceneObjectDrafts) { draft.PropertyChanged -= OnSceneObjectDraftPropertyChanged; }
+        SceneObjectDrafts.Clear();
+        SelectedSceneObject = null;
+    }
+
+    private void RefreshSceneTextureChoicesFromSlots()
+    {
+        var values = new List<string>();
+        foreach (var slot in SceneTextureAssignments)
+        {
+            var value = slot.TextureIdText.Trim();
+            if (uint.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var textureId)
+                && textureId != 0)
+            {
+                var normalized = textureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                if (!values.Contains(normalized, StringComparer.Ordinal)) { values.Add(normalized); }
+            }
+        }
+        SceneTextureIds.Clear();
+        foreach (var value in values) { SceneTextureIds.Add(value); }
+        RaiseAll();
     }
 
     private void RefreshAssetProjection()
@@ -668,6 +942,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     }
 
     private void OnWorkspacePropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
+    private void OnTextureAssignmentPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(TextureAssignmentSlotViewModel.TextureIdText)) { RefreshSceneTextureChoicesFromSlots(); }
+    }
+    private void OnSceneObjectDraftPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
     private void OnProjectPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(EditorProjectViewModel.Session)) { ReconcileProjectIdentity(); }
@@ -677,8 +956,57 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private void HandleCommandError(Exception exception) => _ = _dispatcher.InvokeAsync(() => AddLog("command_failed", exception.Message, null, 0));
     private void AddLog(string eventName, string summary, string? requestId, long sequence) { EventLog.Add(new EditorEventLogItem(sequence, eventName, summary, requestId, DateTimeOffset.Now)); while (EventLog.Count > 200) { EventLog.RemoveAt(0); } }
     private AsyncUiCommand AddCommand(AsyncUiCommand command) { _commands.Add(command); return command; }
+    private DelegateUiCommand AddCommand(DelegateUiCommand command) { _localCommands.Add(command); return command; }
     private void OnPropertyChanged(string propertyName) => RaisePropertyChanged(propertyName);
-    private void RaiseAll() { foreach (var command in _commands) { command.RaiseCanExecuteChanged(); } OnPropertyChanged(nameof(ConnectionStatus)); OnPropertyChanged(nameof(ValidationStatus)); OnPropertyChanged(nameof(ValidationDiagnostics)); OnPropertyChanged(nameof(BakeStatus)); OnPropertyChanged(nameof(PublicationStatus)); OnPropertyChanged(nameof(PreviewStatus)); OnPropertyChanged(nameof(RuntimeSyncStatus)); OnPropertyChanged(nameof(TextureImportStatus)); OnPropertyChanged(nameof(TextureImportDetails)); OnPropertyChanged(nameof(SurfaceMode)); OnPropertyChanged(nameof(SurfaceDetails)); OnPropertyChanged(nameof(SnapshotStatus)); OnPropertyChanged(nameof(AuthoringStatus)); OnPropertyChanged(nameof(AuthoringRevisionStatus)); OnPropertyChanged(nameof(CapabilitySummary)); OnPropertyChanged(nameof(IsBusy)); OnPropertyChanged(nameof(IsConnected)); OnPropertyChanged(nameof(IsProjectOpen)); OnPropertyChanged(nameof(IsWatching)); OnPropertyChanged(nameof(IsPreviewRunning)); OnPropertyChanged(nameof(IsPreviewAutoSync)); OnPropertyChanged(nameof(CanProjectCommand)); OnPropertyChanged(nameof(CanCreateProject)); OnPropertyChanged(nameof(CanApplyAuthoring)); OnPropertyChanged(nameof(CanUndoAuthoring)); OnPropertyChanged(nameof(CanRefreshSnapshots)); OnPropertyChanged(nameof(CanBake)); OnPropertyChanged(nameof(CanImportTexture)); OnPropertyChanged(nameof(CanBakeChanges)); OnPropertyChanged(nameof(CanStartWatch)); OnPropertyChanged(nameof(CanStopWatch)); OnPropertyChanged(nameof(CanRequestWatchStop)); OnPropertyChanged(nameof(CanStopPreview)); OnPropertyChanged(nameof(CanRequestPreviewStop)); OnPropertyChanged(nameof(CanStartPreview)); OnPropertyChanged(nameof(SupportsExternalWindow)); OnPropertyChanged(nameof(SupportsSharedTexture)); OnPropertyChanged(nameof(SupportsFrameStream)); }
+    private void RaiseAll()
+    {
+        foreach (var command in _commands) { command.RaiseCanExecuteChanged(); }
+        foreach (var command in _localCommands) { command.RaiseCanExecuteChanged(); }
+        OnPropertyChanged(nameof(ConnectionStatus));
+        OnPropertyChanged(nameof(ValidationStatus));
+        OnPropertyChanged(nameof(ValidationDiagnostics));
+        OnPropertyChanged(nameof(BakeStatus));
+        OnPropertyChanged(nameof(PublicationStatus));
+        OnPropertyChanged(nameof(PreviewStatus));
+        OnPropertyChanged(nameof(RuntimeSyncStatus));
+        OnPropertyChanged(nameof(TextureImportStatus));
+        OnPropertyChanged(nameof(TextureImportDetails));
+        OnPropertyChanged(nameof(SurfaceMode));
+        OnPropertyChanged(nameof(SurfaceDetails));
+        OnPropertyChanged(nameof(SnapshotStatus));
+        OnPropertyChanged(nameof(AuthoringStatus));
+        OnPropertyChanged(nameof(AuthoringRevisionStatus));
+        OnPropertyChanged(nameof(CapabilitySummary));
+        OnPropertyChanged(nameof(SceneObjectCountStatus));
+        OnPropertyChanged(nameof(HasSelectedSceneObject));
+        OnPropertyChanged(nameof(IsBusy));
+        OnPropertyChanged(nameof(IsConnected));
+        OnPropertyChanged(nameof(IsProjectOpen));
+        OnPropertyChanged(nameof(IsWatching));
+        OnPropertyChanged(nameof(IsPreviewRunning));
+        OnPropertyChanged(nameof(IsPreviewAutoSync));
+        OnPropertyChanged(nameof(CanProjectCommand));
+        OnPropertyChanged(nameof(CanCreateProject));
+        OnPropertyChanged(nameof(CanApplyAuthoring));
+        OnPropertyChanged(nameof(CanUndoAuthoring));
+        OnPropertyChanged(nameof(CanAddSceneObject));
+        OnPropertyChanged(nameof(CanDeleteSelectedSceneObject));
+        OnPropertyChanged(nameof(CanMoveSelectedSceneObjectUp));
+        OnPropertyChanged(nameof(CanMoveSelectedSceneObjectDown));
+        OnPropertyChanged(nameof(CanRefreshSnapshots));
+        OnPropertyChanged(nameof(CanBake));
+        OnPropertyChanged(nameof(CanImportTexture));
+        OnPropertyChanged(nameof(CanBakeChanges));
+        OnPropertyChanged(nameof(CanStartWatch));
+        OnPropertyChanged(nameof(CanStopWatch));
+        OnPropertyChanged(nameof(CanRequestWatchStop));
+        OnPropertyChanged(nameof(CanStopPreview));
+        OnPropertyChanged(nameof(CanRequestPreviewStop));
+        OnPropertyChanged(nameof(CanStartPreview));
+        OnPropertyChanged(nameof(SupportsExternalWindow));
+        OnPropertyChanged(nameof(SupportsSharedTexture));
+        OnPropertyChanged(nameof(SupportsFrameStream));
+    }
 
     public async ValueTask DisposeAsync()
     {
@@ -705,8 +1033,22 @@ public sealed class TextureAssignmentSlotViewModel : ObservableObject
 
     public string SlotLabel { get; }
     public ObservableCollection<string> AssetItems { get => _assetItems; set => SetProperty(ref _assetItems, value); }
-    public string TextureIdText { get => _textureIdText; set => SetProperty(ref _textureIdText, value); }
-    public string? SelectedAssetItem { get => _selectedAssetItem; set => SetProperty(ref _selectedAssetItem, value); }
+    public string TextureIdText
+    {
+        get => _textureIdText;
+        set
+        {
+            if (SetProperty(ref _textureIdText, value)) { RaisePropertyChanged(nameof(IsEmpty)); }
+        }
+    }
+    public string? SelectedAssetItem
+    {
+        get => _selectedAssetItem;
+        set
+        {
+            if (SetProperty(ref _selectedAssetItem, value)) { RaisePropertyChanged(nameof(IsEmpty)); }
+        }
+    }
     public bool IsEmpty => string.IsNullOrWhiteSpace(TextureIdText) && string.IsNullOrWhiteSpace(SelectedAssetItem);
 
     public void SetValue(string textureIdText, string? selectedAssetItem)
@@ -738,10 +1080,14 @@ public sealed class AsyncUiCommand : ICommand
 public sealed class DelegateUiCommand : ICommand
 {
     private readonly Action _execute;
-    public DelegateUiCommand(Action execute) => _execute = execute;
-    public event EventHandler? CanExecuteChanged { add { } remove { } }
-    public bool CanExecute(object? parameter) => true;
-    public void Execute(object? parameter) => _execute();
+    private readonly Func<bool> _canExecute;
+    public DelegateUiCommand(Action execute, Func<bool>? canExecute = null)
+    {
+        _execute = execute;
+        _canExecute = canExecute ?? (() => true);
+    }
+    public event EventHandler? CanExecuteChanged;
+    public bool CanExecute(object? parameter) => _canExecute();
+    public void Execute(object? parameter) { if (CanExecute(parameter)) { _execute(); } }
+    public void RaiseCanExecuteChanged() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
 }
-
-

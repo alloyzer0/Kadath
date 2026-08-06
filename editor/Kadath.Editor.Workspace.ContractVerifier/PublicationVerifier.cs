@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -9,7 +10,7 @@ namespace Kadath.Editor.Workspace.ContractVerifier;
 
 internal static class PublicationVerifier
 {
-    private const string ExpectedSceneArtifactSha256 = "6b7555ea2daa88ca13d51d121468f2d40298369db290dbab29973e6b2959d165";
+    private const string ExpectedSceneArtifactSha256 = "cf8a7088b33e2cdcddc9881dc7cc3c9874bccb108cf932a146c9f85099b1718f";
     private const string ExpectedScriptArtifactSha256 = "754f688cfd3bc473bf4fcbe8bd330580dae3bd70729de747d863368ad6224887";
 
     internal static async Task VerifyAsync()
@@ -24,7 +25,7 @@ internal static class PublicationVerifier
             VerifySceneCodecVariants();
             var both = await model.BakeAsync(project, new BakeStartParameters("Both", "debug"), default);
             Require(both.State == "succeeded" && both.Target == "Both" && both.Profile == "debug", "Both publication result mismatch.");
-            Require(both.SceneArtifactBytes == 258 && both.ScriptArtifactBytes == 48, "Publication artifact byte count mismatch.");
+            Require(both.SceneArtifactBytes == 314 && both.ScriptArtifactBytes == 48, "Publication artifact byte count mismatch.");
             Require(both.SceneArtifactRevision == ExpectedSceneArtifactSha256, "Native KSCN output differs from the PowerShell importer oracle.");
             Require(both.ScriptArtifactRevision == ExpectedScriptArtifactSha256, "Native KSCP output differs from the PowerShell importer oracle.");
             Require(HashFile(Path.Combine(both.DerivedDirectory, "scene.scene")) == ExpectedSceneArtifactSha256, "Committed KSCN identity mismatch.");
@@ -36,12 +37,12 @@ internal static class PublicationVerifier
             {
                 var rootElement = manifest.RootElement;
                 Require(rootElement.GetProperty("schemaVersion").GetInt32() == 1 && rootElement.GetProperty("adapterVersion").GetInt32() == 1, "Manifest version mismatch.");
-                Require(rootElement.GetProperty("scene").GetProperty("artifactFormat").GetString() == "KSCN-SCENE-V3", "Manifest Scene format mismatch.");
+                Require(rootElement.GetProperty("scene").GetProperty("artifactFormat").GetString() == "KSCN-SCENE-V4", "Manifest Scene format mismatch.");
                 Require(rootElement.GetProperty("script").GetProperty("artifactFormat").GetString() == "KSCP-SCRIPT-V1", "Manifest Script format mismatch.");
             }
 
             var snapshot = await new WorkspaceReadModel().ReadPublicationAsync(project, "debug", default);
-            Require(snapshot.State == "current" && snapshot.Scene.ArtifactBytes == 258 && snapshot.Script.ArtifactBytes == 48, "Native publication snapshot mismatch.");
+            Require(snapshot.State == "current" && snapshot.Scene.ArtifactBytes == 314 && snapshot.Script.ArtifactBytes == 48, "Native publication snapshot mismatch.");
 
             var scriptArtifactPath = Path.Combine(both.DerivedDirectory, "script.script");
             var retainedScript = File.ReadAllBytes(scriptArtifactPath);
@@ -137,6 +138,17 @@ internal static class PublicationVerifier
 
     private static void VerifySceneCodecVariants()
     {
+        var defaultV4Artifact = WorkspaceSceneCodec.EncodeSource(Encoding.UTF8.GetBytes(DefaultV4SceneJson));
+        Require(defaultV4Artifact.Length == 444
+            && Convert.ToHexString(SHA256.HashData(defaultV4Artifact)).ToLowerInvariant() == "988183e0a3b3d7f06f1f0fef3ab67634cdcc185aee7cd0cf92a4978a114058af",
+            "Native Scene v4 output differs from the shared PowerShell byte oracle.");
+        var invalidTextureLength = defaultV4Artifact.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(invalidTextureLength.AsSpan(24, 4), uint.MaxValue);
+        Expect<InvalidDataException>(() => WorkspaceSceneCodec.ValidateArtifact(invalidTextureLength));
+        var invalidEntryLength = defaultV4Artifact.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(invalidEntryLength.AsSpan(FirstObjectEntryLengthOffset(invalidEntryLength), 4), uint.MaxValue);
+        Expect<InvalidDataException>(() => WorkspaceSceneCodec.ValidateArtifact(invalidEntryLength));
+
         var lengths = new List<int>();
         for (var textureCount = 1; textureCount <= 4; textureCount++)
         {
@@ -155,6 +167,20 @@ internal static class PublicationVerifier
         Require(pathOffset >= 0, "KSCN path fixture was not encoded.");
         longArtifact[pathOffset + "assets/renderer2d/".Length] = 0xff;
         Expect<InvalidDataException>(() => WorkspaceSceneCodec.ValidateArtifact(longArtifact));
+    }
+
+    private static int FirstObjectEntryLengthOffset(byte[] artifact)
+    {
+        var offset = 16;
+        var textureCount = BinaryPrimitives.ReadUInt32LittleEndian(artifact.AsSpan(offset, 4));
+        offset += 4;
+        for (var index = 0; index < textureCount; index++)
+        {
+            var pathBytes = BinaryPrimitives.ReadUInt32LittleEndian(artifact.AsSpan(offset + 4, 4));
+            offset += 8 + checked((int)pathBytes);
+        }
+        offset += 4;
+        return offset;
     }
 
     private static byte[] BuildSceneSource(int textureCount, string? firstArtifact = null)
@@ -336,6 +362,24 @@ internal static class PublicationVerifier
       "instructions": [
         { "hook": "on_start", "op": "set_goal_position", "value": [680.0, 200.0] },
         { "hook": "fixed_update", "op": "move_goal_velocity", "value": [-12.0, 0.0] }
+      ]
+    }
+    """;
+
+    private const string DefaultV4SceneJson = """
+    {
+      "schemaVersion": 4,
+      "textures": [
+        { "textureId": 1, "artifact": "assets/renderer2d/test.texture" },
+        { "textureId": 2, "artifact": "assets/renderer2d/goal.texture" },
+        { "textureId": 3, "artifact": "assets/renderer2d/goal.texture" }
+      ],
+      "objects": [
+        { "objectId": "decoration-1", "kind": "sprite", "transform": { "position": [100, 420] }, "sprite": { "size": [80, 80], "color": [0.45, 0.65, 1, 0.8], "textureId": 2 } },
+        { "objectId": "goal", "kind": "goal", "transform": { "position": [700, 200] }, "sprite": { "size": [96, 96], "color": [1, 0.75, 0.1, 1], "textureId": 2 } },
+        { "objectId": "hazard-1", "kind": "patrol_hazard", "transform": { "position": [650, 280] }, "sprite": { "size": [96, 96], "color": [0.95, 0.2, 0.2, 1], "textureId": 3 }, "patrol": { "minY": 245, "maxY": 330, "speed": 80 } },
+        { "objectId": "hazard-2", "kind": "patrol_hazard", "transform": { "position": [500, 420] }, "sprite": { "size": [72, 72], "color": [1, 0.35, 0.2, 1], "textureId": 3 }, "patrol": { "minY": 380, "maxY": 460, "speed": 55 } },
+        { "objectId": "player", "kind": "player", "transform": { "position": [312, 130] }, "sprite": { "size": [320, 240], "color": [1, 1, 1, 1], "textureId": 1 }, "player": { "moveSpeed": 180 } }
       ]
     }
     """;

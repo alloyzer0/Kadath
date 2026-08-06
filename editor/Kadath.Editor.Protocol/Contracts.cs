@@ -112,7 +112,7 @@ public sealed record SnapshotQueryParameters(string? ProjectName = null);
 public static class EditorSnapshotVersions
 {
     public const int ProjectModel = 1;
-    public const int Hierarchy = 1;
+    public const int Hierarchy = 2;
     public const int AssetCatalog = 1;
     // Publication 快照使用独立版本，避免与其它只读 snapshot 的演进互相耦合。
     public const int Publication = 1;
@@ -130,9 +130,22 @@ public sealed record ProjectModelScene(
     uint PlayerTextureId,
     uint GoalTextureId,
     uint HazardTextureId,
-    IReadOnlyList<ProjectModelTexture>? Textures = null);
+    IReadOnlyList<ProjectModelTexture>? Textures = null,
+    IReadOnlyList<ProjectModelSceneObject>? Objects = null);
 
 public sealed record ProjectModelTexture(uint TextureId, string Artifact);
+
+public sealed record ProjectModelSceneObject(
+    string ObjectId,
+    string Kind,
+    double[] Position,
+    double[] Size,
+    double[] Color,
+    uint TextureId,
+    double? MoveSpeed = null,
+    double? PatrolMinY = null,
+    double? PatrolMaxY = null,
+    double? PatrolSpeed = null);
 
 public sealed record ProjectModelScript(
     int SchemaVersion,
@@ -237,6 +250,18 @@ public sealed record SceneTextureAssignment(
     uint TextureId,
     string AssetId);
 
+public sealed record SceneObjectDefinition(
+    string ObjectId,
+    string Kind,
+    double[] Position,
+    double[] Size,
+    double[] Color,
+    uint TextureId,
+    double? MoveSpeed = null,
+    double? PatrolMinY = null,
+    double? PatrolMaxY = null,
+    double? PatrolSpeed = null);
+
 public sealed record AuthoringPatch(
     double[]? SceneGoalPosition = null,
     double[]? ScriptGoalPosition = null,
@@ -244,7 +269,8 @@ public sealed record AuthoringPatch(
     uint? ScenePlayerTextureId = null,
     uint? SceneGoalTextureId = null,
     uint? SceneHazardTextureId = null,
-    IReadOnlyList<SceneTextureAssignment>? SceneTextures = null);
+    IReadOnlyList<SceneTextureAssignment>? SceneTextures = null,
+    IReadOnlyList<SceneObjectDefinition>? SceneObjects = null);
 
 public sealed record AuthoringApplyParameters(
     string? ProjectName,

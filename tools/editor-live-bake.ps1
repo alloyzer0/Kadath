@@ -163,9 +163,9 @@ function New-Entry([string]$Source, [string]$Artifact, [object]$Info, [string]$K
         artifactPath = Get-RelativePath $root $Artifact
         artifactSha256 = $Info.sha256
         artifactBytes = $Info.bytes
-        artifactFormat = if ($Kind -eq 'Scene') { 'KSCN-SCENE-V3' } else { 'KSCP-SCRIPT-V1' }
-        importerVersion = if ($Kind -eq 'Scene') { 3 } else { 1 }
-        bakerVersion = if ($Kind -eq 'Scene') { 3 } else { 1 }
+        artifactFormat = if ($Kind -eq 'Scene') { 'KSCN-SCENE-V4' } else { 'KSCP-SCRIPT-V1' }
+        importerVersion = if ($Kind -eq 'Scene') { 4 } else { 1 }
+        bakerVersion = if ($Kind -eq 'Scene') { 4 } else { 1 }
     }
 }
 

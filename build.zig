@@ -155,6 +155,8 @@ pub fn build(b: *std.Build) void {
     runtime_build_step.dependOn(&exe.step);
 
     var async_texture_test_step: ?*std.Build.Step = null;
+    var world_cargo_step: ?*std.Build.Step = null;
+    var world_library_path: ?[]const u8 = null;
     if (target.result.os.tag == .windows) {
         const rust_target = switch (target.result.cpu.arch) {
             .x86_64 => "x86_64-pc-windows-gnu",
@@ -176,7 +178,10 @@ pub fn build(b: *std.Build) void {
         // Cargo 产物必须先生成，再由 Zig 的 GNU 链接器合入同一可执行文件。
         exe.step.dependOn(&cargo_build.step);
         const rust_profile = if (optimize == .Debug) "debug" else "release";
-        exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile }) });
+        const rust_library_path = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile });
+        world_cargo_step = &cargo_build.step;
+        world_library_path = rust_library_path;
+        exe.root_module.addLibraryPath(.{ .cwd_relative = rust_library_path });
         const gcc_runtime_dir = mingw_gcc_runtime_dir.?;
         exe.root_module.addLibraryPath(.{ .cwd_relative = gcc_runtime_dir });
         exe.root_module.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
@@ -238,7 +243,10 @@ pub fn build(b: *std.Build) void {
 
         exe.step.dependOn(&cargo_build.step);
         const rust_profile = if (optimize == .Debug) "debug" else "release";
-        exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile }) });
+        const rust_library_path = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile });
+        world_cargo_step = &cargo_build.step;
+        world_library_path = rust_library_path;
+        exe.root_module.addLibraryPath(.{ .cwd_relative = rust_library_path });
         exe.root_module.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("gcc_s", .{});
@@ -266,6 +274,43 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&preview_status_test_run.step);
     test_step.dependOn(&preview_control_test_run.step);
     test_step.dependOn(&runtime_options_test_run.step);
+
+    if (world_library_path) |library_path| {
+        const scene_generation_test_mod = b.createModule(.{
+            .root_source_file = b.path("app/scene_generation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        scene_generation_test_mod.addImport("platform", platform_mod);
+        scene_generation_test_mod.addImport("world", world_mod);
+        scene_generation_test_mod.addLibraryPath(.{ .cwd_relative = library_path });
+        scene_generation_test_mod.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+        if (target.result.os.tag == .windows) {
+            scene_generation_test_mod.addLibraryPath(.{ .cwd_relative = mingw_gcc_runtime_dir.? });
+            scene_generation_test_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
+            scene_generation_test_mod.linkSystemLibrary("kernel32", .{});
+            scene_generation_test_mod.linkSystemLibrary("dbghelp", .{});
+            scene_generation_test_mod.linkSystemLibrary("advapi32", .{});
+            scene_generation_test_mod.linkSystemLibrary("bcrypt", .{});
+            scene_generation_test_mod.linkSystemLibrary("ntdll", .{});
+            scene_generation_test_mod.linkSystemLibrary("userenv", .{});
+            scene_generation_test_mod.linkSystemLibrary("ws2_32", .{});
+        } else if (target.result.os.tag == .linux) {
+            scene_generation_test_mod.linkSystemLibrary("gcc_s", .{});
+            scene_generation_test_mod.linkSystemLibrary("util", .{});
+            scene_generation_test_mod.linkSystemLibrary("rt", .{});
+            scene_generation_test_mod.linkSystemLibrary("pthread", .{});
+            scene_generation_test_mod.linkSystemLibrary("m", .{});
+            scene_generation_test_mod.linkSystemLibrary("dl", .{});
+        }
+        const scene_generation_tests = b.addTest(.{ .root_module = scene_generation_test_mod });
+        scene_generation_tests.step.dependOn(world_cargo_step.?);
+        const scene_generation_test_run = b.addRunArtifact(scene_generation_tests);
+        const scene_generation_test_step = b.step("test-scene-generation", "Run Scene object generation contracts against World");
+        scene_generation_test_step.dependOn(&scene_generation_test_run.step);
+        test_step.dependOn(scene_generation_test_step);
+    }
 
     const null_rhi_mod = b.createModule(.{
         .root_source_file = b.path("modules/rhi/src/null.zig"),

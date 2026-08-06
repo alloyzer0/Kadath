@@ -28,9 +28,35 @@ public sealed record WorkspaceAuthoringCommit(
     string PreviousRevision,
     string Revision,
     string[] ChangedFields,
-    AuthoringPatch? InversePatch,
+    WorkspaceAuthoringUndoToken? UndoToken,
     ProjectModelSnapshot ProjectSnapshot,
     HierarchySnapshot HierarchySnapshot);
+
+public sealed class WorkspaceAuthoringUndoToken
+{
+    internal WorkspaceAuthoringUndoToken(
+        string projectName,
+        string revisionAfter,
+        byte[] scene,
+        byte[] script,
+        bool sceneChanged,
+        bool scriptChanged)
+    {
+        ProjectName = projectName;
+        RevisionAfter = revisionAfter;
+        Scene = scene.ToArray();
+        Script = script.ToArray();
+        SceneChanged = sceneChanged;
+        ScriptChanged = scriptChanged;
+    }
+
+    internal string ProjectName { get; }
+    internal string RevisionAfter { get; }
+    internal byte[] Scene { get; }
+    internal byte[] Script { get; }
+    internal bool SceneChanged { get; }
+    internal bool ScriptChanged { get; }
+}
 
 public sealed class WorkspaceAuthoringModel
 {
@@ -52,6 +78,13 @@ public sealed class WorkspaceAuthoringModel
         AuthoringPatch? patch,
         CancellationToken cancellationToken) =>
         Task.FromResult(Execute(() => ApplyCore(project, expectedRevision, patch, cancellationToken), cancellationToken));
+
+    public Task<WorkspaceAuthoringCommit> UndoAsync(
+        ProjectSessionInfo project,
+        string expectedRevision,
+        WorkspaceAuthoringUndoToken token,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(Execute(() => UndoCore(project, expectedRevision, token, cancellationToken), cancellationToken));
 
     private WorkspaceAuthoringCommit ApplyCore(
         ProjectSessionInfo project,
@@ -76,10 +109,9 @@ public sealed class WorkspaceAuthoringModel
                 [], null, current.Project, current.Hierarchy);
         }
 
-        var scene = ParseObject(original.Scene, "Scene");
         var script = ParseObject(original.Script, "Script");
-        ApplyPatch(scene, script, normalized.Patch, normalized.ResolvedSceneTextures);
-        var sceneBytes = normalized.SceneChanged ? Serialize(scene) : original.Scene;
+        var sceneBytes = normalized.SceneChanged ? BuildSceneBytes(original.Scene, normalized) : original.Scene;
+        ApplyScriptPatch(script, normalized.Patch);
         var scriptBytes = normalized.ScriptChanged ? Serialize(script) : original.Script;
         if (sceneBytes.Length > 65536 || scriptBytes.Length > 65536)
         {
@@ -103,8 +135,59 @@ public sealed class WorkspaceAuthoringModel
         }
 
         Commit(project, original, intended, normalized.SceneChanged, normalized.ScriptChanged, cancellationToken);
+        var undoToken = new WorkspaceAuthoringUndoToken(
+            project.ProjectName,
+            committed.Project.AuthoringRevision,
+            original.Scene,
+            original.Script,
+            normalized.SceneChanged,
+            normalized.ScriptChanged);
         return new WorkspaceAuthoringCommit("succeeded", current.Project.AuthoringRevision, committed.Project.AuthoringRevision,
-            normalized.ChangedFields, normalized.InversePatch, committed.Project, committed.Hierarchy);
+            normalized.ChangedFields, undoToken, committed.Project, committed.Hierarchy);
+    }
+
+    private WorkspaceAuthoringCommit UndoCore(
+        ProjectSessionInfo project,
+        string expectedRevision,
+        WorkspaceAuthoringUndoToken token,
+        CancellationToken cancellationToken)
+    {
+        ValidateExpectedRevision(expectedRevision);
+        ArgumentNullException.ThrowIfNull(token);
+        var currentBytes = WorkspaceProjectValidator.ReadAndValidate(project, cancellationToken);
+        var current = WorkspaceReadModel.ProjectSnapshotsFromBytes(project, currentBytes);
+        if (!expectedRevision.Equals(current.Project.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
+        {
+            throw Failure(WorkspaceAuthoringFailureKind.RevisionConflict,
+                $"Expected {expectedRevision} but current revision is {current.Project.AuthoringRevision}.");
+        }
+        if (!string.Equals(token.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(token.RevisionAfter, current.Project.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
+        {
+            throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Authoring undo token does not match the current project revision.");
+        }
+        var intended = currentBytes with
+        {
+            Scene = token.SceneChanged ? token.Scene.ToArray() : currentBytes.Scene,
+            Script = token.ScriptChanged ? token.Script.ToArray() : currentBytes.Script
+        };
+        WorkspaceProjectProjection restored;
+        try
+        {
+            WorkspaceProjectValidator.ValidateBytes(project, intended, cancellationToken);
+            restored = WorkspaceReadModel.ProjectSnapshotsFromBytes(project, intended);
+        }
+        catch (WorkspaceProjectValidationException exception)
+        {
+            throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Authoring undo token contains invalid source bytes.", exception);
+        }
+        catch (WorkspaceReadException exception)
+        {
+            throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Authoring undo token cannot be projected.", exception);
+        }
+        Commit(project, currentBytes, intended, token.SceneChanged, token.ScriptChanged, cancellationToken);
+        return new WorkspaceAuthoringCommit("succeeded", current.Project.AuthoringRevision, restored.Project.AuthoringRevision,
+            [], null, restored.Project, restored.Hierarchy);
     }
 
     private static T Execute<T>(Func<T> operation, CancellationToken cancellationToken)
@@ -246,14 +329,38 @@ public sealed class WorkspaceAuthoringModel
         ValidateVector(patch.SceneGoalPosition, "scene.goal.position");
         ValidateVector(patch.ScriptGoalPosition, "script.goal.position");
         ValidateVector(patch.ScriptGoalVelocity, "script.goal.velocity");
+        if (patch.SceneObjects is not null && (patch.SceneGoalPosition is not null || patch.ScenePlayerTextureId is not null
+            || patch.SceneGoalTextureId is not null || patch.SceneHazardTextureId is not null))
+        {
+            throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "sceneObjects cannot be combined with fixed Scene fields.");
+        }
         var sceneTextures = NormalizeSceneTextures(current.Scene, assets, patch.SceneTextures);
         var textureSet = sceneTextures.ResolvedTextures ?? current.Scene.Textures ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene texture set is missing from the snapshot.");
         ValidateTextureId(textureSet, patch.ScenePlayerTextureId, "scene.player.textureId");
         ValidateTextureId(textureSet, patch.SceneGoalTextureId, "scene.goal.textureId");
         ValidateTextureId(textureSet, patch.SceneHazardTextureId, "scene.hazard.textureId");
+        var workspaceTextures = textureSet.Select(value => new WorkspaceSceneTexture(value.TextureId, value.Artifact)).ToArray();
+        var currentObjects = current.Scene.Objects ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene object set is missing from the snapshot.");
+        WorkspaceSceneObject[]? normalizedObjects = null;
+        if (patch.SceneObjects is not null)
+        {
+            try { normalizedObjects = WorkspaceSceneDocumentCodec.NormalizeDefinitions(patch.SceneObjects, workspaceTextures); }
+            catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
+        }
+        else if (sceneTextures.ResolvedTextures is not null)
+        {
+            try
+            {
+                _ = WorkspaceSceneDocumentCodec.NormalizeDefinitions(
+                    currentObjects.Select(value => new SceneObjectDefinition(value.ObjectId, value.Kind, value.Position, value.Size, value.Color,
+                        value.TextureId, value.MoveSpeed, value.PatrolMinY, value.PatrolMaxY, value.PatrolSpeed)).ToArray(),
+                    workspaceTextures);
+            }
+            catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
+        }
         var provided = patch.SceneGoalPosition is not null || patch.ScriptGoalPosition is not null || patch.ScriptGoalVelocity is not null
             || patch.ScenePlayerTextureId is not null || patch.SceneGoalTextureId is not null || patch.SceneHazardTextureId is not null
-            || patch.SceneTextures is not null;
+            || patch.SceneTextures is not null || patch.SceneObjects is not null;
         if (!provided) throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "At least one authoring field is required.");
 
         var sceneGoal = Changed(patch.SceneGoalPosition, current.Scene.GoalPosition) ? patch.SceneGoalPosition : null;
@@ -262,24 +369,63 @@ public sealed class WorkspaceAuthoringModel
         var playerTexture = patch.ScenePlayerTextureId is not null && patch.ScenePlayerTextureId != current.Scene.PlayerTextureId ? patch.ScenePlayerTextureId : null;
         var goalTexture = patch.SceneGoalTextureId is not null && patch.SceneGoalTextureId != current.Scene.GoalTextureId ? patch.SceneGoalTextureId : null;
         var hazardTexture = patch.SceneHazardTextureId is not null && patch.SceneHazardTextureId != current.Scene.HazardTextureId ? patch.SceneHazardTextureId : null;
-        var normalized = new AuthoringPatch(sceneGoal, scriptGoal, velocity, playerTexture, goalTexture, hazardTexture, sceneTextures.RequestedTextures);
+        var objectDefinitions = normalizedObjects is not null
+            && (current.Scene.SchemaVersion != WorkspaceSceneDocumentCodec.CurrentSchemaVersion || !ObjectsEqual(currentObjects, normalizedObjects))
+            ? normalizedObjects.Select(value => value.ToDefinition()).ToArray()
+            : null;
+        var normalized = new AuthoringPatch(sceneGoal, scriptGoal, velocity, playerTexture, goalTexture, hazardTexture,
+            sceneTextures.RequestedTextures, objectDefinitions);
         var fields = ChangedFields(normalized);
-        if (fields.Length == 0) return new NormalizedPatch(normalized, null, [], false, false, null);
-        var inverse = new AuthoringPatch(
-            sceneGoal is null ? null : current.Scene.GoalPosition.ToArray(),
-            scriptGoal is null ? null : current.Script.GoalPosition.ToArray(),
-            velocity is null ? null : current.Script.GoalVelocity.ToArray(),
-            playerTexture is null ? null : current.Scene.PlayerTextureId,
-            goalTexture is null ? null : current.Scene.GoalTextureId,
-            hazardTexture is null ? null : current.Scene.HazardTextureId,
-            sceneTextures.InverseTextures);
-        return new NormalizedPatch(normalized, inverse, fields,
-            sceneGoal is not null || playerTexture is not null || goalTexture is not null || hazardTexture is not null || sceneTextures.ResolvedTextures is not null,
+        if (fields.Length == 0) return new NormalizedPatch(normalized, [], false, false, null, null);
+        return new NormalizedPatch(normalized, fields,
+            sceneGoal is not null || playerTexture is not null || goalTexture is not null || hazardTexture is not null
+                || sceneTextures.ResolvedTextures is not null || objectDefinitions is not null,
             scriptGoal is not null || velocity is not null,
-            sceneTextures.ResolvedTextures);
+            sceneTextures.ResolvedTextures,
+            objectDefinitions is null ? null : normalizedObjects);
     }
 
-    private static void ApplyPatch(JsonObject scene, JsonObject script, AuthoringPatch patch, ProjectModelTexture[]? resolvedSceneTextures)
+    private static byte[] BuildSceneBytes(byte[] original, NormalizedPatch normalized)
+    {
+        WorkspaceSceneDocument current;
+        try { current = WorkspaceSceneDocumentCodec.Parse(original); }
+        catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.Input, exception.Message, exception); }
+        var textures = normalized.ResolvedSceneTextures is null
+            ? current.Textures
+            : normalized.ResolvedSceneTextures.Select(value => new WorkspaceSceneTexture(value.TextureId, value.Artifact)).ToArray();
+        var objects = normalized.ResolvedSceneObjects ?? ApplyFixedObjectPatch(current.Objects, normalized.Patch);
+        if (current.SourceSchemaVersion == WorkspaceSceneDocumentCodec.CurrentSchemaVersion || normalized.ResolvedSceneObjects is not null)
+        {
+            try { return WorkspaceSceneDocumentCodec.SerializeV4(textures, objects); }
+            catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
+        }
+        var scene = ParseObject(original, "Scene");
+        ApplyLegacyScenePatch(scene, normalized.Patch, normalized.ResolvedSceneTextures);
+        return Serialize(scene);
+    }
+
+    private static WorkspaceSceneObject[] ApplyFixedObjectPatch(WorkspaceSceneObject[] current, AuthoringPatch patch)
+    {
+        return current.Select(value => value.Kind switch
+        {
+            WorkspaceSceneDocumentCodec.PlayerKind => value with
+            {
+                TextureId = patch.ScenePlayerTextureId ?? value.TextureId
+            },
+            WorkspaceSceneDocumentCodec.GoalKind => value with
+            {
+                Position = patch.SceneGoalPosition?.ToArray() ?? value.Position.ToArray(),
+                TextureId = patch.SceneGoalTextureId ?? value.TextureId
+            },
+            WorkspaceSceneDocumentCodec.PatrolHazardKind when value.ObjectId == current.First(item => item.Kind == WorkspaceSceneDocumentCodec.PatrolHazardKind).ObjectId => value with
+            {
+                TextureId = patch.SceneHazardTextureId ?? value.TextureId
+            },
+            _ => value with { Position = value.Position.ToArray(), Size = value.Size.ToArray(), Color = value.Color.ToArray() }
+        }).ToArray();
+    }
+
+    private static void ApplyLegacyScenePatch(JsonObject scene, AuthoringPatch patch, ProjectModelTexture[]? resolvedSceneTextures)
     {
         var player = RequireObject(scene, "player", "Scene");
         var goal = RequireObject(scene, "goal", "Scene");
@@ -292,9 +438,26 @@ public sealed class WorkspaceAuthoringModel
         if (patch.ScenePlayerTextureId is not null) player["textureId"] = patch.ScenePlayerTextureId.Value;
         if (patch.SceneGoalTextureId is not null) goal["textureId"] = patch.SceneGoalTextureId.Value;
         if (patch.SceneHazardTextureId is not null) hazard["textureId"] = patch.SceneHazardTextureId.Value;
+    }
+
+    private static void ApplyScriptPatch(JsonObject script, AuthoringPatch patch)
+    {
         if (patch.ScriptGoalPosition is not null) RequireInstruction(script, "on_start", "set_goal_position")["value"] = Vector(patch.ScriptGoalPosition);
         if (patch.ScriptGoalVelocity is not null) RequireInstruction(script, "fixed_update", "move_goal_velocity")["value"] = Vector(patch.ScriptGoalVelocity);
     }
+
+    private static bool ObjectsEqual(IReadOnlyList<ProjectModelSceneObject> current, IReadOnlyList<WorkspaceSceneObject> requested) =>
+        current.Count == requested.Count && current.Zip(requested).All(pair =>
+            pair.First.ObjectId == pair.Second.ObjectId
+            && pair.First.Kind == pair.Second.Kind
+            && pair.First.Position.SequenceEqual(pair.Second.Position)
+            && pair.First.Size.SequenceEqual(pair.Second.Size)
+            && pair.First.Color.SequenceEqual(pair.Second.Color)
+            && pair.First.TextureId == pair.Second.TextureId
+            && pair.First.MoveSpeed == pair.Second.MoveSpeed
+            && pair.First.PatrolMinY == pair.Second.PatrolMinY
+            && pair.First.PatrolMaxY == pair.Second.PatrolMaxY
+            && pair.First.PatrolSpeed == pair.Second.PatrolSpeed);
 
     private static JsonObject ParseObject(byte[] bytes, string name)
     {
@@ -333,6 +496,7 @@ public sealed class WorkspaceAuthoringModel
         if (patch.SceneGoalTextureId is not null) fields.Add("scene.goal.textureId");
         if (patch.SceneHazardTextureId is not null) fields.Add("scene.hazard.textureId");
         if (patch.SceneTextures is not null) fields.Add("scene.textures");
+        if (patch.SceneObjects is not null) fields.Add("scene.objects");
         return fields.ToArray();
     }
 
@@ -366,12 +530,11 @@ public sealed class WorkspaceAuthoringModel
         AssetCatalogSnapshot? assets,
         IReadOnlyList<SceneTextureAssignment>? requested)
     {
-        if (requested is null) return new SceneTextureNormalization(null, null, null);
+        if (requested is null) return new SceneTextureNormalization(null, null);
         if (assets is null) throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "scene.textures requires an asset catalog snapshot.");
         if (requested.Count is < 1 or > 4) throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "scene.textures must contain 1 to 4 entries.");
 
         var assetsById = assets.Items.ToDictionary(item => item.AssetId, StringComparer.Ordinal);
-        var assetsByArtifact = assets.Items.ToDictionary(item => item.RelativePath, StringComparer.Ordinal);
         var resolved = new ProjectModelTexture[requested.Count];
         var seenTextureIds = new HashSet<uint>();
         for (var index = 0; index < requested.Count; index++)
@@ -394,32 +557,21 @@ public sealed class WorkspaceAuthoringModel
         if (current.Textures is null || current.Textures.Count != resolved.Length || current.Textures.Where((texture, index) =>
             texture.TextureId != resolved[index].TextureId || !string.Equals(texture.Artifact, resolved[index].Artifact, StringComparison.Ordinal)).Any())
         {
-            var inverse = new SceneTextureAssignment[current.Textures?.Count ?? 0];
-            if (current.Textures is not null)
-            {
-                for (var index = 0; index < current.Textures.Count; index++)
-                {
-                    var texture = current.Textures[index];
-                    if (!assetsByArtifact.TryGetValue(texture.Artifact, out var asset))
-                    {
-                        throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, $"scene.textures[{index}] cannot be restored because its asset is no longer available.");
-                    }
-                    if (!WorkspaceProjectValidator.IsTextureArtifactPath(asset.RelativePath))
-                    {
-                        throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, $"scene.textures[{index}] cannot be restored because the catalog entry is no longer a texture.");
-                    }
-                    inverse[index] = new SceneTextureAssignment(texture.TextureId, asset.AssetId);
-                }
-            }
-            return new SceneTextureNormalization(resolved, requested.ToArray(), inverse);
+            return new SceneTextureNormalization(resolved, requested.ToArray());
         }
 
-        return new SceneTextureNormalization(null, null, null);
+        return new SceneTextureNormalization(null, null);
     }
 
     private static WorkspaceAuthoringException Failure(WorkspaceAuthoringFailureKind kind, string message, Exception? inner = null) => new(kind, message, inner);
 
-    private sealed record NormalizedPatch(AuthoringPatch Patch, AuthoringPatch? InversePatch, string[] ChangedFields, bool SceneChanged, bool ScriptChanged, ProjectModelTexture[]? ResolvedSceneTextures);
-    private sealed record SceneTextureNormalization(ProjectModelTexture[]? ResolvedTextures, SceneTextureAssignment[]? RequestedTextures, SceneTextureAssignment[]? InverseTextures);
+    private sealed record NormalizedPatch(
+        AuthoringPatch Patch,
+        string[] ChangedFields,
+        bool SceneChanged,
+        bool ScriptChanged,
+        ProjectModelTexture[]? ResolvedSceneTextures,
+        WorkspaceSceneObject[]? ResolvedSceneObjects);
+    private sealed record SceneTextureNormalization(ProjectModelTexture[]? ResolvedTextures, SceneTextureAssignment[]? RequestedTextures);
     private sealed record TransactionEntry(string TargetPath, string StagedPath, string RecoveryPath, byte[] Intended);
 }

@@ -123,13 +123,13 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     [], _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
             }
 
-            if (commit.InversePatch is null) { throw new EditorOperationException("authoring_protocol_error", "Native authoring commit emitted no inverse patch."); }
+            if (commit.UndoToken is null) { throw new EditorOperationException("authoring_protocol_error", "Native authoring commit emitted no undo token."); }
             if (_authoringHistory.Count > 0 && !string.Equals(_authoringHistory[^1].RevisionAfter, commit.PreviousRevision, StringComparison.OrdinalIgnoreCase))
             {
                 // 外部编辑使旧 undo 链失去连续性；清理而不是把不相关内容覆盖回来。
                 _authoringHistory.Clear();
             }
-            _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.InversePatch));
+            _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.UndoToken));
             if (_authoringHistory.Count > MaxAuthoringHistory) { _authoringHistory.RemoveAt(0); }
             return new AuthoringMutationResult("apply", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
                 commit.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
@@ -152,7 +152,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 throw new EditorOperationException("authoring_history_diverged", "Authoring history no longer matches the current revision.");
             }
 
-            var commit = await ApplyWorkspaceAuthoringAsync(project, parameters.ExpectedRevision, record.InversePatch, cancellationToken);
+            var commit = await UndoWorkspaceAuthoringAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
             if (commit.State != "succeeded") { throw new EditorOperationException("authoring_protocol_error", "Native authoring undo did not restore a changed state."); }
             _authoringHistory.RemoveAt(_authoringHistory.Count - 1);
             return new AuthoringMutationResult("undo", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
@@ -266,6 +266,27 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         }
     }
 
+    private async Task<WorkspaceAuthoringCommit> UndoWorkspaceAuthoringAsync(
+        ProjectSessionInfo project,
+        string expectedRevision,
+        WorkspaceAuthoringUndoToken token,
+        CancellationToken cancellationToken)
+    {
+        try { return await _authoringModel.UndoAsync(project, expectedRevision, token, cancellationToken); }
+        catch (WorkspaceAuthoringException exception)
+        {
+            var code = exception.Kind switch
+            {
+                WorkspaceAuthoringFailureKind.InvalidExpectedRevision => "invalid_expected_revision",
+                WorkspaceAuthoringFailureKind.RevisionConflict => "authoring_revision_conflict",
+                WorkspaceAuthoringFailureKind.Input or WorkspaceAuthoringFailureKind.Commit => "authoring_update_failed",
+                WorkspaceAuthoringFailureKind.InvalidPatch or WorkspaceAuthoringFailureKind.Invariant => "authoring_protocol_error",
+                _ => "authoring_protocol_error"
+            };
+            throw new EditorOperationException(code, exception.Message);
+        }
+    }
+
     private static void ValidateSnapshot<T>(ProjectSessionInfo project, T snapshot)
     {
         switch (snapshot)
@@ -273,6 +294,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             case ProjectModelSnapshot model:
                 var sceneModel = model.Scene;
                 var textures = sceneModel?.Textures;
+                var objects = sceneModel?.Objects;
                 var textureSetValid = sceneModel is not null && textures is { Count: >= 1 and <= 4 }
                     && textures.All(texture => texture.TextureId != 0 && IsTextureArtifactPath(texture.Artifact))
                     && textures.Select(texture => texture.TextureId).Distinct().Count() == textures.Count
@@ -286,8 +308,9 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion != 3
+                    || model.Scene.SchemaVersion is not (3 or 4)
                     || !textureSetValid
+                    || !ValidateSceneObjects(objects, textures!, sceneModel!)
                     || model.Script.SchemaVersion != 1
                     || model.Preview.SchemaVersion != 1
                     || !string.Equals(model.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
@@ -379,6 +402,58 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         return artifact.Split('/').All(segment => segment.Length > 0 && segment is not "." and not "..");
     }
 
+    private static bool ValidateSceneObjects(
+        IReadOnlyList<ProjectModelSceneObject>? objects,
+        IReadOnlyList<ProjectModelTexture> textures,
+        ProjectModelScene scene)
+    {
+        if (objects is not { Count: >= 3 and <= 64 }) return false;
+        var textureIds = textures.Select(value => value.TextureId).ToHashSet();
+        var objectIds = new HashSet<string>(StringComparer.Ordinal);
+        var players = objects.Where(value => value.Kind == "player").ToArray();
+        var goals = objects.Where(value => value.Kind == "goal").ToArray();
+        var hazards = objects.Where(value => value.Kind == "patrol_hazard").ToArray();
+        if (players.Length != 1 || goals.Length != 1 || hazards.Length < 1) return false;
+        foreach (var value in objects)
+        {
+            if (!IsObjectId(value.ObjectId) || !objectIds.Add(value.ObjectId)
+                || value.Kind is not ("sprite" or "player" or "goal" or "patrol_hazard")
+                || value.Position is not { Length: 2 } || value.Size is not { Length: 2 } || value.Color is not { Length: 4 }
+                || !value.Position.Concat(value.Size).Concat(value.Color).All(number => double.IsFinite(number) && float.IsFinite((float)number))
+                || value.Size.Any(number => number <= 0) || value.Color.Any(number => number is < 0 or > 1)
+                || value.TextureId == 0 || !textureIds.Contains(value.TextureId))
+            {
+                return false;
+            }
+            if (value.Kind == "player")
+            {
+                if (value.MoveSpeed is null || value.MoveSpeed < 0 || !double.IsFinite(value.MoveSpeed.Value)
+                    || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null) return false;
+            }
+            else if (value.Kind == "patrol_hazard")
+            {
+                if (value.MoveSpeed is not null || value.PatrolMinY is null || value.PatrolMaxY is null || value.PatrolSpeed is null
+                    || !double.IsFinite(value.PatrolMinY.Value) || !double.IsFinite(value.PatrolMaxY.Value) || !double.IsFinite(value.PatrolSpeed.Value)
+                    || value.PatrolMinY >= value.PatrolMaxY || value.PatrolSpeed < 0
+                    || value.Position[1] < value.PatrolMinY || value.Position[1] > value.PatrolMaxY) return false;
+            }
+            else if (value.MoveSpeed is not null || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null)
+            {
+                return false;
+            }
+        }
+        return scene.PlayerTextureId == players[0].TextureId
+            && scene.GoalTextureId == goals[0].TextureId
+            && scene.HazardTextureId == hazards[0].TextureId
+            && scene.GoalPosition.SequenceEqual(goals[0].Position);
+    }
+
+    private static bool IsObjectId(string value)
+    {
+        if (string.IsNullOrEmpty(value) || System.Text.Encoding.UTF8.GetByteCount(value) is < 1 or > 63 || value[0] is < 'a' or > 'z') return false;
+        return value.Skip(1).All(character => character is >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or '-');
+    }
+
     private static void ValidatePublicationTarget(PublicationTargetSnapshot target, string expectedTarget)
     {
         if (target is null || !string.Equals(target.Target, expectedTarget, StringComparison.Ordinal)
@@ -442,7 +517,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         string ProjectName,
         string RevisionAfter,
         string[] ChangedFields,
-        AuthoringPatch InversePatch);
+        WorkspaceAuthoringUndoToken Token);
     private static string NormalizeTarget(string target) => target.ToLowerInvariant() switch
     {
         "scene" => "Scene",

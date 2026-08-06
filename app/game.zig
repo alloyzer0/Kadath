@@ -41,13 +41,13 @@ pub const GameSession = struct {
         player: collision.Body,
         hazard: collision.Body,
     ) bool {
-        if (self.phase != .playing) return false;
+        return self.observeHazardContact(collision.queryContact(player, hazard) != null);
+    }
 
-        if (collision.queryContact(player, hazard) != null) {
-            self.phase = .lost;
-            return true;
-        }
-        return false;
+    pub fn observeHazardContact(self: *GameSession, touching: bool) bool {
+        if (self.phase != .playing or !touching) return false;
+        self.phase = .lost;
+        return true;
     }
 
     pub fn observeGoal(
@@ -55,14 +55,13 @@ pub const GameSession = struct {
         player: collision.Body,
         goal: collision.Body,
     ) bool {
-        if (self.phase != .playing) return false;
+        return self.observeGoalContact(collision.queryContact(player, goal) != null);
+    }
 
-        // 玩法状态只消费 Contact 结果，几何有效性与重叠语义统一留在 collision 模块。
-        if (collision.queryContact(player, goal) != null) {
-            self.phase = .won;
-            return true;
-        }
-        return false;
+    pub fn observeGoalContact(self: *GameSession, touching: bool) bool {
+        if (self.phase != .playing or !touching) return false;
+        self.phase = .won;
+        return true;
     }
 };
 

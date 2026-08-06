@@ -133,37 +133,7 @@ fn downsample(
 
 fn buildSceneArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     const scene = try scene_api.parse(allocator, json);
-    var payload_bytes: usize = 124 + 4;
-    for (scene.textures.slice()) |texture| payload_bytes += 8 + texture.artifact().len;
-    const artifact = try allocator.alloc(u8, 16 + payload_bytes);
-    @memcpy(artifact[0..4], "KSCN");
-    putU32(artifact[4..8], scene_api.scene_artifact_version);
-    putU32(artifact[8..12], scene.schemaVersion);
-    putU32(artifact[12..16], @intCast(payload_bytes));
-    const values = [_]f32{
-        scene.player.position[0], scene.player.position[1], scene.player.size[0],     scene.player.size[1],
-        scene.player.color[0],    scene.player.color[1],    scene.player.color[2],    scene.player.color[3],
-        scene.player.moveSpeed,   scene.goal.position[0],   scene.goal.position[1],   scene.goal.size[0],
-        scene.goal.size[1],       scene.goal.color[0],      scene.goal.color[1],      scene.goal.color[2],
-        scene.goal.color[3],      scene.hazard.position[0], scene.hazard.position[1], scene.hazard.size[0],
-        scene.hazard.size[1],     scene.hazard.color[0],    scene.hazard.color[1],    scene.hazard.color[2],
-        scene.hazard.color[3],    scene.hazard.patrolMinY,  scene.hazard.patrolMaxY,  scene.hazard.patrolSpeed,
-    };
-    for (values, 0..) |value, index| putF32(artifact[16 + index * 4 ..][0..4], value);
-    putU32(artifact[128..132], scene.player.textureId);
-    putU32(artifact[132..136], scene.goal.textureId);
-    putU32(artifact[136..140], scene.hazard.textureId);
-    var cursor: usize = 140;
-    putU32(artifact[cursor..][0..4], scene.textures.count);
-    cursor += 4;
-    for (scene.textures.slice()) |texture| {
-        putU32(artifact[cursor..][0..4], texture.textureId);
-        putU32(artifact[cursor + 4 ..][0..4], @intCast(texture.artifact().len));
-        cursor += 8;
-        @memcpy(artifact[cursor .. cursor + texture.artifact().len], texture.artifact());
-        cursor += texture.artifact().len;
-    }
-    return artifact;
+    return scene_api.encodeArtifact(allocator, &scene);
 }
 
 fn buildScriptArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
@@ -251,11 +221,20 @@ test "scene and script artifacts preserve their frozen disk ABI" {
     defer std.testing.allocator.free(scene);
     const script = try buildScriptArtifact(std.testing.allocator, script_json);
     defer std.testing.allocator.free(script);
-    try std.testing.expectEqual(@as(usize, 258), scene.len);
-    try std.testing.expectEqual(@as(u32, 1), readU32(scene[128..132]));
-    try std.testing.expectEqual(@as(u32, 2), readU32(scene[132..136]));
-    try std.testing.expectEqual(@as(u32, 3), readU32(scene[136..140]));
-    try std.testing.expectEqual(@as(u32, 3), readU32(scene[140..144]));
+    try std.testing.expectEqual(scene_api.scene_artifact_version, readU32(scene[4..8]));
+    try std.testing.expectEqual(scene_api.current_schema_version, readU32(scene[8..12]));
+    try std.testing.expectEqual(@as(u32, 3), readU32(scene[16..20]));
+    var cursor: usize = 20;
+    for (0..3) |_| {
+        const artifact_bytes = readU32(scene[cursor + 4 ..][0..4]);
+        cursor += 8 + artifact_bytes;
+    }
+    try std.testing.expectEqual(@as(u32, 5), readU32(scene[cursor..][0..4]));
+    cursor += 4;
+    const first_entry_bytes = readU32(scene[cursor..][0..4]);
+    try std.testing.expectEqual(@as(u32, 1), readU32(scene[cursor + 4 ..][0..4]));
+    try std.testing.expectEqual(@as(u32, "decoration-1".len), readU32(scene[cursor + 8 ..][0..4]));
+    try std.testing.expectEqual(@as(usize, 44 + "decoration-1".len), first_entry_bytes);
     try std.testing.expectEqual(@as(usize, 48), script.len);
     try std.testing.expectEqualSlices(u8, "KSCN", scene[0..4]);
     try std.testing.expectEqualSlices(u8, "KSCP", script[0..4]);

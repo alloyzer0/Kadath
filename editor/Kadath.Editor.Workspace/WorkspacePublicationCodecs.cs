@@ -10,49 +10,27 @@ internal sealed record WorkspaceArtifactInfo(string Sha256, long Bytes, string F
 internal static class WorkspaceSceneCodec
 {
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
-    internal const string Format = "KSCN-SCENE-V3";
-    internal const int ImporterVersion = 3;
-    internal const int BakerVersion = 3;
+    internal const string Format = "KSCN-SCENE-V4";
+    internal const int ImporterVersion = 4;
+    internal const int BakerVersion = 4;
     private const int HeaderBytes = 16;
-    private const int FieldCount = 28;
-    private const int FixedPayloadBytes = (FieldCount + 3) * sizeof(uint);
+    private const int MaxArtifactBytes = 1024 * 1024;
 
     internal static byte[] EncodeSource(byte[] source)
     {
-        WorkspaceProjectValidator.ValidateSceneSource(source);
-        using var document = Parse(source);
-        var root = document.RootElement;
-        var fields = new List<float>(FieldCount);
-        var player = root.GetProperty("player");
-        var goal = root.GetProperty("goal");
-        var hazard = root.GetProperty("hazard");
-        AddSprite(fields, player, hasMoveSpeed: true);
-        AddSprite(fields, goal, hasMoveSpeed: false);
-        AddVector(fields, hazard.GetProperty("position"));
-        AddVector(fields, hazard.GetProperty("size"));
-        AddVector(fields, hazard.GetProperty("color"));
-        fields.Add((float)hazard.GetProperty("patrolMinY").GetDouble());
-        fields.Add((float)hazard.GetProperty("patrolMaxY").GetDouble());
-        fields.Add((float)hazard.GetProperty("patrolSpeed").GetDouble());
-        if (fields.Count != FieldCount) throw new InvalidOperationException($"Internal Scene field count mismatch: {fields.Count}.");
-
-        var textureIds = new[]
-        {
-            player.GetProperty("textureId").GetUInt32(),
-            goal.GetProperty("textureId").GetUInt32(),
-            hazard.GetProperty("textureId").GetUInt32()
-        };
-        var textures = root.GetProperty("textures").EnumerateArray().Select(value =>
-            new TextureEntry(value.GetProperty("textureId").GetUInt32(), Encoding.UTF8.GetBytes(value.GetProperty("artifact").GetString()!))).ToArray();
-        var payloadBytes = FixedPayloadBytes + sizeof(uint) + textures.Sum(value => 2 * sizeof(uint) + value.Artifact.Length);
+        var scene = WorkspaceSceneDocumentCodec.Parse(source);
+        var textures = scene.Textures.Select(value => new TextureEntry(value.TextureId, StrictUtf8.GetBytes(value.Artifact))).ToArray();
+        var objects = scene.Objects.Select(value => new ObjectEntry(value, StrictUtf8.GetBytes(value.ObjectId))).ToArray();
+        var payloadBytes = sizeof(uint)
+            + textures.Sum(value => 2 * sizeof(uint) + value.Artifact.Length)
+            + sizeof(uint)
+            + objects.Sum(value => sizeof(uint) + value.EntryBytes);
         var artifact = new byte[HeaderBytes + payloadBytes];
         Encoding.ASCII.GetBytes("KSCN").CopyTo(artifact, 0);
-        WriteUInt32(artifact, 4, 3);
-        WriteUInt32(artifact, 8, 3);
+        WriteUInt32(artifact, 4, 4);
+        WriteUInt32(artifact, 8, 4);
         WriteUInt32(artifact, 12, checked((uint)payloadBytes));
         var offset = HeaderBytes;
-        foreach (var field in fields) { WriteSingle(artifact, offset, field); offset += sizeof(float); }
-        foreach (var textureId in textureIds) { WriteUInt32(artifact, offset, textureId); offset += sizeof(uint); }
         WriteUInt32(artifact, offset, checked((uint)textures.Length));
         offset += sizeof(uint);
         foreach (var texture in textures)
@@ -63,6 +41,36 @@ internal static class WorkspaceSceneCodec
             texture.Artifact.CopyTo(artifact, offset);
             offset += texture.Artifact.Length;
         }
+        WriteUInt32(artifact, offset, checked((uint)objects.Length));
+        offset += sizeof(uint);
+        foreach (var entry in objects)
+        {
+            WriteUInt32(artifact, offset, checked((uint)entry.EntryBytes));
+            WriteUInt32(artifact, offset + 4, KindValue(entry.Value.Kind));
+            WriteUInt32(artifact, offset + 8, checked((uint)entry.ObjectId.Length));
+            offset += 12;
+            entry.ObjectId.CopyTo(artifact, offset);
+            offset += entry.ObjectId.Length;
+            foreach (var value in entry.Value.Position.Concat(entry.Value.Size).Concat(entry.Value.Color))
+            {
+                WriteSingle(artifact, offset, (float)value);
+                offset += sizeof(float);
+            }
+            WriteUInt32(artifact, offset, entry.Value.TextureId);
+            offset += sizeof(uint);
+            if (entry.Value.Kind == WorkspaceSceneDocumentCodec.PlayerKind)
+            {
+                WriteSingle(artifact, offset, (float)entry.Value.MoveSpeed!.Value);
+                offset += sizeof(float);
+            }
+            else if (entry.Value.Kind == WorkspaceSceneDocumentCodec.PatrolHazardKind)
+            {
+                WriteSingle(artifact, offset, (float)entry.Value.PatrolMinY!.Value);
+                WriteSingle(artifact, offset + 4, (float)entry.Value.PatrolMaxY!.Value);
+                WriteSingle(artifact, offset + 8, (float)entry.Value.PatrolSpeed!.Value);
+                offset += 12;
+            }
+        }
         if (offset != artifact.Length) throw new InvalidOperationException("Internal KSCN length mismatch.");
         _ = ValidateArtifact(artifact);
         return artifact;
@@ -70,78 +78,133 @@ internal static class WorkspaceSceneCodec
 
     internal static WorkspaceArtifactInfo ValidateArtifact(byte[] artifact)
     {
-        if (artifact.Length < 144 || Encoding.ASCII.GetString(artifact, 0, 4) != "KSCN") throw new InvalidDataException("Scene artifact layout mismatch.");
-        if (ReadUInt32(artifact, 4) != 3 || ReadUInt32(artifact, 8) != 3 || ReadUInt32(artifact, 12) != artifact.Length - HeaderBytes)
+        if (artifact.Length is < HeaderBytes or > MaxArtifactBytes || Encoding.ASCII.GetString(artifact, 0, 4) != "KSCN")
+            throw new InvalidDataException("Scene artifact layout mismatch.");
+        if (ReadUInt32(artifact, 4) != 4 || ReadUInt32(artifact, 8) != 4 || ReadUInt32(artifact, 12) != artifact.Length - HeaderBytes)
             throw new InvalidDataException("Scene artifact header mismatch.");
-        var fields = new float[FieldCount];
         var offset = HeaderBytes;
-        for (var index = 0; index < fields.Length; index++)
-        {
-            fields[index] = ReadSingle(artifact, offset);
-            if (!float.IsFinite(fields[index])) throw new InvalidDataException("Scene artifact contains a non-finite field.");
-            offset += sizeof(float);
-        }
-        ValidateSceneFields(fields);
-        var spriteTextureIds = new[] { ReadUInt32(artifact, offset), ReadUInt32(artifact, offset + 4), ReadUInt32(artifact, offset + 8) };
-        offset += 12;
-        var textureCount = ReadUInt32(artifact, offset);
-        offset += 4;
+        var textureCount = ReadRequiredUInt32(artifact, ref offset);
         if (textureCount is < 1 or > 4) throw new InvalidDataException("Scene artifact texture count mismatch.");
-        var declared = new HashSet<uint>();
+        var textures = new List<WorkspaceSceneTexture>();
         for (var index = 0; index < textureCount; index++)
         {
-            if (offset + 8 > artifact.Length) throw new InvalidDataException("Scene artifact texture entry is truncated.");
-            var textureId = ReadUInt32(artifact, offset);
-            var pathBytes = ReadUInt32(artifact, offset + 4);
-            offset += 8;
-            if (textureId == 0 || !declared.Add(textureId) || pathBytes is 0 or > 255 || offset + pathBytes > artifact.Length)
-                throw new InvalidDataException("Scene artifact texture entry is invalid.");
-            string path;
-            try { path = StrictUtf8.GetString(artifact, offset, checked((int)pathBytes)); }
-            catch (DecoderFallbackException exception) { throw new InvalidDataException("Scene artifact texture path is not valid UTF-8.", exception); }
-            if (!WorkspaceProjectValidator.IsTextureArtifactPath(path)) throw new InvalidDataException("Scene artifact texture path is invalid.");
-            offset += checked((int)pathBytes);
+            var textureId = ReadRequiredUInt32(artifact, ref offset);
+            var pathBytes = ReadRequiredUInt32(artifact, ref offset);
+            var path = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, pathBytes));
+            textures.Add(new WorkspaceSceneTexture(textureId, path));
         }
-        if (offset != artifact.Length || spriteTextureIds.Any(value => !declared.Contains(value))) throw new InvalidDataException("Scene artifact texture binding mismatch.");
-        return Info(artifact, Format, ImporterVersion, BakerVersion);
+        var objectCount = ReadRequiredUInt32(artifact, ref offset);
+        if (objectCount is < WorkspaceSceneDocumentCodec.MinObjectCount or > WorkspaceSceneDocumentCodec.MaxObjectCount)
+            throw new InvalidDataException("Scene artifact object count mismatch.");
+        var objects = new List<WorkspaceSceneObject>();
+        for (var index = 0; index < objectCount; index++)
+        {
+            var entryBytes = ReadRequiredUInt32(artifact, ref offset);
+            if (entryBytes > int.MaxValue || entryBytes > artifact.Length - offset)
+                throw new InvalidDataException("Scene artifact object entry is truncated.");
+            var entryEnd = offset + (int)entryBytes;
+            var kind = KindName(ReadRequiredUInt32(artifact, ref offset));
+            var objectIdBytes = ReadRequiredUInt32(artifact, ref offset);
+            var objectId = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, objectIdBytes));
+            var position = ReadVector(artifact, ref offset, 2);
+            var size = ReadVector(artifact, ref offset, 2);
+            var color = ReadVector(artifact, ref offset, 4);
+            var textureId = ReadRequiredUInt32(artifact, ref offset);
+            double? moveSpeed = null;
+            double? patrolMinY = null;
+            double? patrolMaxY = null;
+            double? patrolSpeed = null;
+            if (kind == WorkspaceSceneDocumentCodec.PlayerKind)
+            {
+                moveSpeed = ReadRequiredSingle(artifact, ref offset);
+            }
+            else if (kind == WorkspaceSceneDocumentCodec.PatrolHazardKind)
+            {
+                patrolMinY = ReadRequiredSingle(artifact, ref offset);
+                patrolMaxY = ReadRequiredSingle(artifact, ref offset);
+                patrolSpeed = ReadRequiredSingle(artifact, ref offset);
+            }
+            if (offset != entryEnd) throw new InvalidDataException("Scene artifact object entry length mismatch.");
+            objects.Add(new WorkspaceSceneObject(objectId, kind, position, size, color, textureId, moveSpeed, patrolMinY, patrolMaxY, patrolSpeed));
+        }
+        if (offset != artifact.Length) throw new InvalidDataException("Scene artifact contains trailing bytes.");
+        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects); }
+        catch (WorkspaceProjectValidationException exception) { throw new InvalidDataException(exception.Message, exception); }
+        return new WorkspaceArtifactInfo(Convert.ToHexString(SHA256.HashData(artifact)).ToLowerInvariant(), artifact.LongLength, Format, ImporterVersion, BakerVersion);
     }
 
-    private static void ValidateSceneFields(float[] fields)
+    private static uint KindValue(string kind) => kind switch
     {
-        if (fields[2] <= 0 || fields[3] <= 0 || fields[11] <= 0 || fields[12] <= 0 || fields[19] <= 0 || fields[20] <= 0)
-            throw new InvalidDataException("Scene artifact contains a non-positive sprite size.");
-        foreach (var index in new[] { 4, 5, 6, 7, 13, 14, 15, 16, 21, 22, 23, 24 })
-            if (fields[index] is < 0 or > 1) throw new InvalidDataException("Scene artifact color is outside [0, 1].");
-        if (fields[8] < 0 || fields[27] < 0 || fields[25] >= fields[26] || fields[18] < fields[25] || fields[18] > fields[26])
-            throw new InvalidDataException("Scene artifact movement fields are invalid.");
-    }
+        WorkspaceSceneDocumentCodec.SpriteKind => 1,
+        WorkspaceSceneDocumentCodec.PlayerKind => 2,
+        WorkspaceSceneDocumentCodec.GoalKind => 3,
+        WorkspaceSceneDocumentCodec.PatrolHazardKind => 4,
+        _ => throw new InvalidOperationException($"Unsupported Scene object kind: {kind}.")
+    };
 
-    private static void AddSprite(List<float> fields, JsonElement sprite, bool hasMoveSpeed)
+    private static string KindName(uint kind) => kind switch
     {
-        AddVector(fields, sprite.GetProperty("position"));
-        AddVector(fields, sprite.GetProperty("size"));
-        AddVector(fields, sprite.GetProperty("color"));
-        if (hasMoveSpeed) fields.Add((float)sprite.GetProperty("moveSpeed").GetDouble());
-    }
+        1 => WorkspaceSceneDocumentCodec.SpriteKind,
+        2 => WorkspaceSceneDocumentCodec.PlayerKind,
+        3 => WorkspaceSceneDocumentCodec.GoalKind,
+        4 => WorkspaceSceneDocumentCodec.PatrolHazardKind,
+        _ => throw new InvalidDataException($"Scene artifact contains unsupported object kind: {kind}.")
+    };
 
-    private static void AddVector(List<float> fields, JsonElement value)
+    private static uint ReadRequiredUInt32(byte[] bytes, ref int offset)
     {
-        foreach (var element in value.EnumerateArray()) fields.Add((float)element.GetDouble());
+        if (offset > bytes.Length - sizeof(uint)) throw new InvalidDataException("Scene artifact is truncated.");
+        var value = ReadUInt32(bytes, offset);
+        offset += sizeof(uint);
+        return value;
     }
 
-    private static JsonDocument Parse(byte[] source)
+    private static float ReadRequiredSingle(byte[] bytes, ref int offset)
     {
-        var offset = source.AsSpan().StartsWith(Encoding.UTF8.Preamble) ? Encoding.UTF8.Preamble.Length : 0;
-        return JsonDocument.Parse(source.AsMemory(offset));
+        if (offset > bytes.Length - sizeof(float)) throw new InvalidDataException("Scene artifact is truncated.");
+        var value = ReadSingle(bytes, offset);
+        offset += sizeof(float);
+        if (!float.IsFinite(value)) throw new InvalidDataException("Scene artifact contains a non-finite value.");
+        return value;
     }
 
-    private static WorkspaceArtifactInfo Info(byte[] bytes, string format, int importerVersion, int bakerVersion) =>
-        new(Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(), bytes.LongLength, format, importerVersion, bakerVersion);
+    private static double[] ReadVector(byte[] bytes, ref int offset, int count)
+    {
+        var values = new double[count];
+        for (var index = 0; index < count; index++) values[index] = ReadRequiredSingle(bytes, ref offset);
+        return values;
+    }
+
+    private static ReadOnlySpan<byte> ReadRequiredBytes(byte[] bytes, ref int offset, uint count)
+    {
+        if (count > int.MaxValue) throw new InvalidDataException("Scene artifact is truncated.");
+        var length = (int)count;
+        if (offset > bytes.Length - length) throw new InvalidDataException("Scene artifact is truncated.");
+        var value = bytes.AsSpan(offset, length);
+        offset += length;
+        return value;
+    }
+
+    private static string DecodeStrictUtf8(ReadOnlySpan<byte> bytes)
+    {
+        try { return StrictUtf8.GetString(bytes); }
+        catch (DecoderFallbackException exception) { throw new InvalidDataException("Scene artifact contains invalid UTF-8.", exception); }
+    }
+
     private static uint ReadUInt32(byte[] bytes, int offset) => BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset, 4));
     private static float ReadSingle(byte[] bytes, int offset) => BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset, 4)));
     private static void WriteUInt32(byte[] bytes, int offset, uint value) => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), value);
     private static void WriteSingle(byte[] bytes, int offset, float value) => BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(offset, 4), BitConverter.SingleToInt32Bits(value));
     private sealed record TextureEntry(uint TextureId, byte[] Artifact);
+    private sealed record ObjectEntry(WorkspaceSceneObject Value, byte[] ObjectId)
+    {
+        internal int EntryBytes => 44 + ObjectId.Length + (Value.Kind switch
+        {
+            WorkspaceSceneDocumentCodec.PlayerKind => 4,
+            WorkspaceSceneDocumentCodec.PatrolHazardKind => 12,
+            _ => 0
+        });
+    }
 }
 
 internal static class WorkspaceScriptCodec

@@ -155,42 +155,7 @@ internal static class WorkspaceProjectValidator
     internal static void ValidateSceneSource(byte[] bytes)
     {
         ValidateDocumentBudget(bytes, "Scene");
-        using var document = Parse(bytes, "Scene");
-        var scene = RequireRootObject(document.RootElement, "Scene");
-        AssertProperties(scene, ["schemaVersion", "textures", "player", "goal", "hazard"], "Scene");
-        if (RequireInt32(scene, "schemaVersion", "Scene") != 3) throw Failure("Unsupported Scene schemaVersion.");
-
-        var textures = RequireArray(scene, "textures", "Scene");
-        if (textures.GetArrayLength() is < 1 or > 4) throw Failure("Scene.textures must contain 1 to 4 entries.");
-        var textureIds = new HashSet<uint>();
-        foreach (var texture in textures.EnumerateArray())
-        {
-            RequireObjectValue(texture, "Scene.textures[]");
-            AssertProperties(texture, ["textureId", "artifact"], "Scene.textures[]");
-            var textureId = RequireUInt32(texture, "textureId", "Scene.textures[]");
-            var artifact = RequireString(texture, "artifact", "Scene.textures[]");
-            if (textureId == 0 || !textureIds.Add(textureId)) throw Failure("Scene.textures textureId must be unique non-zero u32.");
-            if (!IsTextureArtifactPath(artifact)) throw Failure("Scene.textures artifact path is invalid.");
-        }
-
-        var player = RequireObject(scene, "player", "Scene");
-        var goal = RequireObject(scene, "goal", "Scene");
-        var hazard = RequireObject(scene, "hazard", "Scene");
-        AssertProperties(player, ["position", "size", "color", "moveSpeed", "textureId"], "Scene.player");
-        AssertProperties(goal, ["position", "size", "color", "textureId"], "Scene.goal");
-        AssertProperties(hazard, ["position", "size", "color", "patrolMinY", "patrolMaxY", "patrolSpeed", "textureId"], "Scene.hazard");
-        ValidateSprite(player, "Scene.player", textureIds);
-        ValidateSprite(goal, "Scene.goal", textureIds);
-        ValidateSprite(hazard, "Scene.hazard", textureIds);
-
-        if (RequireFiniteDouble(player, "moveSpeed", "Scene.player") < 0) throw Failure("Scene.player.moveSpeed must be non-negative.");
-        var patrolMinY = RequireFiniteDouble(hazard, "patrolMinY", "Scene.hazard");
-        var patrolMaxY = RequireFiniteDouble(hazard, "patrolMaxY", "Scene.hazard");
-        var patrolSpeed = RequireFiniteDouble(hazard, "patrolSpeed", "Scene.hazard");
-        var hazardPosition = RequireVector(hazard, "position", 2, "Scene.hazard");
-        if (patrolMinY >= patrolMaxY) throw Failure("Scene.hazard patrolMinY must be less than patrolMaxY.");
-        if (patrolSpeed < 0) throw Failure("Scene.hazard.patrolSpeed must be non-negative.");
-        if (hazardPosition[1] < patrolMinY || hazardPosition[1] > patrolMaxY) throw Failure("Scene.hazard.position[1] must be inside the patrol range.");
+        _ = WorkspaceSceneDocumentCodec.Parse(bytes);
     }
 
     internal static void ValidateScriptSource(byte[] bytes)

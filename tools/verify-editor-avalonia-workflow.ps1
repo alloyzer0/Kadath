@@ -11,7 +11,6 @@ Set-StrictMode -Version Latest
 $kadath = (Resolve-Path -LiteralPath $KadathRoot).Path
 if ([string]::IsNullOrWhiteSpace($PackageRoot)) { $PackageRoot = Join-Path $kadath 'zig-out' }
 $package = (Resolve-Path -LiteralPath $PackageRoot).Path
-$author = Join-Path $kadath 'tools\editor-author.ps1'
 $project = Join-Path $kadath 'editor\Kadath.Editor.Avalonia\Kadath.Editor.Avalonia.csproj'
 $projectsRoot = [IO.Path]::GetFullPath((Join-Path $package 'bin\projects'))
 $projectsPrefix = $projectsRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
@@ -25,13 +24,37 @@ foreach ($projectDirectory in $projectDirectories) {
     if (Test-Path -LiteralPath $projectDirectory) { throw "Workflow project already exists: $projectDirectory" }
 }
 
+function New-OpenFixture {
+    $sceneTemplate = Join-Path $package 'bin/assets/scenes/preview.scene.json'
+    $scriptTemplate = Join-Path $package 'bin/assets/scripts/preview.script.json'
+    foreach ($template in @($sceneTemplate, $scriptTemplate)) {
+        if (-not (Test-Path -LiteralPath $template -PathType Leaf)) { throw "Workflow template does not exist: $template" }
+    }
+
+    New-Item -ItemType Directory -Path $openProjectDirectory | Out-Null
+    [IO.File]::Copy($sceneTemplate, (Join-Path $openProjectDirectory 'scene.json'))
+    [IO.File]::Copy($scriptTemplate, (Join-Path $openProjectDirectory 'script.json'))
+    $executable = if ($IsWindows) { 'bin/kadath.exe' } else { 'bin/kadath' }
+    $preview = [ordered]@{
+        schemaVersion = 1
+        runtime = [ordered]@{
+            executable = $executable
+            workingDirectory = 'bin'
+            arguments = @('--scene', "projects/$openProjectName/scene.json", '--script', "projects/$openProjectName/script.json")
+        }
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $openProjectDirectory 'preview.json'),
+        ($preview | ConvertTo-Json -Depth 8),
+        [Text.UTF8Encoding]::new($false))
+}
+
 try {
     & dotnet build $project --no-restore -m:1 -p:NuGetAudit=false
     if ($LASTEXITCODE -ne 0) { throw 'Avalonia workflow project build failed.' }
 
-    # 只预建旧 fixture；第二个项目必须由 Avalonia public Create 入口经 typed Client 创建。
-    & pwsh -NoProfile -File $author -Action Create -PackageRoot $package -ProjectName $openProjectName | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Failed to create the Avalonia open fixture.' }
+    # Open fixture 只复制 package 内受控模板；第二个项目必须由 Avalonia public Create 入口经 typed Client 创建。
+    New-OpenFixture
 
     $output = @(& dotnet run --project $project --no-build -- --workflow-smoke $kadath $package $openProjectName $createdProjectName 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "Avalonia shared-Workspace workflow failed: $($output -join ' | ')" }
