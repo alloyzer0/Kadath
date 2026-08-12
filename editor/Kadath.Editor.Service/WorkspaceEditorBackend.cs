@@ -11,10 +11,12 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private readonly WorkspaceAuthoringModel _authoringModel;
     private readonly WorkspacePublicationModel _publicationModel;
     private readonly WorkspaceTextureImportModel _textureImportModel;
+    private readonly WorkspaceScriptSourceAuthoringModel _scriptSourceAuthoringModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
     private readonly List<AuthoringUndoRecord> _authoringHistory = [];
+    private readonly List<ScriptSourceUndoRecord> _scriptSourceHistory = [];
     private const int MaxAuthoringHistory = 32;
     private LiveBakeWatchController? _watch;
     private string _watchProjectName = string.Empty;
@@ -26,13 +28,15 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         WorkspaceReadModel readModel,
         WorkspaceAuthoringModel authoringModel,
         WorkspacePublicationModel publicationModel,
-        WorkspaceTextureImportModel textureImportModel)
+        WorkspaceTextureImportModel textureImportModel,
+        WorkspaceScriptSourceAuthoringModel? scriptSourceAuthoringModel = null)
     {
         _projectLifecycleModel = projectLifecycleModel;
         _readModel = readModel;
         _authoringModel = authoringModel;
         _publicationModel = publicationModel;
         _textureImportModel = textureImportModel;
+        _scriptSourceAuthoringModel = scriptSourceAuthoringModel ?? new WorkspaceScriptSourceAuthoringModel();
     }
 
     public event Func<EditorSessionNotification, Task>? Notification;
@@ -41,6 +45,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     {
         var project = await ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.OpenAsync(parameters, cancellationToken));
         _authoringHistory.Clear();
+        _scriptSourceHistory.Clear();
         return project;
     }
 
@@ -48,6 +53,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     {
         var project = await ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.CreateAsync(parameters, cancellationToken));
         _authoringHistory.Clear();
+        _scriptSourceHistory.Clear();
         return project;
     }
 
@@ -76,6 +82,17 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
 
     public Task<ProjectModelSnapshot> GetProjectSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
         ReadWorkspaceSnapshotAsync(() => _readModel.ReadProjectAsync(project, cancellationToken), project, false);
+
+    public async Task<ScriptSourceDocument> GetScriptSourceAsync(ProjectSessionInfo project, ScriptSourceQueryParameters parameters, CancellationToken cancellationToken)
+    {
+        if (parameters.ScriptId == 0) throw new EditorOperationException("invalid_script_source", "ScriptId must be non-zero.");
+        try
+        {
+            var document = await _scriptSourceAuthoringModel.ReadAsync(project, parameters.ScriptId, cancellationToken);
+            return new ScriptSourceDocument(document.ProjectName, document.ScriptId, document.SourcePath, document.Source, document.AuthoringRevision);
+        }
+        catch (WorkspaceAuthoringException exception) { throw MapScriptSourceError(exception); }
+    }
 
     public Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
         ReadWorkspaceSnapshotAsync(() => _readModel.ReadHierarchyAsync(project, cancellationToken), project, false);
@@ -157,6 +174,52 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             _authoringHistory.RemoveAt(_authoringHistory.Count - 1);
             return new AuthoringMutationResult("undo", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
                 record.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
+        }
+        finally { _authoringGate.Release(); }
+    }
+
+    public async Task<ScriptSourceMutationResult> EditScriptSourceAsync(ProjectSessionInfo project, ScriptSourceEditParameters parameters, CancellationToken cancellationToken)
+    {
+        await _authoringGate.WaitAsync(cancellationToken);
+        try
+        {
+            try
+            {
+                var commit = await _scriptSourceAuthoringModel.ApplyAsync(project, parameters.ExpectedRevision, parameters.ScriptId, parameters.Source, cancellationToken);
+                if (commit.State == "unchanged")
+                    return await CreateScriptSourceResultAsync("edit", project, parameters.ScriptId, commit, _scriptSourceHistory.Count, cancellationToken);
+                if (commit.UndoToken is null) throw new EditorOperationException("script_source_protocol_error", "Script source commit emitted no undo token.");
+                if (_scriptSourceHistory.Count > 0 && !string.Equals(_scriptSourceHistory[^1].RevisionAfter, commit.PreviousRevision, StringComparison.OrdinalIgnoreCase))
+                    _scriptSourceHistory.Clear();
+                _scriptSourceHistory.Add(new ScriptSourceUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.UndoToken));
+                if (_scriptSourceHistory.Count > MaxAuthoringHistory) _scriptSourceHistory.RemoveAt(0);
+                return await CreateScriptSourceResultAsync("edit", project, parameters.ScriptId, commit, _scriptSourceHistory.Count, cancellationToken);
+            }
+            catch (WorkspaceAuthoringException exception) { throw MapScriptSourceError(exception); }
+        }
+        finally { _authoringGate.Release(); }
+    }
+
+    public async Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ProjectSessionInfo project, ScriptSourceUndoParameters parameters, CancellationToken cancellationToken)
+    {
+        await _authoringGate.WaitAsync(cancellationToken);
+        try
+        {
+            try
+            {
+                var current = await GetProjectSnapshotAsync(project, cancellationToken);
+                ValidateExpectedRevision(parameters.ExpectedRevision, current.AuthoringRevision);
+                if (_scriptSourceHistory.Count == 0) throw new EditorOperationException("script_source_undo_empty", "There is no script source mutation to undo.");
+                var record = _scriptSourceHistory[^1];
+                if (!string.Equals(record.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(record.RevisionAfter, current.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
+                    throw new EditorOperationException("script_source_history_diverged", "Script source history no longer matches the current revision.");
+                var commit = await _scriptSourceAuthoringModel.UndoAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
+                if (commit.State != "succeeded") throw new EditorOperationException("script_source_protocol_error", "Script source undo did not restore a changed state.");
+                _scriptSourceHistory.RemoveAt(_scriptSourceHistory.Count - 1);
+                return await CreateScriptSourceResultAsync("undo", project, record.Token.ScriptId, commit, _scriptSourceHistory.Count, cancellationToken);
+            }
+            catch (WorkspaceAuthoringException exception) { throw MapScriptSourceError(exception); }
         }
         finally { _authoringGate.Release(); }
     }
@@ -266,6 +329,31 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         }
     }
 
+    private async Task<ScriptSourceMutationResult> CreateScriptSourceResultAsync(
+        string operation,
+        ProjectSessionInfo project,
+        uint scriptId,
+        WorkspaceScriptSourceAuthoringCommit commit,
+        int undoDepth,
+        CancellationToken cancellationToken)
+    {
+        var document = await GetScriptSourceAsync(project, new ScriptSourceQueryParameters(project.ProjectName, scriptId), cancellationToken);
+        return new ScriptSourceMutationResult(operation, commit.State, project.ProjectName, commit.PreviousRevision, commit.Revision,
+            commit.ChangedFields, undoDepth, document, commit.ProjectSnapshot, commit.HierarchySnapshot);
+    }
+
+    private static EditorOperationException MapScriptSourceError(WorkspaceAuthoringException exception) =>
+        new(exception.Kind switch
+        {
+            WorkspaceAuthoringFailureKind.InvalidExpectedRevision => "invalid_expected_revision",
+            WorkspaceAuthoringFailureKind.RevisionConflict => "script_source_revision_conflict",
+            WorkspaceAuthoringFailureKind.InvalidPatch => "invalid_script_source",
+            WorkspaceAuthoringFailureKind.Input => "script_source_read_failed",
+            WorkspaceAuthoringFailureKind.Commit => "script_source_commit_failed",
+            WorkspaceAuthoringFailureKind.Invariant => "script_source_protocol_error",
+            _ => "script_source_failed"
+        }, exception.Message);
+
     private async Task<WorkspaceAuthoringCommit> UndoWorkspaceAuthoringAsync(
         ProjectSessionInfo project,
         string expectedRevision,
@@ -295,12 +383,18 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 var sceneModel = model.Scene;
                 var textures = sceneModel?.Textures;
                 var objects = sceneModel?.Objects;
+                var scriptDependencies = model.Script?.Dependencies;
                 var textureSetValid = sceneModel is not null && textures is { Count: >= 1 and <= 4 }
                     && textures.All(texture => texture.TextureId != 0 && IsTextureArtifactPath(texture.Artifact))
                     && textures.Select(texture => texture.TextureId).Distinct().Count() == textures.Count
                     && textures.Any(texture => texture.TextureId == sceneModel.PlayerTextureId)
                     && textures.Any(texture => texture.TextureId == sceneModel.GoalTextureId)
                     && textures.Any(texture => texture.TextureId == sceneModel.HazardTextureId);
+                var behaviorDependencySetValid = model.Script?.SchemaVersion == 2
+                    && scriptDependencies is { Count: >= 1 and <= 16 }
+                    && scriptDependencies.All(dependency => dependency.ScriptId != 0 && IsScriptSourcePath(dependency.Source))
+                    && scriptDependencies.Select(dependency => dependency.ScriptId).Distinct().Count() == scriptDependencies.Count
+                    && scriptDependencies.Select(dependency => dependency.Source).Distinct(StringComparer.Ordinal).Count() == scriptDependencies.Count;
                 if (model is null || model.Files is null || model.Scene is null || model.Script is null || model.Preview is null
                     || model.Scene.GoalPosition is null || model.Script.GoalPosition is null || model.Script.GoalVelocity is null
                     // Revision 是 authoring transaction 的并发令牌，非法值必须在跨越 backend seam 前被拒绝。
@@ -308,15 +402,15 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion is not (3 or 4)
+                    || model.Scene.SchemaVersion is not (3 or 4 or 5)
                     || !textureSetValid
-                    || !ValidateSceneObjects(objects, textures!, sceneModel!)
-                    || model.Script.SchemaVersion != 1
+                    || !ValidateSceneObjects(objects, textures!, sceneModel!, behaviorDependencySetValid ? scriptDependencies!.Select(dependency => dependency.ScriptId).ToHashSet() : null)
+                    || model.Script.SchemaVersion is not (1 or 2)
                     || model.Preview.SchemaVersion != 1
                     || !string.Equals(model.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
                     || model.Scene.GoalPosition.Length != 2
-                    || model.Script.GoalPosition.Length != 2
-                    || model.Script.GoalVelocity.Length != 2
+                    || model.Script.SchemaVersion == 1 && (model.Script.GoalPosition.Length != 2 || model.Script.GoalVelocity.Length != 2)
+                    || model.Script.SchemaVersion == 2 && (!behaviorDependencySetValid || model.Script.GoalPosition.Length != 0 || model.Script.GoalVelocity.Length != 0)
                     || !model.Scene.GoalPosition.Concat(model.Script.GoalPosition).Concat(model.Script.GoalVelocity).All(double.IsFinite))
                 {
                     throw new EditorOperationException("snapshot_protocol_error", "Project snapshot version, project name, or vector shape is invalid.");
@@ -402,10 +496,23 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         return artifact.Split('/').All(segment => segment.Length > 0 && segment is not "." and not "..");
     }
 
+    private static bool IsScriptSourcePath(string source)
+    {
+        if (string.IsNullOrEmpty(source) || System.Text.Encoding.UTF8.GetByteCount(source) > 1024
+            || !source.StartsWith("scripts/", StringComparison.Ordinal)
+            || !source.EndsWith(".luau", StringComparison.Ordinal)
+            || source.Contains('\\') || source.Contains('\0'))
+        {
+            return false;
+        }
+        return source.Split('/').All(segment => segment.Length > 0 && segment is not "." and not "..");
+    }
+
     private static bool ValidateSceneObjects(
         IReadOnlyList<ProjectModelSceneObject>? objects,
         IReadOnlyList<ProjectModelTexture> textures,
-        ProjectModelScene scene)
+        ProjectModelScene scene,
+        IReadOnlySet<uint>? behaviorScriptIds)
     {
         if (objects is not { Count: >= 3 and <= 64 }) return false;
         var textureIds = textures.Select(value => value.TextureId).ToHashSet();
@@ -430,16 +537,43 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 if (value.MoveSpeed is null || value.MoveSpeed < 0 || !double.IsFinite(value.MoveSpeed.Value)
                     || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null) return false;
             }
-            else if (value.Kind == "patrol_hazard")
+            if (scene.SchemaVersion == 5)
             {
-                if (value.MoveSpeed is not null || value.PatrolMinY is null || value.PatrolMaxY is null || value.PatrolSpeed is null
-                    || !double.IsFinite(value.PatrolMinY.Value) || !double.IsFinite(value.PatrolMaxY.Value) || !double.IsFinite(value.PatrolSpeed.Value)
-                    || value.PatrolMinY >= value.PatrolMaxY || value.PatrolSpeed < 0
-                    || value.Position[1] < value.PatrolMinY || value.Position[1] > value.PatrolMaxY) return false;
+                if (behaviorScriptIds is null
+                    || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null
+                    || value.Behaviors is null || value.Behaviors.Count > 4)
+                {
+                    return false;
+                }
+                var bindingIds = new HashSet<uint>();
+                foreach (var binding in value.Behaviors)
+                {
+                    if (binding.ScriptId == 0 || !behaviorScriptIds.Contains(binding.ScriptId)
+                        || !bindingIds.Add(binding.ScriptId)
+                        || binding.Parameters is not { Count: <= 16 }) return false;
+                    var parameterNames = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var parameter in binding.Parameters)
+                    {
+                        if (!IsBehaviorParameterName(parameter.Name) || !parameterNames.Add(parameter.Name)
+                            || !double.IsFinite(parameter.Value) || !float.IsFinite((float)parameter.Value)) return false;
+                    }
+                }
+                if (value.Kind == "patrol_hazard" && value.Behaviors.Count == 0) return false;
             }
-            else if (value.MoveSpeed is not null || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null)
+            else
             {
-                return false;
+                if (value.Behaviors is { Count: > 0 }) return false;
+                if (value.Kind == "patrol_hazard")
+                {
+                    if (value.MoveSpeed is not null || value.PatrolMinY is null || value.PatrolMaxY is null || value.PatrolSpeed is null
+                        || !double.IsFinite(value.PatrolMinY.Value) || !double.IsFinite(value.PatrolMaxY.Value) || !double.IsFinite(value.PatrolSpeed.Value)
+                        || value.PatrolMinY >= value.PatrolMaxY || value.PatrolSpeed < 0
+                        || value.Position[1] < value.PatrolMinY || value.Position[1] > value.PatrolMaxY) return false;
+                }
+                else if (value.Kind != "player" && (value.MoveSpeed is not null || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null))
+                {
+                    return false;
+                }
             }
         }
         return scene.PlayerTextureId == players[0].TextureId
@@ -453,6 +587,15 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         if (string.IsNullOrEmpty(value) || System.Text.Encoding.UTF8.GetByteCount(value) is < 1 or > 63 || value[0] is < 'a' or > 'z') return false;
         return value.Skip(1).All(character => character is >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or '-');
     }
+
+    private static bool IsBehaviorParameterName(string value)
+    {
+        if (string.IsNullOrEmpty(value) || System.Text.Encoding.UTF8.GetByteCount(value) is < 1 or > 63
+            || !IsIdentifierStart(value[0])) return false;
+        return value.Skip(1).All(character => IsIdentifierStart(character) || character is >= '0' and <= '9');
+    }
+
+    private static bool IsIdentifierStart(char value) => value is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or '_';
 
     private static void ValidatePublicationTarget(PublicationTargetSnapshot target, string expectedTarget)
     {
@@ -518,6 +661,12 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         string RevisionAfter,
         string[] ChangedFields,
         WorkspaceAuthoringUndoToken Token);
+
+    private sealed record ScriptSourceUndoRecord(
+        string ProjectName,
+        string RevisionAfter,
+        string[] ChangedFields,
+        WorkspaceScriptSourceUndoToken Token);
     private static string NormalizeTarget(string target) => target.ToLowerInvariant() switch
     {
         "scene" => "Scene",

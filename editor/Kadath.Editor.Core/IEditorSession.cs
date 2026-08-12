@@ -19,10 +19,13 @@ public interface IEditorSessionBackend : IAsyncDisposable
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
+    Task<ScriptSourceDocument> GetScriptSourceAsync(ProjectSessionInfo project, ScriptSourceQueryParameters parameters, CancellationToken cancellationToken);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken);
     Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> UndoAuthoringAsync(ProjectSessionInfo project, AuthoringUndoParameters parameters, CancellationToken cancellationToken);
+    Task<ScriptSourceMutationResult> EditScriptSourceAsync(ProjectSessionInfo project, ScriptSourceEditParameters parameters, CancellationToken cancellationToken);
+    Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ProjectSessionInfo project, ScriptSourceUndoParameters parameters, CancellationToken cancellationToken);
     Task<EditorBakeResult> BakeAsync(ProjectSessionInfo project, BakeStartParameters parameters, CancellationToken cancellationToken);
     Task<EditorWatchResult> StartWatchAsync(ProjectSessionInfo project, WatchStartParameters parameters, CancellationToken cancellationToken);
     Task<EditorWatchResult> StopWatchAsync(CancellationToken cancellationToken);
@@ -43,10 +46,13 @@ public interface IEditorSession : IAsyncDisposable
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<EditorBakeResult> BakeAsync(BakeStartParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<EditorWatchResult> StartWatchAsync(WatchStartParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<EditorWatchResult> StopWatchAsync(string? requestId, CancellationToken cancellationToken = default);
@@ -65,9 +71,12 @@ public sealed class EditorSession : IEditorSession
         "hierarchy_snapshot",
         "asset_catalog_snapshot",
         "publication_snapshot",
+        "script_source_read",
         "texture_import",
         "authoring_apply",
         "authoring_undo",
+        "script_source_edit",
+        "script_source_undo",
         "bake_start",
         "watch_start",
         "watch_stop",
@@ -158,6 +167,22 @@ public sealed class EditorSession : IEditorSession
         return result;
     }
 
+    public async Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default)
+    {
+        var project = RequireProject(parameters.ProjectName);
+        try
+        {
+            var result = await _backend.GetScriptSourceAsync(project, parameters, cancellationToken);
+            await EmitAsync("script_source_read", result, requestId);
+            return result;
+        }
+        catch (EditorOperationException exception)
+        {
+            await EmitAsync("script_source_read_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+            throw;
+        }
+    }
+
     public async Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default)
     {
         var project = RequireProject(parameters.ProjectName);
@@ -227,6 +252,50 @@ public sealed class EditorSession : IEditorSession
             catch (EditorOperationException exception)
             {
                 await EmitAsync("authoring_undo_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+                throw;
+            }
+        }
+        finally { _projectMutationGate.Release(); }
+    }
+
+    public async Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, string? requestId, CancellationToken cancellationToken = default)
+    {
+        await _projectMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var project = RequireProject(parameters.ProjectName);
+            await EmitAsync("script_source_edit_started", new { projectName = project.ProjectName, scriptId = parameters.ScriptId, expectedRevision = parameters.ExpectedRevision }, requestId);
+            try
+            {
+                var result = await _backend.EditScriptSourceAsync(project, parameters, cancellationToken);
+                await EmitAsync("script_source_edit_completed", result, requestId);
+                return result;
+            }
+            catch (EditorOperationException exception)
+            {
+                await EmitAsync("script_source_edit_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+                throw;
+            }
+        }
+        finally { _projectMutationGate.Release(); }
+    }
+
+    public async Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default)
+    {
+        await _projectMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var project = RequireProject(parameters.ProjectName);
+            await EmitAsync("script_source_undo_started", new { projectName = project.ProjectName, expectedRevision = parameters.ExpectedRevision }, requestId);
+            try
+            {
+                var result = await _backend.UndoScriptSourceAsync(project, parameters, cancellationToken);
+                await EmitAsync("script_source_undo_completed", result, requestId);
+                return result;
+            }
+            catch (EditorOperationException exception)
+            {
+                await EmitAsync("script_source_undo_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
                 throw;
             }
         }

@@ -546,6 +546,10 @@ internal static class Program
         var capabilities = await client.GetCapabilitiesAsync().ConfigureAwait(false);
         Assert(capabilities.Commands.Contains("project_open"), "real service did not advertise project_open");
         Assert(capabilities.Commands.Contains("project_validate"), "real service did not advertise project_validate");
+        Assert(capabilities.Commands.Contains("script_source_read")
+            && capabilities.Commands.Contains("script_source_edit")
+            && capabilities.Commands.Contains("script_source_undo"),
+            "real service did not advertise script source commands");
         var project = await client.OpenProjectAsync(new ProjectOpenParameters(packageRoot, projectName)).ConfigureAwait(false);
         Assert(project.ProjectName == projectName, "real service project_open mismatch");
         var validation = await client.ValidateProjectAsync(new ProjectValidateParameters()).ConfigureAwait(false);
@@ -555,17 +559,71 @@ internal static class Program
         var assetSnapshot = await client.GetAssetCatalogSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var publicationSnapshot = await client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, "debug")).ConfigureAwait(false);
         Assert(projectSnapshot.ModelVersion == 1 && hierarchySnapshot.SnapshotVersion == 2, "real service snapshot version mismatch");
-        Assert(projectSnapshot.Scene.SchemaVersion == 3
+        Assert(projectSnapshot.Scene.SchemaVersion == 5
             && projectSnapshot.Scene.Textures is { Count: 3 }
             && projectSnapshot.Scene.Textures.Any(texture => texture.TextureId == 3)
-            && projectSnapshot.Scene.HazardTextureId == 3, "real service scene texture snapshot mismatch");
-        Assert(hierarchySnapshot.Nodes.Length == 11, "real service hierarchy snapshot count mismatch");
+            && projectSnapshot.Scene.HazardTextureId == 3
+            && projectSnapshot.Scene.Objects is { Count: 5 }
+            && projectSnapshot.Scene.Objects.Count(value => value.Behaviors is { Count: > 0 }) == 2,
+            "real service scene v5 snapshot mismatch");
+        Assert(projectSnapshot.Script.SchemaVersion == 2
+            && projectSnapshot.Script.GoalPosition.Length == 0
+            && projectSnapshot.Script.GoalVelocity.Length == 0
+            && projectSnapshot.Script.Dependencies is { Count: 1 }
+            && projectSnapshot.Script.Dependencies[0].ScriptId == 1
+            && projectSnapshot.Script.Dependencies[0].Source == "scripts/patrol.luau",
+            "real service script v2 snapshot mismatch");
+        Assert(hierarchySnapshot.Nodes.Any(node => node.Kind == "SceneBehavior")
+            && hierarchySnapshot.Nodes.Any(node => node.Kind == "ScriptDependency"),
+            "real service behavior hierarchy projection mismatch");
         Assert(assetSnapshot.CatalogVersion == 1 && assetSnapshot.ItemCount == assetSnapshot.Items.Length, "real service asset snapshot mismatch");
         Assert(projectSnapshot.AuthoringRevision.Length == 64, "real service authoring revision mismatch");
         Assert(publicationSnapshot.SnapshotVersion == EditorSnapshotVersions.Publication, "real service publication snapshot version mismatch");
         Assert(capabilities.Commands.Contains("publication_snapshot"), "real service did not advertise publication_snapshot");
         Console.WriteLine("publication_service_smoke=ok");
         Console.WriteLine("snapshot_service_smoke=ok");
+
+        var sourceDocument = await client.GetScriptSourceAsync(
+            new ScriptSourceQueryParameters(projectName, 1)).ConfigureAwait(false);
+        Assert(sourceDocument.ProjectName == projectName
+            && sourceDocument.ScriptId == 1
+            && sourceDocument.SourcePath == "scripts/patrol.luau"
+            && sourceDocument.Source.Contains("fixed_update", StringComparison.Ordinal)
+            && sourceDocument.AuthoringRevision == projectSnapshot.AuthoringRevision,
+            "real service script source read failed");
+        const string rpcMarker = "\n-- rpc script source smoke\n";
+        var sourceEdited = await client.EditScriptSourceAsync(
+            new ScriptSourceEditParameters(projectName, sourceDocument.AuthoringRevision, 1, sourceDocument.Source + rpcMarker)).ConfigureAwait(false);
+        Assert(sourceEdited.Operation == "edit"
+            && sourceEdited.State == "succeeded"
+            && sourceEdited.ChangedFields.Contains("script.sources[1]")
+            && sourceEdited.UndoDepth == 1
+            && sourceEdited.SourceDocument.Source.EndsWith(rpcMarker, StringComparison.Ordinal)
+            && sourceEdited.Revision != sourceDocument.AuthoringRevision,
+            "real service script source edit failed");
+        try
+        {
+            _ = await client.EditScriptSourceAsync(new ScriptSourceEditParameters(
+                projectName, sourceDocument.AuthoringRevision, 1, sourceDocument.Source + "\n-- stale\n")).ConfigureAwait(false);
+            throw new InvalidOperationException("stale script source revision unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "script_source_revision_conflict") { }
+        var sourceUndone = await client.UndoScriptSourceAsync(
+            new ScriptSourceUndoParameters(projectName, sourceEdited.Revision)).ConfigureAwait(false);
+        Assert(sourceUndone.Operation == "undo"
+            && sourceUndone.State == "succeeded"
+            && sourceUndone.UndoDepth == 0
+            && sourceUndone.SourceDocument.Source == sourceDocument.Source
+            && sourceUndone.ProjectSnapshot.AuthoringRevision == sourceDocument.AuthoringRevision,
+            "real service script source undo failed");
+        try
+        {
+            _ = await client.UndoScriptSourceAsync(new ScriptSourceUndoParameters(projectName, sourceUndone.Revision)).ConfigureAwait(false);
+            throw new InvalidOperationException("empty script source undo unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "script_source_undo_empty") { }
+        Console.WriteLine("script_source_service_smoke=ok");
+
         Assert(capabilities.Commands.Contains("authoring_apply") && capabilities.Commands.Contains("authoring_undo"), "real service did not advertise authoring commands");
 
         try

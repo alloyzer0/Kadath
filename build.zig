@@ -8,6 +8,8 @@ pub fn build(b: *std.Build) void {
         target.result.os.tag == .linux and
         target.result.abi == .gnu;
     const configured_glslc = b.option([]const u8, "glslc", "Absolute path to the glslc executable");
+    const configured_alsa_include_dir = b.option([]const u8, "alsa-include-dir", "Directory containing alsa/asoundlib.h");
+    const configured_alsa_library_dir = b.option([]const u8, "alsa-library-dir", "Directory containing libasound.so");
     var linux_platform_contract_binary: ?std.Build.LazyPath = null;
     var linux_window_verifier_binary: ?std.Build.LazyPath = null;
     const mingw_gcc_runtime_dir: ?[]const u8 = if (target.result.os.tag == .windows)
@@ -119,6 +121,12 @@ pub fn build(b: *std.Build) void {
             platform_mod.linkSystemLibrary("xcb", .{});
             rhi_mod.linkSystemLibrary("vulkan", .{});
             audio_mod.addCMacro("_FORTIFY_SOURCE", "0");
+            if (configured_alsa_include_dir) |include_dir| {
+                audio_mod.addIncludePath(.{ .cwd_relative = include_dir });
+            }
+            if (configured_alsa_library_dir) |library_dir| {
+                audio_mod.addLibraryPath(.{ .cwd_relative = library_dir });
+            }
             audio_mod.linkSystemLibrary("asound", .{});
         },
         else => {},
@@ -157,6 +165,13 @@ pub fn build(b: *std.Build) void {
     var async_texture_test_step: ?*std.Build.Step = null;
     var world_cargo_step: ?*std.Build.Step = null;
     var world_library_path: ?[]const u8 = null;
+    var behavior_native_step: ?*std.Build.Step = null;
+    var behavior_artifact_mod: ?*std.Build.Module = null;
+    var behavior_manifest_mod: ?*std.Build.Module = null;
+    var behavior_package_builder_mod: ?*std.Build.Module = null;
+    var behavior_runtime_mod: ?*std.Build.Module = null;
+    var behavior_scene_binding_mod: ?*std.Build.Module = null;
+    var behavior_tooling_mod: ?*std.Build.Module = null;
     if (target.result.os.tag == .windows) {
         const rust_target = switch (target.result.cpu.arch) {
             .x86_64 => "x86_64-pc-windows-gnu",
@@ -223,6 +238,141 @@ pub fn build(b: *std.Build) void {
         async_texture_test_mod.linkSystemLibrary("ws2_32", .{});
     } else if (target.result.os.tag == .linux and target.result.cpu.arch == .x86_64) {
         exe.each_lib_rpath = false;
+        const behavior_build_type = if (optimize == .Debug) "Debug" else "Release";
+        const behavior_build_dir = b.pathFromRoot(b.fmt(".zig-cache/behavior-script-{s}", .{@tagName(optimize)}));
+        const behavior_configure = b.addSystemCommand(&.{
+            "cmake",
+            "-S",
+            b.pathFromRoot("modules/behavior_script/native"),
+            "-B",
+            behavior_build_dir,
+            b.fmt("-DCMAKE_BUILD_TYPE={s}", .{behavior_build_type}),
+            b.fmt("-DCMAKE_C_COMPILER={s}", .{b.pathFromRoot("tools/zig-cc.sh")}),
+            b.fmt("-DCMAKE_CXX_COMPILER={s}", .{b.pathFromRoot("tools/zig-cxx.sh")}),
+            "-DLUAU_BUILD_CLI=OFF",
+            "-DLUAU_BUILD_TESTS=OFF",
+            "-DLUAU_BUILD_WEB=OFF",
+        });
+        const behavior_native_build = b.addSystemCommand(&.{
+            "cmake",
+            "--build",
+            behavior_build_dir,
+            "--parallel",
+            "8",
+            "--target",
+            "kadath_luau_runtime",
+            "kadath_luau_tooling",
+        });
+        behavior_native_build.step.dependOn(&behavior_configure.step);
+        behavior_native_step = &behavior_native_build.step;
+
+        const common_module = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/src/common.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const artifact_module = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/src/artifact.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        artifact_module.addImport("behavior_common", common_module);
+        behavior_artifact_mod = artifact_module;
+        const manifest_module = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/src/manifest.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        manifest_module.addImport("behavior_common", common_module);
+        behavior_manifest_mod = manifest_module;
+        const runtime_module = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/src/runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        runtime_module.addIncludePath(b.path("modules/behavior_script/native"));
+        runtime_module.addImport("behavior_common", common_module);
+        runtime_module.addImport("behavior_artifact", artifact_module);
+        runtime_module.addLibraryPath(.{ .cwd_relative = behavior_build_dir });
+        runtime_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ behavior_build_dir, "luau" }) });
+        runtime_module.linkSystemLibrary("kadath_luau_runtime", .{ .preferred_link_mode = .static });
+        runtime_module.linkSystemLibrary("Luau.VM", .{ .preferred_link_mode = .static });
+        runtime_module.linkSystemLibrary("Luau.Common", .{ .preferred_link_mode = .static });
+        behavior_runtime_mod = runtime_module;
+        const scene_binding_module = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/src/scene_binding.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        scene_binding_module.addImport("behavior_common", common_module);
+        scene_binding_module.addImport("behavior_artifact", artifact_module);
+        scene_binding_module.addImport("behavior_runtime", runtime_module);
+        behavior_scene_binding_mod = scene_binding_module;
+
+        const tooling_module = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/src/tooling.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        tooling_module.addIncludePath(b.path("modules/behavior_script/native"));
+        tooling_module.addImport("behavior_common", common_module);
+        tooling_module.addLibraryPath(.{ .cwd_relative = behavior_build_dir });
+        tooling_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ behavior_build_dir, "luau" }) });
+        tooling_module.linkSystemLibrary("kadath_luau_tooling", .{ .preferred_link_mode = .static });
+        tooling_module.linkSystemLibrary("Luau.Analysis", .{ .preferred_link_mode = .static });
+        tooling_module.linkSystemLibrary("Luau.Config", .{ .preferred_link_mode = .static });
+        tooling_module.linkSystemLibrary("Luau.Compiler", .{ .preferred_link_mode = .static });
+        tooling_module.linkSystemLibrary("Luau.Ast", .{ .preferred_link_mode = .static });
+        tooling_module.linkSystemLibrary("Luau.Bytecode", .{ .preferred_link_mode = .static });
+        tooling_module.linkSystemLibrary("Luau.VM", .{ .preferred_link_mode = .static });
+        tooling_module.linkSystemLibrary("Luau.Common", .{ .preferred_link_mode = .static });
+        behavior_tooling_mod = tooling_module;
+        const package_builder_module = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/src/package_builder.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        package_builder_module.addImport("behavior_common", common_module);
+        package_builder_module.addImport("behavior_artifact", artifact_module);
+        package_builder_module.addImport("behavior_manifest", manifest_module);
+        package_builder_module.addImport("behavior_tooling", tooling_module);
+        behavior_package_builder_mod = package_builder_module;
+        const behavior_tool_module = b.createModule(.{
+            .root_source_file = b.path("tools/behavior-script-tool.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        behavior_tool_module.addImport("behavior_manifest", manifest_module);
+        behavior_tool_module.addImport("behavior_package_builder", package_builder_module);
+        behavior_tool_module.addImport("behavior_tooling", tooling_module);
+        const behavior_tool = b.addExecutable(.{
+            .name = "kadath-behavior-tool",
+            .root_module = behavior_tool_module,
+        });
+        behavior_tool.step.dependOn(&behavior_native_build.step);
+        const behavior_tool_build_step = b.step("build-behavior-script-tool", "Build the native Luau behavior Publication adapter");
+        behavior_tool_build_step.dependOn(&behavior_tool.step);
+        const behavior_tool_install = b.addInstallArtifact(behavior_tool, .{
+            .dest_dir = .{ .override = .prefix },
+            .dest_sub_path = "behavior-tools/kadath-behavior-tool",
+        });
+        const behavior_tool_install_step = b.step("install-behavior-script-tool", "Install the native Luau behavior Publication adapter");
+        behavior_tool_install_step.dependOn(&behavior_tool_install.step);
+        exe_mod.addImport("behavior_artifact", artifact_module);
+        exe_mod.addImport("behavior_runtime", runtime_module);
+        exe_mod.addImport("behavior_scene_binding", scene_binding_module);
+        exe.step.dependOn(&behavior_native_build.step);
+
         const rust_target = switch (target.result.cpu.arch) {
             .x86_64 => "x86_64-unknown-linux-gnu",
             else => @panic("P2-Linux-Window-01 supports only x86_64 Linux Rust linking"),
@@ -274,6 +424,138 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&preview_status_test_run.step);
     test_step.dependOn(&preview_control_test_run.step);
     test_step.dependOn(&runtime_options_test_run.step);
+
+    if (behavior_native_step) |native_step| {
+        const behavior_contract_test_mod = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/tests/native_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        behavior_contract_test_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
+        behavior_contract_test_mod.addImport("behavior_tooling", behavior_tooling_mod.?);
+        const behavior_contract_tests = b.addTest(.{ .root_module = behavior_contract_test_mod });
+        behavior_contract_tests.step.dependOn(native_step);
+        const behavior_contract_test_run = b.addRunArtifact(behavior_contract_tests);
+        const behavior_artifact_test_mod = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/tests/artifact_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        behavior_artifact_test_mod.addImport("behavior_artifact", behavior_artifact_mod.?);
+        const behavior_artifact_tests = b.addTest(.{ .root_module = behavior_artifact_test_mod });
+        const behavior_artifact_test_run = b.addRunArtifact(behavior_artifact_tests);
+        const behavior_manifest_test_mod = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/tests/manifest_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        behavior_manifest_test_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
+        const behavior_manifest_tests = b.addTest(.{ .root_module = behavior_manifest_test_mod });
+        const behavior_manifest_test_run = b.addRunArtifact(behavior_manifest_tests);
+        const behavior_package_builder_test_mod = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/tests/package_builder_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        behavior_package_builder_test_mod.addImport("behavior_artifact", behavior_artifact_mod.?);
+        behavior_package_builder_test_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
+        behavior_package_builder_test_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
+        behavior_package_builder_test_mod.addImport("behavior_tooling", behavior_tooling_mod.?);
+        const behavior_package_builder_tests = b.addTest(.{ .root_module = behavior_package_builder_test_mod });
+        behavior_package_builder_tests.step.dependOn(native_step);
+        const behavior_package_builder_test_run = b.addRunArtifact(behavior_package_builder_tests);
+        const behavior_runtime_package_test_mod = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/tests/runtime_package_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        behavior_runtime_package_test_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
+        behavior_runtime_package_test_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
+        behavior_runtime_package_test_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
+        const behavior_runtime_package_tests = b.addTest(.{ .root_module = behavior_runtime_package_test_mod });
+        behavior_runtime_package_tests.step.dependOn(native_step);
+        const behavior_runtime_package_test_run = b.addRunArtifact(behavior_runtime_package_tests);
+        const behavior_scene_binding_test_mod = b.createModule(.{
+            .root_source_file = b.path("modules/behavior_script/tests/scene_binding_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        behavior_scene_binding_test_mod.addImport("behavior_artifact", behavior_artifact_mod.?);
+        behavior_scene_binding_test_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
+        behavior_scene_binding_test_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
+        behavior_scene_binding_test_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
+        behavior_scene_binding_test_mod.addImport("behavior_scene_binding", behavior_scene_binding_mod.?);
+        const behavior_scene_binding_tests = b.addTest(.{ .root_module = behavior_scene_binding_test_mod });
+        behavior_scene_binding_tests.step.dependOn(native_step);
+        const behavior_scene_binding_test_run = b.addRunArtifact(behavior_scene_binding_tests);
+        const behavior_scene_adapter_test_mod = b.createModule(.{
+            .root_source_file = b.path("app/behavior_scene_adapter.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        behavior_scene_adapter_test_mod.addImport("behavior_artifact", behavior_artifact_mod.?);
+        behavior_scene_adapter_test_mod.addImport("behavior_scene_binding", behavior_scene_binding_mod.?);
+        const behavior_scene_adapter_tests = b.addTest(.{ .root_module = behavior_scene_adapter_test_mod });
+        behavior_scene_adapter_tests.step.dependOn(native_step);
+        const behavior_scene_adapter_test_run = b.addRunArtifact(behavior_scene_adapter_tests);
+        const behavior_host_test_mod = b.createModule(.{
+            .root_source_file = b.path("app/behavior_host_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        behavior_host_test_mod.addImport("behavior_artifact", behavior_artifact_mod.?);
+        behavior_host_test_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
+        behavior_host_test_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
+        behavior_host_test_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
+        behavior_host_test_mod.addImport("behavior_scene_binding", behavior_scene_binding_mod.?);
+        const behavior_host_tests = b.addTest(.{ .root_module = behavior_host_test_mod });
+        behavior_host_tests.step.dependOn(native_step);
+        const behavior_host_test_run = b.addRunArtifact(behavior_host_tests);
+        const behavior_tool_test_mod = b.createModule(.{
+            .root_source_file = b.path("tools/behavior-script-tool.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        behavior_tool_test_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
+        behavior_tool_test_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
+        behavior_tool_test_mod.addImport("behavior_tooling", behavior_tooling_mod.?);
+        const behavior_tool_tests = b.addTest(.{ .root_module = behavior_tool_test_mod });
+        behavior_tool_tests.step.dependOn(native_step);
+        const behavior_tool_test_run = b.addRunArtifact(behavior_tool_tests);
+        const behavior_contract_test_step = b.step("test-behavior-script", "Run native Luau behavior contract tests");
+        behavior_contract_test_step.dependOn(&behavior_contract_test_run.step);
+        behavior_contract_test_step.dependOn(&behavior_artifact_test_run.step);
+        behavior_contract_test_step.dependOn(&behavior_manifest_test_run.step);
+        behavior_contract_test_step.dependOn(&behavior_package_builder_test_run.step);
+        behavior_contract_test_step.dependOn(&behavior_tool_test_run.step);
+        behavior_contract_test_step.dependOn(&behavior_runtime_package_test_run.step);
+        behavior_contract_test_step.dependOn(&behavior_scene_binding_test_run.step);
+        behavior_contract_test_step.dependOn(&behavior_scene_adapter_test_run.step);
+        behavior_contract_test_step.dependOn(&behavior_host_test_run.step);
+        test_step.dependOn(&behavior_contract_test_run.step);
+        test_step.dependOn(&behavior_artifact_test_run.step);
+        test_step.dependOn(&behavior_manifest_test_run.step);
+        test_step.dependOn(&behavior_package_builder_test_run.step);
+        test_step.dependOn(&behavior_tool_test_run.step);
+        test_step.dependOn(&behavior_runtime_package_test_run.step);
+        test_step.dependOn(&behavior_scene_binding_test_run.step);
+        test_step.dependOn(&behavior_scene_adapter_test_run.step);
+        test_step.dependOn(&behavior_host_test_run.step);
+    }
 
     if (world_library_path) |library_path| {
         const scene_generation_test_mod = b.createModule(.{
@@ -359,6 +641,12 @@ pub fn build(b: *std.Build) void {
         audio_test_mod.linkSystemLibrary("winmm", .{});
     } else if (target.result.os.tag == .linux) {
         audio_test_mod.addCMacro("_FORTIFY_SOURCE", "0");
+        if (configured_alsa_include_dir) |include_dir| {
+            audio_test_mod.addIncludePath(.{ .cwd_relative = include_dir });
+        }
+        if (configured_alsa_library_dir) |library_dir| {
+            audio_test_mod.addLibraryPath(.{ .cwd_relative = library_dir });
+        }
         audio_test_mod.linkSystemLibrary("asound", .{});
     }
     const audio_tests = b.addTest(.{ .root_module = audio_test_mod });
@@ -959,7 +1247,11 @@ pub fn build(b: *std.Build) void {
     const install_lost_audio_artifact = b.addInstallFile(lost_audio_artifact, "bin/assets/audio/lost.audio.wav");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_lost_audio_artifact.step);
 
-    const install_scene_source_template = b.addInstallFile(b.path("assets/scenes/preview.scene.json"), "bin/assets/scenes/preview.scene.json");
+    const product_scene_source = if (linux_package_supported)
+        b.path("packaging/linux-assets/preview.scene.json")
+    else
+        b.path("assets/scenes/preview.scene.json");
+    const install_scene_source_template = b.addInstallFile(product_scene_source, "bin/assets/scenes/preview.scene.json");
     if (target.result.os.tag == .windows) install_scene_source_template.step.dependOn(&install_assets.step);
     b.getInstallStep().dependOn(&install_scene_source_template.step);
 
@@ -973,7 +1265,11 @@ pub fn build(b: *std.Build) void {
     const install_scene_artifact = b.addInstallFile(scene_artifact, "bin/assets/scenes/preview.scene");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_scene_artifact.step);
 
-    const install_script_source_template = b.addInstallFile(b.path("assets/scripts/preview.script.json"), "bin/assets/scripts/preview.script.json");
+    const product_script_source = if (linux_package_supported)
+        b.path("packaging/linux-assets/preview.script.json")
+    else
+        b.path("assets/scripts/preview.script.json");
+    const install_script_source_template = b.addInstallFile(product_script_source, "bin/assets/scripts/preview.script.json");
     if (target.result.os.tag == .windows) install_script_source_template.step.dependOn(&install_assets.step);
     b.getInstallStep().dependOn(&install_script_source_template.step);
 
@@ -1094,15 +1390,20 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .link_libcpp = true,
         });
         package_assets_mod.addImport("package_support", package_support_mod);
+        package_assets_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
+        package_assets_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
         package_assets_mod.addCMacro("_FORTIFY_SOURCE", "0");
         package_assets_mod.linkSystemLibrary("png", .{});
         const package_assets = b.addExecutable(.{
             .name = "build-linux-runtime-assets",
             .root_module = package_assets_mod,
         });
+        package_assets.step.dependOn(behavior_native_step.?);
         const package_assets_run = b.addRunArtifact(package_assets);
+        package_assets_run.addFileInput(b.path("packaging/linux-assets/scripts/patrol.luau"));
         const linux_texture_artifact = package_assets_run.addOutputFileArg("test.texture");
         const linux_secondary_texture_artifact = package_assets_run.addOutputFileArg("goal.texture");
         const linux_won_audio_artifact = package_assets_run.addOutputFileArg("won.audio.wav");
@@ -1115,11 +1416,15 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .link_libcpp = true,
         });
         package_assets_test_mod.addImport("package_support", package_support_mod);
+        package_assets_test_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
+        package_assets_test_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
         package_assets_test_mod.addCMacro("_FORTIFY_SOURCE", "0");
         package_assets_test_mod.linkSystemLibrary("png", .{});
         const package_assets_tests = b.addTest(.{ .root_module = package_assets_test_mod });
+        package_assets_tests.step.dependOn(behavior_native_step.?);
         const package_assets_test_run = b.addRunArtifact(package_assets_tests);
         const package_assets_test_step = b.step("test-linux-package-assets", "Run Linux Runtime package asset builder tests");
         package_assets_test_step.dependOn(&package_assets_test_run.step);
@@ -1131,6 +1436,10 @@ pub fn build(b: *std.Build) void {
         const install_linux_lost_audio_artifact = b.addInstallFile(linux_lost_audio_artifact, "bin/assets/audio/lost.audio.wav");
         const install_linux_scene_artifact = b.addInstallFile(linux_scene_artifact, "bin/assets/scenes/preview.scene");
         const install_linux_script_artifact = b.addInstallFile(linux_script_artifact, "bin/assets/scripts/preview.script");
+        const install_linux_behavior_source = b.addInstallFile(
+            b.path("packaging/linux-assets/scripts/patrol.luau"),
+            "bin/assets/scripts/patrol.luau",
+        );
         const install_linux_package_readme = b.addInstallFile(b.path("packaging/README-linux.txt"), "README.txt");
         b.getInstallStep().dependOn(&install_linux_texture_artifact.step);
         b.getInstallStep().dependOn(&install_linux_secondary_texture_artifact.step);
@@ -1138,6 +1447,7 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_linux_lost_audio_artifact.step);
         b.getInstallStep().dependOn(&install_linux_scene_artifact.step);
         b.getInstallStep().dependOn(&install_linux_script_artifact.step);
+        b.getInstallStep().dependOn(&install_linux_behavior_source.step);
         b.getInstallStep().dependOn(&install_linux_package_readme.step);
 
         const package_manifest_command = b.addSystemCommand(&.{"sh"});
@@ -1151,8 +1461,9 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.addFileInput(linux_lost_audio_artifact);
         package_manifest_command.addFileInput(linux_scene_artifact);
         package_manifest_command.addFileInput(linux_script_artifact);
-        package_manifest_command.addFileInput(b.path("assets/scenes/preview.scene.json"));
-        package_manifest_command.addFileInput(b.path("assets/scripts/preview.script.json"));
+        package_manifest_command.addFileInput(product_scene_source);
+        package_manifest_command.addFileInput(product_script_source);
+        package_manifest_command.addFileInput(b.path("packaging/linux-assets/scripts/patrol.luau"));
         package_manifest_command.addFileInput(b.path("packaging/README-linux.txt"));
         package_manifest_command.step.dependOn(&install_exe.step);
         package_manifest_command.step.dependOn(&install_linux_texture_artifact.step);
@@ -1163,6 +1474,7 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.step.dependOn(&install_linux_script_artifact.step);
         package_manifest_command.step.dependOn(&install_scene_source_template.step);
         package_manifest_command.step.dependOn(&install_script_source_template.step);
+        package_manifest_command.step.dependOn(&install_linux_behavior_source.step);
         package_manifest_command.step.dependOn(&install_linux_package_readme.step);
         const install_package_manifest = b.addInstallFile(package_manifest, "SHA256SUMS");
         b.getInstallStep().dependOn(&install_package_manifest.step);

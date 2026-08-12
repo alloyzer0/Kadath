@@ -25,9 +25,9 @@ Kadath Runtime Package (Linux x86_64)
 - `assets/renderer2d/test.texture`：TextureId 1；
 - `assets/renderer2d/goal.texture`：TextureId 2；
 - `assets/audio/won.audio.wav` 与 `lost.audio.wav`：规范 PCM WAV；
-- `assets/scenes/preview.scene`：当前写入 KSCN v4 对象表（Runtime 兼容读取 v1/v2/v3）；
-- `assets/scripts/preview.script`：KSCP v1；
-- `assets/scenes/preview.scene.json` 与 `assets/scripts/preview.script.json`：Editor 原生 Project Create 使用的严格校验模板，不是 Runtime 启动输入。
+- `assets/scenes/preview.scene`：KSCN v5，对两个 Patrol Hazard 声明 Behavior Binding；
+- `assets/scripts/preview.script`：聚合 KSCP v2，包含默认 `patrol.luau`；
+- `assets/scenes/preview.scene.json`、`assets/scripts/preview.script.json` 与 `assets/scripts/patrol.luau`：Linux 默认行为项目的 source dependency set，不是 Runtime 启动输入。
 
 完整性
 ------
@@ -39,4 +39,4 @@ Kadath Runtime Package (Linux x86_64)
 
 仓库开发验证说明
 ----------------
-Editor Service 的手动 Bake 与 Watch 自动 Bake 已使用原生 .NET `WorkspacePublicationModel`，不依赖 PowerShell 执行发布事务；输出保持 KSCN v4、KSCP v1 与 manifest v1。包内仍不包含 Editor，仓库中的 PowerShell importer/live-bake 脚本仅用于兼容入口和字节一致性验证。
+Linux Runtime 包的默认资产由 Zig + Luau tooling 生成 KSCN v5/KSCP v2，不依赖 PowerShell。Editor Service 的 legacy v4/v1 Publication 路径继续兼容旧项目；包内仍不包含 Linux Editor。

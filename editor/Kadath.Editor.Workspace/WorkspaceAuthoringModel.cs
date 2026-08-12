@@ -344,7 +344,7 @@ public sealed class WorkspaceAuthoringModel
         WorkspaceSceneObject[]? normalizedObjects = null;
         if (patch.SceneObjects is not null)
         {
-            try { normalizedObjects = WorkspaceSceneDocumentCodec.NormalizeDefinitions(patch.SceneObjects, workspaceTextures); }
+            try { normalizedObjects = WorkspaceSceneDocumentCodec.NormalizeDefinitions(patch.SceneObjects, workspaceTextures, TargetSceneSchema(current.Scene.SchemaVersion)); }
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
         }
         else if (sceneTextures.ResolvedTextures is not null)
@@ -352,9 +352,7 @@ public sealed class WorkspaceAuthoringModel
             try
             {
                 _ = WorkspaceSceneDocumentCodec.NormalizeDefinitions(
-                    currentObjects.Select(value => new SceneObjectDefinition(value.ObjectId, value.Kind, value.Position, value.Size, value.Color,
-                        value.TextureId, value.MoveSpeed, value.PatrolMinY, value.PatrolMaxY, value.PatrolSpeed)).ToArray(),
-                    workspaceTextures);
+                    currentObjects.Select(ToDefinition).ToArray(), workspaceTextures, TargetSceneSchema(current.Scene.SchemaVersion));
             }
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
         }
@@ -394,9 +392,15 @@ public sealed class WorkspaceAuthoringModel
             ? current.Textures
             : normalized.ResolvedSceneTextures.Select(value => new WorkspaceSceneTexture(value.TextureId, value.Artifact)).ToArray();
         var objects = normalized.ResolvedSceneObjects ?? ApplyFixedObjectPatch(current.Objects, normalized.Patch);
-        if (current.SourceSchemaVersion == WorkspaceSceneDocumentCodec.CurrentSchemaVersion || normalized.ResolvedSceneObjects is not null)
+        if (current.SourceSchemaVersion is WorkspaceSceneDocumentCodec.CurrentSchemaVersion or WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
+            || normalized.ResolvedSceneObjects is not null)
         {
-            try { return WorkspaceSceneDocumentCodec.SerializeV4(textures, objects); }
+            try
+            {
+                return current.SourceSchemaVersion == WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
+                    ? WorkspaceSceneDocumentCodec.SerializeV5(textures, objects)
+                    : WorkspaceSceneDocumentCodec.SerializeV4(textures, objects);
+            }
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
         }
         var scene = ParseObject(original, "Scene");
@@ -457,7 +461,41 @@ public sealed class WorkspaceAuthoringModel
             && pair.First.MoveSpeed == pair.Second.MoveSpeed
             && pair.First.PatrolMinY == pair.Second.PatrolMinY
             && pair.First.PatrolMaxY == pair.Second.PatrolMaxY
-            && pair.First.PatrolSpeed == pair.Second.PatrolSpeed);
+            && pair.First.PatrolSpeed == pair.Second.PatrolSpeed
+            && BehaviorsEqual(pair.First.Behaviors, pair.Second.Behaviors));
+
+    private static bool BehaviorsEqual(
+        IReadOnlyList<ProjectModelSceneBehaviorBinding>? current,
+        IReadOnlyList<WorkspaceSceneBehaviorBinding>? requested)
+    {
+        var left = current ?? Array.Empty<ProjectModelSceneBehaviorBinding>();
+        var right = requested ?? Array.Empty<WorkspaceSceneBehaviorBinding>();
+        return left.Count == right.Count && left.Zip(right).All(pair =>
+            pair.First.ScriptId == pair.Second.ScriptId
+            && (pair.First.Parameters ?? Array.Empty<ProjectModelSceneBehaviorParameter>()).Count == pair.Second.Parameters.Length
+            && (pair.First.Parameters ?? Array.Empty<ProjectModelSceneBehaviorParameter>()).Zip(pair.Second.Parameters).All(parameter =>
+                parameter.First.Name == parameter.Second.Name && parameter.First.Value == parameter.Second.Value));
+    }
+
+    private static SceneObjectDefinition ToDefinition(ProjectModelSceneObject value) => new(
+        value.ObjectId,
+        value.Kind,
+        value.Position,
+        value.Size,
+        value.Color,
+        value.TextureId,
+        value.MoveSpeed,
+        value.PatrolMinY,
+        value.PatrolMaxY,
+        value.PatrolSpeed,
+        value.Behaviors?.Select(binding => new SceneBehaviorBindingDefinition(
+            binding.ScriptId,
+            binding.Parameters?.ToDictionary(parameter => parameter.Name, parameter => parameter.Value, StringComparer.Ordinal))).ToArray());
+
+    private static int TargetSceneSchema(int sourceSchemaVersion) =>
+        sourceSchemaVersion == WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
+            ? WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
+            : WorkspaceSceneDocumentCodec.CurrentSchemaVersion;
 
     private static JsonObject ParseObject(byte[] bytes, string name)
     {

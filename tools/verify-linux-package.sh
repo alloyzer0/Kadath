@@ -16,6 +16,7 @@ bin/assets/renderer2d/goal.texture
 bin/assets/renderer2d/test.texture
 bin/assets/scenes/preview.scene
 bin/assets/scenes/preview.scene.json
+bin/assets/scripts/patrol.luau
 bin/assets/scripts/preview.script
 bin/assets/scripts/preview.script.json
 bin/kadath'
@@ -34,6 +35,7 @@ kadath-linux-x86_64/bin/assets/scenes/
 kadath-linux-x86_64/bin/assets/scenes/preview.scene
 kadath-linux-x86_64/bin/assets/scenes/preview.scene.json
 kadath-linux-x86_64/bin/assets/scripts/
+kadath-linux-x86_64/bin/assets/scripts/patrol.luau
 kadath-linux-x86_64/bin/assets/scripts/preview.script
 kadath-linux-x86_64/bin/assets/scripts/preview.script.json
 kadath-linux-x86_64/bin/kadath'

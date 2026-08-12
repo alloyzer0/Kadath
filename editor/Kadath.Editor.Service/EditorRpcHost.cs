@@ -137,6 +137,15 @@ internal sealed class EditorRpcHost
                 case "texture_import":
                     await WriteResponseAsync(request.Id, true, await _session.ImportTextureAsync(DeserializeParams<TextureImportParameters>(request), request.Id), null);
                     break;
+                case "script_source_read":
+                    await WriteResponseAsync(request.Id, true, await _session.GetScriptSourceAsync(DeserializeParams<ScriptSourceQueryParameters>(request), request.Id), null);
+                    break;
+                case "script_source_edit":
+                    await WriteResponseAsync(request.Id, true, await _session.EditScriptSourceAsync(DeserializeParams<ScriptSourceEditParameters>(request), request.Id), null);
+                    break;
+                case "script_source_undo":
+                    await WriteResponseAsync(request.Id, true, await _session.UndoScriptSourceAsync(DeserializeParams<ScriptSourceUndoParameters>(request), request.Id), null);
+                    break;
                 case "authoring_apply":
                     await WriteResponseAsync(request.Id, true, await _session.ApplyAuthoringAsync(DeserializeParams<AuthoringApplyParameters>(request), request.Id), null);
                     break;

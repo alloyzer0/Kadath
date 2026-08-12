@@ -1329,7 +1329,7 @@ fn validateRuntimeLogs(
             "Runtime host initialized with Vulkan RHI scene objects=3",
         },
         .package_root => .{
-            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=4",
+            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=5",
             "Runtime host initialized with Vulkan RHI scene objects=5",
         },
     };
@@ -1337,6 +1337,18 @@ fn validateRuntimeLogs(
         if (!containsEither(stderr, stdout, needle)) {
             std.log.err("Runtime Scene evidence missing: {s}", .{needle});
             return error.RuntimeLogEvidenceMissing;
+        }
+    }
+    if (asset_mode == .package_root) {
+        const behavior_required = [_][]const u8{
+            "Loaded behavior package: assets/scripts/preview.script, artifact_version=2",
+            "Behavior on_start hooks applied",
+        };
+        for (behavior_required) |needle| {
+            if (!containsEither(stderr, stdout, needle)) {
+                std.log.err("Runtime Behavior evidence missing: {s}", .{needle});
+                return error.RuntimeLogEvidenceMissing;
+            }
         }
     }
     const audio_required: []const []const u8 = switch (audio_expectation) {

@@ -85,6 +85,7 @@ public sealed class WorkspacePublicationModel
         byte[]? scriptSource = null;
         byte[]? sceneArtifact = null;
         byte[]? scriptArtifact = null;
+        WorkspaceScriptSourceSnapshot? scriptSnapshot = null;
         ManifestEntry sceneEntry;
         ManifestEntry scriptEntry;
 
@@ -93,7 +94,7 @@ public sealed class WorkspacePublicationModel
             sceneSource = WorkspaceProjectValidator.ReadDocument(sceneSourcePath, "Scene", cancellationToken);
             sceneArtifact = WorkspaceSceneCodec.EncodeSource(sceneSource);
             var info = WorkspaceSceneCodec.ValidateArtifact(sceneArtifact);
-            sceneEntry = Entry("Scene", packageRoot, sceneSourcePath, sceneSource, sceneArtifactPath, info);
+            sceneEntry = Entry("Scene", packageRoot, sceneSourcePath, Sha256(sceneSource), sceneArtifactPath, info);
         }
         else
         {
@@ -102,10 +103,11 @@ public sealed class WorkspacePublicationModel
 
         if (bakeScript)
         {
-            scriptSource = WorkspaceProjectValidator.ReadDocument(scriptSourcePath, "Script", cancellationToken);
-            scriptArtifact = WorkspaceScriptCodec.EncodeSource(scriptSource);
+            scriptSnapshot = WorkspaceScriptSourceModel.Read(scriptSourcePath, cancellationToken);
+            scriptSource = scriptSnapshot.ManifestSource;
+            scriptArtifact = WorkspaceScriptCodec.EncodeSource(packageRoot, scriptSourcePath, scriptSnapshot, cancellationToken);
             var info = WorkspaceScriptCodec.ValidateArtifact(scriptArtifact);
-            scriptEntry = Entry("Script", packageRoot, scriptSourcePath, scriptSource, scriptArtifactPath, info);
+            scriptEntry = Entry("Script", packageRoot, scriptSourcePath, scriptSnapshot.Revision, scriptArtifactPath, info);
         }
         else
         {
@@ -125,8 +127,7 @@ public sealed class WorkspacePublicationModel
             cancellationToken.ThrowIfCancellationRequested();
             if (bakeScene && !Sha256(sceneSource!).Equals(Sha256(WorkspaceProjectValidator.ReadDocument(sceneSourcePath, "Scene", cancellationToken)), StringComparison.Ordinal))
                 throw Failure(WorkspacePublicationFailureKind.SourceChanged, "Scene source changed during bake.");
-            if (bakeScript && !Sha256(scriptSource!).Equals(Sha256(WorkspaceProjectValidator.ReadDocument(scriptSourcePath, "Script", cancellationToken)), StringComparison.Ordinal))
-                throw Failure(WorkspacePublicationFailureKind.SourceChanged, "Script source changed during bake.");
+            if (bakeScript) scriptSnapshot!.VerifyUnchanged(scriptSourcePath, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             Commit(transactions);
         }
@@ -296,8 +297,8 @@ public sealed class WorkspacePublicationModel
         return entry;
     }
 
-    private static ManifestEntry Entry(string kind, string packageRoot, string sourcePath, byte[] source, string artifactPath, WorkspaceArtifactInfo artifact) =>
-        new(kind, Relative(packageRoot, sourcePath), Sha256(source), Relative(packageRoot, artifactPath), artifact.Sha256, artifact.Bytes,
+    private static ManifestEntry Entry(string kind, string packageRoot, string sourcePath, string sourceRevision, string artifactPath, WorkspaceArtifactInfo artifact) =>
+        new(kind, Relative(packageRoot, sourcePath), sourceRevision, Relative(packageRoot, artifactPath), artifact.Sha256, artifact.Bytes,
             artifact.Format, artifact.ImporterVersion, artifact.BakerVersion);
 
     private static void EnsureOutputDirectory(string path, string name)

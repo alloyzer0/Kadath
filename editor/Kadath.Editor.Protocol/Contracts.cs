@@ -109,6 +109,39 @@ public sealed record ProjectSessionInfo(
 /// </summary>
 public sealed record SnapshotQueryParameters(string? ProjectName = null);
 
+public sealed record ScriptSourceQueryParameters(
+    string? ProjectName,
+    uint ScriptId);
+
+public sealed record ScriptSourceEditParameters(
+    string? ProjectName,
+    string ExpectedRevision,
+    uint ScriptId,
+    string Source);
+
+public sealed record ScriptSourceDocument(
+    string ProjectName,
+    uint ScriptId,
+    string SourcePath,
+    string Source,
+    string AuthoringRevision);
+
+public sealed record ScriptSourceMutationResult(
+    string Operation,
+    string State,
+    string ProjectName,
+    string PreviousRevision,
+    string Revision,
+    string[] ChangedFields,
+    int UndoDepth,
+    ScriptSourceDocument SourceDocument,
+    ProjectModelSnapshot ProjectSnapshot,
+    HierarchySnapshot HierarchySnapshot);
+
+public sealed record ScriptSourceUndoParameters(
+    string? ProjectName,
+    string ExpectedRevision);
+
 public static class EditorSnapshotVersions
 {
     public const int ProjectModel = 1;
@@ -135,6 +168,12 @@ public sealed record ProjectModelScene(
 
 public sealed record ProjectModelTexture(uint TextureId, string Artifact);
 
+public sealed record ProjectModelSceneBehaviorParameter(string Name, double Value);
+
+public sealed record ProjectModelSceneBehaviorBinding(
+    uint ScriptId,
+    IReadOnlyList<ProjectModelSceneBehaviorParameter>? Parameters = null);
+
 public sealed record ProjectModelSceneObject(
     string ObjectId,
     string Kind,
@@ -145,12 +184,16 @@ public sealed record ProjectModelSceneObject(
     double? MoveSpeed = null,
     double? PatrolMinY = null,
     double? PatrolMaxY = null,
-    double? PatrolSpeed = null);
+    double? PatrolSpeed = null,
+    IReadOnlyList<ProjectModelSceneBehaviorBinding>? Behaviors = null);
+
+public sealed record ProjectModelScriptDependency(uint ScriptId, string Source);
 
 public sealed record ProjectModelScript(
     int SchemaVersion,
     double[] GoalPosition,
-    double[] GoalVelocity);
+    double[] GoalVelocity,
+    IReadOnlyList<ProjectModelScriptDependency>? Dependencies = null);
 
 public sealed record ProjectModelPreview(int SchemaVersion);
 
@@ -260,7 +303,12 @@ public sealed record SceneObjectDefinition(
     double? MoveSpeed = null,
     double? PatrolMinY = null,
     double? PatrolMaxY = null,
-    double? PatrolSpeed = null);
+    double? PatrolSpeed = null,
+    IReadOnlyList<SceneBehaviorBindingDefinition>? Behaviors = null);
+
+public sealed record SceneBehaviorBindingDefinition(
+    uint ScriptId,
+    IReadOnlyDictionary<string, double>? Parameters = null);
 
 public sealed record AuthoringPatch(
     double[]? SceneGoalPosition = null,

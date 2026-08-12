@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using Kadath.Editor.Core;
 using Kadath.Editor.Protocol;
+using Kadath.Editor.Workspace;
 
 namespace Kadath.Editor.Service;
 
@@ -15,6 +16,7 @@ internal sealed class LiveBakeWatchController : IAsyncDisposable
     private readonly Func<string, CancellationToken, Task<EditorBakeResult>> _bake;
     private readonly Func<EditorSessionNotification, Task> _notify;
     private readonly WatchTarget[] _targets;
+    private DateTime? _lastObservedChange;
     private CancellationTokenSource? _stop;
     private Task? _loop;
 
@@ -39,7 +41,7 @@ internal sealed class LiveBakeWatchController : IAsyncDisposable
         _stop = new CancellationTokenSource();
         foreach (var target in _targets)
         {
-            var revision = GetRevision(target.Path);
+            var revision = target.GetRevision();
             target.ObservedRevision = revision;
             target.LastSuccessfulRevision = revision;
         }
@@ -66,46 +68,91 @@ internal sealed class LiveBakeWatchController : IAsyncDisposable
         while (await timer.WaitForNextTickAsync(cancellationToken))
         {
             var now = DateTime.UtcNow;
-            // 固定 Scene → Script 顺序，保持 Scene restart 后 Script on_start/fixed_update 的确定性。
-            foreach (var target in _targets)
+            await ObserveTargetsAsync(now, cancellationToken);
+            var ready = _targets.Where(IsReady).ToArray();
+            if (ready.Length == 0) continue;
+            if (_lastObservedChange is null
+                || (now - _lastObservedChange.Value).TotalMilliseconds < _parameters.DebounceMilliseconds) continue;
+
+            if (ready.Any(target => target.Name == "scene") && ready.Any(target => target.Name == "script"))
             {
-                await UpdateTargetAsync(target, now, cancellationToken);
+                await BakeTargetsAsync(ready, "Both", cancellationToken);
+            }
+            else
+            {
+                foreach (var target in ready)
+                {
+                    await BakeTargetsAsync([target], target.AdapterTarget, cancellationToken);
+                }
             }
         }
     }
 
-    private async Task UpdateTargetAsync(WatchTarget target, DateTime now, CancellationToken cancellationToken)
+    private async Task ObserveTargetsAsync(DateTime now, CancellationToken cancellationToken)
     {
-        var revision = GetRevision(target.Path);
-        if (!string.Equals(revision, target.ObservedRevision, StringComparison.Ordinal))
+        foreach (var target in _targets)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            var revision = target.GetRevision();
+            if (string.Equals(revision, target.ObservedRevision, StringComparison.Ordinal)) continue;
             target.ObservedRevision = revision;
             target.PendingRevision = revision;
-            target.PendingSince = now;
+            _lastObservedChange = now;
             await EmitAsync("source_change_detected", new { target = target.Name, revision }, null);
         }
-        if (target.PendingRevision is null || !string.Equals(revision, target.PendingRevision, StringComparison.Ordinal)) { return; }
-        if ((now - target.PendingSince).TotalMilliseconds < _parameters.DebounceMilliseconds) { return; }
-        if (string.Equals(revision, target.LastSuccessfulRevision, StringComparison.Ordinal) || string.Equals(revision, target.FailedRevision, StringComparison.Ordinal))
+    }
+
+    private bool IsReady(WatchTarget target)
+    {
+        if (target.PendingRevision is null || !string.Equals(target.ObservedRevision, target.PendingRevision, StringComparison.Ordinal)) return false;
+        if (string.Equals(target.PendingRevision, target.LastSuccessfulRevision, StringComparison.Ordinal)
+            || string.Equals(target.PendingRevision, target.FailedRevision, StringComparison.Ordinal))
         {
             target.PendingRevision = null;
-            return;
+            return false;
         }
+        return true;
+    }
 
-        await EmitAsync("bake_started", new { target = target.Name, profile = _parameters.Profile, revision }, null);
+    private async Task BakeTargetsAsync(
+        IReadOnlyList<WatchTarget> targets,
+        string adapterTarget,
+        CancellationToken cancellationToken)
+    {
+        var revisions = targets.ToDictionary(target => target.Name, target => target.PendingRevision!, StringComparer.Ordinal);
+        await EmitAsync("bake_started", new
+        {
+            target = adapterTarget,
+            profile = _parameters.Profile,
+            revisions
+        }, null);
         try
         {
-            var result = await _bake(target.AdapterTarget, cancellationToken);
-            target.LastSuccessfulRevision = revision;
-            target.FailedRevision = null;
-            target.PendingRevision = null;
+            var result = await _bake(adapterTarget, cancellationToken);
+            foreach (var target in targets)
+            {
+                target.LastSuccessfulRevision = revisions[target.Name];
+                target.FailedRevision = null;
+                target.PendingRevision = null;
+            }
+            _lastObservedChange = null;
             await EmitAsync("bake_completed", result, null);
         }
         catch (EditorOperationException exception)
         {
-            target.FailedRevision = revision;
-            target.PendingRevision = null;
-            await EmitAsync("bake_failed", new { target = target.Name, errorCode = exception.Code, message = exception.Message, retainedArtifact = true }, null);
+            foreach (var target in targets)
+            {
+                target.FailedRevision = revisions[target.Name];
+                target.PendingRevision = null;
+            }
+            _lastObservedChange = null;
+            await EmitAsync("bake_failed", new
+            {
+                target = adapterTarget,
+                errorCode = exception.Code,
+                message = exception.Message,
+                retainedArtifact = true
+            }, null);
         }
     }
 
@@ -114,8 +161,15 @@ internal sealed class LiveBakeWatchController : IAsyncDisposable
         var normalized = target.ToLowerInvariant();
         if (normalized is not ("scene" or "script" or "both")) { throw new EditorOperationException("invalid_bake_target", $"Unsupported watch target: {target}"); }
         var targets = new List<WatchTarget>();
-        if (normalized is "scene" or "both") { targets.Add(new WatchTarget("scene", "Scene", _project.ScenePath)); }
-        if (normalized is "script" or "both") { targets.Add(new WatchTarget("script", "Script", _project.ScriptPath)); }
+        if (normalized is "scene" or "both")
+        {
+            targets.Add(new WatchTarget("scene", "Scene", _project.ScenePath, () => GetFileRevision(_project.ScenePath)));
+        }
+        if (normalized is "script" or "both")
+        {
+            var tracker = WorkspaceScriptDependencySet.CreateRevisionTracker(_project.ScriptPath);
+            targets.Add(new WatchTarget("script", "Script", _project.ScriptPath, tracker.ComputeRevision));
+        }
         return targets.ToArray();
     }
 
@@ -124,7 +178,7 @@ internal sealed class LiveBakeWatchController : IAsyncDisposable
         await _notify(new EditorSessionNotification(eventName, JsonSerializer.SerializeToElement(data, EditorProtocol.JsonOptions), requestId));
     }
 
-    private static string GetRevision(string path)
+    private static string GetFileRevision(string path)
     {
         if (!File.Exists(path)) { return "missing"; }
         try { return Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))); }
@@ -133,14 +187,14 @@ internal sealed class LiveBakeWatchController : IAsyncDisposable
 
     public async ValueTask DisposeAsync() => await StopAsync();
 
-    private sealed class WatchTarget(string name, string adapterTarget, string path)
+    private sealed class WatchTarget(string name, string adapterTarget, string path, Func<string> getRevision)
     {
         public string Name { get; } = name;
         public string AdapterTarget { get; } = adapterTarget;
         public string Path { get; } = path;
+        public Func<string> GetRevision { get; } = getRevision;
         public string? ObservedRevision { get; set; }
         public string? PendingRevision { get; set; }
-        public DateTime PendingSince { get; set; }
         public string? LastSuccessfulRevision { get; set; }
         public string? FailedRevision { get; set; }
     }

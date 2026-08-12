@@ -21,6 +21,7 @@ archived_package="$workspace/extracted/kadath-linux-x86_64"
 (cd "$archived_package" && sha256sum -c SHA256SUMS) >/dev/null
 test -f "$archived_package/bin/assets/scenes/preview.scene.json"
 test -f "$archived_package/bin/assets/scripts/preview.script.json"
+test -f "$archived_package/bin/assets/scripts/patrol.luau"
 
 touch "$workspace/package/unexpected.txt"
 if sh "$finalizer" "$workspace/package" "$workspace/unexpected-manifest" >/dev/null 2>&1; then

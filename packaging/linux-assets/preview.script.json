@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 2,
+  "scripts": [
+    { "scriptId": 1, "source": "scripts/patrol.luau" }
+  ]
+}

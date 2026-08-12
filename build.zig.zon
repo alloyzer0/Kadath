@@ -15,5 +15,6 @@
         "LICENSE",
         "shaders",
         "assets",
+        "third_party",
     },
 }

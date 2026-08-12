@@ -104,14 +104,46 @@ pub const SceneGeneration = struct {
 
     pub fn stepFixed(self: *SceneGeneration, dt_seconds: f32, input: world_api.InputSnapshot) !void {
         if (!@import("std").math.isFinite(dt_seconds) or dt_seconds < 0.0) return error.InvalidFixedDelta;
-        for (self.hazards[0..self.hazard_count]) |*hazard| {
-            const object = &self.scene.objects.entries[hazard.object_index];
-            const advanced = advancePatrol(hazard.y, hazard.direction, object.patrol, dt_seconds);
-            hazard.y = advanced.y;
-            hazard.direction = advanced.direction;
-            try self.world.setSpritePosition(hazard.entity, .{ object.sprite.position[0], hazard.y });
+        if (self.scene.schemaVersion == scene_api.legacy_object_schema_version) {
+            for (self.hazards[0..self.hazard_count]) |*hazard| {
+                const object = &self.scene.objects.entries[hazard.object_index];
+                const advanced = advancePatrol(hazard.y, hazard.direction, object.patrol, dt_seconds);
+                hazard.y = advanced.y;
+                hazard.direction = advanced.direction;
+                try self.world.setSpritePosition(hazard.entity, .{ object.sprite.position[0], hazard.y });
+            }
         }
         try self.world.stepFixed(dt_seconds, input);
+    }
+
+    pub fn applyTranslationDeltas(self: *SceneGeneration, deltas: []const [2]f64) !void {
+        if (deltas.len != self.scene.objects.count) return error.InvalidBehaviorTranslationBatch;
+        var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+        const ordered = try self.extractOrdered(&sprites);
+        var targets: [scene_api.max_scene_object_count][2]f32 = undefined;
+        for (ordered, 0..) |sprite, index| {
+            const target_x = @as(f64, sprite.position[0]) + deltas[index][0];
+            const target_y = @as(f64, sprite.position[1]) + deltas[index][1];
+            if (!@import("std").math.isFinite(target_x) or
+                !@import("std").math.isFinite(target_y) or
+                @abs(target_x) > @import("std").math.floatMax(f32) or
+                @abs(target_y) > @import("std").math.floatMax(f32))
+            {
+                return error.InvalidBehaviorTranslation;
+            }
+            targets[index] = .{ @floatCast(target_x), @floatCast(target_y) };
+        }
+        for (targets[0..self.scene.objects.count], deltas, 0..) |target, delta, index| {
+            if (delta[0] == 0 and delta[1] == 0) continue;
+            try self.world.setSpritePosition(self.entity_by_object[index], target);
+            if (index == self.goal_index) self.goal_position = target;
+            for (self.hazards[0..self.hazard_count]) |*hazard| {
+                if (hazard.object_index == index) {
+                    hazard.y = target[1];
+                    break;
+                }
+            }
+        }
     }
 
     pub fn setGoalPosition(self: *SceneGeneration, position: [2]f32) !void {
@@ -305,4 +337,33 @@ test "SceneGeneration patrol reflection remains bounded after large travel" {
         try @import("std").testing.expect(hazard.y >= patrol.minY and hazard.y <= patrol.maxY);
     }
     try @import("std").testing.expectError(error.InvalidFixedDelta, generation.stepFixed(-1.0, .{}));
+}
+
+test "SceneGeneration v5 stops native patrol and applies one validated translation batch" {
+    var value = scene_api.default_scene;
+    value.schemaVersion = scene_api.current_schema_version;
+    for (value.objects.mutableSlice()) |*object| {
+        if (object.kind != .patrol_hazard) continue;
+        object.behaviors.count = 1;
+        object.behaviors.entries[0].scriptId = 1;
+    }
+    var generation = try SceneGeneration.prepare(value, .{ .width = 1024, .height = 720 });
+    defer generation.deinit();
+    var before_storage: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+    const before = try generation.extractSprites(&before_storage);
+    try generation.stepFixed(1.0, .{});
+    var native_step_storage: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+    const native_step = try generation.extractSprites(&native_step_storage);
+    try @import("std").testing.expectEqual(before[2].position, native_step[2].position);
+    try @import("std").testing.expectEqual(before[3].position, native_step[3].position);
+
+    var deltas = [_][2]f64{.{ 0, 0 }} ** scene_api.max_scene_object_count;
+    deltas[2] = .{ 0, 5 };
+    deltas[3] = .{ -2, -7 };
+    try generation.applyTranslationDeltas(deltas[0..value.objects.count]);
+    var after_storage: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+    const after = try generation.extractSprites(&after_storage);
+    try @import("std").testing.expectApproxEqAbs(before[2].position[1] + 5, after[2].position[1], 0.0001);
+    try @import("std").testing.expectApproxEqAbs(before[3].position[0] - 2, after[3].position[0], 0.0001);
+    try @import("std").testing.expectApproxEqAbs(before[3].position[1] - 7, after[3].position[1], 0.0001);
 }

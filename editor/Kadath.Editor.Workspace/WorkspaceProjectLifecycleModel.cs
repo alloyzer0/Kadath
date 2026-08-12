@@ -31,6 +31,7 @@ internal enum WorkspaceProjectCreatePhase
     AfterClaim,
     AfterScene,
     AfterScript,
+    AfterScriptDependencies,
     AfterPreview,
     BeforeValidation,
     BeforeCommit
@@ -90,6 +91,7 @@ public sealed class WorkspaceProjectLifecycleModel
         var scriptTemplatePath = WorkspaceProjectValidator.ResolveRequiredFile(paths.PackageRoot, "bin/assets/scripts/preview.script.json", "Script template");
         var sceneBytes = WorkspaceProjectValidator.ReadDocument(sceneTemplatePath, "Scene template", cancellationToken);
         var scriptBytes = WorkspaceProjectValidator.ReadDocument(scriptTemplatePath, "Script template", cancellationToken);
+        var scriptDependencies = WorkspaceScriptSourceModel.ReadTemplateDependencies(scriptTemplatePath, cancellationToken);
         var previewBytes = CreatePreview(parameters.ProjectName);
         WorkspaceProjectValidator.ValidateCreateInputs(sceneBytes, scriptBytes, previewBytes, paths, cancellationToken);
 
@@ -101,6 +103,7 @@ public sealed class WorkspaceProjectLifecycleModel
         var token = Guid.NewGuid().ToString("N");
         var claimPath = Path.Combine(paths.ProjectDirectory, ClaimFileName);
         var createdFiles = new List<CreatedFile>();
+        var createdDirectories = new List<string>();
         FileStream? claimStream = null;
         CreatedFile? claimFile = null;
         try
@@ -135,6 +138,13 @@ public sealed class WorkspaceProjectLifecycleModel
             InvokePhase(WorkspaceProjectCreatePhase.AfterScene, cancellationToken);
             createdFiles.Add(CreateFile(paths.ScriptPath, scriptBytes));
             InvokePhase(WorkspaceProjectCreatePhase.AfterScript, cancellationToken);
+            foreach (var dependency in scriptDependencies)
+            {
+                var dependencyPath = Path.Combine(paths.ProjectDirectory, dependency.SourceName.Replace('/', Path.DirectorySeparatorChar));
+                CreateParentDirectories(paths.ProjectDirectory, dependencyPath, createdDirectories);
+                createdFiles.Add(CreateFile(dependencyPath, dependency.Source));
+            }
+            InvokePhase(WorkspaceProjectCreatePhase.AfterScriptDependencies, cancellationToken);
             createdFiles.Add(CreateFile(paths.PreviewPath, previewBytes));
             InvokePhase(WorkspaceProjectCreatePhase.AfterPreview, cancellationToken);
             InvokePhase(WorkspaceProjectCreatePhase.BeforeValidation, cancellationToken);
@@ -155,7 +165,7 @@ public sealed class WorkspaceProjectLifecycleModel
         catch
         {
             claimStream?.Dispose();
-            Cleanup(paths.ProjectDirectory, claimFile, createdFiles);
+            Cleanup(paths.ProjectDirectory, claimFile, createdFiles, createdDirectories);
             throw;
         }
     }
@@ -200,6 +210,30 @@ public sealed class WorkspaceProjectLifecycleModel
         stream.Write(bytes);
         stream.Flush(flushToDisk: true);
         return new CreatedFile(path, bytes.LongLength, Hash(bytes));
+    }
+
+    private static void CreateParentDirectories(string projectDirectory, string filePath, ICollection<string> createdDirectories)
+    {
+        var projectRoot = Path.GetFullPath(projectDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var parent = Path.GetDirectoryName(Path.GetFullPath(filePath))
+            ?? throw Failure(WorkspaceProjectLifecycleFailureKind.PathEscape, $"Project file has no parent: {filePath}.");
+        var prefix = projectRoot + Path.DirectorySeparatorChar;
+        if (!parent.StartsWith(prefix, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            throw Failure(WorkspaceProjectLifecycleFailureKind.PathEscape, $"Project dependency escapes project directory: {filePath}.");
+        var current = projectRoot;
+        foreach (var segment in Path.GetRelativePath(projectRoot, parent).Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            if (Directory.Exists(current))
+            {
+                WorkspaceProjectValidator.RejectReparsePoint(current, "Project dependency directory");
+                continue;
+            }
+            if (File.Exists(current)) throw Failure(WorkspaceProjectLifecycleFailureKind.Create, $"Project dependency directory is a file: {current}.");
+            Directory.CreateDirectory(current);
+            WorkspaceProjectValidator.RejectReparsePoint(current, "Project dependency directory");
+            createdDirectories.Add(current);
+        }
     }
 
     private static void RequireIdentity(CreatedFile file)
@@ -257,7 +291,11 @@ public sealed class WorkspaceProjectLifecycleModel
         }
     }
 
-    private void Cleanup(string projectDirectory, CreatedFile? claimFile, IEnumerable<CreatedFile> createdFiles)
+    private void Cleanup(
+        string projectDirectory,
+        CreatedFile? claimFile,
+        IEnumerable<CreatedFile> createdFiles,
+        IEnumerable<string> createdDirectories)
     {
         if (claimFile is null) return;
 
@@ -276,6 +314,12 @@ public sealed class WorkspaceProjectLifecycleModel
 
         try
         {
+            foreach (var directory in createdDirectories.Reverse())
+            {
+                if (!Directory.Exists(directory)) continue;
+                WorkspaceProjectValidator.RejectReparsePoint(directory, "Created project directory");
+                if (!Directory.EnumerateFileSystemEntries(directory).Any()) Directory.Delete(directory, recursive: false);
+            }
             if (Directory.Exists(projectDirectory))
             {
                 WorkspaceProjectValidator.RejectReparsePoint(projectDirectory, "Project directory");

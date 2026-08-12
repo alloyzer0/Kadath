@@ -109,6 +109,7 @@ internal static class WorkspaceProjectValidator
         cancellationToken.ThrowIfCancellationRequested();
         ValidateSceneSource(bytes.Scene);
         ValidateScriptSource(bytes.Script);
+        _ = WorkspaceScriptSourceModel.Read(bytes.ScriptPath, cancellationToken);
         ValidatePreview(bytes.Preview, bytes.PackageRoot, bytes.ScenePath, bytes.ScriptPath, allowMissingProjectSources: false);
         cancellationToken.ThrowIfCancellationRequested();
     }
@@ -159,6 +160,11 @@ internal static class WorkspaceProjectValidator
     }
 
     internal static void ValidateScriptSource(byte[] bytes)
+    {
+        WorkspaceScriptSourceModel.ValidateManifest(bytes);
+    }
+
+    internal static void ValidateLegacyScriptSource(byte[] bytes)
     {
         ValidateDocumentBudget(bytes, "Script");
         using var document = Parse(bytes, "Script");

@@ -56,10 +56,13 @@ public interface IEditorRpcClient : IAsyncDisposable
     Task<ProjectModelSnapshot> GetProjectSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
+    Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, CancellationToken cancellationToken = default);
+    Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, CancellationToken cancellationToken = default);
+    Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, CancellationToken cancellationToken = default);
     Task<EditorBakeResult> StartBakeAsync(BakeStartParameters parameters, CancellationToken cancellationToken = default);
     Task<EditorWatchResult> StartWatchAsync(WatchStartParameters parameters, CancellationToken cancellationToken = default);
     Task<EditorWatchResult> StopWatchAsync(CancellationToken cancellationToken = default);
@@ -139,6 +142,9 @@ public sealed class EditorRpcClient : IEditorRpcClient
     public Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<SnapshotQueryParameters, AssetCatalogSnapshot>("asset_catalog_snapshot", parameters, cancellationToken);
 
+    public Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ScriptSourceQueryParameters, ScriptSourceDocument>("script_source_read", parameters, cancellationToken);
+
     public Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<PublicationSnapshotQueryParameters, PublicationSnapshot>("publication_snapshot", parameters, cancellationToken);
 
@@ -150,6 +156,12 @@ public sealed class EditorRpcClient : IEditorRpcClient
 
     public Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<AuthoringUndoParameters, AuthoringMutationResult>("authoring_undo", parameters, cancellationToken);
+
+    public Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ScriptSourceEditParameters, ScriptSourceMutationResult>("script_source_edit", parameters, cancellationToken);
+
+    public Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ScriptSourceUndoParameters, ScriptSourceMutationResult>("script_source_undo", parameters, cancellationToken);
     public Task<EditorBakeResult> StartBakeAsync(BakeStartParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<BakeStartParameters, EditorBakeResult>("bake_start", parameters, cancellationToken);
 

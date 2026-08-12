@@ -33,6 +33,7 @@ internal static class Program
             await VerifyStaleReloadAsync(root);
             await VerifyUnexpectedExitAndRestartAsync(root);
             await VerifyBoundedProcessTreeKillAsync(root);
+            await LiveBakeWatchVerifier.VerifyAsync(root);
             Console.WriteLine("preview_diagnostics=ok");
             Console.WriteLine("preview_initial_identity_boundaries=ok");
             Console.WriteLine("preview_reload_rejected=ok");
@@ -40,6 +41,7 @@ internal static class Program
             Console.WriteLine("preview_reload_stale=ok");
             Console.WriteLine("preview_unexpected_exit_restart=ok");
             Console.WriteLine("preview_process_tree_kill=ok");
+            Console.WriteLine("live_bake_dependency_watch=ok");
             Console.WriteLine("verification=ok");
             return 0;
         }

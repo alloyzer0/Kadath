@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const behavior_builder = @import("behavior_package_builder");
+const behavior_manifest = @import("behavior_manifest");
 const support = @import("package_support");
 const scene_api = support.scene;
-const script_api = support.script;
 
 const c = @cImport({
     @cInclude("png.h");
@@ -31,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     try validateCanonicalWav(lost_wav);
     const scene = try buildSceneArtifact(init.gpa, scene_json);
     defer init.gpa.free(scene);
-    const script = try buildScriptArtifact(init.gpa, script_json);
+    const script = try buildScriptArtifact(init.io, init.gpa, script_json);
     defer init.gpa.free(script);
 
     try writeNew(init.io, args[1], primary);
@@ -136,21 +137,16 @@ fn buildSceneArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     return scene_api.encodeArtifact(allocator, &scene);
 }
 
-fn buildScriptArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
-    const program = try script_api.parse(allocator, json);
-    const artifact = try allocator.alloc(u8, 16 + program.count * 16);
-    @memcpy(artifact[0..4], "KSCP");
-    putU32(artifact[4..8], script_api.script_artifact_version);
-    putU32(artifact[8..12], script_api.current_schema_version);
-    putU32(artifact[12..16], @intCast(program.count));
-    for (program.instructions[0..program.count], 0..) |instruction, index| {
-        const offset = 16 + index * 16;
-        putU32(artifact[offset..][0..4], @intFromEnum(instruction.hook));
-        putU32(artifact[offset + 4 ..][0..4], @intFromEnum(instruction.op));
-        putF32(artifact[offset + 8 ..][0..4], instruction.value[0]);
-        putF32(artifact[offset + 12 ..][0..4], instruction.value[1]);
-    }
-    return artifact;
+fn buildScriptArtifact(io: std.Io, allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    var project_dir = try std.Io.Dir.cwd().openDir(io, "packaging/linux-assets", .{});
+    defer project_dir.close(io);
+    var snapshot = try behavior_manifest.loadSnapshot(io, allocator, project_dir, json);
+    defer snapshot.deinit();
+    var diagnostic = behavior_builder.Diagnostic{};
+    var built = try behavior_builder.build(allocator, &snapshot, &diagnostic);
+    const bytes = built.bytes;
+    built = undefined;
+    return bytes;
 }
 
 fn validateCanonicalWav(bytes: []const u8) !void {
@@ -216,10 +212,10 @@ test "release mip generation preserves PNG RGBA and box-filter rules" {
     try std.testing.expectEqualSlices(u8, &expected_secondary, secondary);
 }
 
-test "scene and script artifacts preserve their frozen disk ABI" {
+test "Linux product scene and behavior package preserve their frozen disk ABI" {
     const scene = try buildSceneArtifact(std.testing.allocator, scene_json);
     defer std.testing.allocator.free(scene);
-    const script = try buildScriptArtifact(std.testing.allocator, script_json);
+    const script = try buildScriptArtifact(std.testing.io, std.testing.allocator, script_json);
     defer std.testing.allocator.free(script);
     try std.testing.expectEqual(scene_api.scene_artifact_version, readU32(scene[4..8]));
     try std.testing.expectEqual(scene_api.current_schema_version, readU32(scene[8..12]));
@@ -234,10 +230,11 @@ test "scene and script artifacts preserve their frozen disk ABI" {
     const first_entry_bytes = readU32(scene[cursor..][0..4]);
     try std.testing.expectEqual(@as(u32, 1), readU32(scene[cursor + 4 ..][0..4]));
     try std.testing.expectEqual(@as(u32, "decoration-1".len), readU32(scene[cursor + 8 ..][0..4]));
-    try std.testing.expectEqual(@as(usize, 44 + "decoration-1".len), first_entry_bytes);
-    try std.testing.expectEqual(@as(usize, 48), script.len);
+    try std.testing.expectEqual(@as(usize, 48 + "decoration-1".len), first_entry_bytes);
+    try std.testing.expect(script.len > 48);
     try std.testing.expectEqualSlices(u8, "KSCN", scene[0..4]);
     try std.testing.expectEqualSlices(u8, "KSCP", script[0..4]);
+    try std.testing.expectEqual(@as(u32, 2), readU32(script[4..8]));
 }
 
 test "shipped audio sources are canonical Runtime artifacts" {

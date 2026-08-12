@@ -60,6 +60,7 @@ internal static class ProjectLifecycleVerifier
             await VerifyCancellationAsync(root);
             await VerifyCaseSensitiveContainmentAsync(root, lifecycle, created);
             await VerifyReparseBoundariesAsync(root, lifecycle, created);
+            await VerifyBehaviorProjectLifecycleAsync(root);
         }
         finally
         {
@@ -518,12 +519,170 @@ internal static class ProjectLifecycleVerifier
         return new TemplateBytes(scene, script);
     }
 
+    private static async Task VerifyBehaviorProjectLifecycleAsync(string root)
+    {
+        var packageRoot = Path.Combine(root, "behavior-package");
+        var productAssets = Path.Combine(Directory.GetCurrentDirectory(), "packaging", "linux-assets");
+        var scene = File.ReadAllBytes(Path.Combine(productAssets, "preview.scene.json"));
+        var script = File.ReadAllBytes(Path.Combine(productAssets, "preview.script.json"));
+        var patrol = File.ReadAllBytes(Path.Combine(productAssets, "scripts", "patrol.luau"));
+        Directory.CreateDirectory(Path.Combine(packageRoot, "bin", "assets", "scenes"));
+        Directory.CreateDirectory(Path.Combine(packageRoot, "bin", "assets", "scripts"));
+        Directory.CreateDirectory(Path.Combine(packageRoot, "bin", "projects"));
+        File.WriteAllBytes(Path.Combine(packageRoot, "bin", "assets", "scenes", "preview.scene.json"), scene);
+        File.WriteAllBytes(Path.Combine(packageRoot, "bin", "assets", "scripts", "preview.script.json"), script);
+        var templateDependencyPath = Path.Combine(packageRoot, "bin", "assets", "scripts", "patrol.luau");
+        File.WriteAllBytes(templateDependencyPath, patrol);
+        File.WriteAllBytes(Path.Combine(packageRoot, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), [0]);
+
+        var lifecycle = new WorkspaceProjectLifecycleModel();
+        var created = await lifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "behavior-created"), default);
+        var createdDependencyPath = Path.Combine(created.ProjectDirectory, "scripts", "patrol.luau");
+        Require(File.ReadAllBytes(created.ScenePath).AsSpan().SequenceEqual(scene), "Behavior Create did not preserve the Scene v5 template.");
+        Require(File.ReadAllBytes(created.ScriptPath).AsSpan().SequenceEqual(script), "Behavior Create did not preserve the Script v2 manifest.");
+        Require(File.ReadAllBytes(createdDependencyPath).AsSpan().SequenceEqual(patrol), "Behavior Create did not copy the declared Luau dependency.");
+        Require(!File.Exists(Path.Combine(created.ProjectDirectory, ".kadath-create-claim")), "Behavior Create left an ownership claim.");
+        using (var document = JsonDocument.Parse(File.ReadAllBytes(created.ScenePath)))
+        {
+            Require(document.RootElement.GetProperty("schemaVersion").GetInt32() == 5, "Behavior Create did not produce Scene v5.");
+        }
+        var sceneArtifact = WorkspaceSceneCodec.EncodeSource(File.ReadAllBytes(created.ScenePath));
+        var sceneInfo = WorkspaceSceneCodec.ValidateArtifact(sceneArtifact);
+        Require(sceneInfo.Format == "KSCN-SCENE-V5" && sceneInfo.ImporterVersion == 5 && sceneInfo.BakerVersion == 5,
+            "Behavior Create Scene did not encode as KSCN v5.");
+        Require(WorkspaceScriptDependencySet.ComputeRevision(created.ScriptPath).Length == 64,
+            "Behavior Create Script dependency revision is invalid.");
+        var readModel = new WorkspaceReadModel();
+        var snapshot = await readModel.ReadProjectAsync(created, default);
+        Require(snapshot.Scene.SchemaVersion == 5 && snapshot.Script.SchemaVersion == 2,
+            "Behavior ReadModel did not preserve v5/v2 schema versions.");
+        Require(snapshot.Script.Dependencies?.Single().Source == "scripts/patrol.luau",
+            "Behavior ReadModel did not expose Script dependency metadata.");
+        Require(snapshot.Scene.Objects?.Single(value => value.ObjectId == "hazard-1").Behaviors?.Single().ScriptId == 1,
+            "Behavior ReadModel did not expose Scene behavior bindings.");
+        var hierarchy = await readModel.ReadHierarchyAsync(created, default);
+        Require(hierarchy.Nodes.Any(node => node.Kind == "ScriptDependency" && node.Id == "script.dependencies[1]"),
+            "Behavior hierarchy did not expose Script dependency node.");
+        Require(hierarchy.Nodes.Any(node => node.Kind == "SceneBehavior" && node.Id == "scene.objects[hazard-1].behaviors[1]"),
+            "Behavior hierarchy did not expose Scene behavior node.");
+        var authoring = new WorkspaceAuthoringModel();
+        var editedObjects = snapshot.Scene.Objects!
+            .Select(value => value.ObjectId == "hazard-1"
+                ? value with
+                {
+                    Behaviors = value.Behaviors?.Select(binding => binding with
+                    {
+                        Parameters = binding.Parameters?.Select(parameter => parameter.Name == "speed"
+                            ? parameter with { Value = 96 }
+                            : parameter).ToArray()
+                    }).ToArray()
+                }
+                : value)
+            .Select(ToDefinition)
+            .ToArray();
+        var edit = await authoring.ApplyAsync(created, snapshot.AuthoringRevision,
+            new AuthoringPatch(SceneObjects: editedObjects), default);
+        Require(edit.State == "succeeded" && edit.ProjectSnapshot.Scene.SchemaVersion == 5
+            && edit.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == "hazard-1").Behaviors!.Single().Parameters!.Single(value => value.Name == "speed").Value == 96,
+            "Behavior Authoring did not preserve and update Scene v5 binding parameters.");
+        using (var editedScene = JsonDocument.Parse(File.ReadAllBytes(created.ScenePath)))
+        {
+            Require(editedScene.RootElement.GetProperty("schemaVersion").GetInt32() == 5
+                && editedScene.RootElement.GetProperty("objects")[2].GetProperty("behaviors")[0].GetProperty("parameters").GetProperty("speed").GetDouble() == 96,
+                "Behavior Authoring serialized an invalid Scene v5 document.");
+        }
+        var undo = await authoring.UndoAsync(created, edit.Revision, edit.UndoToken!, default);
+        Require(undo.State == "succeeded" && undo.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == "hazard-1").Behaviors!.Single().Parameters!.Single(value => value.Name == "speed").Value == 80,
+            "Behavior Authoring undo did not restore the original binding parameters.");
+
+        var sourceAuthoring = new WorkspaceScriptSourceAuthoringModel();
+        var sourceDocument = await sourceAuthoring.ReadAsync(created, 1, default);
+        Require(sourceDocument.SourcePath == "scripts/patrol.luau"
+            && sourceDocument.Source == Encoding.UTF8.GetString(patrol)
+            && sourceDocument.AuthoringRevision == undo.Revision,
+            "Behavior source authoring read snapshot mismatch.");
+        var editedSource = sourceDocument.Source + "\n-- editor-source-authoring\n";
+        var sourceEdit = await sourceAuthoring.ApplyAsync(created, sourceDocument.AuthoringRevision, 1, editedSource, default);
+        Require(sourceEdit.State == "succeeded"
+            && sourceEdit.PreviousRevision == sourceDocument.AuthoringRevision
+            && sourceEdit.Revision != sourceEdit.PreviousRevision
+            && sourceEdit.ProjectSnapshot.AuthoringRevision == sourceEdit.Revision
+            && File.ReadAllText(createdDependencyPath, Encoding.UTF8) == editedSource,
+            "Behavior source authoring did not commit the Luau source atomically.");
+        var unchangedSource = await sourceAuthoring.ApplyAsync(created, sourceEdit.Revision, 1, editedSource, default);
+        Require(unchangedSource.State == "unchanged" && unchangedSource.Revision == sourceEdit.Revision && unchangedSource.UndoToken is null,
+            "Behavior source authoring unchanged result mismatch.");
+        await ExpectAuthoringFailureAsync(
+            () => sourceAuthoring.ApplyAsync(created, sourceDocument.AuthoringRevision, 1, editedSource + "-- stale", default),
+            WorkspaceAuthoringFailureKind.RevisionConflict);
+        await ExpectAuthoringFailureAsync(
+            () => sourceAuthoring.ApplyAsync(created, sourceEdit.Revision, 999, editedSource, default),
+            WorkspaceAuthoringFailureKind.InvalidPatch);
+        await ExpectAuthoringFailureAsync(
+            () => sourceAuthoring.ApplyAsync(created, sourceEdit.Revision, 1, new string('x', 65537), default),
+            WorkspaceAuthoringFailureKind.Input);
+        File.WriteAllText(createdDependencyPath, editedSource + "-- external", new UTF8Encoding(false));
+        await ExpectAuthoringFailureAsync(
+            () => sourceAuthoring.UndoAsync(created, sourceEdit.Revision, sourceEdit.UndoToken!, default),
+            WorkspaceAuthoringFailureKind.RevisionConflict);
+        File.WriteAllText(createdDependencyPath, editedSource, new UTF8Encoding(false));
+        var sourceUndo = await sourceAuthoring.UndoAsync(created, sourceEdit.Revision, sourceEdit.UndoToken!, default);
+        Require(sourceUndo.State == "succeeded"
+            && sourceUndo.Revision == sourceDocument.AuthoringRevision
+            && File.ReadAllBytes(createdDependencyPath).AsSpan().SequenceEqual(patrol)
+            && !Directory.EnumerateFiles(Path.GetDirectoryName(createdDependencyPath)!, "*.authoring.*").Any(),
+            "Behavior source authoring undo or temporary-file cleanup mismatch.");
+        Require(await lifecycle.OpenAsync(new ProjectOpenParameters(packageRoot, "behavior-created"), default) == created,
+            "Behavior Open did not preserve project identity.");
+        var validation = await lifecycle.ValidateAsync(created, default);
+        Require(validation.State == "valid", "Behavior project validation failed.");
+
+        var cleanupProjectDirectory = Path.Combine(packageRoot, "bin", "projects", "behavior-cleanup");
+        var cleanupLifecycle = new WorkspaceProjectLifecycleModel(phase =>
+        {
+            if (phase == WorkspaceProjectCreatePhase.AfterScriptDependencies) throw new IOException("injected dependency cleanup failure");
+        });
+        await ExpectLifecycleFailureAsync(
+            () => cleanupLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "behavior-cleanup"), default),
+            WorkspaceProjectLifecycleFailureKind.Create);
+        Require(!Directory.Exists(cleanupProjectDirectory), "Behavior Create failure left dependency files or directories.");
+
+        File.Delete(templateDependencyPath);
+        await ExpectLifecycleFailureAsync(
+            () => lifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "behavior-missing-source"), default),
+            WorkspaceProjectLifecycleFailureKind.Validation);
+        Require(!Directory.Exists(Path.Combine(packageRoot, "bin", "projects", "behavior-missing-source")),
+            "Missing Script template dependency created a partial project.");
+    }
+
     private static async Task ExpectLifecycleFailureAsync(Func<Task> action, WorkspaceProjectLifecycleFailureKind kind)
     {
         try { await action(); }
         catch (WorkspaceProjectLifecycleException exception) when (exception.Kind == kind) { return; }
         throw new InvalidOperationException($"Expected WorkspaceProjectLifecycleException with kind {kind}.");
     }
+
+    private static async Task ExpectAuthoringFailureAsync(Func<Task> action, WorkspaceAuthoringFailureKind kind)
+    {
+        try { await action(); }
+        catch (WorkspaceAuthoringException exception) when (exception.Kind == kind) { return; }
+        throw new InvalidOperationException($"Expected WorkspaceAuthoringException with kind {kind}.");
+    }
+
+    private static SceneObjectDefinition ToDefinition(ProjectModelSceneObject value) => new(
+        value.ObjectId,
+        value.Kind,
+        value.Position,
+        value.Size,
+        value.Color,
+        value.TextureId,
+        value.MoveSpeed,
+        value.PatrolMinY,
+        value.PatrolMaxY,
+        value.PatrolSpeed,
+        value.Behaviors?.Select(binding => new SceneBehaviorBindingDefinition(
+            binding.ScriptId,
+            binding.Parameters?.ToDictionary(parameter => parameter.Name, parameter => parameter.Value, StringComparer.Ordinal))).ToArray());
 
     private static async Task ExpectAsync<T>(Func<Task> action) where T : Exception
     {

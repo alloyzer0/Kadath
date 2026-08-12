@@ -37,6 +37,7 @@ internal static class Program
             await VerifyAuthoringAsync(project, readModel);
             await ProjectLifecycleVerifier.VerifyAsync();
             await PublicationVerifier.VerifyAsync();
+            await BehaviorPublicationVerifier.VerifyAsync();
             await VerifyPreviewModelAsync(project);
 
             var missing = await readModel.ReadPublicationAsync(project, "debug", default);
@@ -125,6 +126,7 @@ internal static class Program
             Console.WriteLine("hierarchy_snapshot=ok");
             Console.WriteLine("asset_catalog_snapshot=ok");
             Console.WriteLine("publication_state_machine=ok");
+            Console.WriteLine("behavior_publication_v2=ok");
             Console.WriteLine("authoring_transaction=ok");
             Console.WriteLine("texture_import=ok");
             Console.WriteLine("native_publication=ok");

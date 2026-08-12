@@ -56,6 +56,10 @@ public sealed class WorkspaceReadModel
         try { return operation(); }
         catch (OperationCanceledException) { throw; }
         catch (WorkspaceReadException) { throw; }
+        catch (WorkspaceProjectValidationException exception)
+        {
+            throw new WorkspaceReadException(WorkspaceReadFailureKind.Input, exception.Message, exception);
+        }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or FormatException or OverflowException)
         {
             throw new WorkspaceReadException(WorkspaceReadFailureKind.Input, exception.Message, exception);
@@ -79,6 +83,7 @@ public sealed class WorkspaceReadModel
         var nodes = new List<HierarchyNode>();
         var scene = WorkspaceSceneDocumentCodec.Parse(loaded.SceneBytes);
         var script = loaded.Script.RootElement;
+        var scriptSource = WorkspaceScriptSourceModel.Read(loaded.Bytes.ScriptPath, default);
         var preview = loaded.Preview.RootElement;
 
         nodes.Add(Node("scene", null, "Scene", "SceneDocument", Properties(
@@ -105,20 +110,49 @@ public sealed class WorkspaceReadModel
                 properties.Add(("patrolMaxY", FormatNumber(sceneObject.PatrolMaxY!.Value)));
                 properties.Add(("patrolSpeed", FormatNumber(sceneObject.PatrolSpeed!.Value)));
             }
-            nodes.Add(Node($"scene.objects[{sceneObject.ObjectId}]", "scene", sceneObject.ObjectId, "SceneObject", Properties(properties.ToArray())));
+            var objectNodeId = $"scene.objects[{sceneObject.ObjectId}]";
+            nodes.Add(Node(objectNodeId, "scene", sceneObject.ObjectId, "SceneObject", Properties(properties.ToArray())));
+            if (sceneObject.Behaviors is not null)
+            {
+                foreach (var behavior in sceneObject.Behaviors)
+                {
+                    var behaviorNodeId = $"{objectNodeId}.behaviors[{behavior.ScriptId}]";
+                    nodes.Add(Node(behaviorNodeId, objectNodeId, $"Behavior {behavior.ScriptId}", "SceneBehavior", Properties(
+                        ("ScriptId", behavior.ScriptId), ("ParameterCount", behavior.Parameters.Length))));
+                    for (var parameterIndex = 0; parameterIndex < behavior.Parameters.Length; parameterIndex++)
+                    {
+                        var parameter = behavior.Parameters[parameterIndex];
+                        nodes.Add(Node($"{behaviorNodeId}.parameters[{parameterIndex}]", behaviorNodeId, parameter.Name, "BehaviorParameter", Properties(
+                            ("Name", parameter.Name), ("Value", FormatNumber(parameter.Value)))));
+                    }
+                }
+            }
         }
 
-        var instructions = RequireArray(script, "instructions", "Script");
-        nodes.Add(Node("script", null, "Script", "ScriptDocument", Properties(
-            ("SchemaVersion", model.Script.SchemaVersion), ("InstructionCount", instructions.GetArrayLength()), ("File", model.Files.Script))));
-        var instructionIndex = 0;
-        foreach (var instruction in instructions.EnumerateArray())
+        if (scriptSource.IsBehaviorPackage)
         {
-            nodes.Add(Node($"script.instructions[{instructionIndex}]", "script", $"Instruction {instructionIndex}", "HookInstruction", Properties(
-                ("Hook", RequireString(instruction, "hook", "Script.instructions[]")),
-                ("Operation", RequireString(instruction, "op", "Script.instructions[]")),
-                ("Value", FormatVector(RequireVector(instruction, "value", 2, "Script.instructions[]"))))));
-            instructionIndex++;
+            nodes.Add(Node("script", null, "Script", "ScriptDocument", Properties(
+                ("SchemaVersion", model.Script.SchemaVersion), ("DependencyCount", scriptSource.Dependencies.Count), ("File", model.Files.Script))));
+            foreach (var dependency in scriptSource.Dependencies)
+            {
+                nodes.Add(Node($"script.dependencies[{dependency.ScriptId}]", "script", dependency.SourceName, "ScriptDependency", Properties(
+                    ("ScriptId", dependency.ScriptId), ("Source", dependency.SourceName), ("Sha256", dependency.Sha256))));
+            }
+        }
+        else
+        {
+            var instructions = RequireArray(script, "instructions", "Script");
+            nodes.Add(Node("script", null, "Script", "ScriptDocument", Properties(
+                ("SchemaVersion", model.Script.SchemaVersion), ("InstructionCount", instructions.GetArrayLength()), ("File", model.Files.Script))));
+            var instructionIndex = 0;
+            foreach (var instruction in instructions.EnumerateArray())
+            {
+                nodes.Add(Node($"script.instructions[{instructionIndex}]", "script", $"Instruction {instructionIndex}", "HookInstruction", Properties(
+                    ("Hook", RequireString(instruction, "hook", "Script.instructions[]")),
+                    ("Operation", RequireString(instruction, "op", "Script.instructions[]")),
+                    ("Value", FormatVector(RequireVector(instruction, "value", 2, "Script.instructions[]"))))));
+                instructionIndex++;
+            }
         }
 
         var runtime = RequireObject(preview, "runtime", "Preview");
@@ -194,7 +228,7 @@ public sealed class WorkspaceReadModel
         if (profile is not ("debug" or "release")) throw Input($"Unsupported publication profile: {profile}.");
         var paths = ResolveProjectPaths(project);
         var sceneBytes = ReadFileSnapshot(paths.Scene, "Scene source", cancellationToken);
-        var scriptBytes = ReadFileSnapshot(paths.Script, "Script source", cancellationToken);
+        var scriptSource = WorkspaceScriptSourceModel.Read(paths.Script, cancellationToken);
         var derived = EnsureInside(paths.ProjectDirectory, Path.Combine(paths.ProjectDirectory, ".kadath", "derived"), "Derived directory");
         if (Directory.Exists(derived)) RejectReparsePoint(derived, "Derived directory");
         var manifestPath = EnsureInside(paths.ProjectDirectory, Path.Combine(derived, ".live-bake.manifest.json"), "Manifest path");
@@ -208,8 +242,8 @@ public sealed class WorkspaceReadModel
         }
 
         var manifest = ReadManifest(manifestPath, cancellationToken, SetDiagnostic);
-        var scene = ReadPublicationTarget("Scene", paths.Scene, sceneBytes, sceneArtifact, manifest, profile, paths.PackageRoot, cancellationToken, SetDiagnostic);
-        var script = ReadPublicationTarget("Script", paths.Script, scriptBytes, scriptArtifact, manifest, profile, paths.PackageRoot, cancellationToken, SetDiagnostic);
+        var scene = ReadPublicationTarget("Scene", paths.Scene, Sha256(sceneBytes), sceneArtifact, manifest, profile, paths.PackageRoot, cancellationToken, SetDiagnostic);
+        var script = ReadPublicationTarget("Script", paths.Script, scriptSource.Revision, scriptArtifact, manifest, profile, paths.PackageRoot, cancellationToken, SetDiagnostic);
         var state = AggregatePublicationState(scene.State, script.State);
         return new PublicationSnapshot(EditorSnapshotVersions.Publication, project.ProjectName, profile,
             manifest.Valid ? manifest.Profile : null, derived, manifestPath, state, manifest.Present, scene, script, diagnosticCode, diagnosticMessage);
@@ -222,25 +256,40 @@ public sealed class WorkspaceReadModel
         var preview = loaded.Preview.RootElement;
         var scriptVersion = RequireInt32(script, "schemaVersion", "Script");
         var previewVersion = RequireInt32(preview, "schemaVersion", "Preview");
-        if (scriptVersion != 1 || previewVersion != 1) throw Input("Snapshot project/model schema version is unsupported.");
+        if (scriptVersion is not (1 or 2) || previewVersion != 1) throw Input("Snapshot project/model schema version is unsupported.");
         var textures = scene.Textures.Select(value => new ProjectModelTexture(value.TextureId, value.Artifact)).ToArray();
         var objects = scene.Objects.Select(value => value.ToProjectModel()).ToArray();
         var player = scene.Player;
         var goal = scene.Goal;
         var hazard = scene.PrimaryHazard;
 
-        var instructions = RequireArray(script, "instructions", "Script").EnumerateArray().ToArray();
-        var onStart = instructions.Where(value => OptionalString(value, "hook") == "on_start" && OptionalString(value, "op") == "set_goal_position").ToArray();
-        var fixedUpdate = instructions.Where(value => OptionalString(value, "hook") == "fixed_update" && OptionalString(value, "op") == "move_goal_velocity").ToArray();
-        if (onStart.Length != 1 || fixedUpdate.Length != 1) throw Input("Project script does not contain the editable Hook v1 instructions.");
-
-        var scriptGoal = RequireVector(onStart[0], "value", 2, "Script on_start instruction");
-        var scriptVelocity = RequireVector(fixedUpdate[0], "value", 2, "Script fixed_update instruction");
+        var scriptSource = WorkspaceScriptSourceModel.Read(loaded.Bytes.ScriptPath, default);
+        var scriptGoal = Array.Empty<double>();
+        var scriptVelocity = Array.Empty<double>();
+        IReadOnlyList<ProjectModelScriptDependency>? dependencies = null;
+        if (scriptVersion == 1)
+        {
+            var instructions = RequireArray(script, "instructions", "Script").EnumerateArray().ToArray();
+            var onStart = instructions.Where(value => OptionalString(value, "hook") == "on_start" && OptionalString(value, "op") == "set_goal_position").ToArray();
+            var fixedUpdate = instructions.Where(value => OptionalString(value, "hook") == "fixed_update" && OptionalString(value, "op") == "move_goal_velocity").ToArray();
+            if (onStart.Length != 1 || fixedUpdate.Length != 1) throw Input("Project script does not contain the editable Hook v1 instructions.");
+            scriptGoal = RequireVector(onStart[0], "value", 2, "Script on_start instruction");
+            scriptVelocity = RequireVector(fixedUpdate[0], "value", 2, "Script fixed_update instruction");
+        }
+        else
+        {
+            dependencies = scriptSource.Dependencies
+                .Select(dependency => new ProjectModelScriptDependency(dependency.ScriptId, dependency.SourceName))
+                .ToArray();
+        }
+        var authoringRevision = scriptVersion == 1
+            ? AuthoringRevision(loaded.SceneBytes, loaded.ScriptBytes)
+            : AuthoringRevision(loaded.SceneBytes, scriptSource.Revision);
         return new ProjectModelSnapshot(EditorSnapshotVersions.ProjectModel, project.ProjectName,
-            AuthoringRevision(loaded.SceneBytes, loaded.ScriptBytes),
+            authoringRevision,
             new ProjectModelFiles(loaded.Bytes.ProjectDirectory, loaded.Bytes.ScenePath, loaded.Bytes.ScriptPath, loaded.Bytes.PreviewPath),
             new ProjectModelScene(scene.SourceSchemaVersion, goal.Position.ToArray(), player.TextureId, goal.TextureId, hazard.TextureId, textures, objects),
-            new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity), new ProjectModelPreview(previewVersion));
+            new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity, dependencies), new ProjectModelPreview(previewVersion));
     }
 
     internal static WorkspaceProjectBytes ReadProjectBytes(ProjectSessionInfo project, CancellationToken cancellationToken)
@@ -323,10 +372,9 @@ public sealed class WorkspaceReadModel
         return new ManifestEntry(sourcePath, sourceHash, artifactPath, artifactHash, artifactBytes);
     }
 
-    private static PublicationTargetSnapshot ReadPublicationTarget(string kind, string sourcePath, byte[] sourceBytes, string artifactPath,
+    private static PublicationTargetSnapshot ReadPublicationTarget(string kind, string sourcePath, string sourceRevision, string artifactPath,
         ManifestSnapshot manifest, string requestedProfile, string packageRoot, CancellationToken cancellationToken, Action<string, string> diagnostic)
     {
-        var sourceRevision = Sha256(sourceBytes);
         ArtifactInfo? artifact = null;
         var artifactFailure = false;
         try { artifact = ReadArtifactInfo(artifactPath, kind, cancellationToken); }
@@ -456,6 +504,12 @@ public sealed class WorkspaceReadModel
     internal static string AuthoringRevision(byte[] scene, byte[] script)
     {
         var identity = $"kadath-authoring-v1\nscene:{Sha256(scene)}\nscript:{Sha256(script)}";
+        return Sha256(Encoding.UTF8.GetBytes(identity));
+    }
+
+    internal static string AuthoringRevision(byte[] scene, string scriptRevision)
+    {
+        var identity = $"kadath-authoring-v2\nscene:{Sha256(scene)}\nscript:{scriptRevision}";
         return Sha256(Encoding.UTF8.GetBytes(identity));
     }
 
