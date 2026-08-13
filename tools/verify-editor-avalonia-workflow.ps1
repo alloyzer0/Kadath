@@ -97,6 +97,7 @@ try {
         'workflow_project_open=ok',
         'workflow_snapshot_projection=ok',
         'workflow_behavior_preservation=ok',
+        'workflow_script_source_authoring=ok',
         'workflow_project_create=ok',
         'workflow_publication_missing=ok',
         'workflow_authoring_apply=ok',

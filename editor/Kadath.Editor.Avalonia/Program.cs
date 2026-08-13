@@ -114,6 +114,97 @@ internal static class Program
         }
         Console.WriteLine("workflow_behavior_preservation=ok");
 
+        Require(openedProject.Script.SchemaVersion == 2, "Avalonia script source workflow requires a Script v2 project");
+        var scriptDependency = openedProject.Script.Dependencies?.FirstOrDefault()
+            ?? throw new InvalidOperationException("Opened Script v2 project exposes no source dependency.");
+        var scriptHierarchyLabel = avaloniaViewModel.HierarchyItems.Single(label =>
+            label.Contains($"script.dependencies[{scriptDependency.ScriptId}]", StringComparison.Ordinal));
+        avaloniaViewModel.SelectedHierarchyItem = scriptHierarchyLabel;
+        await WaitUntilAsync(
+            () => avaloniaViewModel.HasScriptSourceDocument && avaloniaViewModel.SelectedScriptSourceId == scriptDependency.ScriptId,
+            cancellationToken,
+            "selected script source document");
+        var originalSourceDocument = workspace.ScriptSource.Document
+            ?? throw new InvalidOperationException("Selected script source document is missing.");
+        var projectDirectory = Path.GetFullPath(opened.ProjectDirectory);
+        var projectPrefix = projectDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var sourcePath = Path.GetFullPath(Path.Combine(projectDirectory, originalSourceDocument.SourcePath));
+        var pathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        Require(sourcePath.StartsWith(projectPrefix, pathComparison), "Script source workflow path escaped the opened project directory");
+        var originalSourceBytes = File.ReadAllBytes(sourcePath);
+        var originalSourceText = originalSourceDocument.Source;
+        try
+        {
+            Require(avaloniaViewModel.SupportsScriptSourceAuthoring
+                && avaloniaViewModel.HasScriptSourceDocument
+                && !avaloniaViewModel.UsesHookScriptAuthoring
+                && !avaloniaViewModel.IsScriptSourceDirty,
+                "Avalonia did not expose the selected Script v2 source document");
+
+            avaloniaViewModel.ScriptSourceText = originalSourceText + "\n-- Avalonia workflow source save\n";
+            var sceneHierarchyLabel = avaloniaViewModel.HierarchyItems.Single(label => label.Contains("scene.objects[goal]", StringComparison.Ordinal));
+            avaloniaViewModel.SelectedHierarchyItem = sceneHierarchyLabel;
+            Require(avaloniaViewModel.SelectedHierarchyItem == scriptHierarchyLabel,
+                "Avalonia allowed switching Hierarchy while script source changes were dirty");
+            Require(avaloniaViewModel.IsScriptSourceDirty
+                && avaloniaViewModel.CanSaveScriptSource
+                && !avaloniaViewModel.CanApplyAuthoring
+                && !avaloniaViewModel.CanUndoAuthoring,
+                "Unsaved script source did not gate conflicting authoring commands");
+            var savedSource = await avaloniaViewModel.SaveScriptSourceForCurrentProjectAsync(cancellationToken);
+            Require(string.Equals(savedSource.State, "succeeded", StringComparison.OrdinalIgnoreCase)
+                && savedSource.Revision != originalSourceDocument.AuthoringRevision
+                && savedSource.SourceDocument.Source == avaloniaViewModel.ScriptSourceText
+                && !avaloniaViewModel.IsScriptSourceDirty
+                && avaloniaViewModel.CanUndoScriptSource
+                && workspace.ScriptSource.UndoDepth == 1
+                && avaloniaViewModel.SelectedHierarchyItem == scriptHierarchyLabel,
+                "Avalonia script source save did not refresh the document, revision, hierarchy, and undo state");
+
+            var undoneSource = await avaloniaViewModel.UndoScriptSourceForCurrentProjectAsync(cancellationToken);
+            Require(string.Equals(undoneSource.Operation, "undo", StringComparison.OrdinalIgnoreCase)
+                && undoneSource.SourceDocument.Source == originalSourceText
+                && avaloniaViewModel.ScriptSourceText == originalSourceText
+                && !avaloniaViewModel.IsScriptSourceDirty
+                && !avaloniaViewModel.CanUndoScriptSource
+                && workspace.ScriptSource.UndoDepth == 0,
+                "Avalonia script source undo did not restore the original source and UI state");
+
+            var retainedBuffer = originalSourceText + "\n-- Avalonia retained conflict buffer\n";
+            avaloniaViewModel.ScriptSourceText = retainedBuffer;
+            File.AppendAllText(sourcePath, "\n-- external workflow edit\n", new System.Text.UTF8Encoding(false));
+            await avaloniaViewModel.RefreshSnapshotsForCurrentProjectAsync(cancellationToken);
+            Require(avaloniaViewModel.ScriptSourceText == retainedBuffer
+                && avaloniaViewModel.IsScriptSourceDirty
+                && avaloniaViewModel.SelectedHierarchyItem == scriptHierarchyLabel
+                && avaloniaViewModel.IsScriptSourceSelection
+                && workspace.ProjectSnapshot.Value?.AuthoringRevision != originalSourceDocument.AuthoringRevision,
+                "Snapshot refresh overwrote the dirty source buffer or hid the external revision");
+            try
+            {
+                _ = await avaloniaViewModel.SaveScriptSourceForCurrentProjectAsync(cancellationToken);
+                throw new InvalidOperationException("Stale Avalonia script source save unexpectedly succeeded.");
+            }
+            catch (EditorRpcException exception) when (exception.Code == "script_source_revision_conflict") { }
+            Require(avaloniaViewModel.ScriptSourceText == retainedBuffer
+                && avaloniaViewModel.IsScriptSourceDirty
+                && workspace.ScriptSource.State == EditorScriptSourceState.Failed
+                && workspace.ScriptSource.ErrorCode == "script_source_revision_conflict"
+                && workspace.ScriptSource.UndoDepth == 0,
+                "Revision conflict did not preserve the Avalonia source buffer and invalidate stale undo state");
+        }
+        finally
+        {
+            File.WriteAllBytes(sourcePath, originalSourceBytes);
+            if (avaloniaViewModel.IsScriptSourceDirty) { avaloniaViewModel.DiscardScriptSourceChangesCommand.Execute(null); }
+            _ = await avaloniaViewModel.LoadScriptSourceForCurrentProjectAsync(scriptDependency.ScriptId, cancellationToken);
+        }
+        Require(avaloniaViewModel.ScriptSourceText == originalSourceText
+            && !avaloniaViewModel.IsScriptSourceDirty
+            && workspace.ScriptSource.State == EditorScriptSourceState.Ready,
+            "Avalonia script source workflow did not restore its controlled fixture");
+        Console.WriteLine("workflow_script_source_authoring=ok");
+
         var oldHierarchyLabel = avaloniaViewModel.HierarchyItems[0];
         var oldAssetLabel = avaloniaViewModel.AssetItems[0];
         avaloniaViewModel.SelectedHierarchyItem = oldHierarchyLabel;
@@ -371,6 +462,13 @@ internal static class Program
         var viewModel = new AvaloniaEditorViewModel(workspace, new InlineEditorViewDispatcher(), Environment.CurrentDirectory);
         await workspace.ConnectAsync();
         if (!ReferenceEquals(viewModel.Workspace, workspace)) { throw new InvalidOperationException("Avalonia ViewModel did not retain injected Workspace."); }
+        var sourceDocument = await workspace.ReadScriptSourceAsync(new ScriptSourceQueryParameters("smoke_created", 1));
+        Require(workspace.ScriptSource.State == EditorScriptSourceState.Ready
+            && workspace.ScriptSource.Document == sourceDocument
+            && sourceDocument.SourcePath == "scripts/patrol.luau"
+            && sourceDocument.Source.Contains("fixed_update", StringComparison.Ordinal),
+            "shared Workspace did not expose the selected Behavior Script Asset source");
+        Console.WriteLine("script_source_read_model=ok");
         // Live Bake/Watch 保持 opt-in，打开编辑器本身不能隐式启动派生构建。
         if (viewModel.LiveBakeEnabled || viewModel.WatchChanges) { throw new InvalidOperationException("Live Bake/Watch must be disabled by default."); }
         Console.WriteLine("live_bake_opt_in=ok");
@@ -655,6 +753,14 @@ internal static class Program
                     await EmitEventAsync("asset_catalog_snapshot_created", assets, id).ConfigureAwait(false);
                     await SendResponseAsync(id, assets).ConfigureAwait(false);
                     break;
+                case "script_source_read":
+                    await SendResponseAsync(id, new ScriptSourceDocument(
+                        _activeProjectName,
+                        1,
+                        "scripts/patrol.luau",
+                        "return { fixed_update = function() end }\n",
+                        new string('1', 64))).ConfigureAwait(false);
+                    break;
                 case "texture_import":
                     var importParameters = root.GetProperty("params");
                     var assetName = importParameters.GetProperty("assetName").GetString()!;
@@ -729,7 +835,7 @@ internal static class Program
             var commands = new List<string>
             {
                 "get_capabilities", "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot",
-                "asset_catalog_snapshot", "texture_import", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
+                "asset_catalog_snapshot", "script_source_read", "texture_import", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
             };
             if (_advertiseProjectCreate) { commands.Insert(2, "project_create"); }
             return commands.ToArray();

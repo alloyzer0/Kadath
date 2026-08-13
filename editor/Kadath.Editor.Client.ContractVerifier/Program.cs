@@ -691,6 +691,38 @@ internal static class Program
             && undoneTextures[0].Artifact == originalTextureArtifact,
             "real service texture assignment undo failed");
         Console.WriteLine("authoring_service_smoke=ok");
+
+        var authoringBeforeScript = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(
+            projectName,
+            textureUndone.Revision,
+            new AuthoringPatch(SceneGoalPosition: [
+                projectSnapshot.Scene.GoalPosition[0] + 0.5d,
+                projectSnapshot.Scene.GoalPosition[1]]))).ConfigureAwait(false);
+        var scriptAfterAuthoring = await client.EditScriptSourceAsync(new ScriptSourceEditParameters(
+            projectName,
+            authoringBeforeScript.Revision,
+            1,
+            sourceDocument.Source + "\n-- cross-history script edit\n")).ConfigureAwait(false);
+        try
+        {
+            _ = await client.UndoAuthoringAsync(new AuthoringUndoParameters(projectName, scriptAfterAuthoring.Revision)).ConfigureAwait(false);
+            throw new InvalidOperationException("authoring undo unexpectedly survived a script source edit");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "authoring_undo_empty") { }
+
+        var authoringAfterScript = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(
+            projectName,
+            scriptAfterAuthoring.Revision,
+            new AuthoringPatch(SceneGoalPosition: [
+                projectSnapshot.Scene.GoalPosition[0] + 1d,
+                projectSnapshot.Scene.GoalPosition[1]]))).ConfigureAwait(false);
+        try
+        {
+            _ = await client.UndoScriptSourceAsync(new ScriptSourceUndoParameters(projectName, authoringAfterScript.Revision)).ConfigureAwait(false);
+            throw new InvalidOperationException("script source undo unexpectedly survived an authoring edit");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "script_source_undo_empty") { }
+        Console.WriteLine("authoring_history_isolation=ok");
         await client.ShutdownAsync().ConfigureAwait(false);
     }
 

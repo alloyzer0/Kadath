@@ -5,12 +5,12 @@
         Height="900"
         MinWidth="1100"
         MinHeight="680"
-        Title="Kadath Editor · Scene Object Model">
+        Title="Kadath Editor · 行为脚本源码编辑">
   <Grid RowDefinitions="Auto,*,220" Background="#15191F">
     <Border Grid.Row="0" Padding="12,8" Background="#20262E" BorderBrush="#3C4652" BorderThickness="0,0,0,1">
       <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="10">
         <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="Kadath Editor" />
-        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#AEBAC8" Text="P2-Scene-Object-Model-01 · Scene v4" />
+        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#AEBAC8" Text="P2-Avalonia-Script-Source-Authoring-01 · Luau 源码编辑" />
         <TextBlock Grid.Column="2" VerticalAlignment="Center" Foreground="#AEBAC8" Text="{Binding ConnectionStatus}" />
         <Button Grid.Column="3" Padding="14,5" Command="{Binding ConnectCommand}" Content="连接 Service" />
         <Button Grid.Column="4" Padding="14,5" Command="{Binding OpenProjectCommand}" Content="打开项目" />
@@ -95,6 +95,33 @@
             <StackPanel Spacing="8">
               <Border Padding="8" Background="#20262E" CornerRadius="4">
                 <TextBlock TextWrapping="Wrap" Foreground="#C3CEDA" Text="{Binding InspectorText}" />
+              </Border>
+
+              <Border IsVisible="{Binding HasSelectedScriptDependency}" Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="6">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock FontWeight="SemiBold" Text="行为脚本源码" />
+                    <TextBlock Grid.Column="1" FontSize="11" Foreground="#AEBAC8" Text="Luau · UTF-8" />
+                  </Grid>
+                  <TextBlock FontSize="11" Foreground="#9FE3B1" Text="{Binding ScriptSourcePath}" TextWrapping="Wrap" />
+                  <TextBlock FontSize="11" Foreground="#AEBAC8" Text="{Binding ScriptSourceRevisionStatus}" />
+                  <TextBox MinHeight="260"
+                           AcceptsReturn="True"
+                           FontFamily="Consolas"
+                           FontSize="12"
+                           IsEnabled="{Binding CanEditScriptSourceBuffer}"
+                           Text="{Binding ScriptSourceText}"
+                           TextWrapping="NoWrap"
+                           ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                           ScrollViewer.VerticalScrollBarVisibility="Auto" />
+                  <StackPanel Orientation="Horizontal" Spacing="5">
+                    <Button Command="{Binding SaveScriptSourceCommand}" Content="保存源码" />
+                    <Button Command="{Binding UndoScriptSourceCommand}" Content="撤销提交" />
+                    <Button Command="{Binding ReloadScriptSourceCommand}" Content="重新读取" />
+                    <Button Command="{Binding DiscardScriptSourceChangesCommand}" Content="放弃修改" />
+                  </StackPanel>
+                  <TextBlock FontSize="11" Foreground="#D7B46A" Text="{Binding ScriptSourceStatus}" TextWrapping="Wrap" />
+                </StackPanel>
               </Border>
 
               <Border Padding="8" Background="#252D37" CornerRadius="4">
@@ -192,7 +219,7 @@
                 </StackPanel>
               </Border>
 
-              <Border Padding="8" Background="#252D37" CornerRadius="4">
+              <Border IsVisible="{Binding UsesHookScriptAuthoring}" Padding="8" Background="#252D37" CornerRadius="4">
                 <StackPanel Spacing="4">
                   <TextBlock FontWeight="SemiBold" Text="Script Goal" />
                   <Grid ColumnDefinitions="Auto,*,Auto,*" RowDefinitions="Auto,Auto" ColumnSpacing="4" RowSpacing="3">

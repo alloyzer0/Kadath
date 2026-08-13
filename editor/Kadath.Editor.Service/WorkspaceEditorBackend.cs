@@ -148,6 +148,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             }
             _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.UndoToken));
             if (_authoringHistory.Count > MaxAuthoringHistory) { _authoringHistory.RemoveAt(0); }
+            _scriptSourceHistory.Clear();
             return new AuthoringMutationResult("apply", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
                 commit.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
         }
@@ -172,6 +173,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             var commit = await UndoWorkspaceAuthoringAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
             if (commit.State != "succeeded") { throw new EditorOperationException("authoring_protocol_error", "Native authoring undo did not restore a changed state."); }
             _authoringHistory.RemoveAt(_authoringHistory.Count - 1);
+            _scriptSourceHistory.Clear();
             return new AuthoringMutationResult("undo", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
                 record.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
         }
@@ -193,6 +195,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     _scriptSourceHistory.Clear();
                 _scriptSourceHistory.Add(new ScriptSourceUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.UndoToken));
                 if (_scriptSourceHistory.Count > MaxAuthoringHistory) _scriptSourceHistory.RemoveAt(0);
+                _authoringHistory.Clear();
                 return await CreateScriptSourceResultAsync("edit", project, parameters.ScriptId, commit, _scriptSourceHistory.Count, cancellationToken);
             }
             catch (WorkspaceAuthoringException exception) { throw MapScriptSourceError(exception); }
@@ -208,7 +211,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             try
             {
                 var current = await GetProjectSnapshotAsync(project, cancellationToken);
-                ValidateExpectedRevision(parameters.ExpectedRevision, current.AuthoringRevision);
+                ValidateExpectedRevision(parameters.ExpectedRevision, current.AuthoringRevision, "script_source_revision_conflict");
                 if (_scriptSourceHistory.Count == 0) throw new EditorOperationException("script_source_undo_empty", "There is no script source mutation to undo.");
                 var record = _scriptSourceHistory[^1];
                 if (!string.Equals(record.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
@@ -217,6 +220,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 var commit = await _scriptSourceAuthoringModel.UndoAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
                 if (commit.State != "succeeded") throw new EditorOperationException("script_source_protocol_error", "Script source undo did not restore a changed state.");
                 _scriptSourceHistory.RemoveAt(_scriptSourceHistory.Count - 1);
+                _authoringHistory.Clear();
                 return await CreateScriptSourceResultAsync("undo", project, record.Token.ScriptId, commit, _scriptSourceHistory.Count, cancellationToken);
             }
             catch (WorkspaceAuthoringException exception) { throw MapScriptSourceError(exception); }
@@ -644,7 +648,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             throw new EditorOperationException("publication_snapshot_protocol_error", $"{label} escapes the project derived directory.");
         }
     }
-    private static void ValidateExpectedRevision(string expected, string current)
+    private static void ValidateExpectedRevision(string expected, string current, string conflictCode = "authoring_revision_conflict")
     {
         if (string.IsNullOrWhiteSpace(expected) || expected.Length != 64 || expected.Any(value => !Uri.IsHexDigit(value)))
         {
@@ -652,7 +656,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         }
         if (!expected.Equals(current, StringComparison.OrdinalIgnoreCase))
         {
-            throw new EditorOperationException("authoring_revision_conflict", $"Expected {expected} but current revision is {current}.");
+            throw new EditorOperationException(conflictCode, $"Expected {expected} but current revision is {current}.");
         }
     }
 

@@ -22,6 +22,9 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
     public bool CanReadHierarchySnapshot => SupportsCommand("hierarchy_snapshot");
     public bool CanReadAssetCatalogSnapshot => SupportsCommand("asset_catalog_snapshot");
     public bool CanReadPublicationSnapshot => SupportsCommand("publication_snapshot");
+    public bool CanReadScriptSource => SupportsCommand("script_source_read");
+    public bool CanEditScriptSource => SupportsCommand("script_source_edit");
+    public bool CanUndoScriptSource => SupportsCommand("script_source_undo");
     public bool CanImportTexture => SupportsCommand("texture_import");
     public bool CanApplyAuthoring => SupportsCommand("authoring_apply");
     public bool CanUndoAuthoring => SupportsCommand("authoring_undo");
@@ -52,7 +55,12 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
         RaisePropertyChanged(nameof(CanReadHierarchySnapshot));
         RaisePropertyChanged(nameof(CanReadAssetCatalogSnapshot));
         RaisePropertyChanged(nameof(CanReadPublicationSnapshot));
+        RaisePropertyChanged(nameof(CanReadScriptSource));
+        RaisePropertyChanged(nameof(CanEditScriptSource));
+        RaisePropertyChanged(nameof(CanUndoScriptSource));
         RaisePropertyChanged(nameof(CanImportTexture));
+        RaisePropertyChanged(nameof(CanApplyAuthoring));
+        RaisePropertyChanged(nameof(CanUndoAuthoring));
         RaisePropertyChanged(nameof(CanBake));
         RaisePropertyChanged(nameof(CanStartWatch));
         RaisePropertyChanged(nameof(CanStopWatch));

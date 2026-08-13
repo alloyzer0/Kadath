@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows.Input;
@@ -16,6 +17,7 @@ namespace Kadath.Editor.Avalonia.ViewModels;
 /// </summary>
 public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 {
+    private const int MaxScriptSourceBytes = 64 * 1024;
     private readonly EditorWorkspaceViewModel _workspace;
     private readonly IEditorViewDispatcher _dispatcher;
     private readonly List<AsyncUiCommand> _commands = [];
@@ -49,6 +51,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _scriptGoalY = string.Empty;
     private string _scriptVelocityX = string.Empty;
     private string _scriptVelocityY = string.Empty;
+    private ScriptSourceDocument? _scriptSourceDocument;
+    private string _scriptSourceText = string.Empty;
+    private string? _scriptSourceHierarchyItem;
+    private bool _allowScriptSourceSelectionChange;
+    private int _scriptSourceSelectionVersion;
     public ObservableCollection<TextureAssignmentSlotViewModel> SceneTextureAssignments { get; } = [
         new TextureAssignmentSlotViewModel("Texture 1"),
         new TextureAssignmentSlotViewModel("Texture 2"),
@@ -72,6 +79,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace.AssetCatalogSnapshot.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Publication.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Authoring.PropertyChanged += OnNestedPropertyChanged;
+        _workspace.ScriptSource.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Bake.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Watch.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Preview.PropertyChanged += OnNestedPropertyChanged;
@@ -89,6 +97,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         RefreshSnapshotsCommand = AddCommand(new AsyncUiCommand(RefreshSnapshotsAsync, () => CanRefreshSnapshots && !IsBusy, HandleCommandError));
         ApplyAuthoringCommand = AddCommand(new AsyncUiCommand(ApplyAuthoringAsync, () => CanApplyAuthoring && !IsBusy, HandleCommandError));
         UndoAuthoringCommand = AddCommand(new AsyncUiCommand(UndoAuthoringAsync, () => CanUndoAuthoring && !IsBusy, HandleCommandError));
+        SaveScriptSourceCommand = AddCommand(new AsyncUiCommand(SaveScriptSourceAsync, () => CanSaveScriptSource, HandleCommandError));
+        UndoScriptSourceCommand = AddCommand(new AsyncUiCommand(UndoScriptSourceAsync, () => CanUndoScriptSource, HandleCommandError));
+        ReloadScriptSourceCommand = AddCommand(new AsyncUiCommand(ReloadScriptSourceAsync, () => CanReloadScriptSource, HandleCommandError));
         BakeCommand = AddCommand(new AsyncUiCommand(BakeAsync, () => IsProjectOpen && CanBake && !IsWatching && !IsPreviewAutoSync && !IsBusy, HandleCommandError));
         BakeChangesCommand = AddCommand(new AsyncUiCommand(BakeChangesAsync, () => CanBakeChanges, HandleCommandError));
         StartWatchCommand = AddCommand(new AsyncUiCommand(StartWatchAsync, () => IsProjectOpen && CanStartWatch && !IsWatching && !IsBusy, HandleCommandError));
@@ -101,6 +112,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         DeleteSceneObjectCommand = AddCommand(new DelegateUiCommand(DeleteSelectedSceneObjectDraft, () => CanDeleteSelectedSceneObject));
         MoveSceneObjectUpCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectUp, () => CanMoveSelectedSceneObjectUp));
         MoveSceneObjectDownCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectDown, () => CanMoveSelectedSceneObjectDown));
+        DiscardScriptSourceChangesCommand = AddCommand(new DelegateUiCommand(DiscardScriptSourceChanges, () => CanDiscardScriptSourceChanges));
         ClearEventLogCommand = new DelegateUiCommand(() => EventLog.Clear());
     }
 
@@ -119,6 +131,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand RefreshSnapshotsCommand { get; }
     public ICommand ApplyAuthoringCommand { get; }
     public ICommand UndoAuthoringCommand { get; }
+    public ICommand SaveScriptSourceCommand { get; }
+    public ICommand UndoScriptSourceCommand { get; }
+    public ICommand ReloadScriptSourceCommand { get; }
     public ICommand BakeCommand { get; }
     public ICommand BakeChangesCommand { get; }
     public ICommand StartWatchCommand { get; }
@@ -131,6 +146,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand DeleteSceneObjectCommand { get; }
     public ICommand MoveSceneObjectUpCommand { get; }
     public ICommand MoveSceneObjectDownCommand { get; }
+    public ICommand DiscardScriptSourceChangesCommand { get; }
     public ICommand ClearEventLogCommand { get; }
 
     public string PackageRoot { get => _packageRoot; set => SetProperty(ref _packageRoot, value); }
@@ -147,6 +163,14 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         get => _selectedHierarchyItem;
         set
         {
+            if (!_allowScriptSourceSelectionChange
+                && IsScriptSourceDirty
+                && !string.Equals(value, _scriptSourceHierarchyItem, StringComparison.Ordinal))
+            {
+                AddLog("script_source_switch_blocked", "请先保存或放弃当前脚本的未保存内容。", null, 0);
+                RaisePropertyChanged(nameof(SelectedHierarchyItem));
+                return;
+            }
             if (!SetProperty(ref _selectedHierarchyItem, value)) { return; }
             if (value is not null && _hierarchyItemsByLabel.TryGetValue(value, out var node))
             {
@@ -154,9 +178,24 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                 SelectedSceneObject = node.Kind == "SceneObject"
                     ? SceneObjectDrafts.FirstOrDefault(draft => draft.OriginalObjectId == node.DisplayName || draft.ObjectId == node.DisplayName)
                     : null;
+                if (TryGetScriptId(node, out var scriptId))
+                {
+                    _scriptSourceHierarchyItem = value;
+                    if (SelectedScriptSourceId != scriptId)
+                    {
+                        _ = LoadScriptSourceFromSelectionAsync(scriptId);
+                    }
+                }
+                else
+                {
+                    _scriptSourceHierarchyItem = null;
+                    Interlocked.Increment(ref _scriptSourceSelectionVersion);
+                }
             }
             else
             {
+                _scriptSourceHierarchyItem = null;
+                Interlocked.Increment(ref _scriptSourceSelectionVersion);
                 SelectedSceneObject = null;
             }
         }
@@ -181,6 +220,43 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public string ScriptGoalY { get => _scriptGoalY; set => SetProperty(ref _scriptGoalY, value); }
     public string ScriptVelocityX { get => _scriptVelocityX; set => SetProperty(ref _scriptVelocityX, value); }
     public string ScriptVelocityY { get => _scriptVelocityY; set => SetProperty(ref _scriptVelocityY, value); }
+    public string ScriptSourceText
+    {
+        get => _scriptSourceText;
+        set
+        {
+            if (!SetProperty(ref _scriptSourceText, value)) { return; }
+            RaiseAll();
+        }
+    }
+    public uint? SelectedScriptSourceId => _scriptSourceDocument?.ScriptId;
+    public uint? SelectedScriptDependencyId => TryGetSelectedScriptDependency(out var scriptId, out _) ? scriptId : null;
+    public bool HasSelectedScriptDependency => SelectedScriptDependencyId is not null;
+    public bool IsScriptSourceSelection => SelectedScriptDependencyId is { } scriptId
+        && _scriptSourceDocument?.ScriptId == scriptId;
+    public string ScriptSourcePath => IsScriptSourceSelection && _scriptSourceDocument is not null
+        ? _scriptSourceDocument.SourcePath
+        : TryGetSelectedScriptDependency(out _, out var sourcePath)
+            ? sourcePath
+            : "请选择 Hierarchy 中的 ScriptDependency。";
+    public string ScriptSourceRevisionStatus => _scriptSourceDocument is { AuthoringRevision.Length: >= 12 } document
+        ? $"revision={document.AuthoringRevision[..12]}… · undo={_workspace.ScriptSource.UndoDepth}"
+        : "revision=—";
+    public bool HasScriptSourceDocument => _scriptSourceDocument is not null;
+    public bool IsScriptSourceDirty => _scriptSourceDocument is { } document && !string.Equals(ScriptSourceText, document.Source, StringComparison.Ordinal);
+    public int ScriptSourceUtf8Bytes => Encoding.UTF8.GetByteCount(ScriptSourceText);
+    public string ScriptSourceStatus => _workspace.ScriptSource.State switch
+    {
+        EditorScriptSourceState.Loading => "正在读取行为脚本源码…",
+        EditorScriptSourceState.Saving => "正在保存行为脚本源码…",
+        EditorScriptSourceState.Undoing => "正在撤销最近一次脚本源码提交…",
+        EditorScriptSourceState.Failed when IsScriptSourceDirty => $"脚本源码操作失败 · {_workspace.ScriptSource.ErrorCode} · 未保存内容已保留",
+        EditorScriptSourceState.Failed => $"脚本源码操作失败 · {_workspace.ScriptSource.ErrorCode}",
+        _ when !IsScriptSourceSelection => "从 Hierarchy 选择 ScriptDependency 以加载源码。",
+        _ when IsScriptSourceDirty => $"有未保存修改 · UTF-8 {ScriptSourceUtf8Bytes}/{MaxScriptSourceBytes} 字节",
+        _ when HasScriptSourceDocument => $"已加载 · UTF-8 {ScriptSourceUtf8Bytes}/{MaxScriptSourceBytes} 字节",
+        _ => "从 Hierarchy 选择 ScriptDependency 以加载源码。"
+    };
 
     public string ConnectionStatus => _workspace.ConnectionState switch
     {
@@ -297,6 +373,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         || _workspace.Publication.State == EditorPublicationState.Loading
         || _workspace.TextureImport.State == EditorTextureImportState.Running
         || _workspace.Authoring.State is EditorAuthoringState.Applying or EditorAuthoringState.Undoing
+        || _workspace.ScriptSource.State is EditorScriptSourceState.Loading or EditorScriptSourceState.Saving or EditorScriptSourceState.Undoing
         || _workspace.Bake.State == EditorBakeState.Running
         || _workspace.Watch.State is EditorWatchState.Starting or EditorWatchState.Stopping
         || _workspace.Preview.State is EditorPreviewState.Starting or EditorPreviewState.Stopping;
@@ -305,14 +382,39 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool IsWatching => _workspace.Watch.State == EditorWatchState.Watching;
     public bool IsPreviewRunning => _workspace.Preview.State is EditorPreviewState.Starting or EditorPreviewState.Running;
     public bool IsPreviewAutoSync => _workspace.Preview.OwnsPublicationSync;
-    public bool CanProjectCommand => _workspace.Capabilities.CanOpenProject && IsConnected;
+    public bool CanProjectCommand => _workspace.Capabilities.CanOpenProject && IsConnected && !IsScriptSourceDirty;
     public bool CanCreateProject => IsConnected
         && _workspace.Capabilities.CanCreateProject
         && _workspace.Watch.State == EditorWatchState.Stopped
         && _workspace.Preview.State == EditorPreviewState.Stopped
+        && !IsScriptSourceDirty
         && !IsBusy;
-    public bool CanApplyAuthoring => IsProjectOpen && _workspace.Capabilities.CanApplyAuthoring;
-    public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0;
+    public bool CanApplyAuthoring => IsProjectOpen && _workspace.Capabilities.CanApplyAuthoring && !IsScriptSourceDirty;
+    public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0 && !IsScriptSourceDirty;
+    public bool SupportsScriptSourceAuthoring => IsProjectOpen
+        && _workspace.ProjectSnapshot.Value?.Script.SchemaVersion == 2
+        && _workspace.Capabilities.CanReadScriptSource;
+    public bool UsesHookScriptAuthoring => IsProjectOpen && _workspace.ProjectSnapshot.Value?.Script.SchemaVersion == 1;
+    public bool CanSaveScriptSource => SupportsScriptSourceAuthoring
+        && IsScriptSourceSelection
+        && _workspace.Capabilities.CanEditScriptSource
+        && HasScriptSourceDocument
+        && IsScriptSourceDirty
+        && ScriptSourceUtf8Bytes <= MaxScriptSourceBytes
+        && !IsBusy;
+    public bool CanUndoScriptSource => SupportsScriptSourceAuthoring
+        && IsScriptSourceSelection
+        && _workspace.Capabilities.CanUndoScriptSource
+        && HasScriptSourceDocument
+        && _workspace.ScriptSource.UndoDepth > 0
+        && !IsScriptSourceDirty
+        && !IsBusy;
+    public bool CanReloadScriptSource => SupportsScriptSourceAuthoring && HasSelectedScriptDependency && !IsScriptSourceDirty && !IsBusy;
+    public bool CanDiscardScriptSourceChanges => IsScriptSourceDirty && !IsBusy;
+    public bool CanEditScriptSourceBuffer => IsScriptSourceSelection
+        && HasScriptSourceDocument
+        && _workspace.Capabilities.CanEditScriptSource
+        && _workspace.ScriptSource.State is not (EditorScriptSourceState.Loading or EditorScriptSourceState.Saving or EditorScriptSourceState.Undoing);
     public bool HasSelectedSceneObject => SelectedSceneObject is not null;
     public bool CanAddSceneObject => CanApplyAuthoring && SceneObjectDrafts.Count < 64 && SceneTextureIds.Count > 0 && !IsBusy;
     public bool CanAddPatrolHazard => CanAddSceneObject
@@ -382,6 +484,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public async Task<ProjectSessionInfo> CreateProjectForCurrentInputAsync(CancellationToken cancellationToken = default)
     {
         await EnsureConnectedAsync();
+        if (IsScriptSourceDirty) { throw new EditorRpcException("script_source_dirty", "请先保存或放弃行为脚本源码的未保存内容。"); }
         var effectiveToken = cancellationToken == default ? _lifetime.Token : cancellationToken;
         var session = await _workspace.CreateProjectAsync(
             new ProjectCreateParameters(PackageRoot, ProjectName),
@@ -420,6 +523,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public async Task<AuthoringMutationResult> ApplyAuthoringForCurrentProjectAsync(CancellationToken cancellationToken = default)
     {
         await EnsureConnectedAsync();
+        if (IsScriptSourceDirty) { throw new EditorRpcException("script_source_dirty", "请先保存或放弃行为脚本源码的未保存内容。"); }
         var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
         var project = _workspace.ProjectSnapshot.Value ?? throw new EditorRpcException("snapshot_missing", "Project snapshot is not loaded.");
         var sceneTextures = ParseSceneTextureAssignments();
@@ -434,6 +538,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         try
         {
             var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
+            ReconcileScriptSourceDocument();
             ApplySnapshotProjection(session);
             RaiseAll();
             return result;
@@ -455,9 +560,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public async Task<AuthoringMutationResult> UndoAuthoringForCurrentProjectAsync(CancellationToken cancellationToken = default)
     {
         await EnsureConnectedAsync();
+        if (IsScriptSourceDirty) { throw new EditorRpcException("script_source_dirty", "请先保存或放弃行为脚本源码的未保存内容。"); }
         var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
         var project = _workspace.ProjectSnapshot.Value ?? throw new EditorRpcException("snapshot_missing", "Project snapshot is not loaded.");
         var result = await _workspace.UndoAuthoringAsync(new AuthoringUndoParameters(session.ProjectName, project.AuthoringRevision), cancellationToken == default ? _lifetime.Token : cancellationToken);
+        ReconcileScriptSourceDocument();
         ApplySnapshotProjection(session);
         RaiseAll();
         return result;
@@ -475,6 +582,160 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         }
         AddLog("texture_import", $"{result.RelativePath}; profile={result.Profile}; format={result.ArtifactFormat}", null, 0);
         RaiseAll();
+        return result;
+    }
+
+    public async Task<ScriptSourceDocument> LoadScriptSourceForCurrentProjectAsync(uint scriptId, CancellationToken cancellationToken = default)
+    {
+        if (IsScriptSourceDirty) { throw new EditorRpcException("script_source_dirty", "请先保存或放弃当前未保存内容。"); }
+        var selectionVersion = Interlocked.Increment(ref _scriptSourceSelectionVersion);
+        var result = await ReadScriptSourceForCurrentProjectAsync(scriptId, cancellationToken);
+        if (selectionVersion != Volatile.Read(ref _scriptSourceSelectionVersion)) { return result; }
+        ApplyScriptSourceDocument(result);
+        return result;
+    }
+
+    public async Task<ScriptSourceMutationResult> SaveScriptSourceForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureConnectedAsync();
+        var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
+        var document = _scriptSourceDocument ?? throw new EditorRpcException("script_source_not_loaded", "请先选择并加载行为脚本源码。");
+        if (!IsScriptSourceDirty) { throw new EditorRpcException("script_source_unchanged", "脚本源码没有未保存修改。"); }
+        if (ScriptSourceUtf8Bytes > MaxScriptSourceBytes)
+        {
+            throw new EditorRpcException("script_source_too_large", $"脚本源码超过 {MaxScriptSourceBytes} 字节限制。");
+        }
+        var result = await _workspace.EditScriptSourceAsync(
+            new ScriptSourceEditParameters(session.ProjectName, document.AuthoringRevision, document.ScriptId, ScriptSourceText),
+            cancellationToken == default ? _lifetime.Token : cancellationToken);
+        ApplyScriptSourceMutationProjection(session, result);
+        return result;
+    }
+
+    private async Task SaveScriptSourceAsync() => await SaveScriptSourceForCurrentProjectAsync(_lifetime.Token);
+
+    private async Task UndoScriptSourceAsync() => await UndoScriptSourceForCurrentProjectAsync(_lifetime.Token);
+
+    private async Task ReloadScriptSourceAsync()
+    {
+        var scriptId = SelectedScriptDependencyId ?? throw new EditorRpcException("script_source_not_selected", "请先选择行为脚本依赖。");
+        await LoadScriptSourceForCurrentProjectAsync(scriptId, _lifetime.Token);
+    }
+
+    private void DiscardScriptSourceChanges()
+    {
+        if (_scriptSourceDocument is null) { return; }
+        ScriptSourceText = _scriptSourceDocument.Source;
+        AddLog("script_source_discarded", $"已放弃 {_scriptSourceDocument.SourcePath} 的未保存内容。", null, 0);
+    }
+
+    private async Task<ScriptSourceDocument> ReadScriptSourceForCurrentProjectAsync(uint scriptId, CancellationToken cancellationToken)
+    {
+        await EnsureConnectedAsync();
+        var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
+        if (_workspace.ProjectSnapshot.Value?.Script.SchemaVersion != 2)
+        {
+            throw new EditorRpcException("invalid_script_source", "行为脚本源码编辑只支持 Script v2 项目。");
+        }
+        return await _workspace.ReadScriptSourceAsync(
+            new ScriptSourceQueryParameters(session.ProjectName, scriptId),
+            cancellationToken == default ? _lifetime.Token : cancellationToken);
+    }
+
+    private async Task LoadScriptSourceFromSelectionAsync(uint scriptId)
+    {
+        var selectionVersion = Interlocked.Increment(ref _scriptSourceSelectionVersion);
+        var hierarchyItem = _scriptSourceHierarchyItem;
+        try
+        {
+            var result = await ReadScriptSourceForCurrentProjectAsync(scriptId, _lifetime.Token);
+            await _dispatcher.InvokeAsync(() =>
+            {
+                if (selectionVersion != Volatile.Read(ref _scriptSourceSelectionVersion)
+                    || !string.Equals(hierarchyItem, _scriptSourceHierarchyItem, StringComparison.Ordinal)
+                    || !string.Equals(hierarchyItem, SelectedHierarchyItem, StringComparison.Ordinal))
+                {
+                    return;
+                }
+                ApplyScriptSourceDocument(result);
+            });
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+        catch (Exception exception)
+        {
+            if (selectionVersion == Volatile.Read(ref _scriptSourceSelectionVersion)) { HandleCommandError(exception); }
+        }
+    }
+
+    private void ApplyScriptSourceDocument(ScriptSourceDocument document)
+    {
+        _scriptSourceDocument = document;
+        _scriptSourceText = document.Source;
+        RaiseAll();
+    }
+
+    private void ApplyScriptSourceMutationProjection(ProjectSessionInfo session, ScriptSourceMutationResult result)
+    {
+        ApplyScriptSourceDocument(result.SourceDocument);
+        ApplySnapshotProjection(session, $"script.dependencies[{result.SourceDocument.ScriptId}]");
+        RaiseAll();
+    }
+
+    private void ReconcileScriptSourceDocument()
+    {
+        if (_scriptSourceDocument is null || _workspace.ScriptSource.Document is not { } document) { return; }
+        if (_scriptSourceDocument.ScriptId == document.ScriptId) { ApplyScriptSourceDocument(document); }
+    }
+
+    private void ClearScriptSourceProjection()
+    {
+        Interlocked.Increment(ref _scriptSourceSelectionVersion);
+        _scriptSourceDocument = null;
+        _scriptSourceText = string.Empty;
+        _scriptSourceHierarchyItem = null;
+    }
+
+    private static bool TryGetScriptId(HierarchyNode node, out uint scriptId)
+    {
+        scriptId = 0;
+        if (!string.Equals(node.Kind, "ScriptDependency", StringComparison.Ordinal)
+            || !node.Properties.TryGetValue("ScriptId", out var value))
+        {
+            return false;
+        }
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetUInt32(out scriptId)) { return scriptId != 0; }
+        return value.ValueKind == JsonValueKind.String
+            && uint.TryParse(value.GetString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out scriptId)
+            && scriptId != 0;
+    }
+
+    private bool TryGetSelectedScriptDependency(out uint scriptId, out string sourcePath)
+    {
+        scriptId = 0;
+        sourcePath = "正在读取行为脚本源码…";
+        if (SelectedHierarchyItem is null
+            || !_hierarchyItemsByLabel.TryGetValue(SelectedHierarchyItem, out var node)
+            || !TryGetScriptId(node, out scriptId))
+        {
+            return false;
+        }
+        if (node.Properties.TryGetValue("Source", out var value) && value.ValueKind == JsonValueKind.String)
+        {
+            sourcePath = value.GetString() ?? sourcePath;
+        }
+        return true;
+    }
+
+    public async Task<ScriptSourceMutationResult> UndoScriptSourceForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureConnectedAsync();
+        var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
+        var document = _scriptSourceDocument ?? throw new EditorRpcException("script_source_not_loaded", "请先选择并加载行为脚本源码。");
+        if (IsScriptSourceDirty) { throw new EditorRpcException("script_source_dirty", "撤销前请先保存或放弃当前未保存内容。"); }
+        var result = await _workspace.UndoScriptSourceAsync(
+            new ScriptSourceUndoParameters(session.ProjectName, document.AuthoringRevision),
+            cancellationToken == default ? _lifetime.Token : cancellationToken);
+        ApplyScriptSourceMutationProjection(session, result);
         return result;
     }
 
@@ -714,7 +975,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         return parsed;
     }
 
-    private void ApplySnapshotProjection(ProjectSessionInfo session)
+    private void ApplySnapshotProjection(ProjectSessionInfo session, string? preferredHierarchyNodeId = null)
     {
         var project = _workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Project snapshot is missing.");
         var hierarchy = _workspace.HierarchySnapshot.Value ?? throw new InvalidOperationException("Hierarchy snapshot is missing.");
@@ -726,6 +987,13 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         if (project.Scene.Objects is null)
         {
             throw new InvalidOperationException("Project snapshot does not expose Scene Objects.");
+        }
+
+        if (preferredHierarchyNodeId is null
+            && SelectedHierarchyItem is not null
+            && _hierarchyItemsByLabel.TryGetValue(SelectedHierarchyItem, out var selectedNode))
+        {
+            preferredHierarchyNodeId = selectedNode.Id;
         }
 
         HierarchyItems.Clear();
@@ -741,13 +1009,20 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
         PopulateAssetProjection(assets);
 
-        SelectedHierarchyItem = null;
-        SelectedAssetItem = null;
-        InspectorText = $"Project\n{project.ProjectName}\n\nModelVersion: {project.ModelVersion}\nPackage root: {session.PackageRoot}";
-        SetAuthoringFields(project);
-        var defaultHierarchy = _hierarchyItemsByLabel.FirstOrDefault(pair => pair.Value.Id == "scene.objects[goal]").Key
-            ?? _hierarchyItemsByLabel.Keys.FirstOrDefault();
-        if (defaultHierarchy is not null) { SelectedHierarchyItem = defaultHierarchy; }
+        _allowScriptSourceSelectionChange = true;
+        try
+        {
+            SelectedHierarchyItem = null;
+            SelectedAssetItem = null;
+            InspectorText = $"Project\n{project.ProjectName}\n\nModelVersion: {project.ModelVersion}\nPackage root: {session.PackageRoot}";
+            SetAuthoringFields(project);
+            if (project.Script.SchemaVersion != 2 || !_workspace.Capabilities.CanReadScriptSource) { ClearScriptSourceProjection(); }
+            var defaultHierarchy = _hierarchyItemsByLabel.FirstOrDefault(pair => pair.Value.Id == preferredHierarchyNodeId).Key
+                ?? _hierarchyItemsByLabel.FirstOrDefault(pair => pair.Value.Id == "scene.objects[goal]").Key
+                ?? _hierarchyItemsByLabel.Keys.FirstOrDefault();
+            if (defaultHierarchy is not null) { SelectedHierarchyItem = defaultHierarchy; }
+        }
+        finally { _allowScriptSourceSelectionChange = false; }
     }
 
     private void InvalidateProjectProjection()
@@ -758,7 +1033,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         AssetItems.Clear();
         _assetItemsByLabel.Clear();
         _assetLabelsByRelativePath.Clear();
-        SelectedHierarchyItem = null;
+        _allowScriptSourceSelectionChange = true;
+        try { SelectedHierarchyItem = null; }
+        finally { _allowScriptSourceSelectionChange = false; }
         SelectedAssetItem = null;
         ClearSceneObjectDrafts();
         SceneTextureIds.Clear();
@@ -769,6 +1046,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         ScriptGoalY = string.Empty;
         ScriptVelocityX = string.Empty;
         ScriptVelocityY = string.Empty;
+        ClearScriptSourceProjection();
         ClearSceneTextureAssignments();
     }
 
@@ -817,6 +1095,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         AssetItems.Add(Path.GetFileName(session.ScriptPath));
         AssetItems.Add(Path.GetFileName(session.PreviewPath));
         InspectorText = $"Project\n{session.ProjectName}\n\nSnapshot commands unavailable.";
+        ClearScriptSourceProjection();
         ClearSceneObjectDrafts();
         SceneTextureIds.Clear();
         ClearSceneTextureAssignments();
@@ -1018,6 +1297,24 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanCreateProject));
         OnPropertyChanged(nameof(CanApplyAuthoring));
         OnPropertyChanged(nameof(CanUndoAuthoring));
+        OnPropertyChanged(nameof(SupportsScriptSourceAuthoring));
+        OnPropertyChanged(nameof(UsesHookScriptAuthoring));
+        OnPropertyChanged(nameof(CanSaveScriptSource));
+        OnPropertyChanged(nameof(CanUndoScriptSource));
+        OnPropertyChanged(nameof(CanReloadScriptSource));
+        OnPropertyChanged(nameof(CanDiscardScriptSourceChanges));
+        OnPropertyChanged(nameof(CanEditScriptSourceBuffer));
+        OnPropertyChanged(nameof(ScriptSourceText));
+        OnPropertyChanged(nameof(SelectedScriptSourceId));
+        OnPropertyChanged(nameof(SelectedScriptDependencyId));
+        OnPropertyChanged(nameof(HasSelectedScriptDependency));
+        OnPropertyChanged(nameof(IsScriptSourceSelection));
+        OnPropertyChanged(nameof(ScriptSourcePath));
+        OnPropertyChanged(nameof(ScriptSourceRevisionStatus));
+        OnPropertyChanged(nameof(HasScriptSourceDocument));
+        OnPropertyChanged(nameof(IsScriptSourceDirty));
+        OnPropertyChanged(nameof(ScriptSourceUtf8Bytes));
+        OnPropertyChanged(nameof(ScriptSourceStatus));
         OnPropertyChanged(nameof(CanAddSceneObject));
         OnPropertyChanged(nameof(CanAddPatrolHazard));
         OnPropertyChanged(nameof(CanDeleteSelectedSceneObject));

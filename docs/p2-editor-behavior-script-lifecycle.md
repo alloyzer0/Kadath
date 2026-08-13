@@ -15,6 +15,9 @@
 - `Authoring` 接受完整 `SceneObjectDefinition` 行为绑定集合，可修改绑定参数；v5 场景始终以 v5 序列化，撤销恢复原始绑定。
 - Avalonia 对象草稿必须无损保留 `ProjectModelSceneObject.Behaviors`；修改位置、尺寸、颜色、纹理或对象顺序时，必须按原顺序和参数重新提交绑定，不得把已有绑定误序列化为空集合。
 - Avalonia 必须区分 v4 原生 `patrol` 字段与 v5 `behaviors` 字段；v5 不显示或提交已废弃的原生 Patrol 参数，v4 继续保持原有编辑语义。
+- Avalonia 在 Script v2 项目中从 Hierarchy 的 `ScriptDependency` 加载 Luau 源码，提供 UTF-8 文本编辑、保存、放弃修改、重新读取和脚本源码撤销；Script v1 项目继续显示 Hook 编辑区，不展示行为脚本源码编辑区。
+- 脚本源码保存必须携带已加载文档的 `AuthoringRevision`；修订冲突不得覆盖外部修改，也不得丢弃 Avalonia 中尚未保存的源码缓冲区。
+- 场景 Authoring 与脚本源码 Authoring 共用项目修订，因此任一成功提交都必须使另一类旧撤销链失效；界面不得继续提供必然失败的跨链撤销操作。
 - `WorkspaceScriptSourceAuthoringModel` 可按 `scriptId` 读取和修改单个 Luau 源文件，统一使用项目 `AuthoringRevision` 做乐观并发控制。
 - Luau 源编辑采用同目录独占 staging 文件和原子替换；撤销只恢复仍由本次提交拥有的文件，外部修改必须报告修订冲突。
 - v1 Hook 脚本仍保留原有 `GoalPosition` / `GoalVelocity` 投影；v2 行为脚本不伪造 Hook 指令，相关数组为空。
@@ -28,6 +31,7 @@
 - Scene v5 行为绑定解析与模型转换：`editor/Kadath.Editor.Workspace/WorkspaceSceneDocument.cs`
 - Scene v5 行为绑定 Authoring 与事务：`editor/Kadath.Editor.Workspace/WorkspaceAuthoringModel.cs`
 - Avalonia Scene 对象草稿、v4/v5 边界与行为绑定无损回传：`editor/Kadath.Editor.Avalonia/ViewModels/SceneObjectDraftViewModel.cs`、`editor/Kadath.Editor.Avalonia/ViewModels/AvaloniaEditorViewModel.cs`
+- Avalonia 行为脚本源码状态、命令与界面：`editor/Kadath.Editor.ViewModels/EditorScriptSourceViewModel.cs`、`editor/Kadath.Editor.ViewModels/EditorWorkspaceViewModel.cs`、`editor/Kadath.Editor.Avalonia/ViewModels/AvaloniaEditorViewModel.cs`、`editor/Kadath.Editor.Avalonia/Views/MainWindow.axaml`
 - Luau 源文件读取、原子提交和撤销：`editor/Kadath.Editor.Workspace/WorkspaceScriptSourceAuthoringModel.cs`
 - ReadModel 快照和 Hierarchy 投影：`editor/Kadath.Editor.Workspace/WorkspaceReadModel.cs`
 - Editor RPC DTO：`editor/Kadath.Editor.Protocol/Contracts.cs`
@@ -45,12 +49,13 @@
 - v5 行为参数修改不会降级为 v4，也不会在撤销时丢失绑定顺序和参数值。
 - Avalonia 在 Scene v5 中修改非行为字段后，Apply、快照刷新和 Undo 均保持每个对象的行为绑定签名；v4 原生 Patrol 草稿仍保留原生 Patrol 语义。
 - Avalonia headless smoke 已覆盖 v4 原生 Patrol 与 v5 行为绑定草稿投影；真实 workflow 已覆盖 Scene v5 的 Apply、刷新和 Undo 无损回归。
+- Avalonia headless smoke 已覆盖脚本源码共享 ReadModel；真实 stdio workflow 已覆盖从 `ScriptDependency` 自动加载、保存、撤销、修订冲突保留未保存缓冲区，以及受控 fixture 恢复。
 - Luau 源修改会更新完整项目 `AuthoringRevision`；旧修订、未知 `scriptId`、超出 64 KiB 和撤销前外部修改均被拒绝。
-- 真实 stdio RPC 已覆盖 `script_source_read`、`script_source_edit`、`script_source_undo`，并验证过期修订和空撤销错误码。
+- 真实 stdio RPC 已覆盖 `script_source_read`、`script_source_edit`、`script_source_undo`，并验证过期修订、空撤销错误码，以及场景/脚本源码撤销链互斥失效。
 - Luau tooling 已覆盖顶层无限循环和超预算内存分配失败路径。
 - Linux Debug、ReleaseSafe、cold-cache、负向路径和 ReleaseSafe 完整产品包矩阵均已通过；包验收覆盖归档清单、ELF 依赖、窗口像素、ALSA、静音回退和有界退出清理。
 
 ## 当前边界
 
-本阶段完成 Workspace、Editor Service RPC、Client 与 Avalonia 对象编辑层的行为绑定无损接入，但尚未提供 Avalonia 代码编辑器或运行时脚本调试器；脚本源 UI 接入和调试器仍是后续独立切片。
-当前候选已完成 Linux 固定点验收；跨平台 UI 接入和脚本调试器不属于本候选边界。
+本阶段已提供 Avalonia 基础 Luau 源码编辑器，但不包含语法高亮、自动补全、LSP、调试器、多标签页或运行时热重载；这些能力仍是后续独立切片。
+当前候选的验收边界是 Linux 上的共享 ViewModel、Avalonia 编译资源、真实 stdio RPC 源码工作流与现有产品矩阵；跨平台窗口验收不属于本候选边界。

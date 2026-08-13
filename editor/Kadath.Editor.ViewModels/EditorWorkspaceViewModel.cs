@@ -35,6 +35,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public EditorSnapshotViewModel<ProjectModelSnapshot> ProjectSnapshot { get; } = new();
     public EditorSnapshotViewModel<HierarchySnapshot> HierarchySnapshot { get; } = new();
     public EditorSnapshotViewModel<AssetCatalogSnapshot> AssetCatalogSnapshot { get; } = new();
+    public EditorScriptSourceViewModel ScriptSource { get; } = new();
     public EditorPublicationViewModel Publication { get; } = new();
     public EditorTextureImportViewModel TextureImport { get; } = new();
     public EditorAuthoringViewModel Authoring { get; } = new();
@@ -78,7 +79,11 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         try
         {
             var result = await Client.OpenProjectAsync(parameters, cancellationToken).ConfigureAwait(false);
-            await _dispatcher.InvokeAsync(() => Project.ApplyOpened(result)).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() =>
+            {
+                Project.ApplyOpened(result);
+                ScriptSource.Reset();
+            }).ConfigureAwait(false);
             return result;
         }
         catch (Exception exception)
@@ -156,7 +161,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         try
         {
             var result = await Client.GetProjectSnapshotAsync(new SnapshotQueryParameters(projectName), cancellationToken).ConfigureAwait(false);
-            await _dispatcher.InvokeAsync(() => ProjectSnapshot.Apply(result)).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() => ApplyRefreshedProjectSnapshot(result)).ConfigureAwait(false);
             return result;
         }
         catch (Exception exception)
@@ -196,6 +201,59 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         catch (Exception exception)
         {
             await ApplySnapshotExceptionAsync(AssetCatalogSnapshot, exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<ScriptSourceDocument> ReadScriptSourceAsync(ScriptSourceQueryParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanReadScriptSource, "script_source_read");
+        await _dispatcher.InvokeAsync(ScriptSource.BeginRead).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.GetScriptSourceAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() => ScriptSource.ApplyRead(result)).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyScriptSourceExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanEditScriptSource, "script_source_edit");
+        await _dispatcher.InvokeAsync(ScriptSource.BeginEdit).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.EditScriptSourceAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() => ApplyScriptSourceResult(result)).ConfigureAwait(false);
+            await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyScriptSourceExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanUndoScriptSource, "script_source_undo");
+        await _dispatcher.InvokeAsync(ScriptSource.BeginUndo).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.UndoScriptSourceAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() => ApplyScriptSourceResult(result)).ConfigureAwait(false);
+            await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyScriptSourceExceptionAsync(exception).ConfigureAwait(false);
             throw;
         }
     }
@@ -288,6 +346,27 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     private void ApplyAuthoringResult(AuthoringMutationResult result)
     {
         Authoring.Apply(result);
+        ScriptSource.ApplyAuthoringRevision(result.PreviousRevision, result.Revision);
+        ProjectSnapshot.Apply(result.ProjectSnapshot);
+        HierarchySnapshot.Apply(result.HierarchySnapshot);
+    }
+
+    private void ApplyRefreshedProjectSnapshot(ProjectModelSnapshot result)
+    {
+        var revisionChanged = ProjectSnapshot.Value is { } previous
+            && !string.Equals(previous.AuthoringRevision, result.AuthoringRevision, StringComparison.OrdinalIgnoreCase);
+        Authoring.InvalidateHistory(result.AuthoringRevision);
+        if (revisionChanged)
+        {
+            ScriptSource.InvalidateHistory();
+        }
+        ProjectSnapshot.Apply(result);
+    }
+
+    private void ApplyScriptSourceResult(ScriptSourceMutationResult result)
+    {
+        ScriptSource.ApplyMutation(result);
+        Authoring.InvalidateHistory(result.Revision);
         ProjectSnapshot.Apply(result.ProjectSnapshot);
         HierarchySnapshot.Apply(result.HierarchySnapshot);
     }
@@ -449,7 +528,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         switch (notification.Event)
         {
             case "project_opened":
-                if (TryRead(notification.Data, out ProjectSessionInfo? session) && session is not null) { Project.ApplyOpened(session); Authoring.Reset(); Publication.Reset(); }
+                if (TryRead(notification.Data, out ProjectSessionInfo? session) && session is not null) { Project.ApplyOpened(session); Authoring.Reset(); Publication.Reset(); ScriptSource.Reset(); }
                 break;
             case "project_created":
                 if (TryRead(notification.Data, out ProjectSessionInfo? createdSession) && createdSession is not null) { ApplyCreatedSession(createdSession); }
@@ -458,13 +537,43 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
                 if (TryRead(notification.Data, out ProjectValidateResult? validation) && validation is not null) { Project.ApplyValidation(validation); }
                 break;
             case "project_snapshot_created":
-                if (TryRead(notification.Data, out ProjectModelSnapshot? projectSnapshot) && projectSnapshot is not null) { ProjectSnapshot.Apply(projectSnapshot); }
+                if (TryRead(notification.Data, out ProjectModelSnapshot? projectSnapshot) && projectSnapshot is not null) { ApplyRefreshedProjectSnapshot(projectSnapshot); }
                 break;
             case "hierarchy_snapshot_created":
                 if (TryRead(notification.Data, out HierarchySnapshot? hierarchySnapshot) && hierarchySnapshot is not null) { HierarchySnapshot.Apply(hierarchySnapshot); }
                 break;
             case "asset_catalog_snapshot_created":
                 if (TryRead(notification.Data, out AssetCatalogSnapshot? assetSnapshot) && assetSnapshot is not null) { AssetCatalogSnapshot.Apply(assetSnapshot); }
+                break;
+            case "script_source_read":
+                if (TryRead(notification.Data, out ScriptSourceDocument? sourceDocument) && sourceDocument is not null) { ScriptSource.ApplyRead(sourceDocument); }
+                break;
+            case "script_source_read_failed":
+                ScriptSource.ApplyFailure(
+                    ReadString(notification.Data, "errorCode") ?? "script_source_read_failed",
+                    ReadString(notification.Data, "message") ?? "Script source read failed.");
+                break;
+            case "script_source_edit_started":
+                ScriptSource.BeginEdit();
+                break;
+            case "script_source_edit_completed":
+                if (TryRead(notification.Data, out ScriptSourceMutationResult? editedSource) && editedSource is not null) { ApplyScriptSourceResult(editedSource); }
+                break;
+            case "script_source_edit_failed":
+                ScriptSource.ApplyFailure(
+                    ReadString(notification.Data, "errorCode") ?? "script_source_edit_failed",
+                    ReadString(notification.Data, "message") ?? "Script source edit failed.");
+                break;
+            case "script_source_undo_started":
+                ScriptSource.BeginUndo();
+                break;
+            case "script_source_undo_completed":
+                if (TryRead(notification.Data, out ScriptSourceMutationResult? undoneSource) && undoneSource is not null) { ApplyScriptSourceResult(undoneSource); }
+                break;
+            case "script_source_undo_failed":
+                ScriptSource.ApplyFailure(
+                    ReadString(notification.Data, "errorCode") ?? "script_source_undo_failed",
+                    ReadString(notification.Data, "message") ?? "Script source undo failed.");
                 break;
             case "publication_snapshot_created":
                 if (TryRead(notification.Data, out PublicationSnapshot? publicationSnapshot) && publicationSnapshot is not null) { Publication.Apply(publicationSnapshot); }
@@ -612,11 +721,13 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             Project.StageOpened(session);
             Authoring.Reset();
             Publication.Reset();
+            ScriptSource.Reset();
             Project.PublishStagedOpened();
             PublishCreatedSnapshotGroupInvalidation();
             return;
         }
         Project.ApplyOpened(session);
+        ScriptSource.Reset();
     }
 
     private void StageCreatedSnapshotGroupInvalidation()
@@ -728,7 +839,25 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             OperationCanceledException => ("cancelled", "The authoring operation was cancelled."),
             _ => ("authoring_failed", exception.Message)
         };
-        await _dispatcher.InvokeAsync(() => Authoring.ApplyFailure(code, message)).ConfigureAwait(false);
+        await _dispatcher.InvokeAsync(() =>
+        {
+            Authoring.ApplyFailure(code, message);
+            if (code is "authoring_revision_conflict" or "authoring_history_diverged") { ScriptSource.InvalidateHistory(); }
+        }).ConfigureAwait(false);
+    }
+    private async Task ApplyScriptSourceExceptionAsync(Exception exception)
+    {
+        var (code, message) = exception switch
+        {
+            EditorRpcException rpc => (rpc.Code, rpc.Message),
+            OperationCanceledException => ("cancelled", "脚本源码操作已取消。"),
+            _ => ("script_source_failed", exception.Message)
+        };
+        await _dispatcher.InvokeAsync(() =>
+        {
+            ScriptSource.ApplyFailure(code, message);
+            if (code is "script_source_revision_conflict" or "script_source_history_diverged" or "authoring_revision_conflict") { Authoring.InvalidateHistory(); }
+        }).ConfigureAwait(false);
     }
     private async Task ApplyBakeExceptionAsync(Exception exception) =>
         await ApplyExceptionAsync(exception, "bake_failed", (code, message) => Bake.ApplyFailed(code, message, true)).ConfigureAwait(false);

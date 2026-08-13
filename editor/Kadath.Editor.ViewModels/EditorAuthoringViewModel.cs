@@ -50,10 +50,19 @@ public sealed class EditorAuthoringViewModel : ObservableObject
 
     internal void ApplyFailure(string code, string message)
     {
-        // 失败不清空 revision/undoDepth；Runtime 与最近一次成功 authoring 状态仍然有效。
+        if (code is "authoring_revision_conflict" or "authoring_history_diverged") { UndoDepth = 0; }
         State = EditorAuthoringState.Failed;
         ErrorCode = code;
         ErrorMessage = message;
+    }
+
+    internal void InvalidateHistory() => UndoDepth = 0;
+
+    internal void InvalidateHistory(string revision)
+    {
+        if (string.Equals(Revision, revision, StringComparison.OrdinalIgnoreCase)) { return; }
+        Revision = revision;
+        UndoDepth = 0;
     }
 
     internal void Reset()
@@ -66,4 +75,3 @@ public sealed class EditorAuthoringViewModel : ObservableObject
         ErrorMessage = null;
     }
 }
-
