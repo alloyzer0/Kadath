@@ -161,7 +161,7 @@
                         <TextBlock VerticalAlignment="Center" Text="Move speed" />
                         <TextBox Grid.Column="1" Text="{Binding SelectedSceneObject.MoveSpeed}" />
                       </Grid>
-                      <Grid IsVisible="{Binding SelectedSceneObject.IsPatrolHazard}" ColumnDefinitions="Auto,*,Auto,*" RowDefinitions="Auto,Auto" ColumnSpacing="4" RowSpacing="3">
+                      <Grid IsVisible="{Binding SelectedSceneObject.UsesNativePatrol}" ColumnDefinitions="Auto,*,Auto,*" RowDefinitions="Auto,Auto" ColumnSpacing="4" RowSpacing="3">
                         <TextBlock VerticalAlignment="Center" Text="Min Y" />
                         <TextBox Grid.Column="1" Text="{Binding SelectedSceneObject.PatrolMinY}" />
                         <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Max Y" />

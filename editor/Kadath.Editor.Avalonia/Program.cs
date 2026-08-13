@@ -66,7 +66,14 @@ internal static class Program
         avaloniaViewModel.ProjectName = openProjectName;
         await avaloniaViewModel.RefreshSnapshotsForCurrentProjectAsync(cancellationToken);
         var expectedAssetCount = Directory.EnumerateFiles(Path.Combine(packageRoot, "bin", "assets"), "*", SearchOption.AllDirectories).Count();
-        Require(avaloniaViewModel.HierarchyItems.Count == 13 && expectedAssetCount > 0 && avaloniaViewModel.AssetItems.Count == expectedAssetCount,
+        var openedHierarchy = workspace.HierarchySnapshot.Value ?? throw new InvalidOperationException("Opened hierarchy snapshot is missing.");
+        var expectedOpenedHierarchyCount = openedHierarchy.ProjectModelVersion == EditorSnapshotVersions.ProjectModel
+            && workspace.ProjectSnapshot.Value?.Scene.SchemaVersion == 5
+            ? openedHierarchy.Nodes.Length
+            : 13;
+        Require(avaloniaViewModel.HierarchyItems.Count == expectedOpenedHierarchyCount
+            && expectedAssetCount > 0
+            && avaloniaViewModel.AssetItems.Count == expectedAssetCount,
             "Avalonia should project every asset from the current product package.");
         Require(avaloniaViewModel.SceneTextureAssignments.Count == 4
             && avaloniaViewModel.SceneTextureAssignments[0].TextureIdText == "1"
@@ -78,6 +85,34 @@ internal static class Program
             "Avalonia hierarchy selection did not project the typed Scene Object inspector");
         Console.WriteLine("workflow_snapshot_projection=ok");
         Console.WriteLine("workflow_project_open=ok");
+
+        var openedProject = workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Opened project snapshot is missing.");
+        if (openedProject.Scene.SchemaVersion == 5)
+        {
+            var expectedBehaviors = CaptureBehaviorSignatures(openedProject);
+            var hazardDraft = avaloniaViewModel.SceneObjectDrafts.First(draft => draft.Kind == "patrol_hazard");
+            var originalHazardX = hazardDraft.PositionX;
+            hazardDraft.PositionX = (double.Parse(hazardDraft.PositionX, CultureInfo.InvariantCulture) + 7d).ToString("R", CultureInfo.InvariantCulture);
+
+            var preserved = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(preserved.ProjectSnapshot.Scene.SchemaVersion == 5
+                && preserved.ProjectSnapshot.Scene.Objects?.Single(item => item.ObjectId == hazardDraft.ObjectId).Position[0]
+                    == double.Parse(hazardDraft.PositionX, CultureInfo.InvariantCulture),
+                "Avalonia did not commit the non-behavior Scene v5 object edit");
+            RequireBehaviorSignatures(preserved.ProjectSnapshot, expectedBehaviors, "authoring apply");
+
+            await avaloniaViewModel.RefreshSnapshotsForCurrentProjectAsync(cancellationToken);
+            RequireBehaviorSignatures(
+                workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Refreshed project snapshot is missing."),
+                expectedBehaviors,
+                "snapshot refresh");
+
+            var restored = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.ObjectId == hazardDraft.ObjectId).PositionX == originalHazardX,
+                "Avalonia did not restore the Scene v5 object edit");
+            RequireBehaviorSignatures(restored.ProjectSnapshot, expectedBehaviors, "authoring undo");
+        }
+        Console.WriteLine("workflow_behavior_preservation=ok");
 
         var oldHierarchyLabel = avaloniaViewModel.HierarchyItems[0];
         var oldAssetLabel = avaloniaViewModel.AssetItems[0];
@@ -127,7 +162,9 @@ internal static class Program
             && created.ProjectName == createdProjectName
             && workspace.ProjectSnapshot.Value?.ProjectName == createdProjectName
             && workspace.HierarchySnapshot.Value?.ProjectName == createdProjectName
-            && avaloniaViewModel.HierarchyItems.Count == 13
+            && avaloniaViewModel.HierarchyItems.Count == (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion == 5
+                ? workspace.HierarchySnapshot.Value?.Nodes.Length
+                : 13)
             && avaloniaViewModel.AssetItems.Count == expectedAssetCount
             && avaloniaViewModel.SceneObjectDrafts.Count == 5
             && avaloniaViewModel.InspectorText.Contains("scene.objects[goal]", StringComparison.Ordinal),
@@ -141,6 +178,8 @@ internal static class Program
         var originalGoalX = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal").PositionX;
         var originalPlayerTextureId = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "player").TextureIdText;
         var originalSceneTextureAsset = avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem;
+        var createdSceneSchemaVersion = workspace.ProjectSnapshot.Value?.Scene.SchemaVersion
+            ?? throw new InvalidOperationException("Created project snapshot is missing.");
         var alternateSceneTextureAsset = avaloniaViewModel.AssetItems.FirstOrDefault(label => label.Contains("goal.texture", StringComparison.Ordinal) && label != originalSceneTextureAsset)
             ?? avaloniaViewModel.AssetItems.FirstOrDefault(label => label.Contains("test.texture", StringComparison.Ordinal) && label != originalSceneTextureAsset);
         Require(!string.IsNullOrWhiteSpace(alternateSceneTextureAsset), "workflow fixture did not expose an alternate renderer2d texture asset");
@@ -150,8 +189,13 @@ internal static class Program
             "Avalonia allowed deletion of the unique Player");
         avaloniaViewModel.AddDecorativeSpriteDraft();
         var addedSpriteId = avaloniaViewModel.SelectedSceneObject?.ObjectId;
-        avaloniaViewModel.AddPatrolHazardDraft();
-        var addedHazard = avaloniaViewModel.SelectedSceneObject ?? throw new InvalidOperationException("Avalonia did not select the new Patrol Hazard draft");
+        string? addedHazardId = null;
+        if (avaloniaViewModel.CanAddPatrolHazard)
+        {
+            avaloniaViewModel.AddPatrolHazardDraft();
+            addedHazardId = avaloniaViewModel.SelectedSceneObject?.ObjectId
+                ?? throw new InvalidOperationException("Avalonia did not select the new Patrol Hazard draft");
+        }
         avaloniaViewModel.MoveSelectedSceneObjectUp();
         var goalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
         goalDraft.PositionX = (double.Parse(goalDraft.PositionX, CultureInfo.InvariantCulture) + 11d).ToString("R", CultureInfo.InvariantCulture);
@@ -162,10 +206,10 @@ internal static class Program
             && workspace.Authoring.UndoDepth == 1
             && appliedAuthoring.ChangedFields.Contains("scene.objects")
             && appliedAuthoring.ChangedFields.Contains("scene.textures")
-            && appliedAuthoring.ProjectSnapshot.Scene.SchemaVersion == 4
-            && appliedAuthoring.ProjectSnapshot.Scene.Objects?.Count == 7
+            && appliedAuthoring.ProjectSnapshot.Scene.SchemaVersion == createdSceneSchemaVersion
+            && appliedAuthoring.ProjectSnapshot.Scene.Objects?.Count == originalObjectIds.Length + 1 + (addedHazardId is null ? 0 : 1)
             && appliedAuthoring.ProjectSnapshot.Scene.Objects.Any(item => item.ObjectId == addedSpriteId)
-            && appliedAuthoring.ProjectSnapshot.Scene.Objects.Any(item => item.ObjectId == addedHazard.ObjectId),
+            && (addedHazardId is null || appliedAuthoring.ProjectSnapshot.Scene.Objects.Any(item => item.ObjectId == addedHazardId)),
             "authoring apply did not commit the complete Scene Object replacement");
         Require(avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem == alternateSceneTextureAsset,
             "authoring apply did not keep the editable texture assignment in sync");
@@ -290,6 +334,26 @@ internal static class Program
         if (!condition) { throw new InvalidOperationException(message); }
     }
 
+    private static IReadOnlyDictionary<string, string> CaptureBehaviorSignatures(ProjectModelSnapshot project)
+    {
+        var objects = project.Scene.Objects ?? throw new InvalidOperationException("Project snapshot does not expose Scene Objects.");
+        return objects.ToDictionary(
+            sceneObject => sceneObject.ObjectId,
+            sceneObject => JsonSerializer.Serialize(sceneObject.Behaviors, EditorProtocol.JsonOptions),
+            StringComparer.Ordinal);
+    }
+
+    private static void RequireBehaviorSignatures(
+        ProjectModelSnapshot project,
+        IReadOnlyDictionary<string, string> expected,
+        string operation)
+    {
+        var actual = CaptureBehaviorSignatures(project);
+        Require(actual.Count == expected.Count
+            && expected.All(pair => actual.TryGetValue(pair.Key, out var signature) && signature == pair.Value),
+            $"Avalonia {operation} changed Scene v5 behavior bindings");
+    }
+
     private static async Task HeadlessSmokeAsync()
     {
         // 无窗口 smoke 检查编译后的 Avalonia resource，避免平台 backend 启动消息循环。
@@ -317,6 +381,58 @@ internal static class Program
             && viewModel.TextureImportProfile == "debug",
             "Avalonia texture import controls were not initialized behind project/capability gating");
         Console.WriteLine("texture_import_controls=ok");
+
+        var textureIds = new System.Collections.ObjectModel.ObservableCollection<string>(["1"]);
+        var v5Draft = SceneObjectDraftViewModel.FromSnapshot(
+            new ProjectModelSceneObject(
+                "hazard-v5",
+                "patrol_hazard",
+                [0, 0],
+                [1, 1],
+                [1, 1, 1, 1],
+                1,
+                Behaviors:
+                [
+                    new ProjectModelSceneBehaviorBinding(
+                        7,
+                        [new ProjectModelSceneBehaviorParameter("speed", 80)]),
+                    new ProjectModelSceneBehaviorBinding(
+                        11,
+                        [new ProjectModelSceneBehaviorParameter("weight", 0.5)])
+                ]),
+            textureIds);
+        var v5Definitions = v5Draft.CreateBehaviorDefinitions();
+        var v5Binding = v5Definitions?.FirstOrDefault();
+        var v5SecondBinding = v5Definitions?.Skip(1).FirstOrDefault();
+        Require(!v5Draft.UsesNativePatrol
+            && v5Binding is not null
+            && v5Binding.ScriptId == 7
+            && v5Binding.Parameters is { } v5Parameters
+            && v5Parameters.TryGetValue("speed", out var speed)
+            && speed == 80,
+            "Avalonia did not preserve Scene v5 behavior bindings in the draft model");
+        Require(v5SecondBinding is not null
+            && v5SecondBinding.ScriptId == 11
+            && v5Definitions?.Count == 2,
+            "Avalonia did not preserve Scene v5 behavior binding order");
+
+        var v4Draft = SceneObjectDraftViewModel.FromSnapshot(
+            new ProjectModelSceneObject(
+                "hazard-v4",
+                "patrol_hazard",
+                [0, 0],
+                [1, 1],
+                [1, 1, 1, 1],
+                1,
+                PatrolMinY: -1,
+                PatrolMaxY: 1,
+                PatrolSpeed: 2,
+                Behaviors: []),
+            textureIds);
+        Require(v4Draft.UsesNativePatrol && v4Draft.CreateBehaviorDefinitions() is { Count: 0 },
+            "Avalonia did not retain Scene v4 native Patrol semantics");
+        Console.WriteLine("behavior_binding_projection=ok");
+
         if (!viewModel.SupportsExternalWindow || viewModel.SupportsSharedTexture || viewModel.SupportsFrameStream)
         {
             throw new InvalidOperationException("Preview capability gating does not match the v1 external-window contract.");

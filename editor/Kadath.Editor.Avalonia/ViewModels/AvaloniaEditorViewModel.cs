@@ -97,7 +97,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         StopPreviewCommand = AddCommand(new AsyncUiCommand(StopPreviewAsync, () => CanRequestPreviewStop && !IsBusy, HandleCommandError));
         ImportTextureCommand = AddCommand(new AsyncUiCommand(ImportTextureAsync, () => CanImportTexture, HandleCommandError));
         AddDecorativeSpriteCommand = AddCommand(new DelegateUiCommand(AddDecorativeSpriteDraft, () => CanAddSceneObject));
-        AddPatrolHazardCommand = AddCommand(new DelegateUiCommand(AddPatrolHazardDraft, () => CanAddSceneObject));
+        AddPatrolHazardCommand = AddCommand(new DelegateUiCommand(AddPatrolHazardDraft, () => CanAddPatrolHazard));
         DeleteSceneObjectCommand = AddCommand(new DelegateUiCommand(DeleteSelectedSceneObjectDraft, () => CanDeleteSelectedSceneObject));
         MoveSceneObjectUpCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectUp, () => CanMoveSelectedSceneObjectUp));
         MoveSceneObjectDownCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectDown, () => CanMoveSelectedSceneObjectDown));
@@ -315,6 +315,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0;
     public bool HasSelectedSceneObject => SelectedSceneObject is not null;
     public bool CanAddSceneObject => CanApplyAuthoring && SceneObjectDrafts.Count < 64 && SceneTextureIds.Count > 0 && !IsBusy;
+    public bool CanAddPatrolHazard => CanAddSceneObject
+        && _workspace.ProjectSnapshot.Value is { } project
+        && project.Scene.SchemaVersion != 5;
     public bool CanDeleteSelectedSceneObject => SelectedSceneObject is { } selected
         && !IsBusy
         && (selected.Kind == "sprite" || selected.Kind == "patrol_hazard" && SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard") > 1);
@@ -422,9 +425,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         var sceneTextures = ParseSceneTextureAssignments();
         var allowedTextureIds = sceneTextures?.Select(texture => texture.TextureId).ToHashSet()
             ?? (project.Scene.Textures ?? []).Select(texture => texture.TextureId).ToHashSet();
+        var editsHookScript = project.Script.SchemaVersion == 1;
         var patch = new AuthoringPatch(
-            ScriptGoalPosition: ParseVector(ScriptGoalX, ScriptGoalY, "script.goal.position"),
-            ScriptGoalVelocity: ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity"),
+            ScriptGoalPosition: editsHookScript ? ParseVector(ScriptGoalX, ScriptGoalY, "script.goal.position") : null,
+            ScriptGoalVelocity: editsHookScript ? ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity") : null,
             SceneTextures: sceneTextures,
             SceneObjects: ParseSceneObjectDrafts(allowedTextureIds));
         try
@@ -587,6 +591,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             double? patrolMinY = null;
             double? patrolMaxY = null;
             double? patrolSpeed = null;
+            var behaviors = draft.CreateBehaviorDefinitions();
             switch (draft.Kind)
             {
                 case "sprite":
@@ -600,19 +605,33 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                     break;
                 case "patrol_hazard":
                     hazardCount++;
-                    patrolMinY = ParseFiniteNumber(draft.PatrolMinY, $"scene.objects[{objectId}].patrol.minY");
-                    patrolMaxY = ParseFiniteNumber(draft.PatrolMaxY, $"scene.objects[{objectId}].patrol.maxY");
-                    patrolSpeed = ParseNonNegativeNumber(draft.PatrolSpeed, $"scene.objects[{objectId}].patrol.speed");
-                    if (patrolMinY >= patrolMaxY || position[1] < patrolMinY || position[1] > patrolMaxY)
+                    if (draft.UsesNativePatrol)
                     {
-                        throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}] 的 Patrol 范围或初始 Y 无效。");
+                        patrolMinY = ParseFiniteNumber(draft.PatrolMinY, $"scene.objects[{objectId}].patrol.minY");
+                        patrolMaxY = ParseFiniteNumber(draft.PatrolMaxY, $"scene.objects[{objectId}].patrol.maxY");
+                        patrolSpeed = ParseNonNegativeNumber(draft.PatrolSpeed, $"scene.objects[{objectId}].patrol.speed");
+                        if (patrolMinY >= patrolMaxY || position[1] < patrolMinY || position[1] > patrolMaxY)
+                        {
+                            throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}] 的 Patrol 范围或初始 Y 无效。");
+                        }
                     }
                     break;
                 default:
                     throw new EditorRpcException("invalid_authoring_patch", $"不支持的 Object Kind：{draft.Kind}。");
             }
 
-            definitions.Add(new SceneObjectDefinition(objectId, draft.Kind, position, size, color, textureId, moveSpeed, patrolMinY, patrolMaxY, patrolSpeed));
+            definitions.Add(new SceneObjectDefinition(
+                objectId,
+                draft.Kind,
+                position,
+                size,
+                color,
+                textureId,
+                moveSpeed,
+                patrolMinY,
+                patrolMaxY,
+                patrolSpeed,
+                behaviors));
         }
         if (playerCount != 1 || goalCount != 1 || hazardCount < 1)
         {
@@ -629,7 +648,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
     public void AddPatrolHazardDraft()
     {
-        if (!CanAddSceneObject) { return; }
+        if (!CanAddPatrolHazard) { return; }
         AddSceneObjectDraft(SceneObjectDraftViewModel.NewPatrolHazard(NextObjectId("hazard"), SceneTextureIds[0], SceneTextureIds));
     }
 
@@ -768,10 +787,20 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         ScenePlayerTextureId = project.Scene.PlayerTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
         SceneGoalTextureId = project.Scene.GoalTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
         SceneHazardTextureId = project.Scene.HazardTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        ScriptGoalX = project.Script.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
-        ScriptGoalY = project.Script.GoalPosition[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
-        ScriptVelocityX = project.Script.GoalVelocity[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
-        ScriptVelocityY = project.Script.GoalVelocity[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        if (project.Script.SchemaVersion == 1)
+        {
+            ScriptGoalX = project.Script.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+            ScriptGoalY = project.Script.GoalPosition[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+            ScriptVelocityX = project.Script.GoalVelocity[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+            ScriptVelocityY = project.Script.GoalVelocity[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+        }
+        else
+        {
+            ScriptGoalX = string.Empty;
+            ScriptGoalY = string.Empty;
+            ScriptVelocityX = string.Empty;
+            ScriptVelocityY = string.Empty;
+        }
         SetSceneTextureAssignments(project);
         SetSceneObjectDrafts(project.Scene.Objects ?? throw new InvalidOperationException("Project snapshot does not expose Scene Objects."));
     }
@@ -990,6 +1019,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanApplyAuthoring));
         OnPropertyChanged(nameof(CanUndoAuthoring));
         OnPropertyChanged(nameof(CanAddSceneObject));
+        OnPropertyChanged(nameof(CanAddPatrolHazard));
         OnPropertyChanged(nameof(CanDeleteSelectedSceneObject));
         OnPropertyChanged(nameof(CanMoveSelectedSceneObjectUp));
         OnPropertyChanged(nameof(CanMoveSelectedSceneObjectDown));

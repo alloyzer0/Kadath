@@ -34,6 +34,39 @@ function New-OpenFixture {
     New-Item -ItemType Directory -Path $openProjectDirectory | Out-Null
     [IO.File]::Copy($sceneTemplate, (Join-Path $openProjectDirectory 'scene.json'))
     [IO.File]::Copy($scriptTemplate, (Join-Path $openProjectDirectory 'script.json'))
+
+    $scriptManifest = Get-Content -LiteralPath $scriptTemplate -Raw | ConvertFrom-Json
+    $scriptSchemaVersion = [int]$scriptManifest.schemaVersion
+    if ($scriptSchemaVersion -notin @(1, 2)) { throw "Unsupported workflow Script schema version: $scriptSchemaVersion" }
+    if ($scriptSchemaVersion -eq 2) {
+        $assetRoot = Join-Path $package 'bin/assets'
+        foreach ($entry in @($scriptManifest.scripts)) {
+            $source = [string]$entry.source
+            if ($source -notmatch '^scripts/[^/]+(?:/[^/]+)*\.luau$'
+                -or $source.Contains('..')
+                -or $source.Contains('\')
+                -or [IO.Path]::IsPathRooted($source)) {
+                throw "Workflow fixture received an unsafe script source path: $source"
+            }
+            $sourcePath = [IO.Path]::GetFullPath((Join-Path $assetRoot $source))
+            $destinationPath = [IO.Path]::GetFullPath((Join-Path $openProjectDirectory $source))
+            $assetPrefix = $assetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            $projectPrefix = $openProjectDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            if (-not $sourcePath.StartsWith($assetPrefix, [StringComparison]::OrdinalIgnoreCase)
+                -or -not $destinationPath.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Workflow fixture dependency path escaped its controlled root: $source"
+            }
+            $destinationDirectory = Split-Path -Parent $destinationPath
+            if (-not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
+                New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+            }
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                throw "Workflow fixture script dependency does not exist: $source"
+            }
+            [IO.File]::Copy($sourcePath, $destinationPath)
+        }
+    }
+
     $executable = if ($IsWindows) { 'bin/kadath.exe' } else { 'bin/kadath' }
     $preview = [ordered]@{
         schemaVersion = 1
@@ -63,6 +96,7 @@ try {
         'workflow_connect=ok',
         'workflow_project_open=ok',
         'workflow_snapshot_projection=ok',
+        'workflow_behavior_preservation=ok',
         'workflow_project_create=ok',
         'workflow_publication_missing=ok',
         'workflow_authoring_apply=ok',

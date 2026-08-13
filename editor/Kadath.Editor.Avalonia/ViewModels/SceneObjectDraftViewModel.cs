@@ -20,6 +20,7 @@ public sealed class SceneObjectDraftViewModel : ObservableObject
     private string _patrolMinY;
     private string _patrolMaxY;
     private string _patrolSpeed;
+    private readonly bool _usesNativePatrol;
 
     public SceneObjectDraftViewModel(
         string originalObjectId,
@@ -38,7 +39,9 @@ public sealed class SceneObjectDraftViewModel : ObservableObject
         string patrolMinY,
         string patrolMaxY,
         string patrolSpeed,
-        ObservableCollection<string> textureIds)
+        ObservableCollection<string> textureIds,
+        IReadOnlyList<ProjectModelSceneBehaviorBinding>? behaviors = null,
+        bool? usesNativePatrol = null)
     {
         OriginalObjectId = originalObjectId;
         _objectId = objectId;
@@ -57,13 +60,19 @@ public sealed class SceneObjectDraftViewModel : ObservableObject
         _patrolMaxY = patrolMaxY;
         _patrolSpeed = patrolSpeed;
         TextureIds = textureIds;
+        Behaviors = CopyBehaviors(behaviors);
+        _usesNativePatrol = usesNativePatrol ?? (Kind == "patrol_hazard"
+            && patrolMinY.Length > 0
+            && (behaviors is null || behaviors.Count == 0));
     }
 
     public string OriginalObjectId { get; }
     public string Kind { get; }
     public ObservableCollection<string> TextureIds { get; }
+    public IReadOnlyList<ProjectModelSceneBehaviorBinding>? Behaviors { get; }
     public bool IsPlayer => Kind == "player";
     public bool IsPatrolHazard => Kind == "patrol_hazard";
+    public bool UsesNativePatrol => IsPatrolHazard && _usesNativePatrol;
     public string DisplayName => $"{ObjectId} [{Kind}]";
 
     public string ObjectId
@@ -107,7 +116,9 @@ public sealed class SceneObjectDraftViewModel : ObservableObject
         sceneObject.PatrolMinY is null ? string.Empty : Format(sceneObject.PatrolMinY.Value),
         sceneObject.PatrolMaxY is null ? string.Empty : Format(sceneObject.PatrolMaxY.Value),
         sceneObject.PatrolSpeed is null ? string.Empty : Format(sceneObject.PatrolSpeed.Value),
-        textureIds);
+        textureIds,
+        sceneObject.Behaviors,
+        sceneObject.PatrolMinY is not null);
 
     public static SceneObjectDraftViewModel NewSprite(string objectId, string textureId, ObservableCollection<string> textureIds) => new(
         objectId, objectId, "sprite", "160", "160", "64", "64", "1", "1", "1", "1", textureId,
@@ -115,7 +126,20 @@ public sealed class SceneObjectDraftViewModel : ObservableObject
 
     public static SceneObjectDraftViewModel NewPatrolHazard(string objectId, string textureId, ObservableCollection<string> textureIds) => new(
         objectId, objectId, "patrol_hazard", "500", "420", "72", "72", "1", "0.3", "0.2", "1", textureId,
-        string.Empty, "380", "460", "55", textureIds);
+        string.Empty, "380", "460", "55", textureIds, usesNativePatrol: true);
+
+    public IReadOnlyList<SceneBehaviorBindingDefinition>? CreateBehaviorDefinitions() => Behaviors?.Select(binding =>
+        new SceneBehaviorBindingDefinition(
+            binding.ScriptId,
+            binding.Parameters?.ToDictionary(parameter => parameter.Name, parameter => parameter.Value, StringComparer.Ordinal)))
+        .ToArray();
+
+    private static IReadOnlyList<ProjectModelSceneBehaviorBinding>? CopyBehaviors(
+        IReadOnlyList<ProjectModelSceneBehaviorBinding>? behaviors) => behaviors?.Select(binding =>
+            new ProjectModelSceneBehaviorBinding(
+                binding.ScriptId,
+                binding.Parameters?.Select(parameter => new ProjectModelSceneBehaviorParameter(parameter.Name, parameter.Value)).ToArray()))
+        .ToArray();
 
     private static string Format(double value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
 }
