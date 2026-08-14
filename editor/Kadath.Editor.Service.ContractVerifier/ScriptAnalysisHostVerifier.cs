@@ -328,6 +328,7 @@ internal static class ScriptAnalysisHostVerifier
         public Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) => throw Unsupported();
         public Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) => throw Unsupported();
         public Task<ScriptSourceDocument> GetScriptSourceAsync(ProjectSessionInfo project, ScriptSourceQueryParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
+        public Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(ProjectSessionInfo project, BehaviorContractSnapshotParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken) => throw Unsupported();

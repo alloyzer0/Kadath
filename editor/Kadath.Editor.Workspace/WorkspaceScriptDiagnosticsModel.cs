@@ -155,7 +155,7 @@ public sealed class WorkspaceScriptDiagnosticsModel
     private static string ResolveToolPath(string packageRoot)
     {
         try { return WorkspaceBehaviorTool.ResolveToolPath(packageRoot); }
-        catch (Exception exception) when (exception is InvalidDataException or IOException or UnauthorizedAccessException or WorkspaceProjectValidationException)
+        catch (Exception exception) when (exception is InvalidDataException or IOException or UnauthorizedAccessException or WorkspaceProjectValidationException or WorkspaceBehaviorToolException)
         {
             throw Failure(WorkspaceScriptDiagnosticsFailureKind.Unavailable, exception.Message, exception);
         }

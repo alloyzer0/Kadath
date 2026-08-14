@@ -566,6 +566,23 @@ internal static class ProjectLifecycleVerifier
         Require(hierarchy.Nodes.Any(node => node.Kind == "SceneBehavior" && node.Id == "scene.objects[hazard-1].behaviors[1]"),
             "Behavior hierarchy did not expose Scene behavior node.");
         var authoring = new WorkspaceAuthoringModel();
+        var previousToolPath = Environment.GetEnvironmentVariable("KADATH_BEHAVIOR_TOOL");
+        try
+        {
+            Environment.SetEnvironmentVariable("KADATH_BEHAVIOR_TOOL", Path.Combine(root, "missing-non-behavior-tool"));
+            var nonBehaviorObjects = snapshot.Scene.Objects!
+                .Select(value => value.ObjectId == "goal"
+                    ? value with { Position = [value.Position[0] + 3, value.Position[1]] }
+                    : value)
+                .Select(ToDefinition)
+                .ToArray();
+            var nonBehaviorEdit = await authoring.ApplyAsync(created, snapshot.AuthoringRevision,
+                new AuthoringPatch(SceneObjects: nonBehaviorObjects), default);
+            Require(nonBehaviorEdit.State == "succeeded", "Scene v5 non-behavior edit incorrectly required the Behavior Tool.");
+            var nonBehaviorUndo = await authoring.UndoAsync(created, nonBehaviorEdit.Revision, nonBehaviorEdit.UndoToken!, default);
+            snapshot = nonBehaviorUndo.ProjectSnapshot;
+        }
+        finally { Environment.SetEnvironmentVariable("KADATH_BEHAVIOR_TOOL", previousToolPath); }
         var editedObjects = snapshot.Scene.Objects!
             .Select(value => value.ObjectId == "hazard-1"
                 ? value with

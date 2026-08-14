@@ -109,6 +109,8 @@ public sealed class WorkspaceAuthoringModel
                 [], null, current.Project, current.Hierarchy);
         }
 
+        ValidateBehaviorContractChanges(project, current.Project, normalized, cancellationToken);
+
         var script = ParseObject(original.Script, "Script");
         var sceneBytes = normalized.SceneChanged ? BuildSceneBytes(original.Scene, normalized) : original.Scene;
         ApplyScriptPatch(script, normalized.Patch);
@@ -475,6 +477,70 @@ public sealed class WorkspaceAuthoringModel
             && (pair.First.Parameters ?? Array.Empty<ProjectModelSceneBehaviorParameter>()).Count == pair.Second.Parameters.Length
             && (pair.First.Parameters ?? Array.Empty<ProjectModelSceneBehaviorParameter>()).Zip(pair.Second.Parameters).All(parameter =>
                 parameter.First.Name == parameter.Second.Name && parameter.First.Value == parameter.Second.Value));
+    }
+
+    private static void ValidateBehaviorContractChanges(
+        ProjectSessionInfo project,
+        ProjectModelSnapshot current,
+        NormalizedPatch normalized,
+        CancellationToken cancellationToken)
+    {
+        if (normalized.ResolvedSceneObjects is not { } requested) return;
+        var currentObjects = current.Scene.Objects
+            ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene object set is missing from the snapshot.");
+        if (current.Scene.SchemaVersion != WorkspaceSceneDocumentCodec.BehaviorSchemaVersion) return;
+        if (!BehaviorCollectionsChanged(currentObjects, requested)) return;
+
+        WorkspaceBehaviorContractObservation observation;
+        try { observation = WorkspaceBehaviorContractModel.Read(project, cancellationToken); }
+        catch (WorkspaceBehaviorContractException exception)
+        {
+            var kind = exception.Code == "behavior_contract_source_changed"
+                ? WorkspaceAuthoringFailureKind.RevisionConflict
+                : WorkspaceAuthoringFailureKind.InvalidPatch;
+            throw Failure(kind, $"Behavior contract is unavailable: {exception.Code}: {exception.Message}", exception);
+        }
+        if (!observation.AuthoringRevision.Equals(current.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
+            throw Failure(WorkspaceAuthoringFailureKind.RevisionConflict, "Behavior contract no longer matches the current authoring revision.");
+
+        var entries = observation.Catalog.Entries.ToDictionary(entry => entry.ScriptId);
+        foreach (var sceneObject in requested)
+        {
+            foreach (var binding in sceneObject.Behaviors ?? [])
+            {
+                if (!entries.TryGetValue(binding.ScriptId, out var entry))
+                    throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch,
+                        $"Scene.objects[{sceneObject.ObjectId}].behaviors references unknown scriptId {binding.ScriptId}.");
+                var schemas = entry.Parameters.ToDictionary(parameter => parameter.Name, StringComparer.Ordinal);
+                foreach (var parameter in binding.Parameters)
+                {
+                    if (!schemas.TryGetValue(parameter.Name, out var schema))
+                        throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch,
+                            $"Scene.objects[{sceneObject.ObjectId}].behaviors[{binding.ScriptId}] contains unknown parameter {parameter.Name}.");
+                    if (parameter.Value < schema.Minimum || parameter.Value > schema.Maximum)
+                        throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch,
+                            $"Scene.objects[{sceneObject.ObjectId}].behaviors[{binding.ScriptId}].parameters.{parameter.Name} is outside [{schema.Minimum}, {schema.Maximum}].");
+                }
+            }
+        }
+    }
+
+    private static bool BehaviorCollectionsChanged(
+        IReadOnlyList<ProjectModelSceneObject> current,
+        IReadOnlyList<WorkspaceSceneObject> requested)
+    {
+        var requestedById = requested.ToDictionary(value => value.ObjectId, StringComparer.Ordinal);
+        foreach (var currentObject in current)
+        {
+            if (!requestedById.TryGetValue(currentObject.ObjectId, out var requestedObject))
+            {
+                if ((currentObject.Behaviors?.Count ?? 0) != 0) return true;
+                continue;
+            }
+            if (!BehaviorsEqual(currentObject.Behaviors, requestedObject.Behaviors)) return true;
+        }
+        var currentIds = current.Select(value => value.ObjectId).ToHashSet(StringComparer.Ordinal);
+        return requested.Any(value => !currentIds.Contains(value.ObjectId) && (value.Behaviors?.Length ?? 0) != 0);
     }
 
     private static SceneObjectDefinition ToDefinition(ProjectModelSceneObject value) => new(

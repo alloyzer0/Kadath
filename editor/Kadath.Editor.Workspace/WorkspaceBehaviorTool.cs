@@ -4,6 +4,12 @@ using System.Globalization;
 
 namespace Kadath.Editor.Workspace;
 
+internal sealed class WorkspaceBehaviorToolException : Exception
+{
+    internal WorkspaceBehaviorToolException(string message, Exception? innerException = null)
+        : base(message, innerException) { }
+}
+
 internal static class WorkspaceBehaviorTool
 {
     private const int MaxDiagnosticCharacters = 8192;
@@ -27,20 +33,26 @@ internal static class WorkspaceBehaviorTool
             var result = Run(toolPath, projectDirectory, outputPath, cancellationToken);
             if (result.ExitCode != 0)
                 throw new InvalidDataException($"Behavior Tool failed with exit code {result.ExitCode}: {Bounded(result.StandardError)}");
-            if (!File.Exists(outputPath)) throw new InvalidDataException("Behavior Tool succeeded without producing an artifact.");
-
-            var artifact = File.ReadAllBytes(outputPath);
-            var info = WorkspaceScriptCodec.ValidateArtifact(artifact);
-            var fields = ParseFields(result.StandardOutput);
-            Require(fields, "status", "succeeded");
-            Require(fields, "format", info.Format);
-            Require(fields, "source_revision", snapshot.Revision);
-            Require(fields, "artifact_revision", info.Sha256);
-            RequireLong(fields, "artifact_bytes", info.Bytes);
-            RequirePositiveInt(fields, "entry_count");
-            RequireNonEmpty(fields, "toolchain_identity");
-            if (fields.Count != 7) throw new InvalidDataException("Behavior Tool returned unsupported metadata fields.");
-            return artifact;
+            try
+            {
+                if (!File.Exists(outputPath)) throw new InvalidDataException("Behavior Tool succeeded without producing an artifact.");
+                var artifact = File.ReadAllBytes(outputPath);
+                var info = WorkspaceScriptCodec.ValidateArtifact(artifact);
+                var fields = ParseFields(result.StandardOutput);
+                Require(fields, "status", "succeeded");
+                Require(fields, "format", info.Format);
+                Require(fields, "source_revision", snapshot.Revision);
+                Require(fields, "artifact_revision", info.Sha256);
+                RequireLong(fields, "artifact_bytes", info.Bytes);
+                RequirePositiveInt(fields, "entry_count");
+                RequireNonEmpty(fields, "toolchain_identity");
+                if (fields.Count != 7) throw new InvalidDataException("Behavior Tool returned unsupported metadata fields.");
+                return artifact;
+            }
+            catch (InvalidDataException exception)
+            {
+                throw new WorkspaceBehaviorToolException(exception.Message, exception);
+            }
         }
         finally
         {
@@ -67,7 +79,7 @@ internal static class WorkspaceBehaviorTool
             WorkspaceProjectValidator.RejectReparsePoint(fullPath, "Behavior Tool executable");
             return fullPath;
         }
-        throw new InvalidDataException($"Behavior Tool executable was not found. Checked: {string.Join(", ", candidates)}.");
+        throw new WorkspaceBehaviorToolException($"Behavior Tool executable was not found. Checked: {string.Join(", ", candidates)}.");
     }
 
     private static ProcessResult Run(string toolPath, string projectDirectory, string outputPath, CancellationToken cancellationToken)
@@ -105,10 +117,7 @@ internal static class WorkspaceBehaviorTool
             }
             return new ProcessResult(process.ExitCode, stdout.GetAwaiter().GetResult(), stderr.GetAwaiter().GetResult());
         }
-        catch (Win32Exception exception)
-        {
-            throw new InvalidDataException($"Failed to start Behavior Tool: {exception.Message}", exception);
-        }
+        catch (Win32Exception exception) { throw new WorkspaceBehaviorToolException($"Failed to start Behavior Tool: {exception.Message}", exception); }
     }
 
     private static Dictionary<string, string> ParseFields(string output)

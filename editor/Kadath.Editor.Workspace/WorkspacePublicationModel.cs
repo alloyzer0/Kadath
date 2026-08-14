@@ -336,7 +336,7 @@ public sealed class WorkspacePublicationModel
         catch (OperationCanceledException) { throw; }
         catch (WorkspacePublicationException) { throw; }
         catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspacePublicationFailureKind.Validation, exception.Message, exception); }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or FormatException or OverflowException or ArgumentException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException or FormatException or OverflowException or ArgumentException or WorkspaceBehaviorToolException)
         {
             throw Failure(WorkspacePublicationFailureKind.Validation, exception.Message, exception);
         }

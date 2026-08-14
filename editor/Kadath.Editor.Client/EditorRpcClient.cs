@@ -58,6 +58,7 @@ public interface IEditorRpcClient : IAsyncDisposable
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(ScriptSourceAnalyzeParameters parameters, CancellationToken cancellationToken = default);
+    Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(BehaviorContractSnapshotParameters parameters, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default);
@@ -148,6 +149,9 @@ public sealed class EditorRpcClient : IEditorRpcClient
 
     public Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(ScriptSourceAnalyzeParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<ScriptSourceAnalyzeParameters, ScriptSourceAnalysisResult>("script_source_analyze", parameters, cancellationToken);
+
+    public Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(BehaviorContractSnapshotParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<BehaviorContractSnapshotParameters, BehaviorContractSnapshotResult>("behavior_contract_snapshot", parameters, cancellationToken);
 
     public Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<PublicationSnapshotQueryParameters, PublicationSnapshot>("publication_snapshot", parameters, cancellationToken);

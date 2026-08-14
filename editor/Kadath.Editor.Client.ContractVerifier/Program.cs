@@ -26,6 +26,7 @@ internal static class Program
             await VerifyProjectCreateCapabilityProjectionAsync();
             await VerifyProjectCreateWorkspaceProjectionAsync();
             await ScriptDiagnosticsVerifier.VerifyAsync();
+            await VerifyBehaviorContractRefreshAsync();
             await VerifyClientAndViewModelsAsync();
             await VerifyUnexpectedEofProjectionAsync();
             await VerifyExpectedShutdownProjectionAsync();
@@ -50,6 +51,7 @@ internal static class Program
             Console.WriteLine("project_create_capability=ok");
             Console.WriteLine("project_create_workspace=ok");
             Console.WriteLine("script_diagnostics_state_machine=ok");
+            Console.WriteLine("behavior_contract_refresh=ok");
             Console.WriteLine("viewmodel_state=ok");
             Console.WriteLine("verification=ok");
             return 0;
@@ -59,6 +61,51 @@ internal static class Program
             Console.Error.WriteLine($"verification=failed: {exception}");
             return 1;
         }
+    }
+
+    private static async Task VerifyBehaviorContractRefreshAsync()
+    {
+        var transport = new ScriptedTransport();
+        var client = new EditorRpcClient(transport, "behavior-contract-refresh-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+        var retained = workspace.BehaviorContract.Value
+            ?? throw new InvalidOperationException("initial Behavior Contract Snapshot is missing");
+
+        transport.ReturnUnavailableBehaviorContractOnce();
+        var unavailable = await workspace.RefreshBehaviorContractAsync().ConfigureAwait(false);
+        Assert(unavailable.State == "unavailable"
+            && workspace.BehaviorContract.State == EditorSnapshotState.Failed
+            && ReferenceEquals(workspace.BehaviorContract.Value, retained),
+            "unavailable Behavior Contract response discarded the last successful catalog");
+
+        _ = await workspace.RefreshBehaviorContractAsync().ConfigureAwait(false);
+        retained = workspace.BehaviorContract.Value!;
+        transport.ReturnStaleBehaviorContractOnce();
+        _ = await workspace.RefreshBehaviorContractAsync().ConfigureAwait(false);
+        Assert(workspace.BehaviorContract.State == EditorSnapshotState.Failed
+            && workspace.BehaviorContract.ErrorCode == "behavior_contract_stale"
+            && ReferenceEquals(workspace.BehaviorContract.Value, retained),
+            "stale Behavior Contract response replaced the current catalog");
+        _ = await workspace.RefreshBehaviorContractAsync().ConfigureAwait(false);
+        var requestsBeforeQueue = transport.BehaviorContractRequestCount;
+        transport.DelayNextOperationResponse("behavior_contract_snapshot");
+        var inFlight = workspace.RefreshBehaviorContractAsync();
+        await WaitUntilAsync(() => transport.DelayedOperationPending).ConfigureAwait(false);
+        var superseded = workspace.RefreshBehaviorContractAsync();
+        var latest = workspace.RefreshBehaviorContractAsync();
+        try
+        {
+            _ = await superseded.ConfigureAwait(false);
+            throw new InvalidOperationException("superseded Behavior Contract refresh unexpectedly completed");
+        }
+        catch (TaskCanceledException) { }
+        await transport.ReleaseDelayedOperationAsync().ConfigureAwait(false);
+        _ = await inFlight.ConfigureAwait(false);
+        _ = await latest.ConfigureAwait(false);
+        Assert(transport.BehaviorContractRequestCount == requestsBeforeQueue + 2
+            && workspace.BehaviorContract.State == EditorSnapshotState.Ready,
+            "Behavior Contract refresh queue did not preserve one in-flight plus latest pending request");
     }
 
     private static async Task VerifyProjectCreateClientContractAsync()
@@ -556,6 +603,8 @@ internal static class Program
             && capabilities.Commands.Contains("script_source_edit")
             && capabilities.Commands.Contains("script_source_undo"),
             "real service did not advertise script source commands");
+        Assert(capabilities.Commands.Contains("behavior_contract_snapshot"),
+            "real service did not advertise behavior_contract_snapshot");
         var projectDirectory = Path.Combine(packageRoot, "bin", "projects", projectName);
         if (!Directory.Exists(projectDirectory))
         {
@@ -568,6 +617,7 @@ internal static class Program
         var validation = await client.ValidateProjectAsync(new ProjectValidateParameters()).ConfigureAwait(false);
         Assert(string.Equals(validation.State, "valid", StringComparison.OrdinalIgnoreCase), "real service project_validate failed");
         var projectSnapshot = await client.GetProjectSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
+        var behaviorContract = await client.GetBehaviorContractSnapshotAsync(new BehaviorContractSnapshotParameters(projectName)).ConfigureAwait(false);
         var hierarchySnapshot = await client.GetHierarchySnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var assetSnapshot = await client.GetAssetCatalogSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var publicationSnapshot = await client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, "debug")).ConfigureAwait(false);
@@ -591,6 +641,16 @@ internal static class Program
             "real service behavior hierarchy projection mismatch");
         Assert(assetSnapshot.CatalogVersion == 1 && assetSnapshot.ItemCount == assetSnapshot.Items.Length, "real service asset snapshot mismatch");
         Assert(projectSnapshot.AuthoringRevision.Length == 64, "real service authoring revision mismatch");
+        Assert(behaviorContract.State == "ready"
+            && behaviorContract.Entries.Length == 1
+            && behaviorContract.Entries[0].ScriptId == 1
+            && behaviorContract.Entries[0].Parameters.Any(parameter => parameter.Name == "speed"
+                && parameter.Type == "number"
+                && parameter.DefaultValue == 80
+                && parameter.Minimum == 0
+                && parameter.Maximum == 1000)
+            && behaviorContract.AuthoringRevision == projectSnapshot.AuthoringRevision,
+            "real service behavior contract snapshot mismatch");
         Assert(publicationSnapshot.SnapshotVersion == EditorSnapshotVersions.Publication, "real service publication snapshot version mismatch");
         Assert(capabilities.Commands.Contains("publication_snapshot"), "real service did not advertise publication_snapshot");
         Console.WriteLine("publication_service_smoke=ok");
@@ -1215,6 +1275,9 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private bool _publicationDirty;
     private bool _textureImported;
     private bool _failNextPreviewStop;
+    private bool _returnUnavailableBehaviorContract;
+    private bool _returnStaleBehaviorContract;
+    private int _behaviorContractRequestCount;
     private readonly bool _advertiseProjectCreate;
     private readonly bool _advertiseScriptAnalysis;
     private int _scriptAnalyzeRequestCount;
@@ -1240,6 +1303,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     public JsonElement? LastTextureImportRequest { get; private set; }
     public JsonElement? LastScriptAnalyzeRequest { get; private set; }
     public int ScriptAnalyzeRequestCount => Volatile.Read(ref _scriptAnalyzeRequestCount);
+    public int BehaviorContractRequestCount => Volatile.Read(ref _behaviorContractRequestCount);
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -1384,6 +1448,22 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 var assetSnapshot = NewAssetCatalogSnapshot();
                 await EmitEventAsync("asset_catalog_snapshot_created", assetSnapshot, id).ConfigureAwait(false);
                 await SendResponseAsync(id, assetSnapshot).ConfigureAwait(false);
+                break;
+            case "behavior_contract_snapshot":
+                Interlocked.Increment(ref _behaviorContractRequestCount);
+                var behaviorContract = _returnUnavailableBehaviorContract
+                    ? new BehaviorContractSnapshotResult(
+                        "unavailable", _activeProjectName, NewProjectSnapshot(_activeProjectName, _activePackageRoot).AuthoringRevision, new string('b', 64), string.Empty, [], "behavior_contract_tool_failure")
+                    : new BehaviorContractSnapshotResult(
+                        "ready", _activeProjectName, NewProjectSnapshot(_activeProjectName, _activePackageRoot).AuthoringRevision, new string('b', 64), "test-toolchain",
+                        [new BehaviorContractEntry(1, "scripts/patrol.luau", new string('c', 64),
+                            [new BehaviorParameterSchema("speed", "number", 80, 0, 1000)])]);
+                if (_returnStaleBehaviorContract)
+                    behaviorContract = behaviorContract with { AuthoringRevision = new string('f', 64) };
+                _returnUnavailableBehaviorContract = false;
+                _returnStaleBehaviorContract = false;
+                if (DelayOperationIfRequested(method, () => SendResponseAsync(id, behaviorContract))) { break; }
+                await SendResponseAsync(id, behaviorContract).ConfigureAwait(false);
                 break;
             case "texture_import":
                 LastTextureImportRequest = request.Clone();
@@ -1549,11 +1629,15 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
 
     public void FailNextPreviewStop() => _failNextPreviewStop = true;
 
+    public void ReturnUnavailableBehaviorContractOnce() => _returnUnavailableBehaviorContract = true;
+
+    public void ReturnStaleBehaviorContractOnce() => _returnStaleBehaviorContract = true;
+
     private string[] CreateCommands()
     {
         var commands = new List<string>
         {
-            "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot",
+            "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot", "behavior_contract_snapshot",
             "publication_snapshot", "script_source_read", "script_source_edit", "script_source_undo", "texture_import",
             "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop",
             "preview_start", "preview_stop", "shutdown"

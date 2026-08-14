@@ -13,6 +13,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private readonly WorkspaceTextureImportModel _textureImportModel;
     private readonly WorkspaceScriptSourceAuthoringModel _scriptSourceAuthoringModel;
     private readonly WorkspaceScriptDiagnosticsModel _scriptDiagnosticsModel;
+    private readonly WorkspaceBehaviorContractModel _behaviorContractModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
@@ -32,7 +33,8 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         WorkspacePublicationModel publicationModel,
         WorkspaceTextureImportModel textureImportModel,
         WorkspaceScriptSourceAuthoringModel? scriptSourceAuthoringModel = null,
-        WorkspaceScriptDiagnosticsModel? scriptDiagnosticsModel = null)
+        WorkspaceScriptDiagnosticsModel? scriptDiagnosticsModel = null,
+        WorkspaceBehaviorContractModel? behaviorContractModel = null)
     {
         _projectLifecycleModel = projectLifecycleModel;
         _readModel = readModel;
@@ -41,6 +43,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         _textureImportModel = textureImportModel;
         _scriptSourceAuthoringModel = scriptSourceAuthoringModel ?? new WorkspaceScriptSourceAuthoringModel();
         _scriptDiagnosticsModel = scriptDiagnosticsModel ?? new WorkspaceScriptDiagnosticsModel();
+        _behaviorContractModel = behaviorContractModel ?? new WorkspaceBehaviorContractModel();
     }
 
     public event Func<EditorSessionNotification, Task>? Notification;
@@ -129,6 +132,12 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
 
     public Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
         ReadWorkspaceSnapshotAsync(() => _readModel.ReadHierarchyAsync(project, cancellationToken), project, false);
+
+    public Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(
+        ProjectSessionInfo project,
+        BehaviorContractSnapshotParameters parameters,
+        CancellationToken cancellationToken) =>
+        _behaviorContractModel.ReadAsync(project, cancellationToken);
 
     public Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
         ReadWorkspaceSnapshotAsync(() => _readModel.ReadAssetsAsync(project, cancellationToken), project, false);

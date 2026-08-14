@@ -172,6 +172,30 @@ public sealed record ScriptSourceAnalysisResult(
     string ToolchainIdentity,
     ScriptSourceDiagnostic[] Diagnostics);
 
+public sealed record BehaviorContractSnapshotParameters(string? ProjectName = null);
+
+public sealed record BehaviorParameterSchema(
+    string Name,
+    string Type,
+    double DefaultValue,
+    double Minimum,
+    double Maximum);
+
+public sealed record BehaviorContractEntry(
+    uint ScriptId,
+    string SourcePath,
+    string SourceHash,
+    BehaviorParameterSchema[] Parameters);
+
+public sealed record BehaviorContractSnapshotResult(
+    string State,
+    string ProjectName,
+    string AuthoringRevision,
+    string ScriptSourceRevision,
+    string ToolchainIdentity,
+    BehaviorContractEntry[] Entries,
+    string? ErrorCode = null);
+
 public static class EditorSnapshotVersions
 {
     public const int ProjectModel = 1;

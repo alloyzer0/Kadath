@@ -352,6 +352,15 @@ internal static class WorkspaceScriptCodec
         };
     }
 
+    internal static WorkspaceBehaviorContractCatalog ReadBehaviorContractCatalog(byte[] artifact)
+    {
+        if (artifact.Length < 8 || Encoding.ASCII.GetString(artifact, 0, 4) != "KSCP")
+            throw new InvalidDataException("Script artifact layout mismatch.");
+        if (ReadUInt32(artifact, 4) != BehaviorVersion)
+            throw new InvalidDataException("Behavior Script artifact version mismatch.");
+        return ParseBehaviorArtifact(artifact).Catalog;
+    }
+
     private static WorkspaceArtifactInfo ValidateLegacyArtifact(byte[] artifact)
     {
         if (artifact.Length < 16) throw new InvalidDataException("Script artifact layout mismatch.");
@@ -381,6 +390,9 @@ internal static class WorkspaceScriptCodec
     }
 
     private static WorkspaceArtifactInfo ValidateBehaviorArtifact(byte[] artifact)
+        => ParseBehaviorArtifact(artifact).Info;
+
+    private static ParsedBehaviorArtifact ParseBehaviorArtifact(byte[] artifact)
     {
         if (artifact.Length is < BehaviorHeaderBytes or > MaxBehaviorArtifactBytes)
             throw new InvalidDataException("Behavior Script artifact layout mismatch.");
@@ -403,8 +415,10 @@ internal static class WorkspaceScriptCodec
         var toolchainIdentity = ReadRequiredBytes(artifact, ref offset, toolchainIdentityBytes);
         if (!toolchainIdentity.All(IsToolchainIdentityByte))
             throw new InvalidDataException("Behavior Script artifact toolchain identity mismatch.");
+        var toolchainIdentityText = DecodeStrictUtf8(toolchainIdentity);
         var scriptIds = new HashSet<uint>();
         var sourceNames = new HashSet<string>(StringComparer.Ordinal);
+        var entries = new WorkspaceBehaviorContractEntry[entryCount];
         for (var index = 0; index < entryCount; index++)
         {
             var entryStart = offset;
@@ -425,13 +439,14 @@ internal static class WorkspaceScriptCodec
             {
                 throw new InvalidDataException("Behavior Script artifact entry header mismatch.");
             }
-            _ = ReadRequiredBytes(artifact, ref offset, 32);
+            var sourceHash = ReadRequiredBytes(artifact, ref offset, 32);
             var expectedBytecodeSha256 = ReadRequiredBytes(artifact, ref offset, 32);
             var sourceName = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, sourceNameBytes));
             if (!IsSourceName(sourceName) || !sourceNames.Add(sourceName))
                 throw new InvalidDataException("Behavior Script artifact source identity mismatch.");
 
             var parameterNames = new HashSet<string>(StringComparer.Ordinal);
+            var parameters = new WorkspaceBehaviorParameterSchema[parameterCount];
             for (var parameterIndex = 0; parameterIndex < parameterCount; parameterIndex++)
             {
                 var parameterNameBytes = ReadRequiredUInt32(artifact, ref offset);
@@ -447,14 +462,24 @@ internal static class WorkspaceScriptCodec
                 {
                     throw new InvalidDataException("Behavior Script artifact parameter schema mismatch.");
                 }
+                parameters[parameterIndex] = new WorkspaceBehaviorParameterSchema(
+                    parameterName, "number", defaultValue, minimum, maximum);
             }
 
             var bytecode = ReadRequiredBytes(artifact, ref offset, bytecodeBytes);
             if (offset != entryEnd || !expectedBytecodeSha256.SequenceEqual(SHA256.HashData(bytecode)))
                 throw new InvalidDataException("Behavior Script artifact bytecode identity mismatch.");
+            entries[index] = new WorkspaceBehaviorContractEntry(
+                scriptId,
+                sourceName,
+                Convert.ToHexString(sourceHash).ToLowerInvariant(),
+                parameters);
         }
         if (offset != artifact.Length) throw new InvalidDataException("Behavior Script artifact has trailing bytes.");
-        return ArtifactInfo(artifact, BehaviorFormat, BehaviorVersion);
+        var info = ArtifactInfo(artifact, BehaviorFormat, BehaviorVersion);
+        return new ParsedBehaviorArtifact(
+            info,
+            new WorkspaceBehaviorContractCatalog(toolchainIdentityText, entries));
     }
 
     private static JsonDocument Parse(byte[] source)
@@ -517,4 +542,7 @@ internal static class WorkspaceScriptCodec
     private static void WriteUInt32(byte[] bytes, int offset, uint value) => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), value);
     private static void WriteSingle(byte[] bytes, int offset, float value) => BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(offset, 4), BitConverter.SingleToInt32Bits(value));
     private sealed record Instruction(uint Hook, uint Operation, float X, float Y);
+    private sealed record ParsedBehaviorArtifact(
+        WorkspaceArtifactInfo Info,
+        WorkspaceBehaviorContractCatalog Catalog);
 }

@@ -18,6 +18,9 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     private string? _lastEventName;
     private long _lastEventSequence;
     private EditorRpcConnectionClosed? _lastConnectionClosed;
+    private readonly object _behaviorContractRefreshLock = new();
+    private BehaviorContractRefreshRequest? _pendingBehaviorContractRefresh;
+    private bool _behaviorContractRefreshRunning;
 
     public EditorWorkspaceViewModel(IEditorRpcClient client, IEditorViewDispatcher? dispatcher = null)
     {
@@ -38,6 +41,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public EditorSnapshotViewModel<AssetCatalogSnapshot> AssetCatalogSnapshot { get; } = new();
     public EditorScriptSourceViewModel ScriptSource { get; } = new();
     public EditorScriptDiagnosticsViewModel ScriptDiagnostics { get; }
+    public EditorSnapshotViewModel<BehaviorContractSnapshotResult> BehaviorContract { get; } = new();
     public EditorPublicationViewModel Publication { get; } = new();
     public EditorTextureImportViewModel TextureImport { get; } = new();
     public EditorAuthoringViewModel Authoring { get; } = new();
@@ -84,9 +88,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             var result = await Client.OpenProjectAsync(parameters, cancellationToken).ConfigureAwait(false);
             await _dispatcher.InvokeAsync(() =>
             {
-                Project.ApplyOpened(result);
-                ScriptSource.Reset();
-                ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
+                ApplyOpenedSession(result);
             }).ConfigureAwait(false);
             return result;
         }
@@ -152,6 +154,10 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         await RefreshProjectSnapshotAsync(projectName, cancellationToken).ConfigureAwait(false);
         await RefreshHierarchySnapshotAsync(projectName, cancellationToken).ConfigureAwait(false);
         await RefreshAssetCatalogSnapshotAsync(projectName, cancellationToken).ConfigureAwait(false);
+        if (Capabilities.CanReadBehaviorContract)
+        {
+            await RefreshBehaviorContractAsync(projectName, cancellationToken).ConfigureAwait(false);
+        }
         if (Capabilities.CanReadPublicationSnapshot)
         {
             await RefreshPublicationAsync(projectName, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -209,6 +215,101 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         }
     }
 
+    public Task<BehaviorContractSnapshotResult> RefreshBehaviorContractAsync(string? projectName = null, CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanReadBehaviorContract, "behavior_contract_snapshot");
+        var requestProject = Project.Session;
+        var request = new BehaviorContractRefreshRequest(
+            projectName ?? requestProject?.ProjectName,
+            requestProject,
+            cancellationToken);
+        lock (_behaviorContractRefreshLock)
+        {
+            _pendingBehaviorContractRefresh?.Completion.TrySetCanceled();
+            _pendingBehaviorContractRefresh = request;
+            if (!_behaviorContractRefreshRunning)
+            {
+                _behaviorContractRefreshRunning = true;
+                _ = RunBehaviorContractRefreshQueueAsync();
+            }
+        }
+        return request.Completion.Task;
+    }
+
+    private async Task RunBehaviorContractRefreshQueueAsync()
+    {
+        while (true)
+        {
+            BehaviorContractRefreshRequest? request;
+            lock (_behaviorContractRefreshLock)
+            {
+                request = _pendingBehaviorContractRefresh;
+                _pendingBehaviorContractRefresh = null;
+                if (request is null)
+                {
+                    _behaviorContractRefreshRunning = false;
+                    return;
+                }
+            }
+            try
+            {
+                var result = await RefreshBehaviorContractCoreAsync(request).ConfigureAwait(false);
+                request.Completion.TrySetResult(result);
+            }
+            catch (OperationCanceledException exception) { request.Completion.TrySetCanceled(exception.CancellationToken); }
+            catch (Exception exception) { request.Completion.TrySetException(exception); }
+        }
+    }
+
+    private async Task<BehaviorContractSnapshotResult> RefreshBehaviorContractCoreAsync(BehaviorContractRefreshRequest request)
+    {
+        var requestProject = request.Project;
+        if (!IsCurrentBehaviorContractSession(requestProject, null))
+            throw new OperationCanceledException("Behavior Contract refresh belongs to an inactive project.", request.CancellationToken);
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            request.CancellationToken.ThrowIfCancellationRequested();
+            await _dispatcher.InvokeAsync(BehaviorContract.Begin).ConfigureAwait(false);
+            try
+            {
+                var result = await Client.GetBehaviorContractSnapshotAsync(
+                    new BehaviorContractSnapshotParameters(request.ProjectName), request.CancellationToken).ConfigureAwait(false);
+                if (result.ErrorCode == "behavior_contract_source_changed" && attempt == 0) continue;
+                await _dispatcher.InvokeAsync(() =>
+                {
+                    if (!IsCurrentBehaviorContractSession(requestProject, result)) return;
+                    if (!IsCurrentBehaviorContractRequest(requestProject, result))
+                    {
+                        BehaviorContract.ApplyFailure("behavior_contract_stale", "行为契约响应已过期；保留最近一次成功目录。");
+                        return;
+                    }
+                    if (result.State == "ready") BehaviorContract.Apply(result);
+                    else BehaviorContract.ApplyFailure(
+                        result.ErrorCode ?? "behavior_contract_unavailable",
+                        "当前脚本契约不可用；保留最近一次成功目录。");
+                }).ConfigureAwait(false);
+                return result;
+            }
+            catch (Exception exception)
+            {
+                if (IsCurrentBehaviorContractSession(requestProject, null))
+                    await ApplySnapshotExceptionAsync(BehaviorContract, exception).ConfigureAwait(false);
+                throw;
+            }
+        }
+        throw new EditorRpcException("behavior_contract_source_changed", "行为脚本源码在读取期间发生变化。");
+    }
+
+    private bool IsCurrentBehaviorContractSession(ProjectSessionInfo? requestProject, BehaviorContractSnapshotResult? result) =>
+        requestProject is null
+            || EditorProjectIdentity.Matches(Project.Session, requestProject)
+                && (result is null || result.ProjectName.Equals(requestProject.ProjectName, StringComparison.Ordinal));
+
+    private bool IsCurrentBehaviorContractRequest(ProjectSessionInfo? requestProject, BehaviorContractSnapshotResult result) =>
+        IsCurrentBehaviorContractSession(requestProject, result)
+        && (ProjectSnapshot.Value is null
+            || result.AuthoringRevision.Equals(ProjectSnapshot.Value.AuthoringRevision, StringComparison.OrdinalIgnoreCase));
+
     public async Task<ScriptSourceDocument> ReadScriptSourceAsync(ScriptSourceQueryParameters parameters, CancellationToken cancellationToken = default)
     {
         EnsureCommand(Capabilities.CanReadScriptSource, "script_source_read");
@@ -246,6 +347,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             var result = await Client.EditScriptSourceAsync(parameters, cancellationToken).ConfigureAwait(false);
             await _dispatcher.InvokeAsync(() => ApplyScriptSourceResult(result)).ConfigureAwait(false);
+            await RefreshBehaviorContractAfterOperationAsync(result.ProjectName, cancellationToken).ConfigureAwait(false);
             await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
             return result;
         }
@@ -264,6 +366,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             var result = await Client.UndoScriptSourceAsync(parameters, cancellationToken).ConfigureAwait(false);
             await _dispatcher.InvokeAsync(() => ApplyScriptSourceResult(result)).ConfigureAwait(false);
+            await RefreshBehaviorContractAfterOperationAsync(result.ProjectName, cancellationToken).ConfigureAwait(false);
             await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
             return result;
         }
@@ -310,6 +413,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             var result = await Client.ApplyAuthoringAsync(parameters, cancellationToken).ConfigureAwait(false);
             await _dispatcher.InvokeAsync(() => ApplyAuthoringResult(result)).ConfigureAwait(false);
+            await RefreshBehaviorContractAfterOperationAsync(result.ProjectName, cancellationToken).ConfigureAwait(false);
             await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
             return result;
         }
@@ -349,6 +453,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             var result = await Client.UndoAuthoringAsync(parameters, cancellationToken).ConfigureAwait(false);
             await _dispatcher.InvokeAsync(() => ApplyAuthoringResult(result)).ConfigureAwait(false);
+            await RefreshBehaviorContractAfterOperationAsync(result.ProjectName, cancellationToken).ConfigureAwait(false);
             await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
             return result;
         }
@@ -545,7 +650,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         switch (notification.Event)
         {
             case "project_opened":
-                if (TryRead(notification.Data, out ProjectSessionInfo? session) && session is not null) { Project.ApplyOpened(session); Authoring.Reset(); Publication.Reset(); ScriptSource.Reset(); }
+                if (TryRead(notification.Data, out ProjectSessionInfo? session) && session is not null) { ApplyOpenedSession(session); }
                 break;
             case "project_created":
                 if (TryRead(notification.Data, out ProjectSessionInfo? createdSession) && createdSession is not null) { ApplyCreatedSession(createdSession); }
@@ -748,11 +853,31 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         ScriptSource.Reset();
     }
 
+    private void ApplyOpenedSession(ProjectSessionInfo session)
+    {
+        if (EditorProjectIdentity.Matches(Project.Session, session))
+        {
+            Project.ApplyOpened(session);
+            ScriptSource.Reset();
+            ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
+            return;
+        }
+        StageCreatedSnapshotGroupInvalidation();
+        Project.StageOpened(session);
+        Authoring.Reset();
+        Publication.Reset();
+        ScriptSource.Reset();
+        ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
+        Project.PublishStagedOpened();
+        PublishCreatedSnapshotGroupInvalidation();
+    }
+
     private void StageCreatedSnapshotGroupInvalidation()
     {
         ProjectSnapshot.StageInvalidation();
         HierarchySnapshot.StageInvalidation();
         AssetCatalogSnapshot.StageInvalidation();
+        BehaviorContract.StageInvalidation();
     }
 
     private void PublishCreatedSnapshotGroupInvalidation()
@@ -760,6 +885,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         ProjectSnapshot.PublishStagedInvalidation();
         HierarchySnapshot.PublishStagedInvalidation();
         AssetCatalogSnapshot.PublishStagedInvalidation();
+        BehaviorContract.PublishStagedInvalidation();
     }
 
     private async Task RefreshCreatedSnapshotGroupAsync(string projectName, CancellationToken cancellationToken)
@@ -773,6 +899,10 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         if (!await TryRefreshCreatedSnapshotAsync(
             () => RefreshAssetCatalogSnapshotAsync(projectName, cancellationToken),
             (code, message) => AssetCatalogSnapshot.InvalidateFailure(code, message)).ConfigureAwait(false)) { return; }
+
+        if (Capabilities.CanReadBehaviorContract && !await TryRefreshCreatedSnapshotAsync(
+            () => RefreshBehaviorContractAsync(projectName, cancellationToken),
+            (code, message) => BehaviorContract.InvalidateFailure(code, message)).ConfigureAwait(false)) { return; }
 
         await RefreshPublicationAfterOperationAsync(projectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
     }
@@ -815,6 +945,25 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     private void EnsureCommand(bool supported, string command)
     {
         if (!supported) { throw new EditorRpcException("unsupported_command", $"Editor Service capability is not available: {command}"); }
+    }
+
+    private sealed class BehaviorContractRefreshRequest
+    {
+        internal BehaviorContractRefreshRequest(
+            string? projectName,
+            ProjectSessionInfo? project,
+            CancellationToken cancellationToken)
+        {
+            ProjectName = projectName;
+            Project = project;
+            CancellationToken = cancellationToken;
+        }
+
+        internal string? ProjectName { get; }
+        internal ProjectSessionInfo? Project { get; }
+        internal CancellationToken CancellationToken { get; }
+        internal TaskCompletionSource<BehaviorContractSnapshotResult> Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     private void EnsureProjectCreateIdle()
@@ -924,6 +1073,13 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             // Authoring/Bake 已完成；发布快照失败只影响诊断，不伪装成源事务失败。
         }
+    }
+
+    private async Task RefreshBehaviorContractAfterOperationAsync(string? projectName, CancellationToken cancellationToken)
+    {
+        if (!Capabilities.CanReadBehaviorContract) return;
+        try { await RefreshBehaviorContractAsync(projectName, cancellationToken).ConfigureAwait(false); }
+        catch { }
     }
 
     private void EnsureManualBakeAllowed()

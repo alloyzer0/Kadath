@@ -21,6 +21,7 @@ internal static class BehaviorPublicationVerifier
         {
             var project = CreateProject(root);
             await VerifyAdapterFailureFramesAsync(toolPath);
+            await VerifyBehaviorContractSnapshotAsync(project, root, toolPath);
             await VerifyDiagnosticsAsync(project, root);
             var model = new WorkspacePublicationModel();
             var initialSourceRevision = WorkspaceScriptDependencySet.ComputeRevision(project.ScriptPath);
@@ -173,6 +174,38 @@ internal static class BehaviorPublicationVerifier
             WorkspaceScriptDiagnosticsFailureKind.Input);
         await VerifyDiagnosticsProcessFailuresAsync(project, root, validSource);
         Require(before == ProjectIdentity(project.ProjectDirectory), "Workspace Script diagnostics modified project files.");
+    }
+
+    private static async Task VerifyBehaviorContractSnapshotAsync(ProjectSessionInfo project, string root, string toolPath)
+    {
+        var model = new WorkspaceBehaviorContractModel();
+        var before = ProjectIdentity(project.ProjectDirectory);
+        var ready = await model.ReadAsync(project, default);
+        Require(ready.State == "ready"
+            && ready.Entries.Length == 1
+            && ready.Entries[0].ScriptId == 1
+            && ready.Entries[0].SourcePath == "scripts/patrol.luau"
+            && ready.Entries[0].SourceHash == Hash(InitialLuau)
+            && ready.Entries[0].Parameters.Length == 1
+            && ready.Entries[0].Parameters[0] is { Name: "speed", Type: "number", DefaultValue: 80, Minimum: 0, Maximum: 1000 }
+            && ready.AuthoringRevision.Length == 64
+            && ready.ScriptSourceRevision.Length == 64
+            && !string.IsNullOrWhiteSpace(ready.ToolchainIdentity),
+            "Behavior Contract Snapshot did not expose the KSCP v2 parameter catalog.");
+        Require(before == ProjectIdentity(project.ProjectDirectory), "Behavior Contract Snapshot modified the project tree.");
+
+        var previousToolPath = Environment.GetEnvironmentVariable("KADATH_BEHAVIOR_TOOL");
+        try
+        {
+            Environment.SetEnvironmentVariable("KADATH_BEHAVIOR_TOOL", Path.Combine(root, "missing-behavior-tool"));
+            var unavailable = await model.ReadAsync(project, default);
+            Require(unavailable.State == "unavailable"
+                && unavailable.ErrorCode == "behavior_contract_tool_failure"
+                && unavailable.Entries.Length == 0,
+                "Behavior Contract Snapshot did not classify a missing tool as tool_failure.");
+        }
+        finally { Environment.SetEnvironmentVariable("KADATH_BEHAVIOR_TOOL", toolPath); }
+        Require(before == ProjectIdentity(project.ProjectDirectory), "Failed Behavior Contract Snapshot modified the project tree.");
     }
 
     private static async Task VerifyAdapterFailureFramesAsync(string toolPath)

@@ -42,6 +42,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string? _selectedHierarchyItem;
     private string? _selectedAssetItem;
     private SceneObjectDraftViewModel? _selectedSceneObject;
+    private BehaviorContractEntry? _selectedBehaviorContract;
+    private SceneBehaviorBindingDraftViewModel? _selectedBehaviorBinding;
     private string _inspectorText = "选择项目、场景或资产查看其会话信息。";
     private string _sceneGoalX = string.Empty;
     private string _sceneGoalY = string.Empty;
@@ -84,6 +86,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace.Authoring.PropertyChanged += OnNestedPropertyChanged;
         _workspace.ScriptSource.PropertyChanged += OnNestedPropertyChanged;
         _workspace.ScriptDiagnostics.PropertyChanged += OnNestedPropertyChanged;
+        _workspace.BehaviorContract.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Bake.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Watch.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Preview.PropertyChanged += OnNestedPropertyChanged;
@@ -116,6 +119,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         DeleteSceneObjectCommand = AddCommand(new DelegateUiCommand(DeleteSelectedSceneObjectDraft, () => CanDeleteSelectedSceneObject));
         MoveSceneObjectUpCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectUp, () => CanMoveSelectedSceneObjectUp));
         MoveSceneObjectDownCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectDown, () => CanMoveSelectedSceneObjectDown));
+        AddBehaviorBindingCommand = AddCommand(new DelegateUiCommand(AddBehaviorBinding, () => CanAddBehaviorBinding));
+        RemoveBehaviorBindingCommand = AddCommand(new DelegateUiCommand(RemoveBehaviorBinding, () => CanRemoveBehaviorBinding));
+        MoveBehaviorBindingUpCommand = AddCommand(new DelegateUiCommand(MoveBehaviorBindingUp, () => CanMoveBehaviorBindingUp));
+        MoveBehaviorBindingDownCommand = AddCommand(new DelegateUiCommand(MoveBehaviorBindingDown, () => CanMoveBehaviorBindingDown));
         DiscardScriptSourceChangesCommand = AddCommand(new DelegateUiCommand(DiscardScriptSourceChanges, () => CanDiscardScriptSourceChanges));
         ReanalyzeScriptSourceCommand = AddCommand(new DelegateUiCommand(
             () => _workspace.ReanalyzeScriptSource(),
@@ -153,6 +160,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand DeleteSceneObjectCommand { get; }
     public ICommand MoveSceneObjectUpCommand { get; }
     public ICommand MoveSceneObjectDownCommand { get; }
+    public ICommand AddBehaviorBindingCommand { get; }
+    public ICommand RemoveBehaviorBindingCommand { get; }
+    public ICommand MoveBehaviorBindingUpCommand { get; }
+    public ICommand MoveBehaviorBindingDownCommand { get; }
     public ICommand DiscardScriptSourceChangesCommand { get; }
     public ICommand ReanalyzeScriptSourceCommand { get; }
     public ICommand ClearEventLogCommand { get; }
@@ -218,6 +229,25 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         set
         {
             if (!SetProperty(ref _selectedSceneObject, value)) { return; }
+            SelectedBehaviorBinding = value?.Behaviors.FirstOrDefault();
+            RaiseAll();
+        }
+    }
+    public BehaviorContractEntry? SelectedBehaviorContract
+    {
+        get => _selectedBehaviorContract;
+        set
+        {
+            if (!SetProperty(ref _selectedBehaviorContract, value)) return;
+            RaiseAll();
+        }
+    }
+    public SceneBehaviorBindingDraftViewModel? SelectedBehaviorBinding
+    {
+        get => _selectedBehaviorBinding;
+        set
+        {
+            if (!SetProperty(ref _selectedBehaviorBinding, value)) return;
             RaiseAll();
         }
     }
@@ -439,7 +469,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && _workspace.Preview.State == EditorPreviewState.Stopped
         && !IsScriptSourceDirty
         && !IsBusy;
-    public bool CanApplyAuthoring => IsProjectOpen && _workspace.Capabilities.CanApplyAuthoring && !IsScriptSourceDirty;
+    public bool CanApplyAuthoring => IsProjectOpen
+        && _workspace.Capabilities.CanApplyAuthoring
+        && !IsScriptSourceDirty
+        && AreSceneBehaviorsStructurallyValid;
     public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0 && !IsScriptSourceDirty;
     public bool SupportsScriptSourceAuthoring => IsProjectOpen
         && _workspace.ProjectSnapshot.Value?.Script.SchemaVersion == 2
@@ -467,10 +500,58 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && _workspace.Capabilities.CanEditScriptSource
         && _workspace.ScriptSource.State is not (EditorScriptSourceState.Loading or EditorScriptSourceState.Saving or EditorScriptSourceState.Undoing);
     public bool HasSelectedSceneObject => SelectedSceneObject is not null;
+    public IReadOnlyList<BehaviorContractEntry> AvailableBehaviorContracts => IsBehaviorContractReady
+        ? _workspace.BehaviorContract.Value!.Entries
+        : [];
+    public bool IsBehaviorContractReady => _workspace.BehaviorContract.State == EditorSnapshotState.Ready
+        && _workspace.BehaviorContract.Value is { State: "ready" } snapshot
+        && _workspace.ProjectSnapshot.Value is { } project
+        && snapshot.AuthoringRevision.Equals(project.AuthoringRevision, StringComparison.OrdinalIgnoreCase);
+    public string BehaviorContractStatus => _workspace.BehaviorContract.Value switch
+    {
+        null when !_workspace.Capabilities.CanReadBehaviorContract => "当前 Service 不支持行为契约目录。",
+        _ when _workspace.BehaviorContract.State == EditorSnapshotState.Loading => "正在读取行为契约…",
+        _ when _workspace.BehaviorContract.State == EditorSnapshotState.Failed => $"行为契约读取失败 · {_workspace.BehaviorContract.ErrorCode}",
+        null => "行为契约尚未读取。",
+        { State: "ready" } snapshot when IsBehaviorContractReady => $"可用脚本 {snapshot.Entries.Length} 个 · 工具链 {snapshot.ToolchainIdentity}",
+        { State: "ready" } => "行为契约已过期，刷新后才能修改绑定。",
+        { ErrorCode: { } code } => $"行为契约不可用 · {code}",
+        _ => "行为契约不可用。"
+    };
+    public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion == 5;
+    public bool HasSelectedBehaviorBinding => SelectedBehaviorBinding is not null;
+    public bool CanAddBehaviorBinding => UsesBehaviorBindingAuthoring
+        && IsBehaviorContractReady
+        && SelectedSceneObject is { } sceneObject
+        && SelectedBehaviorContract is { } contract
+        && sceneObject.Behaviors.Count < 4
+        && sceneObject.Behaviors.All(binding => binding.ScriptId != contract.ScriptId)
+        && !IsBusy;
+    public bool CanRemoveBehaviorBinding => UsesBehaviorBindingAuthoring
+        && IsBehaviorContractReady
+        && SelectedSceneObject is { } sceneObject
+        && SelectedBehaviorBinding is { } binding
+        && sceneObject.Behaviors.Contains(binding)
+        && !(sceneObject.IsPatrolHazard && sceneObject.Behaviors.Count == 1)
+        && !IsBusy;
+    public bool CanMoveBehaviorBindingUp => UsesBehaviorBindingAuthoring
+        && IsBehaviorContractReady
+        && SelectedSceneObject is { } sceneObject
+        && SelectedBehaviorBinding is { } binding
+        && sceneObject.Behaviors.IndexOf(binding) > 0
+        && !IsBusy;
+    public bool CanMoveBehaviorBindingDown => UsesBehaviorBindingAuthoring
+        && IsBehaviorContractReady
+        && SelectedSceneObject is { } sceneObject
+        && SelectedBehaviorBinding is { } binding
+        && sceneObject.Behaviors.IndexOf(binding) is var index
+        && index >= 0
+        && index < sceneObject.Behaviors.Count - 1
+        && !IsBusy;
     public bool CanAddSceneObject => CanApplyAuthoring && SceneObjectDrafts.Count < 64 && SceneTextureIds.Count > 0 && !IsBusy;
     public bool CanAddPatrolHazard => CanAddSceneObject
         && _workspace.ProjectSnapshot.Value is { } project
-        && project.Scene.SchemaVersion != 5;
+        && (project.Scene.SchemaVersion != 5 || IsBehaviorContractReady && AvailableBehaviorContracts.Count > 0);
     public bool CanDeleteSelectedSceneObject => SelectedSceneObject is { } selected
         && !IsBusy
         && (selected.Kind == "sprite" || selected.Kind == "patrol_hazard" && SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard") > 1);
@@ -586,21 +667,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             ScriptGoalVelocity: editsHookScript ? ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity") : null,
             SceneTextures: sceneTextures,
             SceneObjects: ParseSceneObjectDrafts(allowedTextureIds));
-        try
-        {
-            var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
-            ReconcileScriptSourceDocument();
-            ApplySnapshotProjection(session);
-            RaiseAll();
-            return result;
-        }
-        catch (EditorRpcException exception) when (exception.Code == "authoring_revision_conflict")
-        {
-            await _workspace.RefreshSnapshotsAsync(session.ProjectName, cancellationToken == default ? _lifetime.Token : cancellationToken);
-            ApplySnapshotProjection(session);
-            RaiseAll();
-            throw;
-        }
+        var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
+        ReconcileScriptSourceDocument();
+        ApplySnapshotProjection(session);
+        RaiseAll();
+        return result;
     }
 
     private async Task UndoAuthoringAsync()
@@ -920,6 +991,12 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             double? patrolMinY = null;
             double? patrolMaxY = null;
             double? patrolSpeed = null;
+            if (!draft.AreBehaviorsValid
+                || draft.Behaviors.Count > 4
+                || draft.Behaviors.Select(binding => binding.ScriptId).Distinct().Count() != draft.Behaviors.Count)
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}].behaviors 包含重复脚本或无效参数。");
+            }
             var behaviors = draft.CreateBehaviorDefinitions();
             switch (draft.Kind)
             {
@@ -943,6 +1020,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                         {
                             throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}] 的 Patrol 范围或初始 Y 无效。");
                         }
+                    }
+                    else if (behaviors.Count == 0)
+                    {
+                        throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}] 必须至少绑定一个行为脚本。");
                     }
                     break;
                 default:
@@ -978,7 +1059,48 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public void AddPatrolHazardDraft()
     {
         if (!CanAddPatrolHazard) { return; }
-        AddSceneObjectDraft(SceneObjectDraftViewModel.NewPatrolHazard(NextObjectId("hazard"), SceneTextureIds[0], SceneTextureIds));
+        var usesNativePatrol = !UsesBehaviorBindingAuthoring;
+        var draft = SceneObjectDraftViewModel.NewPatrolHazard(NextObjectId("hazard"), SceneTextureIds[0], SceneTextureIds, usesNativePatrol);
+        if (!usesNativePatrol && AvailableBehaviorContracts.FirstOrDefault() is { } contract)
+            draft.Behaviors.Add(SceneBehaviorBindingDraftViewModel.Create(contract));
+        AddSceneObjectDraft(draft);
+        SelectedBehaviorBinding = draft.Behaviors.FirstOrDefault();
+    }
+
+    public void AddBehaviorBinding()
+    {
+        if (!CanAddBehaviorBinding || SelectedSceneObject is not { } sceneObject || SelectedBehaviorContract is not { } contract) return;
+        var binding = SceneBehaviorBindingDraftViewModel.Create(contract);
+        sceneObject.Behaviors.Add(binding);
+        SelectedBehaviorBinding = binding;
+        RaiseAll();
+    }
+
+    public void RemoveBehaviorBinding()
+    {
+        if (!CanRemoveBehaviorBinding || SelectedSceneObject is not { } sceneObject || SelectedBehaviorBinding is not { } binding) return;
+        var index = sceneObject.Behaviors.IndexOf(binding);
+        sceneObject.Behaviors.RemoveAt(index);
+        SelectedBehaviorBinding = sceneObject.Behaviors.Count == 0
+            ? null
+            : sceneObject.Behaviors[Math.Min(index, sceneObject.Behaviors.Count - 1)];
+        RaiseAll();
+    }
+
+    public void MoveBehaviorBindingUp()
+    {
+        if (!CanMoveBehaviorBindingUp || SelectedSceneObject is not { } sceneObject || SelectedBehaviorBinding is not { } binding) return;
+        var index = sceneObject.Behaviors.IndexOf(binding);
+        sceneObject.Behaviors.Move(index, index - 1);
+        RaiseAll();
+    }
+
+    public void MoveBehaviorBindingDown()
+    {
+        if (!CanMoveBehaviorBindingDown || SelectedSceneObject is not { } sceneObject || SelectedBehaviorBinding is not { } binding) return;
+        var index = sceneObject.Behaviors.IndexOf(binding);
+        sceneObject.Behaviors.Move(index, index + 1);
+        RaiseAll();
     }
 
     public void DeleteSelectedSceneObjectDraft()
@@ -1024,6 +1146,25 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             if (!existing.Contains(candidate)) { return candidate; }
         }
         throw new InvalidOperationException($"无法为 {prefix} 分配新的 ObjectId。");
+    }
+
+    private bool AreSceneBehaviorsStructurallyValid
+    {
+        get
+        {
+            var project = _workspace.ProjectSnapshot.Value;
+            if (project?.Scene.Objects is null) return true;
+            foreach (var draft in SceneObjectDrafts)
+            {
+                if (!draft.AreBehaviorsValid
+                    || draft.Behaviors.Count > 4
+                    || draft.Behaviors.Select(binding => binding.ScriptId).Distinct().Count() != draft.Behaviors.Count)
+                    return false;
+                if (project.Scene.SchemaVersion == 5 && draft.IsPatrolHazard && draft.Behaviors.Count == 0) return false;
+                if (project.Scene.SchemaVersion == 5 && draft.IsPatrolHazard && draft.UsesNativePatrol) return false;
+            }
+            return true;
+        }
     }
 
     private static double ParseFiniteNumber(string value, string field)
@@ -1247,6 +1388,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             draft.PropertyChanged += OnSceneObjectDraftPropertyChanged;
             SceneObjectDrafts.Add(draft);
         }
+        ApplyBehaviorContractProjection();
         SelectedSceneObject = null;
         RaiseAll();
     }
@@ -1256,6 +1398,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         foreach (var draft in SceneObjectDrafts) { draft.PropertyChanged -= OnSceneObjectDraftPropertyChanged; }
         SceneObjectDrafts.Clear();
         SelectedSceneObject = null;
+        SelectedBehaviorBinding = null;
     }
 
     private void RefreshSceneTextureChoicesFromSlots()
@@ -1285,6 +1428,22 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         {
             SelectedAssetItem = null;
         }
+    }
+
+    private void ApplyBehaviorContractProjection()
+    {
+        if (!IsBehaviorContractReady)
+        {
+            RaiseAll();
+            return;
+        }
+        var contracts = AvailableBehaviorContracts.ToDictionary(entry => entry.ScriptId);
+        foreach (var draft in SceneObjectDrafts) draft.ApplyBehaviorContracts(contracts, IsBehaviorContractReady);
+        if (SelectedBehaviorContract is null || !contracts.ContainsKey(SelectedBehaviorContract.ScriptId))
+            SelectedBehaviorContract = contracts.Values.FirstOrDefault();
+        if (SelectedBehaviorBinding is not null)
+            SelectedBehaviorBinding = SelectedSceneObject?.Behaviors.FirstOrDefault(binding => binding.ScriptId == SelectedBehaviorBinding.ScriptId);
+        RaiseAll();
     }
 
     private void PopulateAssetProjection(AssetCatalogSnapshot assets)
@@ -1344,6 +1503,12 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         {
             SelectedScriptDiagnostic = null;
         }
+        if (ReferenceEquals(sender, _workspace.BehaviorContract)
+            && (e.PropertyName is nameof(EditorSnapshotViewModel<BehaviorContractSnapshotResult>.Value)
+                or nameof(EditorSnapshotViewModel<BehaviorContractSnapshotResult>.State)))
+        {
+            ApplyBehaviorContractProjection();
+        }
         RaiseAll();
     }
     private void HandleCommandError(Exception exception) => _ = _dispatcher.InvokeAsync(() => AddLog("command_failed", exception.Message, null, 0));
@@ -1372,6 +1537,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CapabilitySummary));
         OnPropertyChanged(nameof(SceneObjectCountStatus));
         OnPropertyChanged(nameof(HasSelectedSceneObject));
+        OnPropertyChanged(nameof(AvailableBehaviorContracts));
+        OnPropertyChanged(nameof(IsBehaviorContractReady));
+        OnPropertyChanged(nameof(BehaviorContractStatus));
+        OnPropertyChanged(nameof(UsesBehaviorBindingAuthoring));
+        OnPropertyChanged(nameof(HasSelectedBehaviorBinding));
         OnPropertyChanged(nameof(IsBusy));
         OnPropertyChanged(nameof(IsConnected));
         OnPropertyChanged(nameof(IsProjectOpen));
@@ -1411,6 +1581,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanDeleteSelectedSceneObject));
         OnPropertyChanged(nameof(CanMoveSelectedSceneObjectUp));
         OnPropertyChanged(nameof(CanMoveSelectedSceneObjectDown));
+        OnPropertyChanged(nameof(CanAddBehaviorBinding));
+        OnPropertyChanged(nameof(CanRemoveBehaviorBinding));
+        OnPropertyChanged(nameof(CanMoveBehaviorBindingUp));
+        OnPropertyChanged(nameof(CanMoveBehaviorBindingDown));
         OnPropertyChanged(nameof(CanRefreshSnapshots));
         OnPropertyChanged(nameof(CanBake));
         OnPropertyChanged(nameof(CanImportTexture));

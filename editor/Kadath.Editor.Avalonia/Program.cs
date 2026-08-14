@@ -111,8 +111,40 @@ internal static class Program
             Require(avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.ObjectId == hazardDraft.ObjectId).PositionX == originalHazardX,
                 "Avalonia did not restore the Scene v5 object edit");
             RequireBehaviorSignatures(restored.ProjectSnapshot, expectedBehaviors, "authoring undo");
+
+            Require(avaloniaViewModel.IsBehaviorContractReady
+                && avaloniaViewModel.AvailableBehaviorContracts.Count == 1,
+                "Avalonia did not project the Behavior Contract catalog");
+            var bindingGoalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
+            avaloniaViewModel.SelectedSceneObject = bindingGoalDraft;
+            avaloniaViewModel.SelectedBehaviorContract = avaloniaViewModel.AvailableBehaviorContracts[0];
+            Require(avaloniaViewModel.CanAddBehaviorBinding, "Avalonia did not enable a valid behavior binding candidate");
+            avaloniaViewModel.AddBehaviorBinding();
+            var bindingDraft = avaloniaViewModel.SelectedBehaviorBinding
+                ?? throw new InvalidOperationException("Avalonia did not select the added behavior binding");
+            Require(bindingDraft.Parameters.All(parameter => parameter.ValueText.Length == 0)
+                && bindingDraft.CreateDefinition().Parameters?.Count == 0,
+                "Avalonia persisted a schema default as an explicit override");
+            Require(avaloniaViewModel.CanRemoveBehaviorBinding, "Avalonia did not allow removing an optional goal binding");
+            avaloniaViewModel.RemoveBehaviorBinding();
+            Require(bindingGoalDraft.Behaviors.Count == 0, "Avalonia did not remove the optional goal binding draft");
+            avaloniaViewModel.AddBehaviorBinding();
+            bindingDraft = avaloniaViewModel.SelectedBehaviorBinding!;
+            var speedParameter = bindingDraft.Parameters.Single(parameter => parameter.Name == "speed");
+            speedParameter.ValueText = "1001";
+            Require(!avaloniaViewModel.CanApplyAuthoring, "Avalonia enabled Apply for an out-of-range behavior override");
+            speedParameter.ValueText = "120";
+            var bound = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+            var boundGoal = bound.ProjectSnapshot.Scene.Objects!.Single(item => item.ObjectId == bindingGoalDraft.ObjectId);
+            Require(boundGoal.Behaviors?.Single().ScriptId == 1
+                && boundGoal.Behaviors.Single().Parameters?.Single() is { Name: "speed", Value: 120 },
+                "Avalonia did not commit the behavior binding parameter override");
+            var unbound = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(unbound.ProjectSnapshot.Scene.Objects!.Single(item => item.ObjectId == bindingGoalDraft.ObjectId).Behaviors is { Count: 0 },
+                "Avalonia Undo did not restore the previous behavior binding collection");
         }
         Console.WriteLine("workflow_behavior_preservation=ok");
+        Console.WriteLine("workflow_behavior_binding_authoring=ok");
 
         Require(openedProject.Script.SchemaVersion == 2, "Avalonia script source workflow requires a Script v2 project");
         var scriptDependency = openedProject.Script.Dependencies?.FirstOrDefault()
@@ -628,6 +660,27 @@ internal static class Program
             && v5SecondBinding.ScriptId == 11
             && v5Definitions?.Count == 2,
             "Avalonia did not preserve Scene v5 behavior binding order");
+        var contract7 = new BehaviorContractEntry(7, "scripts/seven.luau", new string('7', 64),
+            [new BehaviorParameterSchema("speed", "number", 80, 0, 1000)]);
+        v5Draft.ApplyBehaviorContracts(new Dictionary<uint, BehaviorContractEntry> { [7] = contract7 }, catalogAvailable: true);
+        Require(!v5Draft.AreBehaviorsValid
+            && v5Draft.Behaviors.Single(binding => binding.ScriptId == 11).Status.Contains("不在当前契约目录", StringComparison.Ordinal),
+            "Avalonia accepted an existing binding whose scriptId is absent from the current catalog");
+        var identityDraft = SceneBehaviorBindingDraftViewModel.FromSnapshot(
+            new ProjectModelSceneBehaviorBinding(7, [new ProjectModelSceneBehaviorParameter("speed", 80)]));
+        identityDraft.ApplyContract(contract7, catalogAvailable: true);
+        identityDraft.ApplyContract(contract7 with { SourceHash = new string('8', 64) }, catalogAvailable: true);
+        Require(identityDraft.HasIdentityConflict && !identityDraft.IsValid,
+            "Avalonia silently reused a binding draft after its Script source identity changed");
+        var schemaIdentityDraft = SceneBehaviorBindingDraftViewModel.FromSnapshot(
+            new ProjectModelSceneBehaviorBinding(7, [new ProjectModelSceneBehaviorParameter("speed", 80)]));
+        schemaIdentityDraft.ApplyContract(contract7, catalogAvailable: true);
+        schemaIdentityDraft.ApplyContract(contract7 with
+        {
+            Parameters = [new BehaviorParameterSchema("speed", "number", 90, 0, 1000)]
+        }, catalogAvailable: true);
+        Require(schemaIdentityDraft.HasIdentityConflict && !schemaIdentityDraft.IsValid,
+            "Avalonia silently reused a binding draft after its parameter schema identity changed");
 
         var v4Draft = SceneObjectDraftViewModel.FromSnapshot(
             new ProjectModelSceneObject(

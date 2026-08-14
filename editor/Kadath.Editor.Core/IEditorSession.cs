@@ -21,6 +21,7 @@ public interface IEditorSessionBackend : IAsyncDisposable
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<ScriptSourceDocument> GetScriptSourceAsync(ProjectSessionInfo project, ScriptSourceQueryParameters parameters, CancellationToken cancellationToken);
     Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(ProjectSessionInfo project, ScriptSourceAnalyzeParameters parameters, CancellationToken cancellationToken);
+    Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(ProjectSessionInfo project, BehaviorContractSnapshotParameters parameters, CancellationToken cancellationToken);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken);
     Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken);
@@ -49,6 +50,7 @@ public interface IEditorSession : IAsyncDisposable
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(ScriptSourceAnalyzeParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(BehaviorContractSnapshotParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default);
@@ -75,6 +77,7 @@ public sealed class EditorSession : IEditorSession
         "publication_snapshot",
         "script_source_read",
         "script_source_analyze",
+        "behavior_contract_snapshot",
         "texture_import",
         "authoring_apply",
         "authoring_undo",
@@ -260,6 +263,34 @@ public sealed class EditorSession : IEditorSession
         var result = await _backend.GetPublicationSnapshotAsync(project, parameters, cancellationToken);
         await EmitAsync("publication_snapshot_created", result, requestId);
         return result;
+    }
+
+    public async Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(
+        BehaviorContractSnapshotParameters parameters,
+        string? requestId,
+        CancellationToken cancellationToken = default)
+    {
+        var project = RequireProject(parameters.ProjectName);
+        await EmitAsync("behavior_contract_snapshot_started", new { projectName = project.ProjectName }, requestId);
+        try
+        {
+            var result = await _backend.GetBehaviorContractSnapshotAsync(project, parameters, cancellationToken);
+            await EmitAsync("behavior_contract_snapshot_completed", new
+            {
+                projectName = result.ProjectName,
+                state = result.State,
+                entryCount = result.Entries.Length,
+                authoringRevision = result.AuthoringRevision,
+                scriptSourceRevision = result.ScriptSourceRevision,
+                errorCode = result.ErrorCode
+            }, requestId);
+            return result;
+        }
+        catch (EditorOperationException exception)
+        {
+            await EmitAsync("behavior_contract_snapshot_failed", new { projectName = project.ProjectName, errorCode = exception.Code, message = exception.Message }, requestId);
+            throw;
+        }
     }
 
     public async Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, string? requestId, CancellationToken cancellationToken = default)

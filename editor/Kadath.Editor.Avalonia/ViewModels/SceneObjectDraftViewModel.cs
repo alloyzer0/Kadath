@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using Kadath.Editor.Protocol;
 using Kadath.Editor.ViewModels;
 
@@ -60,7 +62,10 @@ public sealed class SceneObjectDraftViewModel : ObservableObject
         _patrolMaxY = patrolMaxY;
         _patrolSpeed = patrolSpeed;
         TextureIds = textureIds;
-        Behaviors = CopyBehaviors(behaviors);
+        Behaviors = new ObservableCollection<SceneBehaviorBindingDraftViewModel>(
+            (behaviors ?? []).Select(binding => SceneBehaviorBindingDraftViewModel.FromSnapshot(binding)));
+        Behaviors.CollectionChanged += OnBehaviorsChanged;
+        foreach (var binding in Behaviors) binding.PropertyChanged += OnBehaviorPropertyChanged;
         _usesNativePatrol = usesNativePatrol ?? (Kind == "patrol_hazard"
             && patrolMinY.Length > 0
             && (behaviors is null || behaviors.Count == 0));
@@ -69,7 +74,8 @@ public sealed class SceneObjectDraftViewModel : ObservableObject
     public string OriginalObjectId { get; }
     public string Kind { get; }
     public ObservableCollection<string> TextureIds { get; }
-    public IReadOnlyList<ProjectModelSceneBehaviorBinding>? Behaviors { get; }
+    public ObservableCollection<SceneBehaviorBindingDraftViewModel> Behaviors { get; }
+    public bool AreBehaviorsValid => Behaviors.All(binding => binding.IsValid);
     public bool IsPlayer => Kind == "player";
     public bool IsPatrolHazard => Kind == "patrol_hazard";
     public bool UsesNativePatrol => IsPatrolHazard && _usesNativePatrol;
@@ -124,22 +130,39 @@ public sealed class SceneObjectDraftViewModel : ObservableObject
         objectId, objectId, "sprite", "160", "160", "64", "64", "1", "1", "1", "1", textureId,
         string.Empty, string.Empty, string.Empty, string.Empty, textureIds);
 
-    public static SceneObjectDraftViewModel NewPatrolHazard(string objectId, string textureId, ObservableCollection<string> textureIds) => new(
+    public static SceneObjectDraftViewModel NewPatrolHazard(string objectId, string textureId, ObservableCollection<string> textureIds, bool usesNativePatrol = true) => new(
         objectId, objectId, "patrol_hazard", "500", "420", "72", "72", "1", "0.3", "0.2", "1", textureId,
-        string.Empty, "380", "460", "55", textureIds, usesNativePatrol: true);
+        string.Empty,
+        usesNativePatrol ? "380" : string.Empty,
+        usesNativePatrol ? "460" : string.Empty,
+        usesNativePatrol ? "55" : string.Empty,
+        textureIds, usesNativePatrol: usesNativePatrol);
 
-    public IReadOnlyList<SceneBehaviorBindingDefinition>? CreateBehaviorDefinitions() => Behaviors?.Select(binding =>
-        new SceneBehaviorBindingDefinition(
-            binding.ScriptId,
-            binding.Parameters?.ToDictionary(parameter => parameter.Name, parameter => parameter.Value, StringComparer.Ordinal)))
-        .ToArray();
+    public IReadOnlyList<SceneBehaviorBindingDefinition> CreateBehaviorDefinitions() =>
+        Behaviors.Select(binding => binding.CreateDefinition()).ToArray();
 
-    private static IReadOnlyList<ProjectModelSceneBehaviorBinding>? CopyBehaviors(
-        IReadOnlyList<ProjectModelSceneBehaviorBinding>? behaviors) => behaviors?.Select(binding =>
-            new ProjectModelSceneBehaviorBinding(
-                binding.ScriptId,
-                binding.Parameters?.Select(parameter => new ProjectModelSceneBehaviorParameter(parameter.Name, parameter.Value)).ToArray()))
-        .ToArray();
+    public void ApplyBehaviorContracts(IReadOnlyDictionary<uint, BehaviorContractEntry> contracts, bool catalogAvailable = false)
+    {
+        foreach (var binding in Behaviors)
+            binding.ApplyContract(contracts.GetValueOrDefault(binding.ScriptId), catalogAvailable);
+        RaisePropertyChanged(nameof(AreBehaviorsValid));
+    }
+
+    private void OnBehaviorsChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.OldItems is not null)
+            foreach (SceneBehaviorBindingDraftViewModel binding in e.OldItems) binding.PropertyChanged -= OnBehaviorPropertyChanged;
+        if (e.NewItems is not null)
+            foreach (SceneBehaviorBindingDraftViewModel binding in e.NewItems) binding.PropertyChanged += OnBehaviorPropertyChanged;
+        RaisePropertyChanged(nameof(AreBehaviorsValid));
+        RaisePropertyChanged(nameof(DisplayName));
+    }
+
+    private void OnBehaviorPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        RaisePropertyChanged(nameof(AreBehaviorsValid));
+        RaisePropertyChanged(nameof(DisplayName));
+    }
 
     private static string Format(double value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
 }
