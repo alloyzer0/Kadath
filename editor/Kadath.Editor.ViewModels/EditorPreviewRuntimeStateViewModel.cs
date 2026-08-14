@@ -161,11 +161,11 @@ public sealed class EditorPreviewRuntimeStateViewModel : ObservableObject
         _initialTerminalApplied = true;
         Scene.ApplyInitial(notification.Scene);
         Script.ApplyInitial(notification.Script);
-        State = EditorPreviewRuntimeState.Loaded;
         ErrorCode = null;
         ErrorMessage = null;
         LastTarget = "Script";
         Reconcile(_publication);
+        State = EditorPreviewRuntimeState.Loaded;
         RaisePropertyChanged(nameof(Last));
     }
 
@@ -174,9 +174,9 @@ public sealed class EditorPreviewRuntimeStateViewModel : ObservableObject
         // initial 成功/失败共享一次性终态；迟到失败也不能把 reload ack 推进后的 loaded 状态倒退。
         if (_initialTerminalApplied || Scene.Origin == EditorPreviewRuntimeOrigin.Reload || Script.Origin == EditorPreviewRuntimeOrigin.Reload) { return; }
         _initialTerminalApplied = true;
-        State = EditorPreviewRuntimeState.Failed;
         ErrorCode = notification.ErrorCode;
         ErrorMessage = notification.Message;
+        State = EditorPreviewRuntimeState.Failed;
     }
 
     internal void ApplyReload(PreviewReloadNotification notification)
@@ -184,8 +184,8 @@ public sealed class EditorPreviewRuntimeStateViewModel : ObservableObject
         var target = notification.Target == "Scene" ? Scene : Script;
         if (!target.ApplyReload(notification)) { return; }
         LastTarget = notification.Target;
-        State = EditorPreviewRuntimeState.Loaded;
         target.Reconcile(notification.Target == "Scene" ? _publication?.Scene : _publication?.Script);
+        State = EditorPreviewRuntimeState.Loaded;
         RaisePropertyChanged(nameof(Last));
     }
 

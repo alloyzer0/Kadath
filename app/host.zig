@@ -338,7 +338,13 @@ pub const Host = struct {
             if (!self.behavior_runtime.isLoaded()) return;
             const batch = try self.behavior_runtime.onStart(&self.scene);
             try self.generation.applyTranslationDeltas(batch.slice());
-            std.log.info("Behavior on_start hooks applied", .{});
+            var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+            const ordered = try self.generation.extractSprites(&sprites);
+            const player_entity = self.generation.playerEntity();
+            const player = for (ordered) |sprite| {
+                if (sprite.entity_id == player_entity) break sprite;
+            } else return error.WorldProducedNoPlayerSprite;
+            std.log.info("Behavior on_start hooks applied: player_position=({d:.2},{d:.2})", .{ player.position[0], player.position[1] });
             return;
         }
         self.script_tick = 0;

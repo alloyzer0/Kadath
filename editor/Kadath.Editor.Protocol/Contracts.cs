@@ -142,6 +142,42 @@ public sealed record ScriptSourceUndoParameters(
     string? ProjectName,
     string ExpectedRevision);
 
+public sealed record ScriptAssetCreateParameters(
+    string? ProjectName,
+    string ExpectedRevision,
+    string SourcePath);
+
+public sealed record ScriptAssetRenameParameters(
+    string? ProjectName,
+    string ExpectedRevision,
+    uint ScriptId,
+    string SourcePath);
+
+public sealed record ScriptAssetDeleteParameters(
+    string? ProjectName,
+    string ExpectedRevision,
+    uint ScriptId);
+
+public sealed record ScriptAssetUndoParameters(
+    string? ProjectName,
+    string ExpectedRevision);
+
+public sealed record ScriptAssetIdentity(uint ScriptId, string SourcePath);
+
+public sealed record ScriptAssetMutationResult(
+    string Operation,
+    string State,
+    string ProjectName,
+    string PreviousRevision,
+    string Revision,
+    string[] ChangedFields,
+    int UndoDepth,
+    ScriptAssetIdentity Asset,
+    ScriptSourceDocument? SourceDocument,
+    ProjectModelSnapshot ProjectSnapshot,
+    HierarchySnapshot HierarchySnapshot,
+    AssetCatalogSnapshot AssetCatalogSnapshot);
+
 public sealed record ScriptSourceAnalyzeParameters(
     string? ProjectName,
     uint ScriptId,

@@ -117,7 +117,10 @@ internal static class Program
         var initial = await events.WaitAsync("preview_initial_loaded", data => data.GetProperty("scene").GetProperty("correlation").GetString() == "built_in");
         Require(initial.Data.GetProperty("script").GetProperty("kind").GetString() == "built_in", "built-in initial identity mismatch");
         _ = await events.WaitAsync("preview_status", data => data.TryGetProperty("event", out var value) && value.GetString() == "protocol_error");
-        _ = await events.WaitAsync("preview_status", data => data.TryGetProperty("event", out var value) && value.GetString() == "runtime_log");
+        var stdoutLog = await events.WaitAsync("preview_status", data => data.TryGetProperty("event", out var value)
+            && value.GetString() == "runtime_log"
+            && data.GetProperty("stream").GetString() == "stdout");
+        Require(stdoutLog.Data.GetProperty("message").GetString() == "info: fake runtime stdout", "Runtime stdout log projection mismatch");
         _ = await events.WaitAsync("preview_status", data => data.TryGetProperty("event", out var value) && value.GetString() == "unknown_status");
         var failed = await events.WaitAsync("preview_reload_failed", data => data.GetProperty("target").GetString() == "Script");
         Require(failed.Data.GetProperty("result").GetString() == "rejected"
@@ -295,6 +298,7 @@ internal static class Program
         printf '%s' "$1" | sed -n 's/.*"requestId":\([0-9][0-9]*\).*/\1/p'
     }
     emit 'not-json'
+    emit 'info: fake runtime stdout'
     emit '{"schemaVersion":1,"sequence":1,"event":"unknown_status"}'
     printf '%s\n' 'fake runtime stderr' >&2
     if [ "$mode" = "startup_fail" ]; then

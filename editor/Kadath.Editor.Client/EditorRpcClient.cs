@@ -65,6 +65,10 @@ public interface IEditorRpcClient : IAsyncDisposable
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, CancellationToken cancellationToken = default);
     Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, CancellationToken cancellationToken = default);
     Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, CancellationToken cancellationToken = default);
+    Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ScriptAssetCreateParameters parameters, CancellationToken cancellationToken = default);
+    Task<ScriptAssetMutationResult> RenameScriptAssetAsync(ScriptAssetRenameParameters parameters, CancellationToken cancellationToken = default);
+    Task<ScriptAssetMutationResult> DeleteScriptAssetAsync(ScriptAssetDeleteParameters parameters, CancellationToken cancellationToken = default);
+    Task<ScriptAssetMutationResult> UndoScriptAssetAsync(ScriptAssetUndoParameters parameters, CancellationToken cancellationToken = default);
     Task<EditorBakeResult> StartBakeAsync(BakeStartParameters parameters, CancellationToken cancellationToken = default);
     Task<EditorWatchResult> StartWatchAsync(WatchStartParameters parameters, CancellationToken cancellationToken = default);
     Task<EditorWatchResult> StopWatchAsync(CancellationToken cancellationToken = default);
@@ -170,6 +174,19 @@ public sealed class EditorRpcClient : IEditorRpcClient
 
     public Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<ScriptSourceUndoParameters, ScriptSourceMutationResult>("script_source_undo", parameters, cancellationToken);
+
+    public Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ScriptAssetCreateParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ScriptAssetCreateParameters, ScriptAssetMutationResult>("script_asset_create", parameters, cancellationToken);
+
+    public Task<ScriptAssetMutationResult> RenameScriptAssetAsync(ScriptAssetRenameParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ScriptAssetRenameParameters, ScriptAssetMutationResult>("script_asset_rename", parameters, cancellationToken);
+
+    public Task<ScriptAssetMutationResult> DeleteScriptAssetAsync(ScriptAssetDeleteParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ScriptAssetDeleteParameters, ScriptAssetMutationResult>("script_asset_delete", parameters, cancellationToken);
+
+    public Task<ScriptAssetMutationResult> UndoScriptAssetAsync(ScriptAssetUndoParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ScriptAssetUndoParameters, ScriptAssetMutationResult>("script_asset_undo", parameters, cancellationToken);
+
     public Task<EditorBakeResult> StartBakeAsync(BakeStartParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<BakeStartParameters, EditorBakeResult>("bake_start", parameters, cancellationToken);
 

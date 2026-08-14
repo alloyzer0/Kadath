@@ -39,6 +39,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _textureImportSourcePath = string.Empty;
     private string _textureImportAssetName = "imported";
     private string _textureImportProfile = "debug";
+    private string _scriptAssetPath = "scripts/new_behavior.luau";
     private string? _selectedHierarchyItem;
     private string? _selectedAssetItem;
     private SceneObjectDraftViewModel? _selectedSceneObject;
@@ -85,6 +86,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace.Publication.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Authoring.PropertyChanged += OnNestedPropertyChanged;
         _workspace.ScriptSource.PropertyChanged += OnNestedPropertyChanged;
+        _workspace.ScriptAssetLifecycle.PropertyChanged += OnNestedPropertyChanged;
         _workspace.ScriptDiagnostics.PropertyChanged += OnNestedPropertyChanged;
         _workspace.BehaviorContract.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Bake.PropertyChanged += OnNestedPropertyChanged;
@@ -107,6 +109,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         SaveScriptSourceCommand = AddCommand(new AsyncUiCommand(SaveScriptSourceAsync, () => CanSaveScriptSource, HandleCommandError));
         UndoScriptSourceCommand = AddCommand(new AsyncUiCommand(UndoScriptSourceAsync, () => CanUndoScriptSource, HandleCommandError));
         ReloadScriptSourceCommand = AddCommand(new AsyncUiCommand(ReloadScriptSourceAsync, () => CanReloadScriptSource, HandleCommandError));
+        CreateScriptAssetCommand = AddCommand(new AsyncUiCommand(CreateScriptAssetAsync, () => CanCreateScriptAsset, HandleCommandError));
+        RenameScriptAssetCommand = AddCommand(new AsyncUiCommand(RenameScriptAssetAsync, () => CanRenameScriptAsset, HandleCommandError));
+        DeleteScriptAssetCommand = AddCommand(new AsyncUiCommand(DeleteScriptAssetAsync, () => CanDeleteScriptAsset, HandleCommandError));
+        UndoScriptAssetCommand = AddCommand(new AsyncUiCommand(UndoScriptAssetAsync, () => CanUndoScriptAsset, HandleCommandError));
         BakeCommand = AddCommand(new AsyncUiCommand(BakeAsync, () => IsProjectOpen && CanBake && !IsWatching && !IsPreviewAutoSync && !IsBusy, HandleCommandError));
         BakeChangesCommand = AddCommand(new AsyncUiCommand(BakeChangesAsync, () => CanBakeChanges, HandleCommandError));
         StartWatchCommand = AddCommand(new AsyncUiCommand(StartWatchAsync, () => IsProjectOpen && CanStartWatch && !IsWatching && !IsBusy, HandleCommandError));
@@ -148,6 +154,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand SaveScriptSourceCommand { get; }
     public ICommand UndoScriptSourceCommand { get; }
     public ICommand ReloadScriptSourceCommand { get; }
+    public ICommand CreateScriptAssetCommand { get; }
+    public ICommand RenameScriptAssetCommand { get; }
+    public ICommand DeleteScriptAssetCommand { get; }
+    public ICommand UndoScriptAssetCommand { get; }
     public ICommand BakeCommand { get; }
     public ICommand BakeChangesCommand { get; }
     public ICommand StartWatchCommand { get; }
@@ -177,6 +187,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public string TextureImportSourcePath { get => _textureImportSourcePath; set { if (SetProperty(ref _textureImportSourcePath, value)) { RaiseAll(); } } }
     public string TextureImportAssetName { get => _textureImportAssetName; set { if (SetProperty(ref _textureImportAssetName, value)) { RaiseAll(); } } }
     public string TextureImportProfile { get => _textureImportProfile; set { if (SetProperty(ref _textureImportProfile, value)) { RaiseAll(); } } }
+    public string ScriptAssetPath { get => _scriptAssetPath; set { if (SetProperty(ref _scriptAssetPath, value)) { RaiseAll(); } } }
     public string? SelectedHierarchyItem
     {
         get => _selectedHierarchyItem;
@@ -337,6 +348,17 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _ when HasScriptSourceDocument => $"已加载 · UTF-8 {ScriptSourceUtf8Bytes}/{MaxScriptSourceBytes} 字节",
         _ => "从 Hierarchy 选择 ScriptDependency 以加载源码。"
     };
+    public string ScriptAssetLifecycleStatus => _workspace.ScriptAssetLifecycle.State switch
+    {
+        EditorScriptAssetLifecycleState.Creating => "正在创建脚本资产…",
+        EditorScriptAssetLifecycleState.Renaming => "正在重命名脚本资产…",
+        EditorScriptAssetLifecycleState.Deleting => "正在删除脚本资产…",
+        EditorScriptAssetLifecycleState.Undoing => "正在撤销脚本资产操作…",
+        EditorScriptAssetLifecycleState.Succeeded => $"{_workspace.ScriptAssetLifecycle.Operation} 成功 · undo={_workspace.ScriptAssetLifecycle.UndoDepth}",
+        EditorScriptAssetLifecycleState.Failed => $"脚本资产操作失败 · {_workspace.ScriptAssetLifecycle.ErrorCode}",
+        _ when HasSelectedScriptDependency => $"当前脚本 · id={SelectedScriptDependencyId} · {ScriptSourcePath}",
+        _ => "输入项目内 scripts/*.luau 相对路径以创建脚本。"
+    };
 
     public string ConnectionStatus => _workspace.ConnectionState switch
     {
@@ -454,6 +476,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         || _workspace.TextureImport.State == EditorTextureImportState.Running
         || _workspace.Authoring.State is EditorAuthoringState.Applying or EditorAuthoringState.Undoing
         || _workspace.ScriptSource.State is EditorScriptSourceState.Loading or EditorScriptSourceState.Saving or EditorScriptSourceState.Undoing
+        || _workspace.ScriptAssetLifecycle.IsBusy
         || _workspace.Bake.State == EditorBakeState.Running
         || _workspace.Watch.State is EditorWatchState.Starting or EditorWatchState.Stopping
         || _workspace.Preview.State is EditorPreviewState.Starting or EditorPreviewState.Stopping;
@@ -494,6 +517,14 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && !IsScriptSourceDirty
         && !IsBusy;
     public bool CanReloadScriptSource => SupportsScriptSourceAuthoring && HasSelectedScriptDependency && !IsScriptSourceDirty && !IsBusy;
+    public bool CanManageScriptAssets => SupportsScriptSourceAuthoring
+        && _workspace.Capabilities.CanManageScriptAssets
+        && !IsScriptSourceDirty
+        && !IsBusy;
+    public bool CanCreateScriptAsset => CanManageScriptAssets && !string.IsNullOrWhiteSpace(ScriptAssetPath);
+    public bool CanRenameScriptAsset => CanManageScriptAssets && HasSelectedScriptDependency && !string.IsNullOrWhiteSpace(ScriptAssetPath);
+    public bool CanDeleteScriptAsset => CanManageScriptAssets && HasSelectedScriptDependency;
+    public bool CanUndoScriptAsset => CanManageScriptAssets && _workspace.ScriptAssetLifecycle.UndoDepth > 0;
     public bool CanDiscardScriptSourceChanges => IsScriptSourceDirty && !IsBusy;
     public bool CanEditScriptSourceBuffer => IsScriptSourceSelection
         && HasScriptSourceDocument
@@ -746,6 +777,86 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     {
         var scriptId = SelectedScriptDependencyId ?? throw new EditorRpcException("script_source_not_selected", "请先选择行为脚本依赖。");
         await LoadScriptSourceForCurrentProjectAsync(scriptId, _lifetime.Token);
+    }
+
+    private async Task CreateScriptAssetAsync() => await CreateScriptAssetForCurrentProjectAsync(_lifetime.Token);
+
+    private async Task RenameScriptAssetAsync() => await RenameScriptAssetForCurrentProjectAsync(_lifetime.Token);
+
+    private async Task DeleteScriptAssetAsync() => await DeleteScriptAssetForCurrentProjectAsync(_lifetime.Token);
+
+    private async Task UndoScriptAssetAsync() => await UndoScriptAssetForCurrentProjectAsync(_lifetime.Token);
+
+    public async Task<ScriptAssetMutationResult> CreateScriptAssetForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        var (session, project, token) = await PrepareScriptAssetLifecycleAsync(cancellationToken);
+        var result = await _workspace.CreateScriptAssetAsync(new ScriptAssetCreateParameters(
+            session.ProjectName, project.AuthoringRevision, ScriptAssetPath.Trim()), token);
+        ApplyScriptAssetLifecycleProjection(session, result);
+        return result;
+    }
+
+    public async Task<ScriptAssetMutationResult> RenameScriptAssetForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        var (session, project, token) = await PrepareScriptAssetLifecycleAsync(cancellationToken);
+        var scriptId = SelectedScriptDependencyId ?? throw new EditorRpcException("script_asset_not_selected", "请先选择要重命名的 ScriptDependency。");
+        var result = await _workspace.RenameScriptAssetAsync(new ScriptAssetRenameParameters(
+            session.ProjectName, project.AuthoringRevision, scriptId, ScriptAssetPath.Trim()), token);
+        ApplyScriptAssetLifecycleProjection(session, result);
+        return result;
+    }
+
+    public async Task<ScriptAssetMutationResult> DeleteScriptAssetForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        var (session, project, token) = await PrepareScriptAssetLifecycleAsync(cancellationToken);
+        var scriptId = SelectedScriptDependencyId ?? throw new EditorRpcException("script_asset_not_selected", "请先选择要删除的 ScriptDependency。");
+        var result = await _workspace.DeleteScriptAssetAsync(new ScriptAssetDeleteParameters(
+            session.ProjectName, project.AuthoringRevision, scriptId), token);
+        ApplyScriptAssetLifecycleProjection(session, result);
+        return result;
+    }
+
+    public async Task<ScriptAssetMutationResult> UndoScriptAssetForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        var (session, project, token) = await PrepareScriptAssetLifecycleAsync(cancellationToken);
+        var result = await _workspace.UndoScriptAssetAsync(new ScriptAssetUndoParameters(
+            session.ProjectName, project.AuthoringRevision), token);
+        ApplyScriptAssetLifecycleProjection(session, result);
+        return result;
+    }
+
+    private async Task<(ProjectSessionInfo Session, ProjectModelSnapshot Project, CancellationToken Token)> PrepareScriptAssetLifecycleAsync(
+        CancellationToken cancellationToken)
+    {
+        await EnsureConnectedAsync();
+        if (IsScriptSourceDirty) { throw new EditorRpcException("script_source_dirty", "请先保存或放弃行为脚本源码的未保存内容。"); }
+        if (!_workspace.Capabilities.CanManageScriptAssets) { throw new EditorRpcException("unsupported_command", "当前 Service 不支持完整脚本资产生命周期。"); }
+        var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
+        var project = _workspace.ProjectSnapshot.Value ?? throw new EditorRpcException("snapshot_missing", "Project snapshot is not loaded.");
+        if (project.Script.SchemaVersion != 2) { throw new EditorRpcException("script_asset_unsupported", "脚本资产生命周期只支持 Script v2 项目。"); }
+        return (session, project, cancellationToken == default ? _lifetime.Token : cancellationToken);
+    }
+
+    private void ApplyScriptAssetLifecycleProjection(ProjectSessionInfo session, ScriptAssetMutationResult result)
+    {
+        var document = _workspace.ScriptSource.Document;
+        if (document is not null)
+        {
+            _scriptSourceDocument = document;
+            _scriptSourceText = document.Source;
+        }
+        ApplySnapshotProjection(session, document is null ? null : $"script.dependencies[{document.ScriptId}]");
+        if (document is not null)
+        {
+            ApplyScriptSourceDocument(document);
+            ScriptAssetPath = document.SourcePath;
+        }
+        else
+        {
+            ClearScriptSourceProjection();
+        }
+        AddLog($"script_asset_{result.Operation}", $"id={result.Asset.ScriptId}; path={result.Asset.SourcePath}; undo={result.UndoDepth}", null, 0);
+        RaiseAll();
     }
 
     private void DiscardScriptSourceChanges()
@@ -1557,6 +1668,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanSaveScriptSource));
         OnPropertyChanged(nameof(CanUndoScriptSource));
         OnPropertyChanged(nameof(CanReloadScriptSource));
+        OnPropertyChanged(nameof(CanManageScriptAssets));
+        OnPropertyChanged(nameof(CanCreateScriptAsset));
+        OnPropertyChanged(nameof(CanRenameScriptAsset));
+        OnPropertyChanged(nameof(CanDeleteScriptAsset));
+        OnPropertyChanged(nameof(CanUndoScriptAsset));
         OnPropertyChanged(nameof(CanDiscardScriptSourceChanges));
         OnPropertyChanged(nameof(CanEditScriptSourceBuffer));
         OnPropertyChanged(nameof(ScriptSourceText));
@@ -1571,6 +1687,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(ScriptSourceUtf8Bytes));
         OnPropertyChanged(nameof(IsScriptSourceStrictUtf8));
         OnPropertyChanged(nameof(ScriptSourceStatus));
+        OnPropertyChanged(nameof(ScriptAssetLifecycleStatus));
         OnPropertyChanged(nameof(ScriptSourceCaretIndex));
         OnPropertyChanged(nameof(SelectedScriptDiagnostic));
         OnPropertyChanged(nameof(ScriptDiagnostics));

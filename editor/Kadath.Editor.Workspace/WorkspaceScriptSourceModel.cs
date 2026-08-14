@@ -66,7 +66,7 @@ internal sealed record WorkspaceScriptSourceSnapshot(
 
 internal static class WorkspaceScriptSourceModel
 {
-    private const int MaxScriptCount = 16;
+    internal const int MaxScriptCount = 16;
     private const int MaxSourceNameBytes = 1024;
     private const int MaxSourceBytes = 64 * 1024;
     private const int MaxAggregateSourceBytes = 512 * 1024;
@@ -142,6 +142,40 @@ internal static class WorkspaceScriptSourceModel
         catch (EncoderFallbackException exception) { throw Failure($"Script source must contain valid UTF-8: {sourceName}.", exception); }
         if (bytes.Length > MaxSourceBytes) throw Failure($"Script source exceeds 64 KiB: {sourceName}.");
         return bytes;
+    }
+
+    internal static string ResolveLifecycleSourcePath(string scriptPath, string sourceName)
+    {
+        if (!IsSourceName(sourceName)) throw Failure("Script source path must be a safe scripts/*.luau path.");
+        var projectDirectory = Path.GetDirectoryName(Path.GetFullPath(scriptPath))
+            ?? throw Failure("Script source has no project directory.");
+        WorkspaceProjectValidator.RejectReparsePoint(projectDirectory, "Project directory");
+        return ResolveSourcePath(projectDirectory, sourceName, sourceName);
+    }
+
+    internal static byte[] EncodeBehaviorManifest(IEnumerable<(uint ScriptId, string SourceName)> entries)
+    {
+        var values = entries.ToArray();
+        if (values.Length is < 1 or > MaxScriptCount) throw Failure("Script.scripts must contain 1 to 16 entries.");
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("schemaVersion", 2);
+            writer.WriteStartArray("scripts");
+            foreach (var entry in values)
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("scriptId", entry.ScriptId);
+                writer.WriteString("source", entry.SourceName);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+        }
+        var encoded = stream.ToArray();
+        _ = ParseBehaviorManifest(encoded);
+        return encoded;
     }
 
     internal static IReadOnlyList<WorkspaceScriptTemplateDependency> ReadTemplateDependencies(

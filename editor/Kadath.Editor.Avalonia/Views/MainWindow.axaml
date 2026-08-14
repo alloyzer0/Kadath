@@ -10,7 +10,7 @@
     <Border Grid.Row="0" Padding="12,8" Background="#20262E" BorderBrush="#3C4652" BorderThickness="0,0,0,1">
       <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="10">
         <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="18" FontWeight="SemiBold" Text="Kadath Editor" />
-        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#AEBAC8" Text="P2-Avalonia-Script-Source-Authoring-01 · Luau 源码编辑" />
+        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#AEBAC8" Text="P2-Editor-Behavior-Script-Asset-Lifecycle-01 · Luau 脚本资产" />
         <TextBlock Grid.Column="2" VerticalAlignment="Center" Foreground="#AEBAC8" Text="{Binding ConnectionStatus}" />
         <Button Grid.Column="3" Padding="14,5" Command="{Binding ConnectCommand}" Content="连接 Service" />
         <Button Grid.Column="4" Padding="14,5" Command="{Binding OpenProjectCommand}" Content="打开项目" />
@@ -35,7 +35,7 @@
               <ListBox ItemsSource="{Binding HierarchyItems}" SelectedItem="{Binding SelectedHierarchyItem}" />
             </TabItem>
             <TabItem Header="Assets">
-              <Grid RowDefinitions="*,Auto" RowSpacing="8">
+              <Grid RowDefinitions="*,Auto,Auto" RowSpacing="8">
                 <ListBox ItemsSource="{Binding AssetItems}" SelectedItem="{Binding SelectedAssetItem}" />
                 <Border Grid.Row="1" Padding="8" Background="#252D37" CornerRadius="4">
                   <StackPanel Spacing="5">
@@ -48,6 +48,19 @@
                     </Grid>
                     <TextBlock FontSize="11" Foreground="#9FE3B1" Text="{Binding TextureImportStatus}" TextWrapping="Wrap" />
                     <TextBlock FontSize="11" Foreground="#AEBAC8" Text="{Binding TextureImportDetails}" TextWrapping="Wrap" />
+                  </StackPanel>
+                </Border>
+                <Border Grid.Row="2" Padding="8" Background="#252D37" CornerRadius="4">
+                  <StackPanel Spacing="5">
+                    <TextBlock FontWeight="SemiBold" Text="行为脚本资产" />
+                    <TextBox Text="{Binding ScriptAssetPath}" PlaceholderText="scripts/new_behavior.luau" />
+                    <Grid ColumnDefinitions="*,*" RowDefinitions="Auto,Auto" ColumnSpacing="5" RowSpacing="5">
+                      <Button Grid.Row="0" Grid.Column="0" Command="{Binding CreateScriptAssetCommand}" Content="新建脚本" />
+                      <Button Grid.Row="0" Grid.Column="1" Command="{Binding RenameScriptAssetCommand}" Content="重命名当前" />
+                      <Button Grid.Row="1" Grid.Column="0" Command="{Binding DeleteScriptAssetCommand}" Content="删除当前" />
+                      <Button Grid.Row="1" Grid.Column="1" Command="{Binding UndoScriptAssetCommand}" Content="撤销资产操作" />
+                    </Grid>
+                    <TextBlock FontSize="11" Foreground="#D7B46A" Text="{Binding ScriptAssetLifecycleStatus}" TextWrapping="Wrap" />
                   </StackPanel>
                 </Border>
               </Grid>

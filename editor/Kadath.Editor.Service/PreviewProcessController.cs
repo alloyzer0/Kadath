@@ -205,8 +205,9 @@ internal sealed class PreviewProcessController : IAsyncDisposable
                 {
                     await EmitLauncherEventCoreAsync(process, generation, new Dictionary<string, object?>
                     {
-                        ["event"] = "protocol_error",
-                        ["message"] = "Runtime emitted invalid JSONL"
+                        ["event"] = IsRuntimeLogLine(line) ? "runtime_log" : "protocol_error",
+                        ["stream"] = "stdout",
+                        ["message"] = IsRuntimeLogLine(line) ? line : "Runtime emitted invalid JSONL"
                     }).ConfigureAwait(false);
                     continue;
                 }
@@ -216,6 +217,12 @@ internal sealed class PreviewProcessController : IAsyncDisposable
             finally { _eventBoundary.Release(); }
         }
     }
+
+    private static bool IsRuntimeLogLine(string line) =>
+        line.StartsWith("debug: ", StringComparison.Ordinal)
+        || line.StartsWith("info: ", StringComparison.Ordinal)
+        || line.StartsWith("warning: ", StringComparison.Ordinal)
+        || line.StartsWith("error: ", StringComparison.Ordinal);
 
     private async Task PumpStderrAsync(Process process, long generation)
     {

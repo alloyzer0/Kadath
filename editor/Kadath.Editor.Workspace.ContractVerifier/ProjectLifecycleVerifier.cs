@@ -649,6 +649,79 @@ internal static class ProjectLifecycleVerifier
             && File.ReadAllBytes(createdDependencyPath).AsSpan().SequenceEqual(patrol)
             && !Directory.EnumerateFiles(Path.GetDirectoryName(createdDependencyPath)!, "*.authoring.*").Any(),
             "Behavior source authoring undo or temporary-file cleanup mismatch.");
+
+        var assetLifecycle = new WorkspaceScriptAssetLifecycleModel();
+        var assetCreate = await assetLifecycle.CreateAsync(created, sourceUndo.Revision, "scripts/chase.luau", default);
+        var chasePath = Path.Combine(created.ProjectDirectory, "scripts", "chase.luau");
+        Require(assetCreate.State == "succeeded"
+            && assetCreate.Asset.ScriptId == 2
+            && assetCreate.Asset.SourcePath == "scripts/chase.luau"
+            && assetCreate.SourceDocument?.ScriptId == 2
+            && assetCreate.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u, 2u]) == true
+            && assetCreate.HierarchySnapshot.Nodes.Any(node => node.Id == "script.dependencies[2]")
+            && File.Exists(chasePath),
+            "Behavior Script Asset Create did not commit the Manifest/source transaction.");
+        using (var createdManifest = JsonDocument.Parse(File.ReadAllBytes(created.ScriptPath)))
+        {
+            Require(createdManifest.RootElement.GetProperty("scripts").EnumerateArray()
+                .Select(value => (value.GetProperty("scriptId").GetUInt32(), value.GetProperty("source").GetString()))
+                .SequenceEqual([(1u, "scripts/patrol.luau"), (2u, "scripts/chase.luau")]),
+                "Behavior Script Asset Create did not append the canonical Manifest entry.");
+        }
+
+        var defaultSource = File.ReadAllBytes(chasePath);
+        var assetRename = await assetLifecycle.RenameAsync(
+            created, assetCreate.Revision, 2, "scripts/enemy_chase.luau", default);
+        var renamedPath = Path.Combine(created.ProjectDirectory, "scripts", "enemy_chase.luau");
+        Require(assetRename.State == "succeeded"
+            && assetRename.Asset == new WorkspaceScriptAssetIdentity(2, "scripts/enemy_chase.luau")
+            && !File.Exists(chasePath)
+            && File.ReadAllBytes(renamedPath).AsSpan().SequenceEqual(defaultSource)
+            && assetRename.ProjectSnapshot.Script.Dependencies?.Single(value => value.ScriptId == 2).Source == "scripts/enemy_chase.luau",
+            "Behavior Script Asset Rename did not preserve identity and source bytes.");
+
+        var boundObjects = assetRename.ProjectSnapshot.Scene.Objects!
+            .Select(value => value.ObjectId == "decoration-1"
+                ? value with
+                {
+                    Behaviors = [new ProjectModelSceneBehaviorBinding(2, [])]
+                }
+                : value)
+            .Select(ToDefinition)
+            .ToArray();
+        var bindAsset = await authoring.ApplyAsync(created, assetRename.Revision,
+            new AuthoringPatch(SceneObjects: boundObjects), default);
+        await ExpectScriptAssetFailureAsync(
+            () => assetLifecycle.DeleteAsync(created, bindAsset.Revision, 2, default),
+            WorkspaceScriptAssetLifecycleFailureKind.InUse);
+        var unbindAsset = await authoring.UndoAsync(created, bindAsset.Revision, bindAsset.UndoToken!, default);
+
+        var assetDelete = await assetLifecycle.DeleteAsync(created, unbindAsset.Revision, 2, default);
+        Require(assetDelete.State == "succeeded"
+            && assetDelete.SourceDocument is null
+            && !File.Exists(renamedPath)
+            && assetDelete.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u]) == true,
+            "Behavior Script Asset Delete did not remove the unreferenced Manifest/source entry.");
+
+        var undoDelete = await assetLifecycle.UndoAsync(created, assetDelete.Revision, assetDelete.UndoToken!, default);
+        Require(undoDelete.Asset == new WorkspaceScriptAssetIdentity(2, "scripts/enemy_chase.luau")
+            && File.ReadAllBytes(renamedPath).AsSpan().SequenceEqual(defaultSource),
+            "Behavior Script Asset Undo Delete did not restore identity and source.");
+        var undoRename = await assetLifecycle.UndoAsync(created, undoDelete.Revision, assetRename.UndoToken!, default);
+        Require(undoRename.Asset == new WorkspaceScriptAssetIdentity(2, "scripts/chase.luau")
+            && File.ReadAllBytes(chasePath).AsSpan().SequenceEqual(defaultSource)
+            && !File.Exists(renamedPath),
+            "Behavior Script Asset Undo Rename did not restore the old source path.");
+        var undoCreate = await assetLifecycle.UndoAsync(created, undoRename.Revision, assetCreate.UndoToken!, default);
+        Require(undoCreate.SourceDocument is null
+            && undoCreate.Revision == sourceUndo.Revision
+            && !File.Exists(chasePath)
+            && undoCreate.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u]) == true,
+            "Behavior Script Asset Undo Create did not restore the original dependency set.");
+        await VerifyScriptAssetLifecycleFailureMatrixAsync(packageRoot, lifecycle);
+        await ExpectScriptAssetFailureAsync(
+            () => assetLifecycle.DeleteAsync(created, undoCreate.Revision, 1, default),
+            WorkspaceScriptAssetLifecycleFailureKind.LastDependency);
         Require(await lifecycle.OpenAsync(new ProjectOpenParameters(packageRoot, "behavior-created"), default) == created,
             "Behavior Open did not preserve project identity.");
         var validation = await lifecycle.ValidateAsync(created, default);
@@ -672,11 +745,206 @@ internal static class ProjectLifecycleVerifier
             "Missing Script template dependency created a partial project.");
     }
 
+    private static async Task VerifyScriptAssetLifecycleFailureMatrixAsync(
+        string packageRoot,
+        WorkspaceProjectLifecycleModel projectLifecycle)
+    {
+        var createPhases = new[]
+        {
+            WorkspaceScriptAssetLifecyclePhase.CreateBeforeSourcePublish,
+            WorkspaceScriptAssetLifecyclePhase.CreateAfterSourcePublish,
+            WorkspaceScriptAssetLifecyclePhase.CreateAfterManifestPublish
+        };
+        foreach (var phase in createPhases)
+        {
+            var project = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, $"asset-create-{phase}"), default);
+            var revision = (await new WorkspaceReadModel().ReadProjectAsync(project, default)).AuthoringRevision;
+            var identity = TreeIdentity(project.ProjectDirectory);
+            var lifecycle = new WorkspaceScriptAssetLifecycleModel(current =>
+            {
+                if (current == phase) throw new IOException($"injected {phase}");
+            });
+            await ExpectScriptAssetFailureAsync(
+                () => lifecycle.CreateAsync(project, revision, "scripts/chase.luau", default),
+                WorkspaceScriptAssetLifecycleFailureKind.Commit);
+            Require(identity == TreeIdentity(project.ProjectDirectory), $"{phase} did not roll back to the original project tree.");
+            Require(!Directory.EnumerateFiles(project.ProjectDirectory, "*.authoring.*", SearchOption.AllDirectories).Any(),
+                $"{phase} left lifecycle staging files.");
+        }
+
+        var renamePhases = new[]
+        {
+            WorkspaceScriptAssetLifecyclePhase.RenameBeforeTargetPublish,
+            WorkspaceScriptAssetLifecyclePhase.RenameAfterTargetPublish,
+            WorkspaceScriptAssetLifecyclePhase.RenameAfterManifestPublish,
+            WorkspaceScriptAssetLifecyclePhase.RenameAfterOldSourceDelete
+        };
+        foreach (var phase in renamePhases)
+        {
+            var project = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, $"asset-rename-{phase}"), default);
+            var revision = (await new WorkspaceReadModel().ReadProjectAsync(project, default)).AuthoringRevision;
+            var baseline = await new WorkspaceScriptAssetLifecycleModel().CreateAsync(project, revision, "scripts/chase.luau", default);
+            var identity = TreeIdentity(project.ProjectDirectory);
+            var lifecycle = new WorkspaceScriptAssetLifecycleModel(current =>
+            {
+                if (current == phase) throw new IOException($"injected {phase}");
+            });
+            await ExpectScriptAssetFailureAsync(
+                () => lifecycle.RenameAsync(project, baseline.Revision, 2, "scripts/enemy_chase.luau", default),
+                WorkspaceScriptAssetLifecycleFailureKind.Commit);
+            Require(identity == TreeIdentity(project.ProjectDirectory), $"{phase} did not roll back to the pre-rename project tree.");
+            Require(!Directory.EnumerateFiles(project.ProjectDirectory, "*.authoring.*", SearchOption.AllDirectories).Any(),
+                $"{phase} left lifecycle staging files.");
+        }
+
+        var deletePhases = new[]
+        {
+            WorkspaceScriptAssetLifecyclePhase.DeleteBeforeManifestPublish,
+            WorkspaceScriptAssetLifecyclePhase.DeleteAfterManifestPublish,
+            WorkspaceScriptAssetLifecyclePhase.DeleteAfterSourceDelete
+        };
+        foreach (var phase in deletePhases)
+        {
+            var project = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, $"asset-delete-{phase}"), default);
+            var revision = (await new WorkspaceReadModel().ReadProjectAsync(project, default)).AuthoringRevision;
+            var baseline = await new WorkspaceScriptAssetLifecycleModel().CreateAsync(project, revision, "scripts/chase.luau", default);
+            var identity = TreeIdentity(project.ProjectDirectory);
+            var lifecycle = new WorkspaceScriptAssetLifecycleModel(current =>
+            {
+                if (current == phase) throw new IOException($"injected {phase}");
+            });
+            await ExpectScriptAssetFailureAsync(
+                () => lifecycle.DeleteAsync(project, baseline.Revision, 2, default),
+                WorkspaceScriptAssetLifecycleFailureKind.Commit);
+            Require(identity == TreeIdentity(project.ProjectDirectory), $"{phase} did not roll back to the pre-delete project tree.");
+            Require(!Directory.EnumerateFiles(project.ProjectDirectory, "*.authoring.*", SearchOption.AllDirectories).Any(),
+                $"{phase} left lifecycle staging files.");
+        }
+
+        var cancellationProject = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "asset-commit-cancellation"), default);
+        var cancellationRevision = (await new WorkspaceReadModel().ReadProjectAsync(cancellationProject, default)).AuthoringRevision;
+        using (var cancellation = new CancellationTokenSource())
+        {
+            var lifecycle = new WorkspaceScriptAssetLifecycleModel(phase =>
+            {
+                if (phase == WorkspaceScriptAssetLifecyclePhase.CreateAfterSourcePublish) cancellation.Cancel();
+            });
+            var committed = await lifecycle.CreateAsync(cancellationProject, cancellationRevision, "scripts/chase.luau", cancellation.Token);
+            Require(committed.State == "succeeded" && File.Exists(Path.Combine(cancellationProject.ProjectDirectory, "scripts", "chase.luau")),
+                "Cancellation after the first owned publication interrupted the non-cancellable commit region.");
+        }
+
+        var ownershipProject = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "asset-rollback-ownership"), default);
+        var ownershipRevision = (await new WorkspaceReadModel().ReadProjectAsync(ownershipProject, default)).AuthoringRevision;
+        var ownershipTarget = Path.Combine(ownershipProject.ProjectDirectory, "scripts", "chase.luau");
+        var ownershipManifest = File.ReadAllBytes(ownershipProject.ScriptPath);
+        var ownershipLifecycle = new WorkspaceScriptAssetLifecycleModel(phase =>
+        {
+            if (phase != WorkspaceScriptAssetLifecyclePhase.CreateAfterSourcePublish) return;
+            File.Delete(ownershipTarget);
+            File.WriteAllText(ownershipTarget, "foreign replacement", new UTF8Encoding(false));
+            throw new IOException("injected ownership loss");
+        });
+        await ExpectScriptAssetFailureAsync(
+            () => ownershipLifecycle.CreateAsync(ownershipProject, ownershipRevision, "scripts/chase.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.Invariant);
+        Require(File.ReadAllText(ownershipTarget, Encoding.UTF8) == "foreign replacement"
+            && File.ReadAllBytes(ownershipProject.ScriptPath).AsSpan().SequenceEqual(ownershipManifest),
+            "Rollback ownership loss overwrote foreign content or changed the Manifest.");
+
+        var combinedOwnershipProject = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "asset-rollback-combined-ownership"), default);
+        var combinedOwnershipRevision = (await new WorkspaceReadModel().ReadProjectAsync(combinedOwnershipProject, default)).AuthoringRevision;
+        var combinedOwnershipTarget = Path.Combine(combinedOwnershipProject.ProjectDirectory, "scripts", "chase.luau");
+        var foreignManifest = Encoding.UTF8.GetBytes("{\"foreign\":true}");
+        var combinedOwnershipLifecycle = new WorkspaceScriptAssetLifecycleModel(phase =>
+        {
+            if (phase != WorkspaceScriptAssetLifecyclePhase.CreateAfterManifestPublish) return;
+            File.WriteAllBytes(combinedOwnershipProject.ScriptPath, foreignManifest);
+            throw new IOException("injected combined ownership loss");
+        });
+        await ExpectScriptAssetFailureAsync(
+            () => combinedOwnershipLifecycle.CreateAsync(combinedOwnershipProject, combinedOwnershipRevision, "scripts/chase.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.Invariant);
+        Require(File.ReadAllBytes(combinedOwnershipProject.ScriptPath).AsSpan().SequenceEqual(foreignManifest)
+            && !File.Exists(combinedOwnershipTarget),
+            "Rollback stopped after the first ownership loss instead of compensating remaining owned paths.");
+
+        var terminalIdentityProject = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "asset-terminal-identity"), default);
+        var terminalIdentityRevision = (await new WorkspaceReadModel().ReadProjectAsync(terminalIdentityProject, default)).AuthoringRevision;
+        var terminalIdentityManifest = File.ReadAllBytes(terminalIdentityProject.ScriptPath);
+        var terminalIdentityTarget = Path.Combine(terminalIdentityProject.ProjectDirectory, "scripts", "chase.luau");
+        var terminalIdentityLifecycle = new WorkspaceScriptAssetLifecycleModel(phase =>
+        {
+            if (phase != WorkspaceScriptAssetLifecyclePhase.CreateAfterManifestPublish) return;
+            File.WriteAllText(terminalIdentityTarget, "foreign terminal replacement", new UTF8Encoding(false));
+        });
+        await ExpectScriptAssetFailureAsync(
+            () => terminalIdentityLifecycle.CreateAsync(terminalIdentityProject, terminalIdentityRevision, "scripts/chase.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.Invariant);
+        Require(File.ReadAllBytes(terminalIdentityProject.ScriptPath).AsSpan().SequenceEqual(terminalIdentityManifest)
+            && File.ReadAllText(terminalIdentityTarget, Encoding.UTF8) == "foreign terminal replacement",
+            "Terminal identity validation accepted foreign source bytes or overwrote external content.");
+
+        var edgeProject = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "asset-edge-cases"), default);
+        var readModel = new WorkspaceReadModel();
+        var edgeRevision = (await readModel.ReadProjectAsync(edgeProject, default)).AuthoringRevision;
+        var edgeLifecycle = new WorkspaceScriptAssetLifecycleModel();
+        await ExpectScriptAssetFailureAsync(
+            () => edgeLifecycle.CreateAsync(edgeProject, "invalid", "scripts/chase.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.InvalidExpectedRevision);
+        await ExpectScriptAssetFailureAsync(
+            () => edgeLifecycle.CreateAsync(edgeProject, edgeRevision, "scripts/../escape.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.InvalidPath);
+        var orphanPath = Path.Combine(edgeProject.ProjectDirectory, "scripts", "orphan.luau");
+        File.WriteAllText(orphanPath, "orphan", new UTF8Encoding(false));
+        await ExpectScriptAssetFailureAsync(
+            () => edgeLifecycle.CreateAsync(edgeProject, edgeRevision, "scripts/orphan.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.Conflict);
+        var portableOrphanPath = Path.Combine(edgeProject.ProjectDirectory, "scripts", "Portable-Orphan.luau");
+        File.WriteAllText(portableOrphanPath, "portable orphan", new UTF8Encoding(false));
+        await ExpectScriptAssetFailureAsync(
+            () => edgeLifecycle.CreateAsync(edgeProject, edgeRevision, "scripts/portable-orphan.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.Conflict);
+        var edgeCreate = await edgeLifecycle.CreateAsync(edgeProject, edgeRevision, "scripts/chase.luau", default);
+        await ExpectScriptAssetFailureAsync(
+            () => edgeLifecycle.RenameAsync(edgeProject, edgeCreate.Revision, 2, "scripts/CHASE.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.Conflict);
+        await ExpectScriptAssetFailureAsync(
+            () => edgeLifecycle.CreateAsync(edgeProject, edgeRevision, "scripts/stale.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.RevisionConflict);
+        File.AppendAllText(Path.Combine(edgeProject.ProjectDirectory, "scripts", "chase.luau"), "\n-- external\n", new UTF8Encoding(false));
+        var externalRevision = (await readModel.ReadProjectAsync(edgeProject, default)).AuthoringRevision;
+        await ExpectScriptAssetFailureAsync(
+            () => edgeLifecycle.UndoAsync(edgeProject, externalRevision, edgeCreate.UndoToken!, default),
+            WorkspaceScriptAssetLifecycleFailureKind.HistoryDiverged);
+
+        var limitProject = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "asset-limit"), default);
+        var limitRevision = (await readModel.ReadProjectAsync(limitProject, default)).AuthoringRevision;
+        for (var index = 2; index <= WorkspaceScriptSourceModel.MaxScriptCount; index++)
+        {
+            var result = await edgeLifecycle.CreateAsync(limitProject, limitRevision, $"scripts/limit_{index}.luau", default);
+            Require(result.Asset.ScriptId == index, "Script Asset allocation did not choose the smallest unused positive id.");
+            limitRevision = result.Revision;
+        }
+        await ExpectScriptAssetFailureAsync(
+            () => edgeLifecycle.CreateAsync(limitProject, limitRevision, "scripts/limit_17.luau", default),
+            WorkspaceScriptAssetLifecycleFailureKind.LimitReached);
+    }
+
     private static async Task ExpectLifecycleFailureAsync(Func<Task> action, WorkspaceProjectLifecycleFailureKind kind)
     {
         try { await action(); }
         catch (WorkspaceProjectLifecycleException exception) when (exception.Kind == kind) { return; }
         throw new InvalidOperationException($"Expected WorkspaceProjectLifecycleException with kind {kind}.");
+    }
+
+    private static async Task ExpectScriptAssetFailureAsync(
+        Func<Task> action,
+        WorkspaceScriptAssetLifecycleFailureKind kind)
+    {
+        try { await action(); }
+        catch (WorkspaceScriptAssetLifecycleException exception) when (exception.Kind == kind) { return; }
+        throw new InvalidOperationException($"Expected WorkspaceScriptAssetLifecycleException with kind {kind}.");
     }
 
     private static async Task ExpectAuthoringFailureAsync(Func<Task> action, WorkspaceAuthoringFailureKind kind)

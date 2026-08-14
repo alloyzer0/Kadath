@@ -335,6 +335,10 @@ internal static class ScriptAnalysisHostVerifier
         public Task<AuthoringMutationResult> UndoAuthoringAsync(ProjectSessionInfo project, AuthoringUndoParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<ScriptSourceMutationResult> EditScriptSourceAsync(ProjectSessionInfo project, ScriptSourceEditParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ProjectSessionInfo project, ScriptSourceUndoParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
+        public Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ProjectSessionInfo project, ScriptAssetCreateParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
+        public Task<ScriptAssetMutationResult> RenameScriptAssetAsync(ProjectSessionInfo project, ScriptAssetRenameParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
+        public Task<ScriptAssetMutationResult> DeleteScriptAssetAsync(ProjectSessionInfo project, ScriptAssetDeleteParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
+        public Task<ScriptAssetMutationResult> UndoScriptAssetAsync(ProjectSessionInfo project, ScriptAssetUndoParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<EditorBakeResult> BakeAsync(ProjectSessionInfo project, BakeStartParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<EditorWatchResult> StartWatchAsync(ProjectSessionInfo project, WatchStartParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<EditorWatchResult> StopWatchAsync(CancellationToken cancellationToken) =>

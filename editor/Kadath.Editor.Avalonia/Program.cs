@@ -44,7 +44,12 @@ internal static class Program
         var kadathRoot = Path.GetFullPath(kadathRootArgument);
         var packageRoot = Path.GetFullPath(packageRootArgument);
         var editorRoot = Path.Combine(kadathRoot, "editor");
-        var serviceDll = Path.Combine(editorRoot, "Kadath.Editor.Service", "bin", "Debug", "net8.0", "Kadath.Editor.Service.dll");
+#if DEBUG
+        const string serviceConfiguration = "Debug";
+#else
+        const string serviceConfiguration = "Release";
+#endif
+        var serviceDll = Path.Combine(editorRoot, "Kadath.Editor.Service", "bin", serviceConfiguration, "net8.0", "Kadath.Editor.Service.dll");
         if (!File.Exists(serviceDll)) { throw new FileNotFoundException("Editor Service 尚未构建。", serviceDll); }
 
         var transport = new StdioEditorRpcTransport(new EditorRpcProcessOptions(
@@ -236,6 +241,206 @@ internal static class Program
             && workspace.ScriptSource.State == EditorScriptSourceState.Ready,
             "Avalonia script source workflow did not restore its controlled fixture");
         Console.WriteLine("workflow_script_source_authoring=ok");
+
+        await avaloniaViewModel.RefreshSnapshotsForCurrentProjectAsync(cancellationToken);
+        var lifecycleOriginalRevision = workspace.ProjectSnapshot.Value?.AuthoringRevision
+            ?? throw new InvalidOperationException("Script Asset lifecycle initial revision is missing.");
+        var lifecycleSourcePath = $"scripts/avalonia_lifecycle_{Environment.ProcessId}.luau";
+        var lifecycleRenamedPath = $"scripts/avalonia_lifecycle_{Environment.ProcessId}_renamed.luau";
+        var lifecycleSourceFile = Path.Combine(projectDirectory, lifecycleSourcePath.Replace('/', Path.DirectorySeparatorChar));
+        var lifecycleRenamedFile = Path.Combine(projectDirectory, lifecycleRenamedPath.Replace('/', Path.DirectorySeparatorChar));
+        try
+        {
+            avaloniaViewModel.ScriptSourceText = originalSourceText + "\n-- lifecycle dirty gate\n";
+            avaloniaViewModel.ScriptAssetPath = lifecycleSourcePath;
+            Require(!avaloniaViewModel.CanCreateScriptAsset
+                && !avaloniaViewModel.CanRenameScriptAsset
+                && !avaloniaViewModel.CanDeleteScriptAsset
+                && !avaloniaViewModel.CanUndoScriptAsset,
+                "dirty Script Source buffer did not gate Script Asset lifecycle commands");
+            try
+            {
+                _ = await avaloniaViewModel.CreateScriptAssetForCurrentProjectAsync(cancellationToken);
+                throw new InvalidOperationException("dirty Script Source buffer unexpectedly allowed Script Asset create");
+            }
+            catch (EditorRpcException exception) when (exception.Code == "script_source_dirty") { }
+            avaloniaViewModel.ScriptSourceText = workspace.ScriptSource.Document?.Source ?? string.Empty;
+
+            Require(avaloniaViewModel.CanCreateScriptAsset, "Avalonia did not enable Script Asset create for a clean Script v2 project");
+            var createdAsset = await avaloniaViewModel.CreateScriptAssetForCurrentProjectAsync(cancellationToken);
+            Require(createdAsset.Asset.ScriptId > 1
+                && createdAsset.Asset.SourcePath == lifecycleSourcePath
+                && File.Exists(lifecycleSourceFile)
+                && avaloniaViewModel.SelectedScriptSourceId == createdAsset.Asset.ScriptId
+                && avaloniaViewModel.ScriptSourcePath == lifecycleSourcePath
+                && workspace.ScriptAssetLifecycle.UndoDepth == 1,
+                "Avalonia Script Asset create did not project the allocated identity and default source");
+
+            avaloniaViewModel.ScriptSourceText += "\n-- lifecycle create dirty gate\n";
+            Require(!avaloniaViewModel.CanRenameScriptAsset
+                && !avaloniaViewModel.CanDeleteScriptAsset
+                && !avaloniaViewModel.CanUndoScriptAsset,
+                "dirty newly-created Script Source did not gate rename, delete, and lifecycle undo");
+            avaloniaViewModel.ScriptSourceText = """
+                --!strict
+
+                return {
+                    on_start = function(self: Kadath.Object)
+                        self:translate(96, 0)
+                    end,
+                    fixed_update = function(self: Kadath.Object, dt: number)
+                        self:translate(12 * dt, 0)
+                    end,
+                }
+                """;
+            var savedAssetSource = await avaloniaViewModel.SaveScriptSourceForCurrentProjectAsync(cancellationToken);
+            Require(savedAssetSource.SourceDocument.ScriptId == createdAsset.Asset.ScriptId
+                && savedAssetSource.SourceDocument.Source == avaloniaViewModel.ScriptSourceText
+                && workspace.ScriptSource.UndoDepth == 1,
+                "Avalonia did not edit the newly created Script Asset through the existing source-authoring seam");
+
+            var lifecycleObject = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "player");
+            var lifecycleContract = avaloniaViewModel.AvailableBehaviorContracts.Single(entry => entry.ScriptId == createdAsset.Asset.ScriptId);
+            avaloniaViewModel.SelectedSceneObject = lifecycleObject;
+            avaloniaViewModel.SelectedBehaviorContract = lifecycleContract;
+            Require(avaloniaViewModel.CanAddBehaviorBinding, "new Script Asset was not available to Behavior Binding authoring");
+            avaloniaViewModel.AddBehaviorBinding();
+            var boundAsset = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(boundAsset.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId)
+                    .Behaviors?.Any(value => value.ScriptId == createdAsset.Asset.ScriptId) == true,
+                "Avalonia did not bind the new Script Asset to the selected Scene Object");
+
+            var preRenameBake = await workspace.BakeAsync(new BakeStartParameters("Both", "debug"), cancellationToken);
+            Require(preRenameBake.ScriptArtifactRevision is { Length: 64 }
+                && preRenameBake.ScriptArtifactBytes is > 0,
+                "bound Script Asset did not publish its pre-rename KSCP artifact");
+            _ = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: openProjectName, LiveBake: true), cancellationToken);
+            await WaitUntilAsync(
+                () => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded,
+                cancellationToken,
+                "pre-rename Script Asset Runtime load",
+                () => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Failed
+                    || workspace.Preview.State is EditorPreviewState.Failed or EditorPreviewState.Stopped,
+                () => $"preview={workspace.Preview.State}; runtime={workspace.Preview.Runtime.State}; error={workspace.Preview.Runtime.ErrorCode}:{workspace.Preview.Runtime.ErrorMessage}");
+            await WaitUntilAsync(
+                () => LatestBehaviorOnStartPlayerX(avaloniaViewModel.EventLog) is > 400,
+                cancellationToken,
+                "pre-rename Script Asset Runtime execution");
+            Require(workspace.Preview.State == EditorPreviewState.Running
+                && workspace.Preview.Runtime.Script.ArtifactRevision == preRenameBake.ScriptArtifactRevision,
+                "Runtime did not execute the bound Script Asset before rename");
+            _ = await workspace.StopPreviewAsync(cancellationToken);
+            avaloniaViewModel.ClearEventLogCommand.Execute(null);
+
+            avaloniaViewModel.ScriptAssetPath = lifecycleRenamedPath;
+            var renamedAsset = await avaloniaViewModel.RenameScriptAssetForCurrentProjectAsync(cancellationToken);
+            Require(renamedAsset.Asset.ScriptId == createdAsset.Asset.ScriptId
+                && renamedAsset.Asset.SourcePath == lifecycleRenamedPath
+                && !File.Exists(lifecycleSourceFile)
+                && File.Exists(lifecycleRenamedFile)
+                && avaloniaViewModel.SelectedScriptSourceId == createdAsset.Asset.ScriptId
+                && renamedAsset.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId)
+                    .Behaviors?.Any(value => value.ScriptId == createdAsset.Asset.ScriptId) == true,
+                "Avalonia Script Asset rename changed identity, binding, source selection, or file ownership");
+
+            var lifecycleBake = await workspace.BakeAsync(new BakeStartParameters("Both", "debug"), cancellationToken);
+            Require(lifecycleBake.ScriptArtifactRevision is { Length: 64 }
+                && lifecycleBake.ScriptArtifactBytes is > 0,
+                "renamed bound Script Asset did not publish a second KSCP artifact");
+            _ = await workspace.StartPreviewAsync(new PreviewStartParameters(ProjectName: openProjectName, LiveBake: true), cancellationToken);
+            await WaitUntilAsync(
+                () => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded,
+                cancellationToken,
+                "renamed Script Asset Runtime load",
+                () => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Failed
+                    || workspace.Preview.State is EditorPreviewState.Failed or EditorPreviewState.Stopped,
+                () => $"preview={workspace.Preview.State}; runtime={workspace.Preview.Runtime.State}; error={workspace.Preview.Runtime.ErrorCode}:{workspace.Preview.Runtime.ErrorMessage}; "
+                    + $"events={string.Join(" | ", avaloniaViewModel.EventLog.TakeLast(20).Select(item => $"{item.Event}:{item.Summary}"))}");
+            await WaitUntilAsync(
+                () => LatestBehaviorOnStartPlayerX(avaloniaViewModel.EventLog) is > 400,
+                cancellationToken,
+                "renamed Script Asset Runtime execution");
+            Require(workspace.Preview.State == EditorPreviewState.Running
+                && workspace.Preview.Runtime.Script.ArtifactRevision == lifecycleBake.ScriptArtifactRevision,
+                "Runtime did not execute the renamed Script Asset package");
+
+            var lifecycleRetainedManifest = File.ReadAllBytes(opened.ScriptPath);
+            var lifecycleRetainedScene = File.ReadAllBytes(opened.ScenePath);
+            var lifecycleRetainedSource = File.ReadAllBytes(lifecycleRenamedFile);
+            var lifecycleRetainedArtifact = File.ReadAllBytes(Path.Combine(lifecycleBake.DerivedDirectory, "script.script"));
+            var lifecycleRetainedRevision = workspace.ProjectSnapshot.Value?.AuthoringRevision;
+            var lifecycleRetainedRuntimeIdentity = workspace.Preview.Runtime.Script.ArtifactRevision;
+            try
+            {
+                _ = await avaloniaViewModel.DeleteScriptAssetForCurrentProjectAsync(cancellationToken);
+                throw new InvalidOperationException("bound Script Asset deletion unexpectedly succeeded");
+            }
+            catch (EditorRpcException exception) when (exception.Code == "script_asset_in_use") { }
+            Require(File.ReadAllBytes(opened.ScriptPath).AsSpan().SequenceEqual(lifecycleRetainedManifest)
+                && File.ReadAllBytes(opened.ScenePath).AsSpan().SequenceEqual(lifecycleRetainedScene)
+                && File.ReadAllBytes(lifecycleRenamedFile).AsSpan().SequenceEqual(lifecycleRetainedSource)
+                && File.ReadAllBytes(Path.Combine(lifecycleBake.DerivedDirectory, "script.script")).AsSpan().SequenceEqual(lifecycleRetainedArtifact)
+                && workspace.ProjectSnapshot.Value?.AuthoringRevision == lifecycleRetainedRevision
+                && workspace.Preview.Runtime.Script.ArtifactRevision == lifecycleRetainedRuntimeIdentity,
+                "in-use Script Asset rejection changed source, revision, artifact, or Runtime identity");
+            _ = await workspace.StopPreviewAsync(cancellationToken);
+
+            lifecycleObject = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "player");
+            avaloniaViewModel.SelectedSceneObject = lifecycleObject;
+            avaloniaViewModel.SelectedBehaviorBinding = lifecycleObject.Behaviors.Single(value => value.ScriptId == createdAsset.Asset.ScriptId);
+            Require(avaloniaViewModel.CanRemoveBehaviorBinding, "bound Script Asset could not be removed before deletion");
+            avaloniaViewModel.RemoveBehaviorBinding();
+            var unboundAsset = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(unboundAsset.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId).Behaviors is { Count: 0 },
+                "Avalonia did not remove the Script Asset binding before deletion");
+
+            var deletedAsset = await avaloniaViewModel.DeleteScriptAssetForCurrentProjectAsync(cancellationToken);
+            Require(deletedAsset.Asset.ScriptId == createdAsset.Asset.ScriptId
+                && !File.Exists(lifecycleRenamedFile)
+                && avaloniaViewModel.SelectedScriptSourceId == scriptDependency.ScriptId,
+                "Avalonia Script Asset delete did not select the remaining manifest neighbor");
+
+            var deleteUndone = await avaloniaViewModel.UndoScriptAssetForCurrentProjectAsync(cancellationToken);
+            Require(deleteUndone.Asset.ScriptId == createdAsset.Asset.ScriptId
+                && File.Exists(lifecycleRenamedFile)
+                && avaloniaViewModel.SelectedScriptSourceId == createdAsset.Asset.ScriptId
+                && avaloniaViewModel.ScriptSourcePath == lifecycleRenamedPath,
+                "Avalonia lifecycle undo did not restore the deleted Script Asset");
+
+            var undoUnbind = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(undoUnbind.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId)
+                    .Behaviors?.Any(value => value.ScriptId == createdAsset.Asset.ScriptId) == true,
+                "interleaved Authoring undo did not restore the Script Asset binding");
+
+            var renameUndone = await avaloniaViewModel.UndoScriptAssetForCurrentProjectAsync(cancellationToken);
+            Require(renameUndone.Asset.ScriptId == createdAsset.Asset.ScriptId
+                && File.Exists(lifecycleSourceFile)
+                && !File.Exists(lifecycleRenamedFile)
+                && avaloniaViewModel.ScriptSourcePath == lifecycleSourcePath
+                && renameUndone.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId)
+                    .Behaviors?.Any(value => value.ScriptId == createdAsset.Asset.ScriptId) == true,
+                "Avalonia lifecycle undo did not restore the pre-rename source path");
+            var undoBind = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(undoBind.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId).Behaviors is { Count: 0 },
+                "interleaved Authoring undo did not restore the pre-binding Scene state");
+            var sourceUndone = await avaloniaViewModel.UndoScriptSourceForCurrentProjectAsync(cancellationToken);
+            Require(sourceUndone.SourceDocument.Source == createdAsset.SourceDocument?.Source
+                && workspace.ScriptSource.UndoDepth == 0,
+                "interleaved Script Source undo did not restore the lifecycle default source");
+            var createUndone = await avaloniaViewModel.UndoScriptAssetForCurrentProjectAsync(cancellationToken);
+            Require(createUndone.Revision == lifecycleOriginalRevision
+                && !File.Exists(lifecycleSourceFile)
+                && workspace.ScriptAssetLifecycle.UndoDepth == 0
+                && avaloniaViewModel.SelectedScriptSourceId == scriptDependency.ScriptId,
+                "Avalonia lifecycle undo did not remove the created Script Asset and restore the original revision");
+            Console.WriteLine("workflow_script_asset_runtime_execution=ok");
+        }
+        finally
+        {
+            if (avaloniaViewModel.IsScriptSourceDirty) { avaloniaViewModel.ScriptSourceText = workspace.ScriptSource.Document?.Source ?? string.Empty; }
+            if (workspace.Preview.OwnsPublicationSync) { try { _ = await workspace.StopPreviewAsync(cancellationToken); } catch { } }
+        }
+        Console.WriteLine("workflow_script_asset_lifecycle=ok");
 
         var oldHierarchyLabel = avaloniaViewModel.HierarchyItems[0];
         var oldAssetLabel = avaloniaViewModel.AssetItems[0];
@@ -535,6 +740,27 @@ internal static class Program
 
         // 保持描述参数用于调用点自解释；条件已满足时不产生额外输出，输出协议保持稳定。
         _ = description;
+    }
+
+    private static double? LatestBehaviorOnStartPlayerX(IEnumerable<EditorEventLogItem> eventLog)
+    {
+        foreach (var item in eventLog.Reverse().Where(value => value.Event == "runtime_log"))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(item.Summary);
+                var message = document.RootElement.GetProperty("message").GetString();
+                const string marker = "player_position=(";
+                var start = message?.IndexOf(marker, StringComparison.Ordinal) ?? -1;
+                if (start < 0) continue;
+                start += marker.Length;
+                var end = message!.IndexOf(',', start);
+                if (end > start && double.TryParse(message.AsSpan(start, end - start), NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+                    return value;
+            }
+            catch (JsonException) { }
+        }
+        return null;
     }
 
     private static void Require(bool condition, string message)

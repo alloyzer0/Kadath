@@ -28,6 +28,10 @@ public interface IEditorSessionBackend : IAsyncDisposable
     Task<AuthoringMutationResult> UndoAuthoringAsync(ProjectSessionInfo project, AuthoringUndoParameters parameters, CancellationToken cancellationToken);
     Task<ScriptSourceMutationResult> EditScriptSourceAsync(ProjectSessionInfo project, ScriptSourceEditParameters parameters, CancellationToken cancellationToken);
     Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ProjectSessionInfo project, ScriptSourceUndoParameters parameters, CancellationToken cancellationToken);
+    Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ProjectSessionInfo project, ScriptAssetCreateParameters parameters, CancellationToken cancellationToken);
+    Task<ScriptAssetMutationResult> RenameScriptAssetAsync(ProjectSessionInfo project, ScriptAssetRenameParameters parameters, CancellationToken cancellationToken);
+    Task<ScriptAssetMutationResult> DeleteScriptAssetAsync(ProjectSessionInfo project, ScriptAssetDeleteParameters parameters, CancellationToken cancellationToken);
+    Task<ScriptAssetMutationResult> UndoScriptAssetAsync(ProjectSessionInfo project, ScriptAssetUndoParameters parameters, CancellationToken cancellationToken);
     Task<EditorBakeResult> BakeAsync(ProjectSessionInfo project, BakeStartParameters parameters, CancellationToken cancellationToken);
     Task<EditorWatchResult> StartWatchAsync(ProjectSessionInfo project, WatchStartParameters parameters, CancellationToken cancellationToken);
     Task<EditorWatchResult> StopWatchAsync(CancellationToken cancellationToken);
@@ -57,6 +61,10 @@ public interface IEditorSession : IAsyncDisposable
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ScriptAssetCreateParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ScriptAssetMutationResult> RenameScriptAssetAsync(ScriptAssetRenameParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ScriptAssetMutationResult> DeleteScriptAssetAsync(ScriptAssetDeleteParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ScriptAssetMutationResult> UndoScriptAssetAsync(ScriptAssetUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<EditorBakeResult> BakeAsync(BakeStartParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<EditorWatchResult> StartWatchAsync(WatchStartParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<EditorWatchResult> StopWatchAsync(string? requestId, CancellationToken cancellationToken = default);
@@ -83,6 +91,10 @@ public sealed class EditorSession : IEditorSession
         "authoring_undo",
         "script_source_edit",
         "script_source_undo",
+        "script_asset_create",
+        "script_asset_rename",
+        "script_asset_delete",
+        "script_asset_undo",
         "bake_start",
         "watch_start",
         "watch_stop",
@@ -402,6 +414,92 @@ public sealed class EditorSession : IEditorSession
             }
         }
         finally { _projectMutationGate.Release(); }
+    }
+
+    public Task<ScriptAssetMutationResult> CreateScriptAssetAsync(
+        ScriptAssetCreateParameters parameters,
+        string? requestId,
+        CancellationToken cancellationToken = default) =>
+        MutateScriptAssetAsync("script_asset_create", parameters.ProjectName, parameters.ExpectedRevision, null, parameters.SourcePath,
+            (project, token) => _backend.CreateScriptAssetAsync(project, parameters, token), requestId, cancellationToken);
+
+    public Task<ScriptAssetMutationResult> RenameScriptAssetAsync(
+        ScriptAssetRenameParameters parameters,
+        string? requestId,
+        CancellationToken cancellationToken = default) =>
+        MutateScriptAssetAsync("script_asset_rename", parameters.ProjectName, parameters.ExpectedRevision, parameters.ScriptId, parameters.SourcePath,
+            (project, token) => _backend.RenameScriptAssetAsync(project, parameters, token), requestId, cancellationToken);
+
+    public Task<ScriptAssetMutationResult> DeleteScriptAssetAsync(
+        ScriptAssetDeleteParameters parameters,
+        string? requestId,
+        CancellationToken cancellationToken = default) =>
+        MutateScriptAssetAsync("script_asset_delete", parameters.ProjectName, parameters.ExpectedRevision, parameters.ScriptId, null,
+            (project, token) => _backend.DeleteScriptAssetAsync(project, parameters, token), requestId, cancellationToken);
+
+    public Task<ScriptAssetMutationResult> UndoScriptAssetAsync(
+        ScriptAssetUndoParameters parameters,
+        string? requestId,
+        CancellationToken cancellationToken = default) =>
+        MutateScriptAssetAsync("script_asset_undo", parameters.ProjectName, parameters.ExpectedRevision, null, null,
+            (project, token) => _backend.UndoScriptAssetAsync(project, parameters, token), requestId, cancellationToken);
+
+    private async Task<ScriptAssetMutationResult> MutateScriptAssetAsync(
+        string command,
+        string? projectName,
+        string expectedRevision,
+        uint? scriptId,
+        string? sourcePath,
+        Func<ProjectSessionInfo, CancellationToken, Task<ScriptAssetMutationResult>> mutation,
+        string? requestId,
+        CancellationToken cancellationToken)
+    {
+        await _projectMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var project = RequireProject(projectName);
+            await EmitAsync($"{command}_started", new { projectName = project.ProjectName, expectedRevision, scriptId, sourcePath }, requestId);
+            ScriptAssetMutationResult result;
+            try
+            {
+                result = await mutation(project, cancellationToken);
+            }
+            catch (EditorOperationException exception)
+            {
+                await TryEmitAsync($"{command}_failed", new { projectName = project.ProjectName, scriptId, sourcePath, errorCode = exception.Code }, requestId);
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                await TryEmitAsync($"{command}_failed", new { projectName = project.ProjectName, scriptId, sourcePath, errorCode = "request_cancelled" }, requestId);
+                throw;
+            }
+            catch (Exception)
+            {
+                await TryEmitAsync($"{command}_failed", new { projectName = project.ProjectName, scriptId, sourcePath, errorCode = "script_asset_protocol_error" }, requestId);
+                throw;
+            }
+            await TryEmitAsync($"{command}_completed", new
+            {
+                result.ProjectName,
+                result.Operation,
+                result.State,
+                scriptId = result.Asset.ScriptId,
+                sourcePath = result.Asset.SourcePath,
+                result.PreviousRevision,
+                result.Revision,
+                result.UndoDepth,
+                result.ChangedFields
+            }, requestId);
+            return result;
+        }
+        finally { _projectMutationGate.Release(); }
+    }
+
+    private async Task TryEmitAsync(string eventName, object data, string? requestId)
+    {
+        try { await EmitAsync(eventName, data, requestId); }
+        catch { }
     }
     public async Task<EditorBakeResult> BakeAsync(BakeStartParameters parameters, string? requestId, CancellationToken cancellationToken = default)
     {

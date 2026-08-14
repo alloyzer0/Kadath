@@ -91,6 +91,35 @@ public sealed class EditorScriptSourceViewModel : ObservableObject
         }
     }
 
+    internal void ApplyLifecycleDocument(ScriptSourceDocument? document, string previousRevision, string revision)
+    {
+        if (document is not null)
+        {
+            Document = document;
+            Operation = "lifecycle";
+            ErrorCode = null;
+            ErrorMessage = null;
+            State = EditorScriptSourceState.Ready;
+            RaisePropertyChanged(nameof(HasDocument));
+            return;
+        }
+        if (Document is not null
+            && string.Equals(Document.AuthoringRevision, previousRevision, StringComparison.OrdinalIgnoreCase))
+        {
+            Document = Document with { AuthoringRevision = revision };
+        }
+    }
+
+    internal void ClearLifecycleDocument()
+    {
+        Document = null;
+        Operation = "lifecycle";
+        ErrorCode = null;
+        ErrorMessage = null;
+        State = EditorScriptSourceState.Empty;
+        RaisePropertyChanged(nameof(HasDocument));
+    }
+
     internal void ApplyFailure(string code, string message)
     {
         if (code is "script_source_history_diverged" or "script_source_revision_conflict" or "authoring_revision_conflict") { UndoDepth = 0; }

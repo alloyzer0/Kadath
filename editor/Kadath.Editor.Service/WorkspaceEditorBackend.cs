@@ -12,6 +12,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private readonly WorkspacePublicationModel _publicationModel;
     private readonly WorkspaceTextureImportModel _textureImportModel;
     private readonly WorkspaceScriptSourceAuthoringModel _scriptSourceAuthoringModel;
+    private readonly WorkspaceScriptAssetLifecycleModel _scriptAssetLifecycleModel;
     private readonly WorkspaceScriptDiagnosticsModel _scriptDiagnosticsModel;
     private readonly WorkspaceBehaviorContractModel _behaviorContractModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
@@ -20,6 +21,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private readonly SemaphoreSlim _scriptAnalysisGate = new(1, 1);
     private readonly List<AuthoringUndoRecord> _authoringHistory = [];
     private readonly List<ScriptSourceUndoRecord> _scriptSourceHistory = [];
+    private readonly List<ScriptAssetUndoRecord> _scriptAssetHistory = [];
     private const int MaxAuthoringHistory = 32;
     private LiveBakeWatchController? _watch;
     private string _watchProjectName = string.Empty;
@@ -33,6 +35,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         WorkspacePublicationModel publicationModel,
         WorkspaceTextureImportModel textureImportModel,
         WorkspaceScriptSourceAuthoringModel? scriptSourceAuthoringModel = null,
+        WorkspaceScriptAssetLifecycleModel? scriptAssetLifecycleModel = null,
         WorkspaceScriptDiagnosticsModel? scriptDiagnosticsModel = null,
         WorkspaceBehaviorContractModel? behaviorContractModel = null)
     {
@@ -42,6 +45,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         _publicationModel = publicationModel;
         _textureImportModel = textureImportModel;
         _scriptSourceAuthoringModel = scriptSourceAuthoringModel ?? new WorkspaceScriptSourceAuthoringModel();
+        _scriptAssetLifecycleModel = scriptAssetLifecycleModel ?? new WorkspaceScriptAssetLifecycleModel();
         _scriptDiagnosticsModel = scriptDiagnosticsModel ?? new WorkspaceScriptDiagnosticsModel();
         _behaviorContractModel = behaviorContractModel ?? new WorkspaceBehaviorContractModel();
     }
@@ -53,6 +57,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         var project = await ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.OpenAsync(parameters, cancellationToken));
         _authoringHistory.Clear();
         _scriptSourceHistory.Clear();
+        _scriptAssetHistory.Clear();
         return project;
     }
 
@@ -61,6 +66,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         var project = await ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.CreateAsync(parameters, cancellationToken));
         _authoringHistory.Clear();
         _scriptSourceHistory.Clear();
+        _scriptAssetHistory.Clear();
         return project;
     }
 
@@ -183,14 +189,8 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             }
 
             if (commit.UndoToken is null) { throw new EditorOperationException("authoring_protocol_error", "Native authoring commit emitted no undo token."); }
-            if (_authoringHistory.Count > 0 && !string.Equals(_authoringHistory[^1].RevisionAfter, commit.PreviousRevision, StringComparison.OrdinalIgnoreCase))
-            {
-                // 外部编辑使旧 undo 链失去连续性；清理而不是把不相关内容覆盖回来。
-                _authoringHistory.Clear();
-            }
             _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.UndoToken));
             if (_authoringHistory.Count > MaxAuthoringHistory) { _authoringHistory.RemoveAt(0); }
-            _scriptSourceHistory.Clear();
             return new AuthoringMutationResult("apply", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
                 commit.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
         }
@@ -215,7 +215,6 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             var commit = await UndoWorkspaceAuthoringAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
             if (commit.State != "succeeded") { throw new EditorOperationException("authoring_protocol_error", "Native authoring undo did not restore a changed state."); }
             _authoringHistory.RemoveAt(_authoringHistory.Count - 1);
-            _scriptSourceHistory.Clear();
             return new AuthoringMutationResult("undo", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
                 record.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
         }
@@ -233,11 +232,8 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 if (commit.State == "unchanged")
                     return await CreateScriptSourceResultAsync("edit", project, parameters.ScriptId, commit, _scriptSourceHistory.Count, cancellationToken);
                 if (commit.UndoToken is null) throw new EditorOperationException("script_source_protocol_error", "Script source commit emitted no undo token.");
-                if (_scriptSourceHistory.Count > 0 && !string.Equals(_scriptSourceHistory[^1].RevisionAfter, commit.PreviousRevision, StringComparison.OrdinalIgnoreCase))
-                    _scriptSourceHistory.Clear();
                 _scriptSourceHistory.Add(new ScriptSourceUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.UndoToken));
                 if (_scriptSourceHistory.Count > MaxAuthoringHistory) _scriptSourceHistory.RemoveAt(0);
-                _authoringHistory.Clear();
                 return await CreateScriptSourceResultAsync("edit", project, parameters.ScriptId, commit, _scriptSourceHistory.Count, cancellationToken);
             }
             catch (WorkspaceAuthoringException exception) { throw MapScriptSourceError(exception); }
@@ -262,13 +258,140 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 var commit = await _scriptSourceAuthoringModel.UndoAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
                 if (commit.State != "succeeded") throw new EditorOperationException("script_source_protocol_error", "Script source undo did not restore a changed state.");
                 _scriptSourceHistory.RemoveAt(_scriptSourceHistory.Count - 1);
-                _authoringHistory.Clear();
                 return await CreateScriptSourceResultAsync("undo", project, record.Token.ScriptId, commit, _scriptSourceHistory.Count, cancellationToken);
             }
             catch (WorkspaceAuthoringException exception) { throw MapScriptSourceError(exception); }
         }
         finally { _authoringGate.Release(); }
     }
+
+    public Task<ScriptAssetMutationResult> CreateScriptAssetAsync(
+        ProjectSessionInfo project,
+        ScriptAssetCreateParameters parameters,
+        CancellationToken cancellationToken) =>
+        MutateScriptAssetAsync(project, "create", parameters.ExpectedRevision,
+            token => _scriptAssetLifecycleModel.CreateAsync(project, parameters.ExpectedRevision, parameters.SourcePath, token), cancellationToken);
+
+    public Task<ScriptAssetMutationResult> RenameScriptAssetAsync(
+        ProjectSessionInfo project,
+        ScriptAssetRenameParameters parameters,
+        CancellationToken cancellationToken) =>
+        MutateScriptAssetAsync(project, "rename", parameters.ExpectedRevision,
+            token => _scriptAssetLifecycleModel.RenameAsync(project, parameters.ExpectedRevision, parameters.ScriptId, parameters.SourcePath, token), cancellationToken);
+
+    public Task<ScriptAssetMutationResult> DeleteScriptAssetAsync(
+        ProjectSessionInfo project,
+        ScriptAssetDeleteParameters parameters,
+        CancellationToken cancellationToken) =>
+        MutateScriptAssetAsync(project, "delete", parameters.ExpectedRevision,
+            token => _scriptAssetLifecycleModel.DeleteAsync(project, parameters.ExpectedRevision, parameters.ScriptId, token), cancellationToken);
+
+    public async Task<ScriptAssetMutationResult> UndoScriptAssetAsync(
+        ProjectSessionInfo project,
+        ScriptAssetUndoParameters parameters,
+        CancellationToken cancellationToken)
+    {
+        await _authoringGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_scriptAssetHistory.Count == 0)
+                throw new EditorOperationException("script_asset_history_empty", "There is no Script Asset lifecycle mutation to undo.");
+            var current = await GetProjectSnapshotAsync(project, cancellationToken);
+            ValidateExpectedRevision(parameters.ExpectedRevision, current.AuthoringRevision, "script_asset_revision_conflict");
+            var record = _scriptAssetHistory[^1];
+            if (!record.ProjectName.Equals(project.ProjectName, StringComparison.OrdinalIgnoreCase)
+                || !record.RevisionAfter.Equals(current.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new EditorOperationException("script_asset_history_diverged", "Script Asset lifecycle history no longer matches the current revision.");
+            }
+            try
+            {
+                var assets = await GetAssetCatalogSnapshotAsync(project, cancellationToken);
+                var commit = await _scriptAssetLifecycleModel.UndoAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
+                _scriptAssetHistory.RemoveAt(_scriptAssetHistory.Count - 1);
+                return CreateScriptAssetResult("undo", project, commit, _scriptAssetHistory.Count, assets);
+            }
+            catch (WorkspaceScriptAssetLifecycleException exception) { throw MapScriptAssetError(exception); }
+        }
+        finally { _authoringGate.Release(); }
+    }
+
+    private async Task<ScriptAssetMutationResult> MutateScriptAssetAsync(
+        ProjectSessionInfo project,
+        string operation,
+        string expectedRevision,
+        Func<CancellationToken, Task<WorkspaceScriptAssetLifecycleCommit>> mutation,
+        CancellationToken cancellationToken)
+    {
+        await _authoringGate.WaitAsync(cancellationToken);
+        try
+        {
+            try
+            {
+                var assets = await GetAssetCatalogSnapshotAsync(project, cancellationToken);
+                var commit = await mutation(cancellationToken);
+                if (commit.State == "unchanged")
+                    return CreateScriptAssetResult(operation, project, commit, _scriptAssetHistory.Count, assets);
+                if (commit.UndoToken is null)
+                    throw new EditorOperationException("script_asset_protocol_error", "Script Asset lifecycle commit emitted no undo token.");
+                _scriptAssetHistory.Add(new ScriptAssetUndoRecord(project.ProjectName, commit.Revision, commit.UndoToken));
+                if (_scriptAssetHistory.Count > MaxAuthoringHistory) _scriptAssetHistory.RemoveAt(0);
+                return CreateScriptAssetResult(operation, project, commit, _scriptAssetHistory.Count, assets);
+            }
+            catch (WorkspaceScriptAssetLifecycleException exception) { throw MapScriptAssetError(exception); }
+        }
+        finally { _authoringGate.Release(); }
+    }
+
+    private static ScriptAssetMutationResult CreateScriptAssetResult(
+        string operation,
+        ProjectSessionInfo project,
+        WorkspaceScriptAssetLifecycleCommit commit,
+        int undoDepth,
+        AssetCatalogSnapshot assets)
+    {
+        ValidateSnapshot(project, commit.ProjectSnapshot);
+        ValidateSnapshot(project, commit.HierarchySnapshot);
+        ValidateSnapshot(project, assets);
+        var source = commit.SourceDocument is null ? null : new ScriptSourceDocument(
+            commit.SourceDocument.ProjectName,
+            commit.SourceDocument.ScriptId,
+            commit.SourceDocument.SourcePath,
+            commit.SourceDocument.Source,
+            commit.SourceDocument.AuthoringRevision);
+        return new ScriptAssetMutationResult(
+            operation,
+            commit.State,
+            project.ProjectName,
+            commit.PreviousRevision,
+            commit.Revision,
+            commit.ChangedFields,
+            undoDepth,
+            new ScriptAssetIdentity(commit.Asset.ScriptId, commit.Asset.SourcePath),
+            source,
+            commit.ProjectSnapshot,
+            commit.HierarchySnapshot,
+            assets);
+    }
+
+    internal static EditorOperationException MapScriptAssetError(WorkspaceScriptAssetLifecycleException exception) =>
+        new(exception.Kind switch
+        {
+            WorkspaceScriptAssetLifecycleFailureKind.InvalidExpectedRevision => "invalid_expected_revision",
+            WorkspaceScriptAssetLifecycleFailureKind.Unsupported => "script_asset_unsupported",
+            WorkspaceScriptAssetLifecycleFailureKind.InvalidPath => "invalid_script_asset_path",
+            WorkspaceScriptAssetLifecycleFailureKind.NotFound => "script_asset_not_found",
+            WorkspaceScriptAssetLifecycleFailureKind.Conflict => "script_asset_conflict",
+            WorkspaceScriptAssetLifecycleFailureKind.LimitReached => "script_asset_limit_reached",
+            WorkspaceScriptAssetLifecycleFailureKind.LastDependency => "script_asset_last_dependency",
+            WorkspaceScriptAssetLifecycleFailureKind.InUse => "script_asset_in_use",
+            WorkspaceScriptAssetLifecycleFailureKind.RevisionConflict => "script_asset_revision_conflict",
+            WorkspaceScriptAssetLifecycleFailureKind.HistoryDiverged => "script_asset_history_diverged",
+            WorkspaceScriptAssetLifecycleFailureKind.Commit => "script_asset_commit_failed",
+            WorkspaceScriptAssetLifecycleFailureKind.Invariant => "script_asset_protocol_error",
+            WorkspaceScriptAssetLifecycleFailureKind.Input => "script_asset_commit_failed",
+            _ => "script_asset_protocol_error"
+        }, exception.Message);
     public async Task<EditorBakeResult> BakeAsync(ProjectSessionInfo project, BakeStartParameters parameters, CancellationToken cancellationToken)
     {
         await _bakeGate.WaitAsync(cancellationToken);
@@ -713,6 +836,11 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         string RevisionAfter,
         string[] ChangedFields,
         WorkspaceScriptSourceUndoToken Token);
+
+    private sealed record ScriptAssetUndoRecord(
+        string ProjectName,
+        string RevisionAfter,
+        WorkspaceScriptAssetLifecycleUndoToken Token);
     private static string NormalizeTarget(string target) => target.ToLowerInvariant() switch
     {
         "scene" => "Scene",

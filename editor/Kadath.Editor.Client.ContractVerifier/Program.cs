@@ -27,6 +27,7 @@ internal static class Program
             await VerifyProjectCreateWorkspaceProjectionAsync();
             await ScriptDiagnosticsVerifier.VerifyAsync();
             await VerifyBehaviorContractRefreshAsync();
+            await VerifyScriptAssetLifecycleViewModelAsync();
             await VerifyClientAndViewModelsAsync();
             await VerifyUnexpectedEofProjectionAsync();
             await VerifyExpectedShutdownProjectionAsync();
@@ -52,6 +53,7 @@ internal static class Program
             Console.WriteLine("project_create_workspace=ok");
             Console.WriteLine("script_diagnostics_state_machine=ok");
             Console.WriteLine("behavior_contract_refresh=ok");
+            Console.WriteLine("script_asset_lifecycle_viewmodel=ok");
             Console.WriteLine("viewmodel_state=ok");
             Console.WriteLine("verification=ok");
             return 0;
@@ -106,6 +108,70 @@ internal static class Program
         Assert(transport.BehaviorContractRequestCount == requestsBeforeQueue + 2
             && workspace.BehaviorContract.State == EditorSnapshotState.Ready,
             "Behavior Contract refresh queue did not preserve one in-flight plus latest pending request");
+    }
+
+    private static async Task VerifyScriptAssetLifecycleViewModelAsync()
+    {
+        await using (var partialTransport = new ScriptedTransport(advertiseScriptAssetUndo: false))
+        await using (var partialClient = new EditorRpcClient(partialTransport, "script-asset-partial-capability-verifier", "1"))
+        await using (var partialWorkspace = new EditorWorkspaceViewModel(partialClient))
+        {
+            await partialWorkspace.ConnectAsync().ConfigureAwait(false);
+            Assert(!partialWorkspace.Capabilities.CanManageScriptAssets,
+                "partial Script Asset lifecycle command set was exposed as a complete capability");
+        }
+
+        await using var transport = new ScriptedTransport();
+        await using var client = new EditorRpcClient(transport, "script-asset-lifecycle-verifier", "1");
+        await using var workspace = new EditorWorkspaceViewModel(client);
+        await PrepareOpenedWorkspaceAsync(workspace).ConfigureAwait(false);
+        Assert(workspace.Capabilities.CanManageScriptAssets, "complete Script Asset lifecycle capability was not exposed");
+        var originalRevision = workspace.ProjectSnapshot.Value?.AuthoringRevision
+            ?? throw new InvalidOperationException("Script Asset lifecycle initial revision missing");
+
+        var created = await workspace.CreateScriptAssetAsync(new ScriptAssetCreateParameters(
+            "demo", originalRevision, "scripts/chase.luau")).ConfigureAwait(false);
+        Assert(workspace.ScriptAssetLifecycle.State == EditorScriptAssetLifecycleState.Succeeded
+            && workspace.ScriptAssetLifecycle.UndoDepth == 1
+            && workspace.ProjectSnapshot.Value?.AuthoringRevision == created.Revision
+            && workspace.HierarchySnapshot.Value?.ProjectName == created.ProjectName
+            && workspace.AssetCatalogSnapshot.Value?.CatalogVersion == created.AssetCatalogSnapshot.CatalogVersion
+            && workspace.ScriptSource.Document is { ScriptId: 2, SourcePath: "scripts/chase.luau" },
+            "Script Asset create result was not projected atomically");
+        transport.FailNextRequest("script_asset_undo", "script_asset_history_diverged", "a newer authoring stack must be undone first");
+        try
+        {
+            _ = await workspace.UndoScriptAssetAsync(new ScriptAssetUndoParameters("demo", created.Revision)).ConfigureAwait(false);
+            throw new InvalidOperationException("diverged Script Asset undo unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "script_asset_history_diverged") { }
+        Assert(workspace.ScriptAssetLifecycle.UndoDepth == 1,
+            "history-diverged failure hid a lifecycle history that can become valid after reverse-order undo");
+
+        var renamed = await workspace.RenameScriptAssetAsync(new ScriptAssetRenameParameters(
+            "demo", created.Revision, 2, "scripts/enemy_chase.luau")).ConfigureAwait(false);
+        Assert(workspace.ScriptSource.Document is { ScriptId: 2, SourcePath: "scripts/enemy_chase.luau" }
+            && workspace.ProjectSnapshot.Value?.AuthoringRevision == renamed.Revision,
+            "Script Asset rename did not preserve selected identity");
+
+        var deleted = await workspace.DeleteScriptAssetAsync(new ScriptAssetDeleteParameters(
+            "demo", renamed.Revision, 2)).ConfigureAwait(false);
+        Assert(workspace.ProjectSnapshot.Value?.AuthoringRevision == deleted.Revision
+            && workspace.ScriptSource.Document is { ScriptId: 1, SourcePath: "scripts/patrol.luau" },
+            "deleting the selected Script Asset did not choose the manifest neighbor");
+
+        var deleteUndone = await workspace.UndoScriptAssetAsync(new ScriptAssetUndoParameters("demo", deleted.Revision)).ConfigureAwait(false);
+        Assert(workspace.ScriptSource.Document is { ScriptId: 2, SourcePath: "scripts/enemy_chase.luau" }
+            && workspace.ScriptSource.Document.Source.Contains("fixed_update", StringComparison.Ordinal),
+            "undo delete did not restore and select the returned Script Asset identity");
+        var renameUndone = await workspace.UndoScriptAssetAsync(new ScriptAssetUndoParameters("demo", deleteUndone.Revision)).ConfigureAwait(false);
+        Assert(workspace.ScriptSource.Document is { ScriptId: 2, SourcePath: "scripts/chase.luau" },
+            "undo rename did not restore the previous Script Asset path");
+        var createUndone = await workspace.UndoScriptAssetAsync(new ScriptAssetUndoParameters("demo", renameUndone.Revision)).ConfigureAwait(false);
+        Assert(createUndone.Revision == originalRevision
+            && workspace.ScriptAssetLifecycle.UndoDepth == 0
+            && workspace.ScriptSource.Document is { ScriptId: 1, SourcePath: "scripts/patrol.luau" },
+            "undo create did not remove the selected Script Asset and choose the remaining dependency");
     }
 
     private static async Task VerifyProjectCreateClientContractAsync()
@@ -593,6 +659,12 @@ internal static class Program
             [serviceDll, "--kadath-root", kadathRoot],
             Path.GetDirectoryName(serviceDll)));
         await using var client = new EditorRpcClient(transport, "real-service-smoke", "1");
+        var serviceEvents = new ConcurrentQueue<EditorEvent>();
+        client.EventReceived += notification =>
+        {
+            serviceEvents.Enqueue(notification);
+            return Task.CompletedTask;
+        };
         await client.ConnectAsync().ConfigureAwait(false);
         var capabilities = await client.GetCapabilitiesAsync().ConfigureAwait(false);
         Assert(capabilities.Commands.Contains("project_open"), "real service did not advertise project_open");
@@ -603,6 +675,11 @@ internal static class Program
             && capabilities.Commands.Contains("script_source_edit")
             && capabilities.Commands.Contains("script_source_undo"),
             "real service did not advertise script source commands");
+        Assert(capabilities.Commands.Contains("script_asset_create")
+            && capabilities.Commands.Contains("script_asset_rename")
+            && capabilities.Commands.Contains("script_asset_delete")
+            && capabilities.Commands.Contains("script_asset_undo"),
+            "real service did not advertise script asset lifecycle commands");
         Assert(capabilities.Commands.Contains("behavior_contract_snapshot"),
             "real service did not advertise behavior_contract_snapshot");
         var projectDirectory = Path.Combine(packageRoot, "bin", "projects", projectName);
@@ -742,6 +819,93 @@ internal static class Program
         catch (EditorRpcException exception) when (exception.Code == "script_source_undo_empty") { }
         Console.WriteLine("script_source_service_smoke=ok");
 
+        var scriptAssetCreated = await client.CreateScriptAssetAsync(new ScriptAssetCreateParameters(
+            projectName, sourceUndone.Revision, "scripts/chase.luau")).ConfigureAwait(false);
+        Assert(scriptAssetCreated.Operation == "create"
+            && scriptAssetCreated.State == "succeeded"
+            && scriptAssetCreated.Asset == new ScriptAssetIdentity(2, "scripts/chase.luau")
+            && scriptAssetCreated.SourceDocument is { ScriptId: 2, SourcePath: "scripts/chase.luau" }
+            && scriptAssetCreated.ProjectSnapshot.Script.Dependencies is { Count: 2 }
+            && scriptAssetCreated.HierarchySnapshot.Nodes.Count(node => node.Kind == "ScriptDependency") == 2
+            && scriptAssetCreated.AssetCatalogSnapshot.ItemCount == assetSnapshot.ItemCount,
+            "real service script asset create failed");
+        var createdSource = scriptAssetCreated.SourceDocument?.Source
+            ?? throw new InvalidOperationException("created Script Asset source document missing");
+        var editedCreatedSource = createdSource + "\n-- lifecycle interleaved source edit\n";
+        var scriptAssetSourceEdited = await client.EditScriptSourceAsync(new ScriptSourceEditParameters(
+            projectName, scriptAssetCreated.Revision, 2, editedCreatedSource)).ConfigureAwait(false);
+        var scriptAssetRenamed = await client.RenameScriptAssetAsync(new ScriptAssetRenameParameters(
+            projectName, scriptAssetSourceEdited.Revision, 2, "scripts/enemy_chase.luau")).ConfigureAwait(false);
+        Assert(scriptAssetRenamed.Operation == "rename"
+            && scriptAssetRenamed.Asset == new ScriptAssetIdentity(2, "scripts/enemy_chase.luau")
+            && scriptAssetRenamed.SourceDocument is { SourcePath: "scripts/enemy_chase.luau" }
+            && scriptAssetRenamed.SourceDocument.Source == editedCreatedSource
+            && scriptAssetRenamed.ProjectSnapshot.Script.Dependencies?.Single(value => value.ScriptId == 2).Source == "scripts/enemy_chase.luau",
+            "real service script asset rename failed");
+        var scriptAssetDeleted = await client.DeleteScriptAssetAsync(new ScriptAssetDeleteParameters(
+            projectName, scriptAssetRenamed.Revision, 2)).ConfigureAwait(false);
+        Assert(scriptAssetDeleted.Operation == "delete"
+            && scriptAssetDeleted.SourceDocument is null
+            && scriptAssetDeleted.ProjectSnapshot.Script.Dependencies is { Count: 1 }
+            && scriptAssetDeleted.HierarchySnapshot.Nodes.Count(node => node.Kind == "ScriptDependency") == 1
+            && scriptAssetDeleted.AssetCatalogSnapshot.ItemCount == assetSnapshot.ItemCount,
+            "real service script asset delete failed");
+        var scriptAssetDeleteUndone = await client.UndoScriptAssetAsync(new ScriptAssetUndoParameters(
+            projectName, scriptAssetDeleted.Revision)).ConfigureAwait(false);
+        Assert(scriptAssetDeleteUndone.Operation == "undo"
+            && scriptAssetDeleteUndone.Asset == new ScriptAssetIdentity(2, "scripts/enemy_chase.luau")
+            && scriptAssetDeleteUndone.SourceDocument?.Source == editedCreatedSource,
+            "real service script asset delete undo failed");
+        var scriptAssetRenameUndone = await client.UndoScriptAssetAsync(new ScriptAssetUndoParameters(
+            projectName, scriptAssetDeleteUndone.Revision)).ConfigureAwait(false);
+        Assert(scriptAssetRenameUndone.Asset == new ScriptAssetIdentity(2, "scripts/chase.luau")
+            && scriptAssetRenameUndone.SourceDocument?.Source == editedCreatedSource,
+            "real service script asset rename undo failed");
+        var scriptAssetSourceUndone = await client.UndoScriptSourceAsync(new ScriptSourceUndoParameters(
+            projectName, scriptAssetRenameUndone.Revision)).ConfigureAwait(false);
+        Assert(scriptAssetSourceUndone.SourceDocument.ScriptId == 2
+            && scriptAssetSourceUndone.SourceDocument.Source == createdSource
+            && scriptAssetSourceUndone.UndoDepth == 0,
+            "Script Source undo did not survive interleaved Script Asset lifecycle operations");
+        var scriptAssetCreateUndone = await client.UndoScriptAssetAsync(new ScriptAssetUndoParameters(
+            projectName, scriptAssetSourceUndone.Revision)).ConfigureAwait(false);
+        Assert(scriptAssetCreateUndone.Asset == new ScriptAssetIdentity(2, "scripts/chase.luau")
+            && scriptAssetCreateUndone.SourceDocument is null
+            && scriptAssetCreateUndone.ProjectSnapshot.Script.Dependencies is { Count: 1 }
+            && scriptAssetCreateUndone.Revision == sourceUndone.Revision,
+            "real service script asset create undo failed");
+        try
+        {
+            _ = await client.CreateScriptAssetAsync(new ScriptAssetCreateParameters(
+                projectName, scriptAssetCreateUndone.Revision, "scripts/../escape.luau")).ConfigureAwait(false);
+            throw new InvalidOperationException("invalid Script Asset path unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "invalid_script_asset_path") { }
+        try
+        {
+            _ = await client.DeleteScriptAssetAsync(new ScriptAssetDeleteParameters(
+                projectName, scriptAssetCreateUndone.Revision, 1)).ConfigureAwait(false);
+            throw new InvalidOperationException("last Script Asset deletion unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "script_asset_last_dependency") { }
+        try
+        {
+            _ = await client.UndoScriptAssetAsync(new ScriptAssetUndoParameters(
+                projectName, scriptAssetCreateUndone.Revision)).ConfigureAwait(false);
+            throw new InvalidOperationException("empty Script Asset lifecycle history unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "script_asset_history_empty") { }
+        var lifecycleEvents = serviceEvents.Where(value => value.Event.StartsWith("script_asset_", StringComparison.Ordinal)).ToArray();
+        Assert(lifecycleEvents.Any(value => value.Event == "script_asset_create_completed")
+            && lifecycleEvents.Any(value => value.Event == "script_asset_undo_completed")
+            && lifecycleEvents.Any(value => value.Event == "script_asset_create_failed")
+            && lifecycleEvents.All(value => value.Data is null
+                || !value.Data.Value.GetRawText().Contains(project.ProjectDirectory, StringComparison.Ordinal)
+                    && !value.Data.Value.GetRawText().Contains("fixed_update", StringComparison.Ordinal)
+                    && !value.Data.Value.GetRawText().Contains("\"source\":", StringComparison.Ordinal)),
+            "Script Asset lifecycle events leaked host paths or source text, or omitted terminal events");
+        Console.WriteLine("script_asset_lifecycle_service_smoke=ok");
+
         Assert(capabilities.Commands.Contains("authoring_apply") && capabilities.Commands.Contains("authoring_undo"), "real service did not advertise authoring commands");
 
         try
@@ -824,23 +988,40 @@ internal static class Program
         try
         {
             _ = await client.UndoAuthoringAsync(new AuthoringUndoParameters(projectName, scriptAfterAuthoring.Revision)).ConfigureAwait(false);
-            throw new InvalidOperationException("authoring undo unexpectedly survived a script source edit");
+            throw new InvalidOperationException("authoring undo unexpectedly crossed a newer script source edit");
         }
-        catch (EditorRpcException exception) when (exception.Code == "authoring_undo_empty") { }
+        catch (EditorRpcException exception) when (exception.Code == "authoring_history_diverged") { }
+        var scriptAfterAuthoringUndone = await client.UndoScriptSourceAsync(new ScriptSourceUndoParameters(
+            projectName, scriptAfterAuthoring.Revision)).ConfigureAwait(false);
+        var authoringBeforeScriptUndone = await client.UndoAuthoringAsync(new AuthoringUndoParameters(
+            projectName, scriptAfterAuthoringUndone.Revision)).ConfigureAwait(false);
+        Assert(authoringBeforeScriptUndone.Revision == textureUndone.Revision,
+            "cross-stack reverse undo did not restore the pre-authoring revision");
 
+        var scriptBeforeAuthoring = await client.EditScriptSourceAsync(new ScriptSourceEditParameters(
+            projectName,
+            authoringBeforeScriptUndone.Revision,
+            1,
+            sourceDocument.Source + "\n-- cross-history script edit before authoring\n")).ConfigureAwait(false);
         var authoringAfterScript = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(
             projectName,
-            scriptAfterAuthoring.Revision,
+            scriptBeforeAuthoring.Revision,
             new AuthoringPatch(SceneGoalPosition: [
                 projectSnapshot.Scene.GoalPosition[0] + 1d,
                 projectSnapshot.Scene.GoalPosition[1]]))).ConfigureAwait(false);
         try
         {
             _ = await client.UndoScriptSourceAsync(new ScriptSourceUndoParameters(projectName, authoringAfterScript.Revision)).ConfigureAwait(false);
-            throw new InvalidOperationException("script source undo unexpectedly survived an authoring edit");
+            throw new InvalidOperationException("script source undo unexpectedly crossed a newer authoring edit");
         }
-        catch (EditorRpcException exception) when (exception.Code == "script_source_undo_empty") { }
-        Console.WriteLine("authoring_history_isolation=ok");
+        catch (EditorRpcException exception) when (exception.Code == "script_source_history_diverged") { }
+        var authoringAfterScriptUndone = await client.UndoAuthoringAsync(new AuthoringUndoParameters(
+            projectName, authoringAfterScript.Revision)).ConfigureAwait(false);
+        var scriptBeforeAuthoringUndone = await client.UndoScriptSourceAsync(new ScriptSourceUndoParameters(
+            projectName, authoringAfterScriptUndone.Revision)).ConfigureAwait(false);
+        Assert(scriptBeforeAuthoringUndone.Revision == authoringBeforeScriptUndone.Revision,
+            "cross-stack reverse undo did not restore the pre-script revision");
+        Console.WriteLine("authoring_history_ordering=ok");
         await client.ShutdownAsync().ConfigureAwait(false);
     }
 
@@ -1280,6 +1461,12 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private int _behaviorContractRequestCount;
     private readonly bool _advertiseProjectCreate;
     private readonly bool _advertiseScriptAnalysis;
+    private readonly bool _advertiseScriptAssetUndo;
+    private readonly List<ScriptAssetIdentity> _scriptAssets = [new(1, "scripts/patrol.luau")];
+    private readonly Dictionary<uint, string> _scriptAssetSources = new() { [1] = "--!strict\nreturn { fixed_update = function(_self: Kadath.Object, _dt: number) end }\n" };
+    private readonly Stack<ScriptAssetHistoryEntry> _scriptAssetHistory = new();
+    private string _scriptAssetRevision = new string('0', 63) + "1";
+    private int _scriptAssetRevisionSequence = 1;
     private int _scriptAnalyzeRequestCount;
     private TaskCompletionSource<bool>? _delayedValidationRelease;
     private TaskCompletionSource<bool>? _delayedValidationCompleted;
@@ -1288,10 +1475,14 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private TaskCompletionSource<bool>? _delayedOperationRelease;
     private TaskCompletionSource<bool>? _delayedOperationCompleted;
 
-    public ScriptedTransport(bool advertiseProjectCreate = true, bool advertiseScriptAnalysis = true)
+    public ScriptedTransport(
+        bool advertiseProjectCreate = true,
+        bool advertiseScriptAnalysis = true,
+        bool advertiseScriptAssetUndo = true)
     {
         _advertiseProjectCreate = advertiseProjectCreate;
         _advertiseScriptAnalysis = advertiseScriptAnalysis;
+        _advertiseScriptAssetUndo = advertiseScriptAssetUndo;
     }
 
     public bool IsOpen => _started && !_stop.IsCancellationRequested;
@@ -1513,6 +1704,27 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 if (DelayOperationIfRequested(method, () => SendResponseAsync(id, analysis))) { break; }
                 await SendResponseAsync(id, analysis).ConfigureAwait(false);
                 break;
+            case "script_source_read":
+            {
+                var scriptId = request.GetProperty("params").GetProperty("scriptId").GetUInt32();
+                var asset = _scriptAssets.Single(value => value.ScriptId == scriptId);
+                var document = NewScriptAssetDocument(asset);
+                await EmitEventAsync("script_source_read", document, id).ConfigureAwait(false);
+                await SendResponseAsync(id, document).ConfigureAwait(false);
+                break;
+            }
+            case "script_asset_create":
+            case "script_asset_rename":
+            case "script_asset_delete":
+            case "script_asset_undo":
+            {
+                var operation = method["script_asset_".Length..];
+                await EmitEventAsync($"{method}_started", new { projectName = _activeProjectName }, id).ConfigureAwait(false);
+                var result = ApplyScriptAssetMutation(operation, request);
+                await EmitEventAsync($"{method}_completed", result, id).ConfigureAwait(false);
+                await SendResponseAsync(id, result).ConfigureAwait(false);
+                break;
+            }
             case "bake_start":
                 var bakeParameters = request.GetProperty("params");
                 var bakeTarget = bakeParameters.GetProperty("target").GetString() ?? "Both";
@@ -1638,12 +1850,14 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         var commands = new List<string>
         {
             "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot", "behavior_contract_snapshot",
-            "publication_snapshot", "script_source_read", "script_source_edit", "script_source_undo", "texture_import",
+            "publication_snapshot", "script_source_read", "script_source_edit", "script_source_undo",
+            "script_asset_create", "script_asset_rename", "script_asset_delete", "texture_import",
             "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop",
             "preview_start", "preview_stop", "shutdown"
         };
         if (_advertiseProjectCreate) { commands.Insert(1, "project_create"); }
         if (_advertiseScriptAnalysis) { commands.Insert(commands.IndexOf("texture_import"), "script_source_analyze"); }
+        if (_advertiseScriptAssetUndo) { commands.Insert(commands.IndexOf("texture_import"), "script_asset_undo"); }
         return commands.ToArray();
     }
 
@@ -1782,6 +1996,129 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
             $"{projectDirectory}/preview.json",
             1);
     }
+
+    private ScriptAssetMutationResult ApplyScriptAssetMutation(string operation, JsonElement request)
+    {
+        var parameters = request.GetProperty("params");
+        var previousRevision = _scriptAssetRevision;
+        ScriptAssetIdentity asset;
+        ScriptSourceDocument? sourceDocument;
+        switch (operation)
+        {
+            case "create":
+            {
+                var scriptId = Enumerable.Range(1, 64).Select(value => (uint)value).First(value => _scriptAssets.All(asset => asset.ScriptId != value));
+                asset = new ScriptAssetIdentity(scriptId, parameters.GetProperty("sourcePath").GetString() ?? "scripts/chase.luau");
+                _scriptAssetHistory.Push(CaptureScriptAssetHistory(asset));
+                _scriptAssets.Add(asset);
+                _scriptAssetSources[scriptId] = "--!strict\n\nreturn {\n    fixed_update = function(_self: Kadath.Object, _dt: number)\n    end,\n}\n";
+                _scriptAssetRevision = NextScriptAssetRevision();
+                sourceDocument = NewScriptAssetDocument(asset);
+                break;
+            }
+            case "rename":
+            {
+                var scriptId = parameters.GetProperty("scriptId").GetUInt32();
+                var index = _scriptAssets.FindIndex(value => value.ScriptId == scriptId);
+                var previousAsset = _scriptAssets[index];
+                _scriptAssetHistory.Push(CaptureScriptAssetHistory(previousAsset));
+                asset = previousAsset with { SourcePath = parameters.GetProperty("sourcePath").GetString() ?? previousAsset.SourcePath };
+                _scriptAssets[index] = asset;
+                _scriptAssetRevision = NextScriptAssetRevision();
+                sourceDocument = NewScriptAssetDocument(asset);
+                break;
+            }
+            case "delete":
+            {
+                var scriptId = parameters.GetProperty("scriptId").GetUInt32();
+                asset = _scriptAssets.Single(value => value.ScriptId == scriptId);
+                _scriptAssetHistory.Push(CaptureScriptAssetHistory(asset));
+                _scriptAssets.RemoveAll(value => value.ScriptId == scriptId);
+                _scriptAssetSources.Remove(scriptId);
+                _scriptAssetRevision = NextScriptAssetRevision();
+                sourceDocument = null;
+                break;
+            }
+            case "undo":
+            {
+                var history = _scriptAssetHistory.Pop();
+                asset = history.Asset;
+                _scriptAssets.Clear();
+                _scriptAssets.AddRange(history.Assets);
+                _scriptAssetSources.Clear();
+                foreach (var pair in history.Sources) _scriptAssetSources.Add(pair.Key, pair.Value);
+                _scriptAssetRevision = history.Revision;
+                sourceDocument = _scriptAssets.Any(value => value.ScriptId == asset.ScriptId)
+                    ? NewScriptAssetDocument(_scriptAssets.Single(value => value.ScriptId == asset.ScriptId))
+                    : null;
+                break;
+            }
+            default:
+                throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown Script Asset lifecycle operation.");
+        }
+
+        _publicationDirty = true;
+        return new ScriptAssetMutationResult(
+            operation,
+            "succeeded",
+            _activeProjectName,
+            previousRevision,
+            _scriptAssetRevision,
+            operation == "rename" ? [$"script.assets[{asset.ScriptId}].source"] : [$"script.assets[{asset.ScriptId}]"],
+            _scriptAssetHistory.Count,
+            asset,
+            sourceDocument,
+            NewScriptAssetProjectSnapshot(),
+            NewScriptAssetHierarchySnapshot(),
+            NewAssetCatalogSnapshot());
+    }
+
+    private ScriptAssetHistoryEntry CaptureScriptAssetHistory(ScriptAssetIdentity asset) => new(
+        _scriptAssets.ToArray(),
+        new Dictionary<uint, string>(_scriptAssetSources),
+        _scriptAssetRevision,
+        asset);
+
+    private string NextScriptAssetRevision() => (++_scriptAssetRevisionSequence).ToString("x64");
+
+    private ScriptSourceDocument NewScriptAssetDocument(ScriptAssetIdentity asset) => new(
+        _activeProjectName,
+        asset.ScriptId,
+        asset.SourcePath,
+        _scriptAssetSources[asset.ScriptId],
+        _scriptAssetRevision);
+
+    private ProjectModelSnapshot NewScriptAssetProjectSnapshot()
+    {
+        var snapshot = NewProjectSnapshot(_activeProjectName, _activePackageRoot);
+        return snapshot with
+        {
+            AuthoringRevision = _scriptAssetRevision,
+            Script = new ProjectModelScript(
+                2,
+                [],
+                [],
+                _scriptAssets.Select(value => new ProjectModelScriptDependency(value.ScriptId, value.SourcePath)).ToArray())
+        };
+    }
+
+    private HierarchySnapshot NewScriptAssetHierarchySnapshot()
+    {
+        var snapshot = NewHierarchySnapshot(_activeProjectName);
+        var nodes = snapshot.Nodes.Concat(_scriptAssets.Select(value => new HierarchyNode(
+            $"script.dependencies[{value.ScriptId}]",
+            "script",
+            value.SourcePath,
+            "ScriptDependency",
+            Props(("ScriptId", value.ScriptId), ("Source", value.SourcePath))))).ToArray();
+        return snapshot with { Nodes = nodes };
+    }
+
+    private sealed record ScriptAssetHistoryEntry(
+        ScriptAssetIdentity[] Assets,
+        Dictionary<uint, string> Sources,
+        string Revision,
+        ScriptAssetIdentity Asset);
 
     private static ProjectModelSnapshot NewProjectSnapshot(string projectName = "demo", string packageRoot = "C:/package") => new(
         1,

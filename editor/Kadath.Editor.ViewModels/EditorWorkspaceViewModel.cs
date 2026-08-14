@@ -40,6 +40,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public EditorSnapshotViewModel<HierarchySnapshot> HierarchySnapshot { get; } = new();
     public EditorSnapshotViewModel<AssetCatalogSnapshot> AssetCatalogSnapshot { get; } = new();
     public EditorScriptSourceViewModel ScriptSource { get; } = new();
+    public EditorScriptAssetLifecycleViewModel ScriptAssetLifecycle { get; } = new();
     public EditorScriptDiagnosticsViewModel ScriptDiagnostics { get; }
     public EditorSnapshotViewModel<BehaviorContractSnapshotResult> BehaviorContract { get; } = new();
     public EditorPublicationViewModel Publication { get; } = new();
@@ -376,6 +377,141 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             throw;
         }
     }
+
+    public async Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ScriptAssetCreateParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureScriptAssetLifecycleReady();
+        await _dispatcher.InvokeAsync(() => ScriptAssetLifecycle.Begin("create")).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.CreateScriptAssetAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await ApplyScriptAssetLifecycleResultAsync(result, ScriptSource.Document?.ScriptId, ProjectSnapshot.Value?.Script.Dependencies, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyScriptAssetLifecycleExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<ScriptAssetMutationResult> RenameScriptAssetAsync(ScriptAssetRenameParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureScriptAssetLifecycleReady();
+        await _dispatcher.InvokeAsync(() => ScriptAssetLifecycle.Begin("rename")).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.RenameScriptAssetAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await ApplyScriptAssetLifecycleResultAsync(result, ScriptSource.Document?.ScriptId, ProjectSnapshot.Value?.Script.Dependencies, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyScriptAssetLifecycleExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<ScriptAssetMutationResult> DeleteScriptAssetAsync(ScriptAssetDeleteParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureScriptAssetLifecycleReady();
+        var selectedScriptId = ScriptSource.Document?.ScriptId;
+        var previousDependencies = ProjectSnapshot.Value?.Script.Dependencies;
+        await _dispatcher.InvokeAsync(() => ScriptAssetLifecycle.Begin("delete")).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.DeleteScriptAssetAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await ApplyScriptAssetLifecycleResultAsync(result, selectedScriptId, previousDependencies, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyScriptAssetLifecycleExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<ScriptAssetMutationResult> UndoScriptAssetAsync(ScriptAssetUndoParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureScriptAssetLifecycleReady();
+        var selectedScriptId = ScriptSource.Document?.ScriptId;
+        var previousDependencies = ProjectSnapshot.Value?.Script.Dependencies;
+        await _dispatcher.InvokeAsync(() => ScriptAssetLifecycle.Begin("undo")).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.UndoScriptAssetAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await ApplyScriptAssetLifecycleResultAsync(result, selectedScriptId, previousDependencies, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyScriptAssetLifecycleExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private async Task ApplyScriptAssetLifecycleResultAsync(
+        ScriptAssetMutationResult result,
+        uint? selectedScriptId,
+        IReadOnlyList<ProjectModelScriptDependency>? previousDependencies,
+        CancellationToken cancellationToken)
+    {
+        uint? replacementScriptId = null;
+        await _dispatcher.InvokeAsync(() =>
+        {
+            ScriptAssetLifecycle.Apply(result);
+            ProjectSnapshot.Apply(result.ProjectSnapshot);
+            HierarchySnapshot.Apply(result.HierarchySnapshot);
+            AssetCatalogSnapshot.Apply(result.AssetCatalogSnapshot);
+
+            if (result.SourceDocument is not null)
+            {
+                ScriptSource.ApplyLifecycleDocument(result.SourceDocument, result.PreviousRevision, result.Revision);
+            }
+            else if (selectedScriptId == result.Asset.ScriptId)
+            {
+                ScriptSource.ClearLifecycleDocument();
+                ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
+                replacementScriptId = SelectReplacementScriptId(previousDependencies, result.ProjectSnapshot.Script.Dependencies, result.Asset.ScriptId);
+            }
+            else
+            {
+                ScriptSource.ApplyLifecycleDocument(null, result.PreviousRevision, result.Revision);
+            }
+        }).ConfigureAwait(false);
+
+        if (result.SourceDocument is not null)
+        {
+            ObserveScriptSourceBuffer(result.SourceDocument, result.SourceDocument.Source);
+        }
+        else if (replacementScriptId is { } scriptId)
+        {
+            try
+            {
+                var replacement = await ReadScriptSourceAsync(new ScriptSourceQueryParameters(result.ProjectName, scriptId), cancellationToken).ConfigureAwait(false);
+                ObserveScriptSourceBuffer(replacement, replacement.Source);
+            }
+            catch { }
+        }
+
+        await RefreshBehaviorContractAfterOperationAsync(result.ProjectName, cancellationToken).ConfigureAwait(false);
+        await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static uint? SelectReplacementScriptId(
+        IReadOnlyList<ProjectModelScriptDependency>? previousDependencies,
+        IReadOnlyList<ProjectModelScriptDependency>? currentDependencies,
+        uint removedScriptId)
+    {
+        if (currentDependencies is not { Count: > 0 }) return null;
+        var previousIndex = previousDependencies is null
+            ? 0
+            : Enumerable.Range(0, previousDependencies.Count)
+                .FirstOrDefault(index => previousDependencies[index].ScriptId == removedScriptId, -1);
+        if (previousIndex < 0) previousIndex = 0;
+        return currentDependencies[Math.Min(previousIndex, currentDependencies.Count - 1)].ScriptId;
+    }
+
     public async Task<PublicationSnapshot> RefreshPublicationAsync(string? projectName = null, string profile = "debug", CancellationToken cancellationToken = default)
     {
         EnsureCommand(Capabilities.CanReadPublicationSnapshot, "publication_snapshot");
@@ -697,6 +833,26 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
                     ReadString(notification.Data, "errorCode") ?? "script_source_undo_failed",
                     ReadString(notification.Data, "message") ?? "Script source undo failed.");
                 break;
+            case "script_asset_create_started":
+                ScriptAssetLifecycle.Begin("create");
+                break;
+            case "script_asset_rename_started":
+                ScriptAssetLifecycle.Begin("rename");
+                break;
+            case "script_asset_delete_started":
+                ScriptAssetLifecycle.Begin("delete");
+                break;
+            case "script_asset_undo_started":
+                ScriptAssetLifecycle.Begin("undo");
+                break;
+            case "script_asset_create_failed":
+            case "script_asset_rename_failed":
+            case "script_asset_delete_failed":
+            case "script_asset_undo_failed":
+                ScriptAssetLifecycle.ApplyFailure(
+                    ReadString(notification.Data, "errorCode") ?? "script_asset_failed",
+                    ReadString(notification.Data, "message") ?? "脚本资产生命周期操作失败。");
+                break;
             case "publication_snapshot_created":
                 if (TryRead(notification.Data, out PublicationSnapshot? publicationSnapshot) && publicationSnapshot is not null) { Publication.Apply(publicationSnapshot); }
                 break;
@@ -842,6 +998,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             StageCreatedSnapshotGroupInvalidation();
             Project.StageOpened(session);
             Authoring.Reset();
+            ScriptAssetLifecycle.Reset();
             Publication.Reset();
             ScriptSource.Reset();
             ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
@@ -851,6 +1008,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         }
         Project.ApplyOpened(session);
         ScriptSource.Reset();
+        ScriptAssetLifecycle.Reset();
     }
 
     private void ApplyOpenedSession(ProjectSessionInfo session)
@@ -859,12 +1017,14 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         {
             Project.ApplyOpened(session);
             ScriptSource.Reset();
+            ScriptAssetLifecycle.Reset();
             ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
             return;
         }
         StageCreatedSnapshotGroupInvalidation();
         Project.StageOpened(session);
         Authoring.Reset();
+        ScriptAssetLifecycle.Reset();
         Publication.Reset();
         ScriptSource.Reset();
         ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
@@ -947,6 +1107,15 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         if (!supported) { throw new EditorRpcException("unsupported_command", $"Editor Service capability is not available: {command}"); }
     }
 
+    private void EnsureScriptAssetLifecycleReady()
+    {
+        EnsureCommand(Capabilities.CanManageScriptAssets, "script_asset_create/script_asset_rename/script_asset_delete/script_asset_undo");
+        if (ScriptAssetLifecycle.IsBusy)
+        {
+            throw new EditorRpcException("script_asset_busy", "另一个脚本资产生命周期操作仍在进行中。");
+        }
+    }
+
     private sealed class BehaviorContractRefreshRequest
     {
         internal BehaviorContractRefreshRequest(
@@ -1025,6 +1194,16 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             ScriptSource.ApplyFailure(code, message);
             if (code is "script_source_revision_conflict" or "script_source_history_diverged" or "authoring_revision_conflict") { Authoring.InvalidateHistory(); }
         }).ConfigureAwait(false);
+    }
+    private async Task ApplyScriptAssetLifecycleExceptionAsync(Exception exception)
+    {
+        var (code, message) = exception switch
+        {
+            EditorRpcException rpc => (rpc.Code, rpc.Message),
+            OperationCanceledException => ("cancelled", "脚本资产生命周期操作已取消。"),
+            _ => ("script_asset_failed", exception.Message)
+        };
+        await _dispatcher.InvokeAsync(() => ScriptAssetLifecycle.ApplyFailure(code, message)).ConfigureAwait(false);
     }
     private async Task ApplyBakeExceptionAsync(Exception exception) =>
         await ApplyExceptionAsync(exception, "bake_failed", (code, message) => Bake.ApplyFailed(code, message, true)).ConfigureAwait(false);

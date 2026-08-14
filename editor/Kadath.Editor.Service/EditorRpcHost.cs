@@ -158,6 +158,18 @@ internal sealed class EditorRpcHost
                 case "script_source_undo":
                     await WriteResponseAsync(request.Id, true, await _session.UndoScriptSourceAsync(DeserializeParams<ScriptSourceUndoParameters>(request), request.Id), null);
                     break;
+                case "script_asset_create":
+                    await WriteResponseAsync(request.Id, true, await _session.CreateScriptAssetAsync(DeserializeParams<ScriptAssetCreateParameters>(request), request.Id), null);
+                    break;
+                case "script_asset_rename":
+                    await WriteResponseAsync(request.Id, true, await _session.RenameScriptAssetAsync(DeserializeParams<ScriptAssetRenameParameters>(request), request.Id), null);
+                    break;
+                case "script_asset_delete":
+                    await WriteResponseAsync(request.Id, true, await _session.DeleteScriptAssetAsync(DeserializeParams<ScriptAssetDeleteParameters>(request), request.Id), null);
+                    break;
+                case "script_asset_undo":
+                    await WriteResponseAsync(request.Id, true, await _session.UndoScriptAssetAsync(DeserializeParams<ScriptAssetUndoParameters>(request), request.Id), null);
+                    break;
                 case "authoring_apply":
                     await WriteResponseAsync(request.Id, true, await _session.ApplyAuthoringAsync(DeserializeParams<AuthoringApplyParameters>(request), request.Id), null);
                     break;

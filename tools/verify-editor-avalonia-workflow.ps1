@@ -2,7 +2,9 @@
 param(
     [string]$KadathRoot = (Join-Path $PSScriptRoot '..'),
     [string]$PackageRoot = '',
-    [string]$ProjectName = "codex_avalonia_workflow_$PID"
+    [string]$ProjectName = "codex_avalonia_workflow_$PID",
+    [ValidateSet('Debug', 'Release')]
+    [string]$Configuration = 'Debug'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -85,13 +87,13 @@ function New-OpenFixture {
 }
 
 try {
-    & dotnet build $project --no-restore -m:1 -p:NuGetAudit=false
+    & dotnet build $project -c $Configuration --no-restore -m:1 -p:NuGetAudit=false
     if ($LASTEXITCODE -ne 0) { throw 'Avalonia workflow project build failed.' }
 
     # Open fixture 只复制 package 内受控模板；第二个项目必须由 Avalonia public Create 入口经 typed Client 创建。
     New-OpenFixture
 
-    $output = @(& dotnet run --project $project --no-build -- --workflow-smoke $kadath $package $openProjectName $createdProjectName 2>&1)
+    $output = @(& dotnet run --project $project -c $Configuration --no-build -- --workflow-smoke $kadath $package $openProjectName $createdProjectName 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "Avalonia shared-Workspace workflow failed: $($output -join ' | ')" }
 
     $expected = @(
@@ -99,7 +101,10 @@ try {
         'workflow_project_open=ok',
         'workflow_snapshot_projection=ok',
         'workflow_behavior_preservation=ok',
+        'workflow_behavior_binding_authoring=ok',
         'workflow_script_source_authoring=ok',
+        'workflow_script_asset_lifecycle=ok',
+        'workflow_script_asset_runtime_execution=ok',
         'workflow_project_create=ok',
         'workflow_publication_missing=ok',
         'workflow_authoring_apply=ok',

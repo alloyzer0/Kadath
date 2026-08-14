@@ -27,6 +27,10 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
     public bool CanReadBehaviorContract => SupportsCommand("behavior_contract_snapshot");
     public bool CanEditScriptSource => SupportsCommand("script_source_edit");
     public bool CanUndoScriptSource => SupportsCommand("script_source_undo");
+    public bool CanManageScriptAssets => SupportsCommand("script_asset_create")
+        && SupportsCommand("script_asset_rename")
+        && SupportsCommand("script_asset_delete")
+        && SupportsCommand("script_asset_undo");
     public bool CanImportTexture => SupportsCommand("texture_import");
     public bool CanApplyAuthoring => SupportsCommand("authoring_apply");
     public bool CanUndoAuthoring => SupportsCommand("authoring_undo");
@@ -62,6 +66,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
         RaisePropertyChanged(nameof(CanReadBehaviorContract));
         RaisePropertyChanged(nameof(CanEditScriptSource));
         RaisePropertyChanged(nameof(CanUndoScriptSource));
+        RaisePropertyChanged(nameof(CanManageScriptAssets));
         RaisePropertyChanged(nameof(CanImportTexture));
         RaisePropertyChanged(nameof(CanApplyAuthoring));
         RaisePropertyChanged(nameof(CanUndoAuthoring));
