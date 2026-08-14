@@ -110,6 +110,7 @@
                            FontFamily="Consolas"
                            FontSize="12"
                            IsEnabled="{Binding CanEditScriptSourceBuffer}"
+                           CaretIndex="{Binding ScriptSourceCaretIndex, Mode=TwoWay}"
                            Text="{Binding ScriptSourceText}"
                            TextWrapping="NoWrap"
                            ScrollViewer.HorizontalScrollBarVisibility="Auto"
@@ -119,8 +120,20 @@
                     <Button Command="{Binding UndoScriptSourceCommand}" Content="撤销提交" />
                     <Button Command="{Binding ReloadScriptSourceCommand}" Content="重新读取" />
                     <Button Command="{Binding DiscardScriptSourceChangesCommand}" Content="放弃修改" />
+                    <Button Command="{Binding ReanalyzeScriptSourceCommand}" Content="重新分析" />
                   </StackPanel>
                   <TextBlock FontSize="11" Foreground="#D7B46A" Text="{Binding ScriptSourceStatus}" TextWrapping="Wrap" />
+                  <TextBlock FontSize="11" Foreground="#9FE3B1" Text="{Binding ScriptDiagnosticsStatus}" TextWrapping="Wrap" />
+                  <ListBox MaxHeight="180"
+                           IsVisible="{Binding HasScriptDiagnostics}"
+                           ItemsSource="{Binding ScriptDiagnostics}"
+                           SelectedItem="{Binding SelectedScriptDiagnostic}">
+                    <ListBox.ItemTemplate>
+                      <DataTemplate>
+                        <TextBlock FontFamily="Consolas" FontSize="11" Text="{Binding DisplayText}" TextWrapping="Wrap" />
+                      </DataTemplate>
+                    </ListBox.ItemTemplate>
+                  </ListBox>
                 </StackPanel>
               </Border>
 

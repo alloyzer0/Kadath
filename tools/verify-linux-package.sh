@@ -10,6 +10,7 @@ evidence_base=$5
 archive_root=kadath-linux-x86_64
 expected='README.txt
 SHA256SUMS
+behavior-tools/kadath-behavior-tool
 bin/assets/audio/lost.audio.wav
 bin/assets/audio/won.audio.wav
 bin/assets/renderer2d/goal.texture
@@ -23,6 +24,8 @@ bin/kadath'
 expected_archive_entries='kadath-linux-x86_64/
 kadath-linux-x86_64/README.txt
 kadath-linux-x86_64/SHA256SUMS
+kadath-linux-x86_64/behavior-tools/
+kadath-linux-x86_64/behavior-tools/kadath-behavior-tool
 kadath-linux-x86_64/bin/
 kadath-linux-x86_64/bin/assets/
 kadath-linux-x86_64/bin/assets/audio/
@@ -81,6 +84,21 @@ grep -F 'Shared library: [libxcb.so.1]' "$evidence_root/readelf-dynamic.txt" >/d
 grep -F 'Shared library: [libvulkan.so.1]' "$evidence_root/readelf-dynamic.txt" >/dev/null
 grep -F 'Shared library: [libasound.so.2]' "$evidence_root/readelf-dynamic.txt" >/dev/null
 
+analysis_response="$evidence_root/behavior-analysis.bin"
+analysis_stderr="$evidence_root/behavior-analysis.stderr.log"
+printf 'KLAN\001\000\000\000\023\000\000\000\011\000\000\000scripts/patrol.luaureturn {}' \
+    | "$package_root/behavior-tools/kadath-behavior-tool" --analyze-stdin \
+        > "$analysis_response" 2> "$analysis_stderr"
+test ! -s "$analysis_stderr"
+test "$(dd if="$analysis_response" bs=1 count=4 2>/dev/null)" = 'KLAR'
+test "$(od -An -tu4 -N4 -j4 "$analysis_response" | tr -d ' ')" = '1'
+analysis_bytes=$(od -An -tu4 -N4 -j8 "$analysis_response" | tr -d ' ')
+test "$(wc -c < "$analysis_response" | tr -d ' ')" -eq $((12 + analysis_bytes))
+dd if="$analysis_response" bs=1 skip=12 2>/dev/null > "$evidence_root/behavior-analysis.json"
+grep -F '"state":"valid"' "$evidence_root/behavior-analysis.json" >/dev/null
+grep -F '"toolchainIdentity":"luau-0.732-decb2d0"' "$evidence_root/behavior-analysis.json" >/dev/null
+grep -F '"diagnostics":[]' "$evidence_root/behavior-analysis.json" >/dev/null
+
 sha256sum "$archive_path" > "$evidence_root/archive.sha256"
 cp "$package_root/SHA256SUMS" "$evidence_root/SHA256SUMS"
 "$window_verifier" "$platform_test" "$package_root/bin/kadath" "$profile-Package" "$package_root/bin" \
@@ -108,4 +126,5 @@ printf 'linux_package_runtime_pixels=ok\n'
 printf 'linux_package_audio_feedback=ok\n'
 printf 'linux_package_audio_fallback=ok\n'
 printf 'linux_package_shutdown=ok\n'
+printf 'linux_package_behavior_analyze=ok\n'
 printf 'evidence_root=%s\n' "$evidence_root"

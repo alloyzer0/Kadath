@@ -18,6 +18,7 @@ namespace Kadath.Editor.Avalonia.ViewModels;
 public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 {
     private const int MaxScriptSourceBytes = 64 * 1024;
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly EditorWorkspaceViewModel _workspace;
     private readonly IEditorViewDispatcher _dispatcher;
     private readonly List<AsyncUiCommand> _commands = [];
@@ -53,6 +54,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _scriptVelocityY = string.Empty;
     private ScriptSourceDocument? _scriptSourceDocument;
     private string _scriptSourceText = string.Empty;
+    private int _scriptSourceCaretIndex;
+    private EditorScriptDiagnosticItem? _selectedScriptDiagnostic;
     private string? _scriptSourceHierarchyItem;
     private bool _allowScriptSourceSelectionChange;
     private int _scriptSourceSelectionVersion;
@@ -80,6 +83,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace.Publication.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Authoring.PropertyChanged += OnNestedPropertyChanged;
         _workspace.ScriptSource.PropertyChanged += OnNestedPropertyChanged;
+        _workspace.ScriptDiagnostics.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Bake.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Watch.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Preview.PropertyChanged += OnNestedPropertyChanged;
@@ -113,6 +117,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         MoveSceneObjectUpCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectUp, () => CanMoveSelectedSceneObjectUp));
         MoveSceneObjectDownCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectDown, () => CanMoveSelectedSceneObjectDown));
         DiscardScriptSourceChangesCommand = AddCommand(new DelegateUiCommand(DiscardScriptSourceChanges, () => CanDiscardScriptSourceChanges));
+        ReanalyzeScriptSourceCommand = AddCommand(new DelegateUiCommand(
+            () => _workspace.ReanalyzeScriptSource(),
+            () => _workspace.ScriptDiagnostics.CanReanalyze));
         ClearEventLogCommand = new DelegateUiCommand(() => EventLog.Clear());
     }
 
@@ -147,6 +154,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand MoveSceneObjectUpCommand { get; }
     public ICommand MoveSceneObjectDownCommand { get; }
     public ICommand DiscardScriptSourceChangesCommand { get; }
+    public ICommand ReanalyzeScriptSourceCommand { get; }
     public ICommand ClearEventLogCommand { get; }
 
     public string PackageRoot { get => _packageRoot; set => SetProperty(ref _packageRoot, value); }
@@ -183,6 +191,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                     _scriptSourceHierarchyItem = value;
                     if (SelectedScriptSourceId != scriptId)
                     {
+                        _workspace.ScriptDiagnostics.Reset(!_workspace.Capabilities.CanAnalyzeScriptSource);
                         _ = LoadScriptSourceFromSelectionAsync(scriptId);
                     }
                 }
@@ -190,12 +199,14 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                 {
                     _scriptSourceHierarchyItem = null;
                     Interlocked.Increment(ref _scriptSourceSelectionVersion);
+                    _workspace.ScriptDiagnostics.Reset(!_workspace.Capabilities.CanAnalyzeScriptSource);
                 }
             }
             else
             {
                 _scriptSourceHierarchyItem = null;
                 Interlocked.Increment(ref _scriptSourceSelectionVersion);
+                _workspace.ScriptDiagnostics.Reset(!_workspace.Capabilities.CanAnalyzeScriptSource);
                 SelectedSceneObject = null;
             }
         }
@@ -226,9 +237,39 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         set
         {
             if (!SetProperty(ref _scriptSourceText, value)) { return; }
+            ObserveScriptSourceBuffer();
             RaiseAll();
         }
     }
+    public int ScriptSourceCaretIndex
+    {
+        get => _scriptSourceCaretIndex;
+        set => SetProperty(ref _scriptSourceCaretIndex, Math.Clamp(value, 0, ScriptSourceText.Length));
+    }
+    public EditorScriptDiagnosticItem? SelectedScriptDiagnostic
+    {
+        get => _selectedScriptDiagnostic;
+        set
+        {
+            if (!SetProperty(ref _selectedScriptDiagnostic, value) || value?.CaretIndex is not { } caretIndex) return;
+            ScriptSourceCaretIndex = caretIndex;
+        }
+    }
+    public IReadOnlyList<EditorScriptDiagnosticItem> ScriptDiagnostics => _workspace.ScriptDiagnostics.Items;
+    public bool HasScriptDiagnostics => ScriptDiagnostics.Count > 0;
+    public string ScriptDiagnosticsStatus => _workspace.ScriptDiagnostics.State switch
+    {
+        EditorScriptDiagnosticsState.Unsupported => "当前 Service 不支持即时诊断。",
+        EditorScriptDiagnosticsState.Idle => "等待加载行为脚本源码。",
+        EditorScriptDiagnosticsState.Debouncing => "等待输入结束…",
+        EditorScriptDiagnosticsState.Analyzing => "正在分析当前未保存缓冲区…",
+        EditorScriptDiagnosticsState.Valid => "未发现问题。",
+        EditorScriptDiagnosticsState.Invalid => $"发现 {ScriptDiagnostics.Count} 个错误。",
+        EditorScriptDiagnosticsState.Failed when _workspace.ScriptDiagnostics.Result is not null =>
+            $"分析器失败 · {_workspace.ScriptDiagnostics.ErrorCode} · 保留当前缓冲区最近诊断",
+        EditorScriptDiagnosticsState.Failed => $"分析器失败 · {_workspace.ScriptDiagnostics.ErrorCode}",
+        _ => "等待输入。"
+    };
     public uint? SelectedScriptSourceId => _scriptSourceDocument?.ScriptId;
     public uint? SelectedScriptDependencyId => TryGetSelectedScriptDependency(out var scriptId, out _) ? scriptId : null;
     public bool HasSelectedScriptDependency => SelectedScriptDependencyId is not null;
@@ -244,7 +285,15 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         : "revision=—";
     public bool HasScriptSourceDocument => _scriptSourceDocument is not null;
     public bool IsScriptSourceDirty => _scriptSourceDocument is { } document && !string.Equals(ScriptSourceText, document.Source, StringComparison.Ordinal);
-    public int ScriptSourceUtf8Bytes => Encoding.UTF8.GetByteCount(ScriptSourceText);
+    public int ScriptSourceUtf8Bytes
+    {
+        get
+        {
+            try { return StrictUtf8.GetByteCount(ScriptSourceText); }
+            catch (EncoderFallbackException) { return -1; }
+        }
+    }
+    public bool IsScriptSourceStrictUtf8 => ScriptSourceUtf8Bytes >= 0;
     public string ScriptSourceStatus => _workspace.ScriptSource.State switch
     {
         EditorScriptSourceState.Loading => "正在读取行为脚本源码…",
@@ -253,6 +302,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         EditorScriptSourceState.Failed when IsScriptSourceDirty => $"脚本源码操作失败 · {_workspace.ScriptSource.ErrorCode} · 未保存内容已保留",
         EditorScriptSourceState.Failed => $"脚本源码操作失败 · {_workspace.ScriptSource.ErrorCode}",
         _ when !IsScriptSourceSelection => "从 Hierarchy 选择 ScriptDependency 以加载源码。",
+        _ when !IsScriptSourceStrictUtf8 => "源码包含无法编码为严格 UTF-8 的字符。",
         _ when IsScriptSourceDirty => $"有未保存修改 · UTF-8 {ScriptSourceUtf8Bytes}/{MaxScriptSourceBytes} 字节",
         _ when HasScriptSourceDocument => $"已加载 · UTF-8 {ScriptSourceUtf8Bytes}/{MaxScriptSourceBytes} 字节",
         _ => "从 Hierarchy 选择 ScriptDependency 以加载源码。"
@@ -400,6 +450,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && _workspace.Capabilities.CanEditScriptSource
         && HasScriptSourceDocument
         && IsScriptSourceDirty
+        && IsScriptSourceStrictUtf8
         && ScriptSourceUtf8Bytes <= MaxScriptSourceBytes
         && !IsBusy;
     public bool CanUndoScriptSource => SupportsScriptSourceAuthoring
@@ -601,6 +652,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
         var document = _scriptSourceDocument ?? throw new EditorRpcException("script_source_not_loaded", "请先选择并加载行为脚本源码。");
         if (!IsScriptSourceDirty) { throw new EditorRpcException("script_source_unchanged", "脚本源码没有未保存修改。"); }
+        if (!IsScriptSourceStrictUtf8)
+        {
+            throw new EditorRpcException("invalid_script_source", "脚本源码包含无法编码为严格 UTF-8 的字符。");
+        }
         if (ScriptSourceUtf8Bytes > MaxScriptSourceBytes)
         {
             throw new EditorRpcException("script_source_too_large", $"脚本源码超过 {MaxScriptSourceBytes} 字节限制。");
@@ -671,6 +726,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     {
         _scriptSourceDocument = document;
         _scriptSourceText = document.Source;
+        ScriptSourceCaretIndex = Math.Min(ScriptSourceCaretIndex, document.Source.Length);
+        SelectedScriptDiagnostic = null;
+        ObserveScriptSourceBuffer();
         RaiseAll();
     }
 
@@ -693,7 +751,17 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _scriptSourceDocument = null;
         _scriptSourceText = string.Empty;
         _scriptSourceHierarchyItem = null;
+        ScriptSourceCaretIndex = 0;
+        SelectedScriptDiagnostic = null;
+        _workspace.ScriptDiagnostics.Reset(!_workspace.Capabilities.CanAnalyzeScriptSource);
     }
+
+    private void ObserveScriptSourceBuffer() => _workspace.ObserveScriptSourceBuffer(
+        _scriptSourceDocument,
+        _scriptSourceText,
+        IsScriptSourceSelection
+            && _workspace.ProjectSnapshot.Value?.Script.SchemaVersion == 2
+            && _workspace.Capabilities.CanAnalyzeScriptSource);
 
     private static bool TryGetScriptId(HierarchyNode node, out uint scriptId)
     {
@@ -1244,7 +1312,16 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         await _dispatcher.InvokeAsync(() =>
         {
             var summary = notification.Data is { } data ? data.GetRawText() : string.Empty;
-            AddLog(notification.Event, summary.Length <= 240 ? summary : summary[..237] + "…", notification.RequestId, notification.Sequence);
+            var eventName = notification.Event;
+            if (notification.Event == "preview_status"
+                && notification.Data is { ValueKind: JsonValueKind.Object } previewStatus
+                && previewStatus.TryGetProperty("event", out var nestedEvent)
+                && nestedEvent.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(nestedEvent.GetString()))
+            {
+                eventName = nestedEvent.GetString()!;
+            }
+            AddLog(eventName, summary.Length <= 240 ? summary : summary[..237] + "…", notification.RequestId, notification.Sequence);
             RaiseAll();
         });
     }
@@ -1260,7 +1337,15 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         if (e.PropertyName == nameof(EditorProjectViewModel.Session)) { ReconcileProjectIdentity(); }
         RaiseAll();
     }
-    private void OnNestedPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
+    private void OnNestedPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (ReferenceEquals(sender, _workspace.ScriptDiagnostics)
+            && e.PropertyName == nameof(EditorScriptDiagnosticsViewModel.Items))
+        {
+            SelectedScriptDiagnostic = null;
+        }
+        RaiseAll();
+    }
     private void HandleCommandError(Exception exception) => _ = _dispatcher.InvokeAsync(() => AddLog("command_failed", exception.Message, null, 0));
     private void AddLog(string eventName, string summary, string? requestId, long sequence) { EventLog.Add(new EditorEventLogItem(sequence, eventName, summary, requestId, DateTimeOffset.Now)); while (EventLog.Count > 200) { EventLog.RemoveAt(0); } }
     private AsyncUiCommand AddCommand(AsyncUiCommand command) { _commands.Add(command); return command; }
@@ -1314,7 +1399,13 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(HasScriptSourceDocument));
         OnPropertyChanged(nameof(IsScriptSourceDirty));
         OnPropertyChanged(nameof(ScriptSourceUtf8Bytes));
+        OnPropertyChanged(nameof(IsScriptSourceStrictUtf8));
         OnPropertyChanged(nameof(ScriptSourceStatus));
+        OnPropertyChanged(nameof(ScriptSourceCaretIndex));
+        OnPropertyChanged(nameof(SelectedScriptDiagnostic));
+        OnPropertyChanged(nameof(ScriptDiagnostics));
+        OnPropertyChanged(nameof(HasScriptDiagnostics));
+        OnPropertyChanged(nameof(ScriptDiagnosticsStatus));
         OnPropertyChanged(nameof(CanAddSceneObject));
         OnPropertyChanged(nameof(CanAddPatrolHazard));
         OnPropertyChanged(nameof(CanDeleteSelectedSceneObject));

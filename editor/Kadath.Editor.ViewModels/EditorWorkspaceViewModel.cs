@@ -23,6 +23,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     {
         Client = client ?? throw new ArgumentNullException(nameof(client));
         _dispatcher = dispatcher ?? new InlineEditorViewDispatcher();
+        ScriptDiagnostics = new EditorScriptDiagnosticsViewModel(Client, _dispatcher);
         Client.EventReceived += HandleEventAsync;
         Client.ConnectionClosed += HandleConnectionClosedAsync;
         Publication.PropertyChanged += (_, _) => Preview.Runtime.Reconcile(Publication.Snapshot);
@@ -36,6 +37,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public EditorSnapshotViewModel<HierarchySnapshot> HierarchySnapshot { get; } = new();
     public EditorSnapshotViewModel<AssetCatalogSnapshot> AssetCatalogSnapshot { get; } = new();
     public EditorScriptSourceViewModel ScriptSource { get; } = new();
+    public EditorScriptDiagnosticsViewModel ScriptDiagnostics { get; }
     public EditorPublicationViewModel Publication { get; } = new();
     public EditorTextureImportViewModel TextureImport { get; } = new();
     public EditorAuthoringViewModel Authoring { get; } = new();
@@ -62,6 +64,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             await _dispatcher.InvokeAsync(() =>
             {
                 Capabilities.Apply(capabilities);
+                ScriptDiagnostics.SetSupported(Capabilities.CanAnalyzeScriptSource);
                 ConnectionState = EditorConnectionState.Ready;
             }).ConfigureAwait(false);
         }
@@ -83,6 +86,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             {
                 Project.ApplyOpened(result);
                 ScriptSource.Reset();
+                ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
             }).ConfigureAwait(false);
             return result;
         }
@@ -221,6 +225,18 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             throw;
         }
     }
+
+    public void ObserveScriptSourceBuffer(
+        ScriptSourceDocument? document,
+        string source,
+        bool eligible = true) => ScriptDiagnostics.Observe(
+            document?.ProjectName,
+            document?.ScriptId,
+            document?.SourcePath,
+            source,
+            eligible && document is not null);
+
+    public void ReanalyzeScriptSource() => ScriptDiagnostics.Reanalyze();
 
     public async Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, CancellationToken cancellationToken = default)
     {
@@ -495,6 +511,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     {
         await _dispatcher.InvokeAsync(() =>
         {
+            ScriptDiagnostics.SetSupported(false);
             LastConnectionClosed = notification;
             LastEventName = "connection_closed";
             if (notification.Expected)
@@ -722,6 +739,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             Authoring.Reset();
             Publication.Reset();
             ScriptSource.Reset();
+            ScriptDiagnostics.Reset(!Capabilities.CanAnalyzeScriptSource);
             Project.PublishStagedOpened();
             PublishCreatedSnapshotGroupInvalidation();
             return;
@@ -930,6 +948,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public async ValueTask DisposeAsync()
     {
         Client.EventReceived -= HandleEventAsync;
+        await ScriptDiagnostics.DisposeAsync().ConfigureAwait(false);
         try { await Client.DisposeAsync().ConfigureAwait(false); }
         finally { Client.ConnectionClosed -= HandleConnectionClosedAsync; }
     }

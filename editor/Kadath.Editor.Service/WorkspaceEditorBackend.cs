@@ -12,9 +12,11 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private readonly WorkspacePublicationModel _publicationModel;
     private readonly WorkspaceTextureImportModel _textureImportModel;
     private readonly WorkspaceScriptSourceAuthoringModel _scriptSourceAuthoringModel;
+    private readonly WorkspaceScriptDiagnosticsModel _scriptDiagnosticsModel;
     private readonly SemaphoreSlim _bakeGate = new(1, 1);
     private readonly SemaphoreSlim _watchGate = new(1, 1);
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
+    private readonly SemaphoreSlim _scriptAnalysisGate = new(1, 1);
     private readonly List<AuthoringUndoRecord> _authoringHistory = [];
     private readonly List<ScriptSourceUndoRecord> _scriptSourceHistory = [];
     private const int MaxAuthoringHistory = 32;
@@ -29,7 +31,8 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         WorkspaceAuthoringModel authoringModel,
         WorkspacePublicationModel publicationModel,
         WorkspaceTextureImportModel textureImportModel,
-        WorkspaceScriptSourceAuthoringModel? scriptSourceAuthoringModel = null)
+        WorkspaceScriptSourceAuthoringModel? scriptSourceAuthoringModel = null,
+        WorkspaceScriptDiagnosticsModel? scriptDiagnosticsModel = null)
     {
         _projectLifecycleModel = projectLifecycleModel;
         _readModel = readModel;
@@ -37,6 +40,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         _publicationModel = publicationModel;
         _textureImportModel = textureImportModel;
         _scriptSourceAuthoringModel = scriptSourceAuthoringModel ?? new WorkspaceScriptSourceAuthoringModel();
+        _scriptDiagnosticsModel = scriptDiagnosticsModel ?? new WorkspaceScriptDiagnosticsModel();
     }
 
     public event Func<EditorSessionNotification, Task>? Notification;
@@ -92,6 +96,35 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             return new ScriptSourceDocument(document.ProjectName, document.ScriptId, document.SourcePath, document.Source, document.AuthoringRevision);
         }
         catch (WorkspaceAuthoringException exception) { throw MapScriptSourceError(exception); }
+    }
+
+    public async Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(
+        ProjectSessionInfo project,
+        ScriptSourceAnalyzeParameters parameters,
+        CancellationToken cancellationToken)
+    {
+        if (!await _scriptAnalysisGate.WaitAsync(0, cancellationToken))
+            throw new EditorOperationException("script_source_analysis_busy", "A Script source analysis is already running.");
+        try
+        {
+            try { return await _scriptDiagnosticsModel.AnalyzeAsync(project, parameters, cancellationToken); }
+            catch (WorkspaceScriptDiagnosticsException exception) { throw MapScriptDiagnosticsFailure(exception); }
+        }
+        finally { _scriptAnalysisGate.Release(); }
+    }
+
+    internal static EditorOperationException MapScriptDiagnosticsFailure(WorkspaceScriptDiagnosticsException exception)
+    {
+        var code = exception.Kind switch
+        {
+            WorkspaceScriptDiagnosticsFailureKind.Input => "invalid_script_source_analysis_request",
+            WorkspaceScriptDiagnosticsFailureKind.Unavailable => "script_source_analyzer_unavailable",
+            WorkspaceScriptDiagnosticsFailureKind.Timeout => "script_source_analysis_timeout",
+            WorkspaceScriptDiagnosticsFailureKind.Cleanup => "script_source_analysis_cleanup_failed",
+            WorkspaceScriptDiagnosticsFailureKind.Protocol => "script_source_analysis_protocol_error",
+            _ => "script_source_analysis_protocol_error"
+        };
+        return new EditorOperationException(code, exception.Message);
     }
 
     public Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken) =>
@@ -692,6 +725,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         _bakeGate.Dispose();
         _watchGate.Dispose();
         _authoringGate.Dispose();
+        _scriptAnalysisGate.Dispose();
     }
 
 }

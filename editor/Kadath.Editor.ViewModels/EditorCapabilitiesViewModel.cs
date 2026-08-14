@@ -23,6 +23,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
     public bool CanReadAssetCatalogSnapshot => SupportsCommand("asset_catalog_snapshot");
     public bool CanReadPublicationSnapshot => SupportsCommand("publication_snapshot");
     public bool CanReadScriptSource => SupportsCommand("script_source_read");
+    public bool CanAnalyzeScriptSource => SupportsCommand("script_source_analyze");
     public bool CanEditScriptSource => SupportsCommand("script_source_edit");
     public bool CanUndoScriptSource => SupportsCommand("script_source_undo");
     public bool CanImportTexture => SupportsCommand("texture_import");
@@ -56,6 +57,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
         RaisePropertyChanged(nameof(CanReadAssetCatalogSnapshot));
         RaisePropertyChanged(nameof(CanReadPublicationSnapshot));
         RaisePropertyChanged(nameof(CanReadScriptSource));
+        RaisePropertyChanged(nameof(CanAnalyzeScriptSource));
         RaisePropertyChanged(nameof(CanEditScriptSource));
         RaisePropertyChanged(nameof(CanUndoScriptSource));
         RaisePropertyChanged(nameof(CanImportTexture));

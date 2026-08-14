@@ -13,12 +13,12 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var preview_status = PreviewStatus.init(init.io, options.preview_status_jsonl);
-    var host = Host.init(init.io, options.scene_path, options.script_path, &preview_status) catch |err| {
+    const host = Host.init(init.io, options.scene_path, options.script_path, &preview_status) catch |err| {
         preview_status.runtimeFailed("startup", err);
         std.log.err("Runtime startup failed: {s}", .{@errorName(err)});
         return err;
     };
-    defer host.deinit();
+    defer host.destroy();
 
     var preview_control = PreviewControl.init(init.io, options.preview_control_jsonl) catch |err| {
         preview_status.runtimeFailed("preview_control", err);

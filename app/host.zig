@@ -77,7 +77,7 @@ pub const Host = struct {
     frame_count: u64 = 0,
     last_heartbeat_seconds: f64 = 0.0,
 
-    pub fn init(io: std.Io, scene_path: ?[]const u8, script_path: ?[]const u8, preview_status: *preview_status_api.PreviewStatus) !Host {
+    pub fn init(io: std.Io, scene_path: ?[]const u8, script_path: ?[]const u8, preview_status: *preview_status_api.PreviewStatus) !*Host {
         var scene_identity: ?content_identity.ContentIdentity = null;
         const scene = if (scene_path) |path| blk: {
             const loaded = try scene_api.loadWithIdentity(io, std.heap.page_allocator, path);
@@ -146,7 +146,9 @@ pub const Host = struct {
         var generation = try scene_generation_api.SceneGeneration.prepare(scene, extent);
         errdefer generation.deinit();
 
-        var self = Host{
+        const self = try std.heap.page_allocator.create(Host);
+        errdefer std.heap.page_allocator.destroy(self);
+        self.* = .{
             .io = io,
             .preview_status = preview_status,
             .initial_loaded = .{
@@ -196,6 +198,11 @@ pub const Host = struct {
         self.rhi.deinit();
         self.platform.deinit();
         std.log.info("Kadath runtime shutdown complete", .{});
+    }
+
+    pub fn destroy(self: *Host) void {
+        self.deinit();
+        std.heap.page_allocator.destroy(self);
     }
 
     fn processReloadCommand(self: *Host, command: preview_status_api.Command, request_id: ?u64) void {

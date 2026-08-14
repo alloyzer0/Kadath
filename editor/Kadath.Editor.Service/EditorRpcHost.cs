@@ -13,11 +13,14 @@ internal sealed class EditorRpcHost
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly object _lifecycleStateGate = new();
+    private readonly object _analysisStateGate = new();
     private LifecycleState _watchState = LifecycleState.Stopped;
     private LifecycleState _previewState = LifecycleState.Stopped;
     private long _sequence;
     private bool _helloAccepted;
     private bool _shutdownRequested;
+    private Task? _analysisTask;
+    private CancellationTokenSource? _analysisCancellation;
 
     public EditorRpcHost(IEditorSession session, PreviewProcessController preview, TextReader input, TextWriter output)
     {
@@ -50,6 +53,7 @@ internal sealed class EditorRpcHost
         }
         finally
         {
+            await CancelAnalysisAsync();
             try { await _session.StopWatchAsync(null); } catch { }
             await _preview.StopAsync();
         }
@@ -105,6 +109,11 @@ internal sealed class EditorRpcHost
     {
         try
         {
+            if (request.Method == "script_source_analyze")
+            {
+                await StartAnalysisAsync(request);
+                return;
+            }
             switch (request.Method)
             {
                 case "get_capabilities":
@@ -180,6 +189,7 @@ internal sealed class EditorRpcHost
                     break;
                 }
                 case "shutdown":
+                    await CancelAnalysisAsync();
                     await WriteResponseAsync(request.Id, true, new { state = "stopping" }, null);
                     _shutdownRequested = true;
                     await PublishEventAsync("service_stopping", request.Id, JsonSerializer.SerializeToElement(new { }, EditorProtocol.JsonOptions));
@@ -197,6 +207,117 @@ internal sealed class EditorRpcHost
         {
             await WriteResponseAsync(request.Id, false, null, new EditorRpcError("command_failed", exception.Message));
         }
+    }
+
+    private async Task StartAnalysisAsync(EditorRpcRequest request)
+    {
+        ScriptSourceAnalyzeParameters parameters;
+        try { parameters = DeserializeParams<ScriptSourceAnalyzeParameters>(request); }
+        catch (Exception exception)
+        {
+            await WriteResponseAsync(request.Id, false, null, new EditorRpcError("invalid_script_source_analysis_request", exception.Message));
+            return;
+        }
+
+        CancellationTokenSource? cancellation = null;
+        lock (_analysisStateGate)
+        {
+            if (_analysisTask is null)
+            {
+                cancellation = new CancellationTokenSource();
+                _analysisCancellation = cancellation;
+                Task<ScriptSourceAnalysisResult> operation;
+                try
+                {
+                    // 调用 async Interface 会在返回 Task 前同步捕获当前 Project Session；
+                    // 后续 project_open 不得把本请求改指向新项目。
+                    operation = _session.AnalyzeScriptSourceAsync(parameters, request.Id, cancellation.Token);
+                }
+                catch (Exception exception)
+                {
+                    operation = Task.FromException<ScriptSourceAnalysisResult>(exception);
+                }
+                _analysisTask = RunAnalysisAsync(request.Id, operation, cancellation);
+            }
+        }
+        if (cancellation is null)
+        {
+            await WriteResponseAsync(request.Id, false, null, new EditorRpcError(
+                "script_source_analysis_busy",
+                "A Script source analysis is already running."));
+        }
+    }
+
+    private async Task RunAnalysisAsync(
+        string requestId,
+        Task<ScriptSourceAnalysisResult> operation,
+        CancellationTokenSource cancellation)
+    {
+        await Task.Yield();
+        bool ok;
+        object? result;
+        EditorRpcError? error;
+        try
+        {
+            result = await operation;
+            ok = true;
+            error = null;
+        }
+        catch (EditorOperationException exception)
+        {
+            ok = false;
+            result = null;
+            error = new EditorRpcError(exception.Code, exception.Message);
+        }
+        catch (OperationCanceledException)
+        {
+            ok = false;
+            result = null;
+            error = new EditorRpcError(
+                "script_source_analysis_cancelled",
+                "Script source analysis was cancelled.");
+        }
+        catch (Exception exception)
+        {
+            ok = false;
+            result = null;
+            error = new EditorRpcError("command_failed", exception.Message);
+        }
+
+        try
+        {
+            // EOF/dispose 后输出可能已不可用；terminal wire message 可丢失，
+            // 但后台任务必须继续完成 Tool 子进程清理和 ownership 释放。
+            try { await WriteResponseAsync(requestId, ok, result, error); }
+            catch { }
+        }
+        finally
+        {
+            lock (_analysisStateGate)
+            {
+                if (ReferenceEquals(_analysisCancellation, cancellation))
+                {
+                    _analysisCancellation = null;
+                    _analysisTask = null;
+                }
+            }
+            cancellation.Dispose();
+        }
+    }
+
+    private async Task CancelAnalysisAsync()
+    {
+        Task? task;
+        CancellationTokenSource? cancellation;
+        lock (_analysisStateGate)
+        {
+            task = _analysisTask;
+            cancellation = _analysisCancellation;
+        }
+        if (task is null || cancellation is null) return;
+        try { cancellation.Cancel(); }
+        catch (ObjectDisposedException) { }
+        await task;
     }
 
     private async Task<ProjectSessionInfo> CreateProjectWithLifecycleAsync(ProjectCreateParameters parameters, string? requestId)

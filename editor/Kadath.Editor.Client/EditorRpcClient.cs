@@ -57,6 +57,7 @@ public interface IEditorRpcClient : IAsyncDisposable
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, CancellationToken cancellationToken = default);
+    Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(ScriptSourceAnalyzeParameters parameters, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default);
@@ -144,6 +145,9 @@ public sealed class EditorRpcClient : IEditorRpcClient
 
     public Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<ScriptSourceQueryParameters, ScriptSourceDocument>("script_source_read", parameters, cancellationToken);
+
+    public Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(ScriptSourceAnalyzeParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<ScriptSourceAnalyzeParameters, ScriptSourceAnalysisResult>("script_source_analyze", parameters, cancellationToken);
 
     public Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<PublicationSnapshotQueryParameters, PublicationSnapshot>("publication_snapshot", parameters, cancellationToken);

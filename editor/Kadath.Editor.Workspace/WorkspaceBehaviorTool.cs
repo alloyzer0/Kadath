@@ -49,7 +49,7 @@ internal static class WorkspaceBehaviorTool
         }
     }
 
-    private static string ResolveToolPath(string packageRoot)
+    internal static string ResolveToolPath(string packageRoot)
     {
         var overridePath = Environment.GetEnvironmentVariable("KADATH_BEHAVIOR_TOOL");
         var executableName = OperatingSystem.IsWindows() ? "kadath-behavior-tool.exe" : "kadath-behavior-tool";
@@ -62,9 +62,10 @@ internal static class WorkspaceBehaviorTool
             : new[] { Path.GetFullPath(overridePath) };
         foreach (var candidate in candidates)
         {
-            if (!File.Exists(candidate)) continue;
-            WorkspaceProjectValidator.RejectReparsePoint(candidate, "Behavior Tool executable");
-            return candidate;
+            var fullPath = Path.GetFullPath(candidate);
+            if (!File.Exists(fullPath)) continue;
+            WorkspaceProjectValidator.RejectReparsePoint(fullPath, "Behavior Tool executable");
+            return fullPath;
         }
         throw new InvalidDataException($"Behavior Tool executable was not found. Checked: {string.Join(", ", candidates)}.");
     }

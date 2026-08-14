@@ -490,7 +490,7 @@ internal sealed class PreviewProcessController : IAsyncDisposable
         var now = DateTimeOffset.UtcNow;
         foreach (var target in _watchTargets)
         {
-            var revision = TryGetFileRevision(target.Path);
+            var revision = target.GetRevision();
             if (!string.Equals(revision, target.ObservedRevision, StringComparison.Ordinal))
             {
                 target.ObservedRevision = revision;
@@ -538,7 +538,7 @@ internal sealed class PreviewProcessController : IAsyncDisposable
             return;
         }
         await EmitLiveBakeEventAsync(process, generation, "live_bake_completed", target.Name, plan, bake, null).ConfigureAwait(false);
-        if (!string.Equals(TryGetFileRevision(target.Path), revision, StringComparison.Ordinal))
+        if (!string.Equals(target.GetRevision(), revision, StringComparison.Ordinal))
         {
             target.ClearPending();
             return;
@@ -906,10 +906,13 @@ internal sealed class PreviewProcessController : IAsyncDisposable
     {
         var scenePath = liveBake ? plan.SceneSourcePath! : plan.SceneInputPath;
         var scriptPath = liveBake ? plan.ScriptSourcePath! : plan.ScriptInputPath;
+        Func<string> scriptRevision = liveBake
+            ? WorkspaceScriptDependencySet.CreateRevisionTracker(scriptPath).ComputeRevision
+            : () => TryGetFileRevision(scriptPath);
         return
         [
-            WatchTarget.Create("Scene", scenePath, liveBake),
-            WatchTarget.Create("Script", scriptPath, liveBake)
+            WatchTarget.Create("Scene", scenePath, () => TryGetFileRevision(scenePath), liveBake),
+            WatchTarget.Create("Script", scriptPath, scriptRevision, liveBake)
         ];
     }
 
@@ -1018,10 +1021,12 @@ internal sealed class PreviewProcessController : IAsyncDisposable
 
     private sealed class WatchTarget
     {
-        private WatchTarget(string name, string path, string revision, bool liveBake)
+        private WatchTarget(string name, string path, Func<string> getRevision, bool liveBake)
         {
             Name = name;
             Path = path;
+            GetRevision = getRevision;
+            var revision = getRevision();
             ObservedRevision = revision;
             LastSuccessfulRevision = liveBake ? revision : null;
             LastRequestedRevision = liveBake ? null : revision;
@@ -1029,6 +1034,7 @@ internal sealed class PreviewProcessController : IAsyncDisposable
 
         public string Name { get; }
         public string Path { get; }
+        public Func<string> GetRevision { get; }
         public string ObservedRevision { get; set; }
         public string? PendingRevision { get; set; }
         public DateTimeOffset PendingSince { get; set; }
@@ -1036,8 +1042,8 @@ internal sealed class PreviewProcessController : IAsyncDisposable
         public string? LastSuccessfulRevision { get; set; }
         public string? FailedRevision { get; set; }
 
-        public static WatchTarget Create(string name, string path, bool liveBake) =>
-            new(name, path, TryGetFileRevision(path), liveBake);
+        public static WatchTarget Create(string name, string path, Func<string> getRevision, bool liveBake) =>
+            new(name, path, getRevision, liveBake);
 
         public void ClearPending()
         {

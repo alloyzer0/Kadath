@@ -20,6 +20,12 @@ Kadath Runtime Package (Linux x86_64)
 `libpng` 仅用于构建阶段生成 KDAT，不是 Runtime 动态依赖。
 若默认 PCM 设备不可用，Runtime 会记录 warning 并降级为 silent；可用 `KADATH_AUDIO_DEVICE` 指定 ALSA PCM 名称。
 
+Editor 诊断工具
+--------------
+- `behavior-tools/kadath-behavior-tool` 是供 Kadath Editor Service 调用的 Luau 行为脚本工具；
+- Editor Service 通过有界 stdin/stdout frame 使用 `--analyze-stdin`，可分析未保存缓冲区而不创建临时 `.luau` 文件；
+- 该工具不等于完整 Linux Editor，本包仍不携带 .NET、Avalonia 或 Editor Service。
+
 资产
 ----
 - `assets/renderer2d/test.texture`：TextureId 1；
@@ -39,4 +45,4 @@ Kadath Runtime Package (Linux x86_64)
 
 仓库开发验证说明
 ----------------
-Linux Runtime 包的默认资产由 Zig + Luau tooling 生成 KSCN v5/KSCP v2，不依赖 PowerShell。Editor Service 的 legacy v4/v1 Publication 路径继续兼容旧项目；包内仍不包含 Linux Editor。
+Linux Runtime 包的默认资产由 Zig + Luau tooling 生成 KSCN v5/KSCP v2，不依赖 PowerShell。Editor Service 的 legacy v4/v1 Publication 路径继续兼容旧项目；包内只携带受控 Behavior Tool，不包含完整 Linux Editor。

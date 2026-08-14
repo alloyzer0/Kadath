@@ -27,6 +27,7 @@ internal static class Program
         try
         {
             Directory.CreateDirectory(root);
+            await ScriptAnalysisHostVerifier.VerifyAsync();
             await VerifyInitialIdentityBoundariesAsync(root);
             await VerifyRejectedReloadAsync(root);
             await VerifyReloadTimeoutAsync(root);
@@ -35,6 +36,8 @@ internal static class Program
             await VerifyBoundedProcessTreeKillAsync(root);
             await LiveBakeWatchVerifier.VerifyAsync(root);
             Console.WriteLine("preview_diagnostics=ok");
+            Console.WriteLine("script_analysis_host_concurrency=ok");
+            Console.WriteLine("script_analysis_cleanup_mapping=ok");
             Console.WriteLine("preview_initial_identity_boundaries=ok");
             Console.WriteLine("preview_reload_rejected=ok");
             Console.WriteLine("preview_reload_timeout=ok");

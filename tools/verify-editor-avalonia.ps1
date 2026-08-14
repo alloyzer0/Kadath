@@ -15,14 +15,16 @@ if ($LASTEXITCODE -ne 0) { throw 'Avalonia project build failed.' }
 
 $output = @(& dotnet run --project $project --no-build -- --headless-smoke 2>&1)
 if ($LASTEXITCODE -ne 0) { throw "Avalonia headless smoke failed: $($output -join ' | ')" }
-foreach ($expected in @('avalonia_compiled_xaml=ok', 'script_source_read_model=ok', 'shared_workspace_injection=ok', 'live_bake_opt_in=ok', 'scene_object_draft_commands=ok', 'texture_import_controls=ok', 'behavior_binding_projection=ok', 'texture_import_projection=ok', 'capability_gating=ok', 'verification=ok'))
+foreach ($expected in @('avalonia_compiled_xaml=ok', 'preview_status_event_log_projection=ok', 'script_source_read_model=ok', 'script_source_diagnostics=ok', 'shared_workspace_injection=ok', 'live_bake_opt_in=ok', 'scene_object_draft_commands=ok', 'texture_import_controls=ok', 'behavior_binding_projection=ok', 'texture_import_projection=ok', 'capability_gating=ok', 'verification=ok'))
 {
     if ($output -notcontains $expected) { throw "Avalonia smoke output is missing: $expected" }
 }
 
 Write-Output 'avalonia_build=ok'
 Write-Output 'avalonia_compiled_xaml=ok'
+Write-Output 'preview_status_event_log_projection=ok'
 Write-Output 'script_source_read_model=ok'
+Write-Output 'script_source_diagnostics=ok'
 Write-Output 'shared_workspace_injection=ok'
 Write-Output 'live_bake_opt_in=ok'
 Write-Output 'scene_object_draft_commands=ok'

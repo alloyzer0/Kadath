@@ -5,6 +5,7 @@ export LC_ALL=C
 package_root=$1
 output=$2
 expected='README.txt
+behavior-tools/kadath-behavior-tool
 bin/assets/audio/lost.audio.wav
 bin/assets/audio/won.audio.wav
 bin/assets/renderer2d/goal.texture

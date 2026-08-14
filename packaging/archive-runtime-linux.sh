@@ -7,6 +7,7 @@ archive_path=$2
 archive_root=kadath-linux-x86_64
 files='README.txt
 SHA256SUMS
+behavior-tools/kadath-behavior-tool
 bin/assets/audio/lost.audio.wav
 bin/assets/audio/won.audio.wav
 bin/assets/renderer2d/goal.texture
@@ -48,7 +49,11 @@ printf '%s\n' "$files" | while IFS= read -r path; do
     cp -- "$package_root/$path" "$stage/$archive_root/$path"
 done
 chmod 755 "$stage/$archive_root/bin/kadath"
-find "$stage/$archive_root" -type f ! -path "$stage/$archive_root/bin/kadath" -exec chmod 644 {} +
+chmod 755 "$stage/$archive_root/behavior-tools/kadath-behavior-tool"
+find "$stage/$archive_root" -type f \
+    ! -path "$stage/$archive_root/bin/kadath" \
+    ! -path "$stage/$archive_root/behavior-tools/kadath-behavior-tool" \
+    -exec chmod 644 {} +
 find "$stage/$archive_root" -type d -exec chmod 755 {} +
 
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=ustar -C "$stage" -cf "$tar_path" "$archive_root"

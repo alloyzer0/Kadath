@@ -172,6 +172,8 @@ pub fn build(b: *std.Build) void {
     var behavior_runtime_mod: ?*std.Build.Module = null;
     var behavior_scene_binding_mod: ?*std.Build.Module = null;
     var behavior_tooling_mod: ?*std.Build.Module = null;
+    var behavior_tool_install_artifact_step: ?*std.Build.Step = null;
+    var behavior_tool_binary: ?std.Build.LazyPath = null;
     if (target.result.os.tag == .windows) {
         const rust_target = switch (target.result.cpu.arch) {
             .x86_64 => "x86_64-pc-windows-gnu",
@@ -293,6 +295,7 @@ pub fn build(b: *std.Build) void {
             .link_libcpp = true,
         });
         runtime_module.addIncludePath(b.path("modules/behavior_script/native"));
+        runtime_module.addIncludePath(b.path("abi"));
         runtime_module.addImport("behavior_common", common_module);
         runtime_module.addImport("behavior_artifact", artifact_module);
         runtime_module.addLibraryPath(.{ .cwd_relative = behavior_build_dir });
@@ -321,6 +324,7 @@ pub fn build(b: *std.Build) void {
             .link_libcpp = true,
         });
         tooling_module.addIncludePath(b.path("modules/behavior_script/native"));
+        tooling_module.addIncludePath(b.path("abi"));
         tooling_module.addImport("behavior_common", common_module);
         tooling_module.addLibraryPath(.{ .cwd_relative = behavior_build_dir });
         tooling_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ behavior_build_dir, "luau" }) });
@@ -366,8 +370,10 @@ pub fn build(b: *std.Build) void {
             .dest_dir = .{ .override = .prefix },
             .dest_sub_path = "behavior-tools/kadath-behavior-tool",
         });
+        behavior_tool_install_artifact_step = &behavior_tool_install.step;
+        behavior_tool_binary = behavior_tool.getEmittedBin();
         const behavior_tool_install_step = b.step("install-behavior-script-tool", "Install the native Luau behavior Publication adapter");
-        behavior_tool_install_step.dependOn(&behavior_tool_install.step);
+        behavior_tool_install_step.dependOn(behavior_tool_install_artifact_step.?);
         exe_mod.addImport("behavior_artifact", artifact_module);
         exe_mod.addImport("behavior_runtime", runtime_module);
         exe_mod.addImport("behavior_scene_binding", scene_binding_module);
@@ -433,6 +439,8 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .link_libcpp = true,
         });
+        behavior_contract_test_mod.addIncludePath(b.path("modules/behavior_script/native"));
+        behavior_contract_test_mod.addIncludePath(b.path("abi"));
         behavior_contract_test_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
         behavior_contract_test_mod.addImport("behavior_tooling", behavior_tooling_mod.?);
         const behavior_contract_tests = b.addTest(.{ .root_module = behavior_contract_test_mod });
@@ -1449,6 +1457,7 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_linux_script_artifact.step);
         b.getInstallStep().dependOn(&install_linux_behavior_source.step);
         b.getInstallStep().dependOn(&install_linux_package_readme.step);
+        b.getInstallStep().dependOn(behavior_tool_install_artifact_step.?);
 
         const package_manifest_command = b.addSystemCommand(&.{"sh"});
         package_manifest_command.addFileArg(b.path("packaging/finalize-linux-runtime.sh"));
@@ -1465,6 +1474,7 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.addFileInput(product_script_source);
         package_manifest_command.addFileInput(b.path("packaging/linux-assets/scripts/patrol.luau"));
         package_manifest_command.addFileInput(b.path("packaging/README-linux.txt"));
+        package_manifest_command.addFileInput(behavior_tool_binary.?);
         package_manifest_command.step.dependOn(&install_exe.step);
         package_manifest_command.step.dependOn(&install_linux_texture_artifact.step);
         package_manifest_command.step.dependOn(&install_linux_secondary_texture_artifact.step);
@@ -1476,6 +1486,7 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.step.dependOn(&install_script_source_template.step);
         package_manifest_command.step.dependOn(&install_linux_behavior_source.step);
         package_manifest_command.step.dependOn(&install_linux_package_readme.step);
+        package_manifest_command.step.dependOn(behavior_tool_install_artifact_step.?);
         const install_package_manifest = b.addInstallFile(package_manifest, "SHA256SUMS");
         b.getInstallStep().dependOn(&install_package_manifest.step);
 

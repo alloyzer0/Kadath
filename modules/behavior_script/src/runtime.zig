@@ -137,13 +137,18 @@ pub const PreparedSet = struct {
     }
 
     pub fn activate(self: *PreparedSet) ActiveSet {
-        const active = ActiveSet{
-            .bindings = self.bindings,
-            .binding_count = self.binding_count,
-        };
+        var active: ActiveSet = undefined;
+        self.activateInto(&active);
+        return active;
+    }
+
+    pub fn activateInto(self: *PreparedSet, active: *ActiveSet) void {
+        active.bindings = self.bindings;
+        active.binding_count = self.binding_count;
+        active.command_intent_count = 0;
+        active.failure_count = 0;
         self.bindings = [_]?PreparedBinding{null} ** max_binding_count;
         self.binding_count = 0;
-        return active;
     }
 };
 

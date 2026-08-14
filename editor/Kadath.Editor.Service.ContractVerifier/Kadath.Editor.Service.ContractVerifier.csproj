@@ -5,6 +5,7 @@
     <RootNamespace>Kadath.Editor.Service.ContractVerifier</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\Kadath.Editor.Core\Kadath.Editor.Core.csproj" />
     <ProjectReference Include="..\Kadath.Editor.Protocol\Kadath.Editor.Protocol.csproj" />
     <ProjectReference Include="..\Kadath.Editor.Service\Kadath.Editor.Service.csproj" />
     <ProjectReference Include="..\Kadath.Editor.Workspace\Kadath.Editor.Workspace.csproj" />

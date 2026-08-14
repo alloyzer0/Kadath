@@ -42,18 +42,20 @@ function New-OpenFixture {
         $assetRoot = Join-Path $package 'bin/assets'
         foreach ($entry in @($scriptManifest.scripts)) {
             $source = [string]$entry.source
-            if ($source -notmatch '^scripts/[^/]+(?:/[^/]+)*\.luau$'
-                -or $source.Contains('..')
-                -or $source.Contains('\')
-                -or [IO.Path]::IsPathRooted($source)) {
+            $unsafeSource = ($source -notmatch '^scripts/[^/]+(?:/[^/]+)*\.luau$') -or
+                $source.Contains('..') -or
+                $source.Contains('\') -or
+                [IO.Path]::IsPathRooted($source)
+            if ($unsafeSource) {
                 throw "Workflow fixture received an unsafe script source path: $source"
             }
             $sourcePath = [IO.Path]::GetFullPath((Join-Path $assetRoot $source))
             $destinationPath = [IO.Path]::GetFullPath((Join-Path $openProjectDirectory $source))
             $assetPrefix = $assetRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
             $projectPrefix = $openProjectDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-            if (-not $sourcePath.StartsWith($assetPrefix, [StringComparison]::OrdinalIgnoreCase)
-                -or -not $destinationPath.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $escapesRoot = -not $sourcePath.StartsWith($assetPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+                -not $destinationPath.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)
+            if ($escapesRoot) {
                 throw "Workflow fixture dependency path escaped its controlled root: $source"
             }
             $destinationDirectory = Split-Path -Parent $destinationPath
@@ -110,6 +112,7 @@ try {
         'workflow_watch_stop=ok',
         'workflow_preview_start=ok',
         'workflow_preview_initial_loaded=ok',
+        'workflow_script_diagnostics_publication=ok',
         'workflow_preview_reload_ack=ok',
         'workflow_preview_stop=ok',
         'workflow_texture_import=ok',

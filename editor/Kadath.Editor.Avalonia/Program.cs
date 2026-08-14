@@ -353,13 +353,89 @@ internal static class Program
         Require(string.Equals(preview.SurfaceMode, PreviewSurfaceModes.ExternalWindow, StringComparison.Ordinal), "preview surface mode mismatch");
         await WaitUntilAsync(() => workspace.Preview.Surface is not null && workspace.Preview.RuntimeProcessId is not null, cancellationToken, "preview surface/runtime pid");
         Console.WriteLine("workflow_preview_start=ok");
-        await WaitUntilAsync(() => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded, cancellationToken, "preview initial loaded identity");
+        await WaitUntilAsync(
+            () => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded,
+            cancellationToken,
+            "preview initial loaded identity",
+            () => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Failed
+                || workspace.Preview.State is EditorPreviewState.Failed or EditorPreviewState.Stopped,
+            () => $"preview={workspace.Preview.State}; runtime={workspace.Preview.Runtime.State}; "
+                + $"runtimeError={workspace.Preview.Runtime.ErrorCode}:{workspace.Preview.Runtime.ErrorMessage}; "
+                + $"events={string.Join(" | ", avaloniaViewModel.EventLog.TakeLast(20).Select(item => $"{item.Event}:{item.Summary}"))}");
         Require(workspace.Preview.Runtime.Scene.ArtifactRevision is { Length: 64 }
             && workspace.Preview.Runtime.Scene.ArtifactBytes is > 0
             && workspace.Preview.Runtime.Script.ArtifactRevision is { Length: 64 }
             && workspace.Preview.Runtime.Script.ArtifactBytes is > 0,
             "Avalonia did not project the atomic Runtime initial identity");
         Console.WriteLine("workflow_preview_initial_loaded=ok");
+
+        var createdScriptDependency = workspace.ProjectSnapshot.Value?.Script.Dependencies?.FirstOrDefault()
+            ?? throw new InvalidOperationException("Created Script v2 project exposes no source dependency.");
+        var createdScriptHierarchyLabel = avaloniaViewModel.HierarchyItems.Single(label =>
+            label.Contains($"script.dependencies[{createdScriptDependency.ScriptId}]", StringComparison.Ordinal));
+        avaloniaViewModel.SelectedHierarchyItem = createdScriptHierarchyLabel;
+        await WaitUntilAsync(
+            () => avaloniaViewModel.HasScriptSourceDocument
+                && avaloniaViewModel.SelectedScriptSourceId == createdScriptDependency.ScriptId,
+            cancellationToken,
+            "created project Script source document");
+        var createdScriptDocument = workspace.ScriptSource.Document
+            ?? throw new InvalidOperationException("Created Script source document is missing.");
+        var retainedScriptArtifactRevision = workspace.Preview.Runtime.Script.ArtifactRevision
+            ?? throw new InvalidOperationException("Runtime Script artifact identity is missing.");
+        var retainedScriptSourceRevision = workspace.Preview.Runtime.Script.SourceRevision;
+        var retainedScriptReloadRequest = workspace.Preview.Reload.Script.LatestRequestId;
+        var scriptArtifactPath = Path.Combine(baked.DerivedDirectory, "script.script");
+        var retainedScriptArtifact = File.ReadAllBytes(scriptArtifactPath);
+        var retainedManifest = File.ReadAllBytes(baked.ManifestPath);
+        var liveBakeFailureCount = avaloniaViewModel.EventLog.Count(item => item.Event == "live_bake_failed");
+
+        const string invalidScriptBuffer = "--!strict\nlocal value: string = 1\nreturn {}";
+        avaloniaViewModel.ScriptSourceText = invalidScriptBuffer;
+        await WaitUntilAsync(
+            () => workspace.ScriptDiagnostics.State == EditorScriptDiagnosticsState.Invalid
+                && workspace.ScriptDiagnostics.Items.Count > 0,
+            cancellationToken,
+            "invalid Script buffer diagnostics");
+        Require(avaloniaViewModel.CanSaveScriptSource,
+            "Invalid diagnostics incorrectly disabled Script source save.");
+        var invalidSaved = await avaloniaViewModel.SaveScriptSourceForCurrentProjectAsync(cancellationToken);
+        Require(string.Equals(invalidSaved.State, "succeeded", StringComparison.OrdinalIgnoreCase)
+            && invalidSaved.SourceDocument.Source == invalidScriptBuffer,
+            "Avalonia did not persist the intentionally invalid Script buffer.");
+        await WaitUntilAsync(
+            () => avaloniaViewModel.EventLog.Count(item => item.Event == "live_bake_failed") > liveBakeFailureCount,
+            cancellationToken,
+            "invalid Script Live Bake failure");
+        Require(File.ReadAllBytes(scriptArtifactPath).AsSpan().SequenceEqual(retainedScriptArtifact)
+            && File.ReadAllBytes(baked.ManifestPath).AsSpan().SequenceEqual(retainedManifest)
+            && workspace.Preview.Runtime.Script.ArtifactRevision == retainedScriptArtifactRevision
+            && workspace.Preview.Runtime.Script.SourceRevision == retainedScriptSourceRevision
+            && workspace.Preview.Reload.Script.LatestRequestId == retainedScriptReloadRequest,
+            "Invalid Script Live Bake replaced the retained KSCP or advanced Runtime identity.");
+
+        var fixedScriptBuffer = createdScriptDocument.Source + "\n-- Avalonia diagnostics workflow fixed\n";
+        avaloniaViewModel.ScriptSourceText = fixedScriptBuffer;
+        await WaitUntilAsync(
+            () => workspace.ScriptDiagnostics.State == EditorScriptDiagnosticsState.Valid,
+            cancellationToken,
+            "fixed Script buffer diagnostics");
+        var fixedSaved = await avaloniaViewModel.SaveScriptSourceForCurrentProjectAsync(cancellationToken);
+        Require(string.Equals(fixedSaved.State, "succeeded", StringComparison.OrdinalIgnoreCase)
+            && fixedSaved.SourceDocument.Source == fixedScriptBuffer,
+            "Avalonia did not persist the fixed Script buffer.");
+        await WaitUntilAsync(
+            () => workspace.Preview.Reload.Script.State == EditorPreviewReloadState.Acknowledged
+                && workspace.Preview.Reload.Script.LatestRequestId > retainedScriptReloadRequest
+                && workspace.Preview.Reload.Script.AcknowledgedArtifactRevision is { } revision
+                && revision != retainedScriptArtifactRevision,
+            cancellationToken,
+            "fixed Script Runtime reload acknowledgement");
+        Require(!File.ReadAllBytes(scriptArtifactPath).AsSpan().SequenceEqual(retainedScriptArtifact)
+            && !File.ReadAllBytes(baked.ManifestPath).AsSpan().SequenceEqual(retainedManifest)
+            && workspace.Preview.Runtime.Script.ArtifactRevision != retainedScriptArtifactRevision,
+            "Fixed Script Live Bake did not publish and load a new KSCP identity.");
+        Console.WriteLine("workflow_script_diagnostics_publication=ok");
 
         var liveGoalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
         liveGoalDraft.PositionX = (double.Parse(liveGoalDraft.PositionX, CultureInfo.InvariantCulture) + 3d).ToString("R", CultureInfo.InvariantCulture);
@@ -409,10 +485,19 @@ internal static class Program
         Console.WriteLine("verification=ok");
     }
 
-    private static async Task WaitUntilAsync(Func<bool> predicate, CancellationToken cancellationToken, string description)
+    private static async Task WaitUntilAsync(
+        Func<bool> predicate,
+        CancellationToken cancellationToken,
+        string description,
+        Func<bool>? terminalFailure = null,
+        Func<string>? failureDetails = null)
     {
         while (!predicate())
         {
+            if (terminalFailure?.Invoke() == true)
+            {
+                throw new InvalidOperationException($"{description} failed: {failureDetails?.Invoke() ?? "terminal failure"}");
+            }
             await Task.Delay(50, cancellationToken);
         }
 
@@ -462,6 +547,13 @@ internal static class Program
         var viewModel = new AvaloniaEditorViewModel(workspace, new InlineEditorViewDispatcher(), Environment.CurrentDirectory);
         await workspace.ConnectAsync();
         if (!ReferenceEquals(viewModel.Workspace, workspace)) { throw new InvalidOperationException("Avalonia ViewModel did not retain injected Workspace."); }
+        await transport.EmitPreviewStatusAsync("live_bake_failed");
+        using var eventProjectionTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(
+            () => viewModel.EventLog.Any(item => item.Event == "live_bake_failed"),
+            eventProjectionTimeout.Token,
+            "preview_status nested event projection");
+        Console.WriteLine("preview_status_event_log_projection=ok");
         var sourceDocument = await workspace.ReadScriptSourceAsync(new ScriptSourceQueryParameters("smoke_created", 1));
         Require(workspace.ScriptSource.State == EditorScriptSourceState.Ready
             && workspace.ScriptSource.Document == sourceDocument
@@ -469,6 +561,29 @@ internal static class Program
             && sourceDocument.Source.Contains("fixed_update", StringComparison.Ordinal),
             "shared Workspace did not expose the selected Behavior Script Asset source");
         Console.WriteLine("script_source_read_model=ok");
+        const string invalidBuffer = "-- invalid\nreturn {}";
+        workspace.ObserveScriptSourceBuffer(sourceDocument, invalidBuffer);
+        using var diagnosticsTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(
+            () => workspace.ScriptDiagnostics.State == EditorScriptDiagnosticsState.Invalid,
+            diagnosticsTimeout.Token,
+            "headless Script diagnostics");
+        Require(viewModel.HasScriptDiagnostics
+            && viewModel.ScriptDiagnostics.Count == 1
+            && viewModel.ScriptDiagnosticsStatus.Contains("1 个错误", StringComparison.Ordinal)
+            && viewModel.ReanalyzeScriptSourceCommand.CanExecute(null),
+            "Avalonia did not project the shared Script diagnostics state and command");
+        viewModel.SelectedScriptDiagnostic = viewModel.ScriptDiagnostics[0];
+        Require(viewModel.ScriptSourceCaretIndex == 0,
+            "Avalonia diagnostic selection did not move the source caret");
+        workspace.ObserveScriptSourceBuffer(sourceDocument, sourceDocument.Source);
+        await WaitUntilAsync(
+            () => workspace.ScriptDiagnostics.State == EditorScriptDiagnosticsState.Valid,
+            diagnosticsTimeout.Token,
+            "headless valid Script diagnostics");
+        Require(!viewModel.HasScriptDiagnostics && viewModel.ScriptDiagnosticsStatus == "未发现问题。",
+            "Avalonia did not clear diagnostics after the buffer became valid");
+        Console.WriteLine("script_source_diagnostics=ok");
         // Live Bake/Watch 保持 opt-in，打开编辑器本身不能隐式启动派生构建。
         if (viewModel.LiveBakeEnabled || viewModel.WatchChanges) { throw new InvalidOperationException("Live Bake/Watch must be disabled by default."); }
         Console.WriteLine("live_bake_opt_in=ok");
@@ -761,6 +876,33 @@ internal static class Program
                         "return { fixed_update = function() end }\n",
                         new string('1', 64))).ConfigureAwait(false);
                     break;
+                case "script_source_analyze":
+                    var analysisParameters = root.GetProperty("params");
+                    var analysisSource = analysisParameters.GetProperty("source").GetString() ?? string.Empty;
+                    var diagnostics = analysisSource.Contains("-- invalid", StringComparison.Ordinal)
+                        ? new[]
+                        {
+                            new ScriptSourceDiagnostic(
+                                "error",
+                                "analysis",
+                                "LUAU_ANALYSIS_ERROR",
+                                "injected analysis error",
+                                "scripts/patrol.luau",
+                                new ScriptSourceRange(
+                                    new ScriptSourcePosition(1, 1),
+                                    new ScriptSourcePosition(1, 2)))
+                        }
+                        : [];
+                    await SendResponseAsync(id, new ScriptSourceAnalysisResult(
+                        diagnostics.Length == 0 ? "valid" : "invalid",
+                        analysisParameters.GetProperty("projectName").GetString() ?? _activeProjectName,
+                        analysisParameters.GetProperty("scriptId").GetUInt32(),
+                        "scripts/patrol.luau",
+                        analysisParameters.GetProperty("sourceHash").GetString() ?? string.Empty,
+                        new string('1', 64),
+                        "luau-0.732-decb2d0",
+                        diagnostics)).ConfigureAwait(false);
+                    break;
                 case "texture_import":
                     var importParameters = root.GetProperty("params");
                     var assetName = importParameters.GetProperty("assetName").GetString()!;
@@ -830,12 +972,15 @@ internal static class Program
         public Task EmitReplayBarrierAsync() =>
             EmitEventAsync("headless_project_replay_barrier", new { });
 
+        public Task EmitPreviewStatusAsync(string eventName) =>
+            EmitEventAsync("preview_status", new { @event = eventName, errorCode = "injected" });
+
         private string[] CreateCommands()
         {
             var commands = new List<string>
             {
                 "get_capabilities", "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot",
-                "asset_catalog_snapshot", "script_source_read", "texture_import", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
+                "asset_catalog_snapshot", "script_source_read", "script_source_analyze", "texture_import", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
             };
             if (_advertiseProjectCreate) { commands.Insert(2, "project_create"); }
             return commands.ToArray();

@@ -20,6 +20,7 @@ public interface IEditorSessionBackend : IAsyncDisposable
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(ProjectSessionInfo project, CancellationToken cancellationToken);
     Task<ScriptSourceDocument> GetScriptSourceAsync(ProjectSessionInfo project, ScriptSourceQueryParameters parameters, CancellationToken cancellationToken);
+    Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(ProjectSessionInfo project, ScriptSourceAnalyzeParameters parameters, CancellationToken cancellationToken);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken);
     Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken);
@@ -47,6 +48,7 @@ public interface IEditorSession : IAsyncDisposable
     Task<HierarchySnapshot> GetHierarchySnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AssetCatalogSnapshot> GetAssetCatalogSnapshotAsync(SnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ScriptSourceDocument> GetScriptSourceAsync(ScriptSourceQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(ScriptSourceAnalyzeParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default);
@@ -72,6 +74,7 @@ public sealed class EditorSession : IEditorSession
         "asset_catalog_snapshot",
         "publication_snapshot",
         "script_source_read",
+        "script_source_analyze",
         "texture_import",
         "authoring_apply",
         "authoring_undo",
@@ -179,6 +182,74 @@ public sealed class EditorSession : IEditorSession
         catch (EditorOperationException exception)
         {
             await EmitAsync("script_source_read_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+            throw;
+        }
+    }
+
+    public async Task<ScriptSourceAnalysisResult> AnalyzeScriptSourceAsync(
+        ScriptSourceAnalyzeParameters parameters,
+        string? requestId,
+        CancellationToken cancellationToken = default)
+    {
+        var project = RequireProject(parameters.ProjectName);
+        var identity = new
+        {
+            projectName = project.ProjectName,
+            scriptId = parameters.ScriptId,
+            sourceHash = parameters.SourceHash
+        };
+        await EmitAsync("script_source_analysis_started", identity, requestId);
+        try
+        {
+            var result = await _backend.AnalyzeScriptSourceAsync(project, parameters, cancellationToken);
+            await EmitAsync("script_source_analysis_completed", new
+            {
+                identity.projectName,
+                identity.scriptId,
+                identity.sourceHash,
+                state = result.State,
+                diagnosticCount = result.Diagnostics.Length,
+                authoringRevision = result.AuthoringRevision,
+                toolchainIdentity = result.ToolchainIdentity
+            }, requestId);
+            return result;
+        }
+        catch (EditorOperationException exception)
+        {
+            await EmitAsync("script_source_analysis_failed", new
+            {
+                identity.projectName,
+                identity.scriptId,
+                identity.sourceHash,
+                errorCode = exception.Code,
+                message = BoundedAnalysisMessage(exception.Message)
+            }, requestId);
+            throw;
+        }
+        catch (OperationCanceledException)
+        {
+            const string code = "script_source_analysis_cancelled";
+            await EmitAsync("script_source_analysis_failed", new
+            {
+                identity.projectName,
+                identity.scriptId,
+                identity.sourceHash,
+                errorCode = code,
+                message = "Script source analysis was cancelled."
+            }, requestId);
+            throw new EditorOperationException(code, "Script source analysis was cancelled.");
+        }
+        catch (Exception exception)
+        {
+            const string code = "command_failed";
+            await EmitAsync("script_source_analysis_failed", new
+            {
+                identity.projectName,
+                identity.scriptId,
+                identity.sourceHash,
+                errorCode = code,
+                message = BoundedAnalysisMessage(exception.Message)
+            }, requestId);
             throw;
         }
     }
@@ -361,6 +432,14 @@ public sealed class EditorSession : IEditorSession
             throw new EditorOperationException("project_mismatch", $"Current project is {_currentProject.ProjectName}, not {requestedName}.");
         }
         return _currentProject;
+    }
+
+    private static string BoundedAnalysisMessage(string value)
+    {
+        if (value.Length <= 1024) return value;
+        var length = 1024;
+        if (char.IsHighSurrogate(value[length - 1]) && char.IsLowSurrogate(value[length])) length -= 1;
+        return value[..length];
     }
 
     private async Task EmitAsync(string eventName, object data, string? requestId)

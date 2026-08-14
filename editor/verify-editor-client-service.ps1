@@ -26,7 +26,6 @@ $service = if ([string]::IsNullOrWhiteSpace($ServiceDll)) {
     (Resolve-Path -LiteralPath $ServiceDll).Path
 }
 $verifier = Join-Path $editorRoot 'Kadath.Editor.Client.ContractVerifier\Kadath.Editor.Client.ContractVerifier.csproj'
-$author = Join-Path $kadath 'tools\editor-author.ps1'
 
 if (-not (Test-Path -LiteralPath $service -PathType Leaf)) { throw "Editor Service DLL does not exist: $service" }
 if (-not (Test-Path -LiteralPath $verifier -PathType Leaf)) { throw "Client verifier project does not exist: $verifier" }
@@ -40,11 +39,12 @@ if (-not $projectDirectory.StartsWith($projectsPrefix, [StringComparison]::Ordin
 
 $created = $false
 try {
-    & pwsh -NoProfile -File $author -Action Create -PackageRoot $package -ProjectName $ProjectName | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Authoring Create failed with exit code $LASTEXITCODE" }
+    if (Test-Path -LiteralPath $projectDirectory) {
+        throw "Verifier project already exists: $projectDirectory"
+    }
     $created = $true
 
-    # 该入口跨越真实 stdio transport，不使用 fake server；它会验证 handshake、capabilities、open、validate、shutdown。
+    # 该入口跨越真实 stdio transport，不使用 fake server；项目由当前 project_create RPC 创建。
     $verifierArguments = @($service, $kadath, $package, $ProjectName)
     if ($RealServiceOnly) { $verifierArguments = @('--real-service-only') + $verifierArguments }
     & dotnet run --project $verifier --no-build -- @verifierArguments

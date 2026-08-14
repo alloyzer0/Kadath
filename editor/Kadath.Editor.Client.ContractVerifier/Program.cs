@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using Kadath.Editor.Client;
@@ -23,6 +25,7 @@ internal static class Program
             await VerifyProjectCreateClientContractAsync();
             await VerifyProjectCreateCapabilityProjectionAsync();
             await VerifyProjectCreateWorkspaceProjectionAsync();
+            await ScriptDiagnosticsVerifier.VerifyAsync();
             await VerifyClientAndViewModelsAsync();
             await VerifyUnexpectedEofProjectionAsync();
             await VerifyExpectedShutdownProjectionAsync();
@@ -46,6 +49,7 @@ internal static class Program
             Console.WriteLine("project_create_client=ok");
             Console.WriteLine("project_create_capability=ok");
             Console.WriteLine("project_create_workspace=ok");
+            Console.WriteLine("script_diagnostics_state_machine=ok");
             Console.WriteLine("viewmodel_state=ok");
             Console.WriteLine("verification=ok");
             return 0;
@@ -545,11 +549,20 @@ internal static class Program
         await client.ConnectAsync().ConfigureAwait(false);
         var capabilities = await client.GetCapabilitiesAsync().ConfigureAwait(false);
         Assert(capabilities.Commands.Contains("project_open"), "real service did not advertise project_open");
+        Assert(capabilities.Commands.Contains("project_create"), "real service did not advertise project_create");
         Assert(capabilities.Commands.Contains("project_validate"), "real service did not advertise project_validate");
         Assert(capabilities.Commands.Contains("script_source_read")
+            && capabilities.Commands.Contains("script_source_analyze")
             && capabilities.Commands.Contains("script_source_edit")
             && capabilities.Commands.Contains("script_source_undo"),
             "real service did not advertise script source commands");
+        var projectDirectory = Path.Combine(packageRoot, "bin", "projects", projectName);
+        if (!Directory.Exists(projectDirectory))
+        {
+            var created = await client.CreateProjectAsync(new ProjectCreateParameters(packageRoot, projectName)).ConfigureAwait(false);
+            Assert(created.ProjectName == projectName && Directory.Exists(created.ProjectDirectory),
+                "real service project_create did not materialize the controlled project");
+        }
         var project = await client.OpenProjectAsync(new ProjectOpenParameters(packageRoot, projectName)).ConfigureAwait(false);
         Assert(project.ProjectName == projectName, "real service project_open mismatch");
         var validation = await client.ValidateProjectAsync(new ProjectValidateParameters()).ConfigureAwait(false);
@@ -591,6 +604,51 @@ internal static class Program
             && sourceDocument.Source.Contains("fixed_update", StringComparison.Ordinal)
             && sourceDocument.AuthoringRevision == projectSnapshot.AuthoringRevision,
             "real service script source read failed");
+        var sourcePath = Path.Combine(project.ProjectDirectory, sourceDocument.SourcePath);
+        var sourceBytesBeforeAnalysis = File.ReadAllBytes(sourcePath);
+        var validAnalysis = await client.AnalyzeScriptSourceAsync(new ScriptSourceAnalyzeParameters(
+            projectName,
+            sourceDocument.ScriptId,
+            sourceDocument.Source,
+            HashScriptSource(sourceDocument.Source))).ConfigureAwait(false);
+        Assert(validAnalysis.State == "valid"
+            && validAnalysis.Diagnostics.Length == 0
+            && validAnalysis.ProjectName == projectName
+            && validAnalysis.ScriptId == sourceDocument.ScriptId
+            && validAnalysis.SourcePath == sourceDocument.SourcePath
+            && validAnalysis.AuthoringRevision == sourceDocument.AuthoringRevision
+            && validAnalysis.ToolchainIdentity == "luau-0.732-decb2d0",
+            "real service valid Script Buffer analysis mismatch");
+
+        const string invalidAnalysisSource = "--!strict\nlocal value: string = 1\nreturn {}";
+        var invalidAnalysis = await client.AnalyzeScriptSourceAsync(new ScriptSourceAnalyzeParameters(
+            projectName,
+            sourceDocument.ScriptId,
+            invalidAnalysisSource,
+            HashScriptSource(invalidAnalysisSource))).ConfigureAwait(false);
+        Assert(invalidAnalysis.State == "invalid"
+            && invalidAnalysis.Diagnostics.Length >= 1
+            && invalidAnalysis.Diagnostics.All(value => value.SourcePath == sourceDocument.SourcePath)
+            && invalidAnalysis.Diagnostics[0].Stage == "analysis"
+            && invalidAnalysis.Diagnostics[0].Code == "LUAU_ANALYSIS_ERROR"
+            && invalidAnalysis.Diagnostics[0].Range?.Start.Line == 2,
+            "real service invalid Script Buffer was not returned as structured diagnostics");
+        try
+        {
+            _ = await client.AnalyzeScriptSourceAsync(new ScriptSourceAnalyzeParameters(
+                projectName,
+                sourceDocument.ScriptId,
+                sourceDocument.Source,
+                new string('0', 64))).ConfigureAwait(false);
+            throw new InvalidOperationException("mismatched Script Buffer hash unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "invalid_script_source_analysis_request") { }
+        var projectAfterAnalysis = await client.GetProjectSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
+        Assert(projectAfterAnalysis.AuthoringRevision == projectSnapshot.AuthoringRevision
+            && File.ReadAllBytes(sourcePath).AsSpan().SequenceEqual(sourceBytesBeforeAnalysis),
+            "Script Buffer analysis changed project revision or persisted source bytes");
+        Console.WriteLine("script_diagnostics_service_smoke=ok");
+
         const string rpcMarker = "\n-- rpc script source smoke\n";
         var sourceEdited = await client.EditScriptSourceAsync(
             new ScriptSourceEditParameters(projectName, sourceDocument.AuthoringRevision, 1, sourceDocument.Source + rpcMarker)).ConfigureAwait(false);
@@ -1121,6 +1179,9 @@ internal static class Program
     {
         if (!condition) { throw new InvalidOperationException(message); }
     }
+
+    private static string HashScriptSource(string source) =>
+        Convert.ToHexString(SHA256.HashData(new UTF8Encoding(false, true).GetBytes(source))).ToLowerInvariant();
 }
 
 /// <summary>
@@ -1155,6 +1216,8 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private bool _textureImported;
     private bool _failNextPreviewStop;
     private readonly bool _advertiseProjectCreate;
+    private readonly bool _advertiseScriptAnalysis;
+    private int _scriptAnalyzeRequestCount;
     private TaskCompletionSource<bool>? _delayedValidationRelease;
     private TaskCompletionSource<bool>? _delayedValidationCompleted;
     private TaskCompletionSource<bool>? _delayedCreateRelease;
@@ -1162,7 +1225,11 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private TaskCompletionSource<bool>? _delayedOperationRelease;
     private TaskCompletionSource<bool>? _delayedOperationCompleted;
 
-    public ScriptedTransport(bool advertiseProjectCreate = true) => _advertiseProjectCreate = advertiseProjectCreate;
+    public ScriptedTransport(bool advertiseProjectCreate = true, bool advertiseScriptAnalysis = true)
+    {
+        _advertiseProjectCreate = advertiseProjectCreate;
+        _advertiseScriptAnalysis = advertiseScriptAnalysis;
+    }
 
     public bool IsOpen => _started && !_stop.IsCancellationRequested;
     public bool DelayedValidationPending => _delayedValidationRelease is not null;
@@ -1171,6 +1238,8 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     public JsonElement? LastProjectCreateRequest { get; private set; }
     public JsonElement? LastAuthoringApplyRequest { get; private set; }
     public JsonElement? LastTextureImportRequest { get; private set; }
+    public JsonElement? LastScriptAnalyzeRequest { get; private set; }
+    public int ScriptAnalyzeRequestCount => Volatile.Read(ref _scriptAnalyzeRequestCount);
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
@@ -1218,6 +1287,11 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     {
         var id = request.GetProperty("id").GetString() ?? "";
         var method = request.GetProperty("method").GetString() ?? "";
+        if (method == "script_source_analyze")
+        {
+            LastScriptAnalyzeRequest = request.Clone();
+            Interlocked.Increment(ref _scriptAnalyzeRequestCount);
+        }
         if (string.Equals(method, _failNextMethod, StringComparison.Ordinal))
         {
             _failNextMethod = null;
@@ -1354,6 +1428,11 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 await EmitEventAsync("publication_snapshot_created", publication, id).ConfigureAwait(false);
                 await SendResponseAsync(id, publication).ConfigureAwait(false);
                 break;
+            case "script_source_analyze":
+                var analysis = NewScriptAnalysis(request);
+                if (DelayOperationIfRequested(method, () => SendResponseAsync(id, analysis))) { break; }
+                await SendResponseAsync(id, analysis).ConfigureAwait(false);
+                break;
             case "bake_start":
                 var bakeParameters = request.GetProperty("params");
                 var bakeTarget = bakeParameters.GetProperty("target").GetString() ?? "Both";
@@ -1475,10 +1554,12 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         var commands = new List<string>
         {
             "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot",
-            "publication_snapshot", "texture_import", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop",
+            "publication_snapshot", "script_source_read", "script_source_edit", "script_source_undo", "texture_import",
+            "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop",
             "preview_start", "preview_stop", "shutdown"
         };
         if (_advertiseProjectCreate) { commands.Insert(1, "project_create"); }
+        if (_advertiseScriptAnalysis) { commands.Insert(commands.IndexOf("texture_import"), "script_source_analyze"); }
         return commands.ToArray();
     }
 
@@ -1641,6 +1722,35 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         undoDepth,
         NewProjectSnapshot(),
         NewHierarchySnapshot());
+    private ScriptSourceAnalysisResult NewScriptAnalysis(JsonElement request)
+    {
+        var parameters = request.GetProperty("params");
+        var source = parameters.GetProperty("source").GetString() ?? string.Empty;
+        var projectName = parameters.GetProperty("projectName").GetString() ?? _activeProjectName;
+        var scriptId = parameters.GetProperty("scriptId").GetUInt32();
+        var sourceHash = parameters.GetProperty("sourceHash").GetString() ?? string.Empty;
+        var diagnostics = source.Contains("-- invalid", StringComparison.Ordinal)
+            ? new[]
+            {
+                new ScriptSourceDiagnostic(
+                    "error",
+                    "analysis",
+                    "LUAU_ANALYSIS_ERROR",
+                    "injected Luau analysis error",
+                    "scripts/patrol.luau",
+                    new ScriptSourceRange(new ScriptSourcePosition(1, 1), new ScriptSourcePosition(1, 2)))
+            }
+            : [];
+        return new ScriptSourceAnalysisResult(
+            diagnostics.Length == 0 ? "valid" : "invalid",
+            projectName,
+            scriptId,
+            "scripts/patrol.luau",
+            sourceHash,
+            new string('1', 64),
+            "luau-0.732-decb2d0",
+            diagnostics);
+    }
     private static HierarchySnapshot NewHierarchySnapshot(string projectName = "demo") => new(
         1,
         1,

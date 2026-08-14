@@ -35,6 +35,10 @@ const scene_source =
     \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[]}]}
 ;
 
+test "Behavior Host keeps runtime ownership stack bounded" {
+    try std.testing.expect(@sizeOf(behavior_host.Runtime) < 1024);
+}
+
 test "Behavior Host applies on_start and fixed commands in Scene order" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

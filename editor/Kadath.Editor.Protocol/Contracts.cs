@@ -142,6 +142,36 @@ public sealed record ScriptSourceUndoParameters(
     string? ProjectName,
     string ExpectedRevision);
 
+public sealed record ScriptSourceAnalyzeParameters(
+    string? ProjectName,
+    uint ScriptId,
+    string Source,
+    string SourceHash);
+
+public sealed record ScriptSourcePosition(int Line, int Column);
+
+public sealed record ScriptSourceRange(
+    ScriptSourcePosition Start,
+    ScriptSourcePosition End);
+
+public sealed record ScriptSourceDiagnostic(
+    string Severity,
+    string Stage,
+    string Code,
+    string Message,
+    string SourcePath,
+    ScriptSourceRange? Range);
+
+public sealed record ScriptSourceAnalysisResult(
+    string State,
+    string ProjectName,
+    uint ScriptId,
+    string SourcePath,
+    string SourceHash,
+    string AuthoringRevision,
+    string ToolchainIdentity,
+    ScriptSourceDiagnostic[] Diagnostics);
+
 public static class EditorSnapshotVersions
 {
     public const int ProjectModel = 1;

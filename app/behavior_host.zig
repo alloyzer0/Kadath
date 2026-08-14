@@ -21,12 +21,19 @@ pub const LoadedRuntime = struct {
 };
 
 pub const Runtime = struct {
-    package: ?behavior_runtime.Package = null,
-    active: ?behavior_runtime.ActiveSet = null,
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    package: ?*behavior_runtime.Package = null,
+    active: ?*behavior_runtime.ActiveSet = null,
 
     pub fn deinit(self: *Runtime) void {
-        if (self.active) |*active| active.deinit();
-        if (self.package) |*package| package.deinit();
+        if (self.active) |active| {
+            active.deinit();
+            self.allocator.destroy(active);
+        }
+        if (self.package) |package| {
+            package.deinit();
+            self.allocator.destroy(package);
+        }
         self.* = .{};
     }
 
@@ -40,7 +47,7 @@ pub const Runtime = struct {
     }
 
     pub fn onStart(self: *Runtime, scene: *const scene_api.Scene) !TranslationBatch {
-        const active = if (self.active) |*value| value else return error.BehaviorRuntimeNotLoaded;
+        const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
         var positions: [scene_api.max_scene_object_count][2]f32 = undefined;
         for (scene.objects.slice(), 0..) |object, index| positions[index] = object.sprite.position;
         return aggregateCommands(active, scene, positions[0..scene.objects.count], active.onStartCommands(), true);
@@ -53,7 +60,7 @@ pub const Runtime = struct {
         dt_seconds: f32,
     ) !TranslationBatch {
         if (positions.len != scene.objects.count) return error.InvalidBehaviorSnapshotBatch;
-        const active = if (self.active) |*value| value else return error.BehaviorRuntimeNotLoaded;
+        const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
         var snapshots: [scene_api.max_scene_object_count]behavior_runtime.ObjectSnapshot = undefined;
         for (scene.objects.slice(), positions, 0..) |*object, position, index| {
             snapshots[index] = .{ .object_id = object.objectId.slice(), .position = position };
@@ -83,7 +90,9 @@ pub fn loadWithIdentity(
 pub fn initArtifact(allocator: std.mem.Allocator, bytes: []const u8, scene: *const scene_api.Scene) !Runtime {
     if (scene.schemaVersion != scene_api.current_schema_version) return error.UnsupportedBehaviorSceneSchema;
     var diagnostic = behavior_runtime.Diagnostic{};
-    var package = behavior_runtime.Package.init(
+    const package = try allocator.create(behavior_runtime.Package);
+    errdefer allocator.destroy(package);
+    package.* = behavior_runtime.Package.init(
         allocator,
         bytes,
         behavior_runtime.default_asset_memory_limit,
@@ -95,11 +104,15 @@ pub fn initArtifact(allocator: std.mem.Allocator, bytes: []const u8, scene: *con
     };
     errdefer package.deinit();
     const normalized = try scene_adapter.normalize(&package.parsed, scene);
-    var prepared = normalized.prepare(&package, &diagnostic) catch |err| {
+    var prepared = normalized.prepare(package, &diagnostic) catch |err| {
         logDiagnostic("Behavior binding preparation failed", err, diagnostic.slice());
         return err;
     };
-    return .{ .package = package, .active = prepared.activate() };
+    errdefer prepared.deinit();
+    const active = try allocator.create(behavior_runtime.ActiveSet);
+    errdefer allocator.destroy(active);
+    prepared.activateInto(active);
+    return .{ .allocator = allocator, .package = package, .active = active };
 }
 
 fn aggregateCommands(

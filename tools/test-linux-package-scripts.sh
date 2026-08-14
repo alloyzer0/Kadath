@@ -22,6 +22,7 @@ archived_package="$workspace/extracted/kadath-linux-x86_64"
 test -f "$archived_package/bin/assets/scenes/preview.scene.json"
 test -f "$archived_package/bin/assets/scripts/preview.script.json"
 test -f "$archived_package/bin/assets/scripts/patrol.luau"
+test -x "$archived_package/behavior-tools/kadath-behavior-tool"
 
 touch "$workspace/package/unexpected.txt"
 if sh "$finalizer" "$workspace/package" "$workspace/unexpected-manifest" >/dev/null 2>&1; then
@@ -69,6 +70,7 @@ fi
 printf 'linux_package_reproducible_archive=ok\n'
 printf 'linux_package_archive_manifest=ok\n'
 printf 'linux_package_json_templates_archived=ok\n'
+printf 'linux_package_behavior_tool_archived=ok\n'
 printf 'linux_package_unexpected_file_rejected=ok\n'
 printf 'linux_package_symlink_rejected=ok\n'
 printf 'linux_package_hardlink_rejected=ok\n'
