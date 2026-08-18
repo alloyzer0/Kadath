@@ -293,6 +293,7 @@ internal static class WorkspaceScriptCodec
     internal const string BehaviorFormat = "KSCP-SCRIPT-V2";
     private const int LegacyVersion = 1;
     private const int BehaviorVersion = 2;
+    private const int BehaviorHostInterfaceVersion = 2;
     private const int BehaviorHeaderBytes = 60;
     private const int BehaviorEntryHeaderBytes = 84;
     private const int MaxBehaviorArtifactBytes = 16 * 1024 * 1024;
@@ -396,7 +397,7 @@ internal static class WorkspaceScriptCodec
     {
         if (artifact.Length is < BehaviorHeaderBytes or > MaxBehaviorArtifactBytes)
             throw new InvalidDataException("Behavior Script artifact layout mismatch.");
-        if (ReadUInt32(artifact, 8) != BehaviorVersion || ReadUInt32(artifact, 12) != 1)
+        if (ReadUInt32(artifact, 8) != BehaviorVersion || ReadUInt32(artifact, 12) != BehaviorHostInterfaceVersion)
             throw new InvalidDataException("Behavior Script artifact contract mismatch.");
         var entryCount = ReadUInt32(artifact, 16);
         var toolchainIdentityBytes = ReadUInt32(artifact, 20);

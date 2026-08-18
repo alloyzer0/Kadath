@@ -22,6 +22,7 @@ archived_package="$workspace/extracted/kadath-linux-x86_64"
 test -f "$archived_package/bin/assets/scenes/preview.scene.json"
 test -f "$archived_package/bin/assets/scripts/preview.script.json"
 test -f "$archived_package/bin/assets/scripts/patrol.luau"
+test -f "$archived_package/bin/assets/scripts/player_controller.luau"
 test -x "$archived_package/behavior-tools/kadath-behavior-tool"
 
 touch "$workspace/package/unexpected.txt"

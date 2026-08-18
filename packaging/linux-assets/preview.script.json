@@ -1,6 +1,7 @@
 {
   "schemaVersion": 2,
   "scripts": [
-    { "scriptId": 1, "source": "scripts/patrol.luau" }
+    { "scriptId": 1, "source": "scripts/patrol.luau" },
+    { "scriptId": 2, "source": "scripts/player_controller.luau" }
   ]
 }

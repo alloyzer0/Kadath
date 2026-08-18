@@ -5,6 +5,8 @@ const content_identity = @import("content_identity.zig");
 const scene_adapter = @import("behavior_scene_adapter.zig");
 const scene_api = @import("scene.zig");
 
+pub const InputSnapshot = behavior_runtime.InputSnapshot;
+
 pub const TranslationBatch = struct {
     deltas: [scene_api.max_scene_object_count][2]f64 = [_][2]f64{.{ 0, 0 }} ** scene_api.max_scene_object_count,
     object_count: usize = 0,
@@ -58,6 +60,7 @@ pub const Runtime = struct {
         scene: *const scene_api.Scene,
         positions: []const [2]f32,
         dt_seconds: f32,
+        input: InputSnapshot,
     ) !TranslationBatch {
         if (positions.len != scene.objects.count) return error.InvalidBehaviorSnapshotBatch;
         const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
@@ -65,7 +68,7 @@ pub const Runtime = struct {
         for (scene.objects.slice(), positions, 0..) |*object, position, index| {
             snapshots[index] = .{ .object_id = object.objectId.slice(), .position = position };
         }
-        try active.runFixed(dt_seconds, snapshots[0..scene.objects.count]);
+        try active.runFixed(dt_seconds, snapshots[0..scene.objects.count], input);
         const batch = try aggregateCommands(active, scene, positions, active.commandSlice(), false);
         logFailures(active);
         return batch;

@@ -526,6 +526,7 @@ internal static class ProjectLifecycleVerifier
         var scene = File.ReadAllBytes(Path.Combine(productAssets, "preview.scene.json"));
         var script = File.ReadAllBytes(Path.Combine(productAssets, "preview.script.json"));
         var patrol = File.ReadAllBytes(Path.Combine(productAssets, "scripts", "patrol.luau"));
+        var playerController = File.ReadAllBytes(Path.Combine(productAssets, "scripts", "player_controller.luau"));
         Directory.CreateDirectory(Path.Combine(packageRoot, "bin", "assets", "scenes"));
         Directory.CreateDirectory(Path.Combine(packageRoot, "bin", "assets", "scripts"));
         Directory.CreateDirectory(Path.Combine(packageRoot, "bin", "projects"));
@@ -533,14 +534,19 @@ internal static class ProjectLifecycleVerifier
         File.WriteAllBytes(Path.Combine(packageRoot, "bin", "assets", "scripts", "preview.script.json"), script);
         var templateDependencyPath = Path.Combine(packageRoot, "bin", "assets", "scripts", "patrol.luau");
         File.WriteAllBytes(templateDependencyPath, patrol);
+        var templatePlayerControllerPath = Path.Combine(packageRoot, "bin", "assets", "scripts", "player_controller.luau");
+        File.WriteAllBytes(templatePlayerControllerPath, playerController);
         File.WriteAllBytes(Path.Combine(packageRoot, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), [0]);
 
         var lifecycle = new WorkspaceProjectLifecycleModel();
         var created = await lifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "behavior-created"), default);
         var createdDependencyPath = Path.Combine(created.ProjectDirectory, "scripts", "patrol.luau");
+        var createdPlayerControllerPath = Path.Combine(created.ProjectDirectory, "scripts", "player_controller.luau");
         Require(File.ReadAllBytes(created.ScenePath).AsSpan().SequenceEqual(scene), "Behavior Create did not preserve the Scene v5 template.");
         Require(File.ReadAllBytes(created.ScriptPath).AsSpan().SequenceEqual(script), "Behavior Create did not preserve the Script v2 manifest.");
         Require(File.ReadAllBytes(createdDependencyPath).AsSpan().SequenceEqual(patrol), "Behavior Create did not copy the declared Luau dependency.");
+        Require(File.ReadAllBytes(createdPlayerControllerPath).AsSpan().SequenceEqual(playerController),
+            "Behavior Create did not copy the Player controller dependency.");
         Require(!File.Exists(Path.Combine(created.ProjectDirectory, ".kadath-create-claim")), "Behavior Create left an ownership claim.");
         using (var document = JsonDocument.Parse(File.ReadAllBytes(created.ScenePath)))
         {
@@ -556,15 +562,22 @@ internal static class ProjectLifecycleVerifier
         var snapshot = await readModel.ReadProjectAsync(created, default);
         Require(snapshot.Scene.SchemaVersion == 5 && snapshot.Script.SchemaVersion == 2,
             "Behavior ReadModel did not preserve v5/v2 schema versions.");
-        Require(snapshot.Script.Dependencies?.Single().Source == "scripts/patrol.luau",
+        Require(snapshot.Script.Dependencies?.Select(value => (value.ScriptId, value.Source))
+                .SequenceEqual([(1u, "scripts/patrol.luau"), (2u, "scripts/player_controller.luau")]) == true,
             "Behavior ReadModel did not expose Script dependency metadata.");
         Require(snapshot.Scene.Objects?.Single(value => value.ObjectId == "hazard-1").Behaviors?.Single().ScriptId == 1,
             "Behavior ReadModel did not expose Scene behavior bindings.");
+        Require(snapshot.Scene.Objects?.Single(value => value.ObjectId == "player").Behaviors?.Single().ScriptId == 2,
+            "Behavior ReadModel did not expose Player movement behavior ownership.");
         var hierarchy = await readModel.ReadHierarchyAsync(created, default);
         Require(hierarchy.Nodes.Any(node => node.Kind == "ScriptDependency" && node.Id == "script.dependencies[1]"),
             "Behavior hierarchy did not expose Script dependency node.");
+        Require(hierarchy.Nodes.Any(node => node.Kind == "ScriptDependency" && node.Id == "script.dependencies[2]"),
+            "Behavior hierarchy did not expose the Player controller dependency node.");
         Require(hierarchy.Nodes.Any(node => node.Kind == "SceneBehavior" && node.Id == "scene.objects[hazard-1].behaviors[1]"),
             "Behavior hierarchy did not expose Scene behavior node.");
+        Require(hierarchy.Nodes.Any(node => node.Kind == "SceneBehavior" && node.Id == "scene.objects[player].behaviors[2]"),
+            "Behavior hierarchy did not expose Player movement behavior node.");
         var authoring = new WorkspaceAuthoringModel();
         var previousToolPath = Environment.GetEnvironmentVariable("KADATH_BEHAVIOR_TOOL");
         try
@@ -654,37 +667,37 @@ internal static class ProjectLifecycleVerifier
         var assetCreate = await assetLifecycle.CreateAsync(created, sourceUndo.Revision, "scripts/chase.luau", default);
         var chasePath = Path.Combine(created.ProjectDirectory, "scripts", "chase.luau");
         Require(assetCreate.State == "succeeded"
-            && assetCreate.Asset.ScriptId == 2
+            && assetCreate.Asset.ScriptId == 3
             && assetCreate.Asset.SourcePath == "scripts/chase.luau"
-            && assetCreate.SourceDocument?.ScriptId == 2
-            && assetCreate.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u, 2u]) == true
-            && assetCreate.HierarchySnapshot.Nodes.Any(node => node.Id == "script.dependencies[2]")
+            && assetCreate.SourceDocument?.ScriptId == 3
+            && assetCreate.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u, 2u, 3u]) == true
+            && assetCreate.HierarchySnapshot.Nodes.Any(node => node.Id == "script.dependencies[3]")
             && File.Exists(chasePath),
             "Behavior Script Asset Create did not commit the Manifest/source transaction.");
         using (var createdManifest = JsonDocument.Parse(File.ReadAllBytes(created.ScriptPath)))
         {
             Require(createdManifest.RootElement.GetProperty("scripts").EnumerateArray()
                 .Select(value => (value.GetProperty("scriptId").GetUInt32(), value.GetProperty("source").GetString()))
-                .SequenceEqual([(1u, "scripts/patrol.luau"), (2u, "scripts/chase.luau")]),
+                .SequenceEqual([(1u, "scripts/patrol.luau"), (2u, "scripts/player_controller.luau"), (3u, "scripts/chase.luau")]),
                 "Behavior Script Asset Create did not append the canonical Manifest entry.");
         }
 
         var defaultSource = File.ReadAllBytes(chasePath);
         var assetRename = await assetLifecycle.RenameAsync(
-            created, assetCreate.Revision, 2, "scripts/enemy_chase.luau", default);
+            created, assetCreate.Revision, assetCreate.Asset.ScriptId, "scripts/enemy_chase.luau", default);
         var renamedPath = Path.Combine(created.ProjectDirectory, "scripts", "enemy_chase.luau");
         Require(assetRename.State == "succeeded"
-            && assetRename.Asset == new WorkspaceScriptAssetIdentity(2, "scripts/enemy_chase.luau")
+            && assetRename.Asset == new WorkspaceScriptAssetIdentity(3, "scripts/enemy_chase.luau")
             && !File.Exists(chasePath)
             && File.ReadAllBytes(renamedPath).AsSpan().SequenceEqual(defaultSource)
-            && assetRename.ProjectSnapshot.Script.Dependencies?.Single(value => value.ScriptId == 2).Source == "scripts/enemy_chase.luau",
+            && assetRename.ProjectSnapshot.Script.Dependencies?.Single(value => value.ScriptId == 3).Source == "scripts/enemy_chase.luau",
             "Behavior Script Asset Rename did not preserve identity and source bytes.");
 
         var boundObjects = assetRename.ProjectSnapshot.Scene.Objects!
             .Select(value => value.ObjectId == "decoration-1"
                 ? value with
                 {
-                    Behaviors = [new ProjectModelSceneBehaviorBinding(2, [])]
+                    Behaviors = [new ProjectModelSceneBehaviorBinding(3, [])]
                 }
                 : value)
             .Select(ToDefinition)
@@ -692,23 +705,23 @@ internal static class ProjectLifecycleVerifier
         var bindAsset = await authoring.ApplyAsync(created, assetRename.Revision,
             new AuthoringPatch(SceneObjects: boundObjects), default);
         await ExpectScriptAssetFailureAsync(
-            () => assetLifecycle.DeleteAsync(created, bindAsset.Revision, 2, default),
+            () => assetLifecycle.DeleteAsync(created, bindAsset.Revision, 3, default),
             WorkspaceScriptAssetLifecycleFailureKind.InUse);
         var unbindAsset = await authoring.UndoAsync(created, bindAsset.Revision, bindAsset.UndoToken!, default);
 
-        var assetDelete = await assetLifecycle.DeleteAsync(created, unbindAsset.Revision, 2, default);
+        var assetDelete = await assetLifecycle.DeleteAsync(created, unbindAsset.Revision, 3, default);
         Require(assetDelete.State == "succeeded"
             && assetDelete.SourceDocument is null
             && !File.Exists(renamedPath)
-            && assetDelete.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u]) == true,
+            && assetDelete.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u, 2u]) == true,
             "Behavior Script Asset Delete did not remove the unreferenced Manifest/source entry.");
 
         var undoDelete = await assetLifecycle.UndoAsync(created, assetDelete.Revision, assetDelete.UndoToken!, default);
-        Require(undoDelete.Asset == new WorkspaceScriptAssetIdentity(2, "scripts/enemy_chase.luau")
+        Require(undoDelete.Asset == new WorkspaceScriptAssetIdentity(3, "scripts/enemy_chase.luau")
             && File.ReadAllBytes(renamedPath).AsSpan().SequenceEqual(defaultSource),
             "Behavior Script Asset Undo Delete did not restore identity and source.");
         var undoRename = await assetLifecycle.UndoAsync(created, undoDelete.Revision, assetRename.UndoToken!, default);
-        Require(undoRename.Asset == new WorkspaceScriptAssetIdentity(2, "scripts/chase.luau")
+        Require(undoRename.Asset == new WorkspaceScriptAssetIdentity(3, "scripts/chase.luau")
             && File.ReadAllBytes(chasePath).AsSpan().SequenceEqual(defaultSource)
             && !File.Exists(renamedPath),
             "Behavior Script Asset Undo Rename did not restore the old source path.");
@@ -716,12 +729,12 @@ internal static class ProjectLifecycleVerifier
         Require(undoCreate.SourceDocument is null
             && undoCreate.Revision == sourceUndo.Revision
             && !File.Exists(chasePath)
-            && undoCreate.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u]) == true,
+            && undoCreate.ProjectSnapshot.Script.Dependencies?.Select(value => value.ScriptId).SequenceEqual([1u, 2u]) == true,
             "Behavior Script Asset Undo Create did not restore the original dependency set.");
         await VerifyScriptAssetLifecycleFailureMatrixAsync(packageRoot, lifecycle);
         await ExpectScriptAssetFailureAsync(
             () => assetLifecycle.DeleteAsync(created, undoCreate.Revision, 1, default),
-            WorkspaceScriptAssetLifecycleFailureKind.LastDependency);
+            WorkspaceScriptAssetLifecycleFailureKind.InUse);
         Require(await lifecycle.OpenAsync(new ProjectOpenParameters(packageRoot, "behavior-created"), default) == created,
             "Behavior Open did not preserve project identity.");
         var validation = await lifecycle.ValidateAsync(created, default);
@@ -790,7 +803,7 @@ internal static class ProjectLifecycleVerifier
                 if (current == phase) throw new IOException($"injected {phase}");
             });
             await ExpectScriptAssetFailureAsync(
-                () => lifecycle.RenameAsync(project, baseline.Revision, 2, "scripts/enemy_chase.luau", default),
+                () => lifecycle.RenameAsync(project, baseline.Revision, baseline.Asset.ScriptId, "scripts/enemy_chase.luau", default),
                 WorkspaceScriptAssetLifecycleFailureKind.Commit);
             Require(identity == TreeIdentity(project.ProjectDirectory), $"{phase} did not roll back to the pre-rename project tree.");
             Require(!Directory.EnumerateFiles(project.ProjectDirectory, "*.authoring.*", SearchOption.AllDirectories).Any(),
@@ -814,7 +827,7 @@ internal static class ProjectLifecycleVerifier
                 if (current == phase) throw new IOException($"injected {phase}");
             });
             await ExpectScriptAssetFailureAsync(
-                () => lifecycle.DeleteAsync(project, baseline.Revision, 2, default),
+                () => lifecycle.DeleteAsync(project, baseline.Revision, baseline.Asset.ScriptId, default),
                 WorkspaceScriptAssetLifecycleFailureKind.Commit);
             Require(identity == TreeIdentity(project.ProjectDirectory), $"{phase} did not roll back to the pre-delete project tree.");
             Require(!Directory.EnumerateFiles(project.ProjectDirectory, "*.authoring.*", SearchOption.AllDirectories).Any(),
@@ -907,7 +920,7 @@ internal static class ProjectLifecycleVerifier
             WorkspaceScriptAssetLifecycleFailureKind.Conflict);
         var edgeCreate = await edgeLifecycle.CreateAsync(edgeProject, edgeRevision, "scripts/chase.luau", default);
         await ExpectScriptAssetFailureAsync(
-            () => edgeLifecycle.RenameAsync(edgeProject, edgeCreate.Revision, 2, "scripts/CHASE.luau", default),
+            () => edgeLifecycle.RenameAsync(edgeProject, edgeCreate.Revision, edgeCreate.Asset.ScriptId, "scripts/CHASE.luau", default),
             WorkspaceScriptAssetLifecycleFailureKind.Conflict);
         await ExpectScriptAssetFailureAsync(
             () => edgeLifecycle.CreateAsync(edgeProject, edgeRevision, "scripts/stale.luau", default),
@@ -920,7 +933,7 @@ internal static class ProjectLifecycleVerifier
 
         var limitProject = await projectLifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "asset-limit"), default);
         var limitRevision = (await readModel.ReadProjectAsync(limitProject, default)).AuthoringRevision;
-        for (var index = 2; index <= WorkspaceScriptSourceModel.MaxScriptCount; index++)
+        for (var index = 3; index <= WorkspaceScriptSourceModel.MaxScriptCount; index++)
         {
             var result = await edgeLifecycle.CreateAsync(limitProject, limitRevision, $"scripts/limit_{index}.luau", default);
             Require(result.Asset.ScriptId == index, "Script Asset allocation did not choose the smallest unused positive id.");

@@ -38,6 +38,11 @@ typedef struct KadathLuauTranslateCommand {
     double dy;
 } KadathLuauTranslateCommand;
 
+typedef struct KadathLuauInputSnapshot {
+    int32_t move_x;
+    int32_t move_y;
+} KadathLuauInputSnapshot;
+
 typedef struct KadathLuauCompileResult {
     uint8_t* bytecode;
     size_t bytecode_size;
@@ -163,6 +168,7 @@ int kadath_luau_instance_fixed_update(
     double dt_seconds,
     double position_x,
     double position_y,
+    const KadathLuauInputSnapshot* input_snapshot,
     KadathLuauTranslateCommand* commands,
     size_t command_capacity,
     size_t* command_count,

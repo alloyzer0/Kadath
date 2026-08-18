@@ -13,6 +13,7 @@ bin/assets/renderer2d/test.texture
 bin/assets/scenes/preview.scene
 bin/assets/scenes/preview.scene.json
 bin/assets/scripts/patrol.luau
+bin/assets/scripts/player_controller.luau
 bin/assets/scripts/preview.script
 bin/assets/scripts/preview.script.json
 bin/kadath'

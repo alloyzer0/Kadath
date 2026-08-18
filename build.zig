@@ -430,6 +430,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&preview_status_test_run.step);
     test_step.dependOn(&preview_control_test_run.step);
     test_step.dependOn(&runtime_options_test_run.step);
+    const player_movement_ownership_mod = b.createModule(.{
+        .root_source_file = b.path("app/player_movement_ownership.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const player_movement_ownership_tests = b.addTest(.{ .root_module = player_movement_ownership_mod });
+    const player_movement_ownership_test_run = b.addRunArtifact(player_movement_ownership_tests);
+    const player_movement_ownership_test_step = b.step("test-player-movement-ownership", "Run Player movement ownership contracts");
+    player_movement_ownership_test_step.dependOn(&player_movement_ownership_test_run.step);
+    test_step.dependOn(player_movement_ownership_test_step);
 
     if (behavior_native_step) |native_step| {
         const behavior_contract_test_mod = b.createModule(.{
@@ -1412,6 +1422,7 @@ pub fn build(b: *std.Build) void {
         package_assets.step.dependOn(behavior_native_step.?);
         const package_assets_run = b.addRunArtifact(package_assets);
         package_assets_run.addFileInput(b.path("packaging/linux-assets/scripts/patrol.luau"));
+        package_assets_run.addFileInput(b.path("packaging/linux-assets/scripts/player_controller.luau"));
         const linux_texture_artifact = package_assets_run.addOutputFileArg("test.texture");
         const linux_secondary_texture_artifact = package_assets_run.addOutputFileArg("goal.texture");
         const linux_won_audio_artifact = package_assets_run.addOutputFileArg("won.audio.wav");
@@ -1448,6 +1459,10 @@ pub fn build(b: *std.Build) void {
             b.path("packaging/linux-assets/scripts/patrol.luau"),
             "bin/assets/scripts/patrol.luau",
         );
+        const install_linux_player_behavior_source = b.addInstallFile(
+            b.path("packaging/linux-assets/scripts/player_controller.luau"),
+            "bin/assets/scripts/player_controller.luau",
+        );
         const install_linux_package_readme = b.addInstallFile(b.path("packaging/README-linux.txt"), "README.txt");
         b.getInstallStep().dependOn(&install_linux_texture_artifact.step);
         b.getInstallStep().dependOn(&install_linux_secondary_texture_artifact.step);
@@ -1456,6 +1471,7 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_linux_scene_artifact.step);
         b.getInstallStep().dependOn(&install_linux_script_artifact.step);
         b.getInstallStep().dependOn(&install_linux_behavior_source.step);
+        b.getInstallStep().dependOn(&install_linux_player_behavior_source.step);
         b.getInstallStep().dependOn(&install_linux_package_readme.step);
         b.getInstallStep().dependOn(behavior_tool_install_artifact_step.?);
 
@@ -1473,6 +1489,7 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.addFileInput(product_scene_source);
         package_manifest_command.addFileInput(product_script_source);
         package_manifest_command.addFileInput(b.path("packaging/linux-assets/scripts/patrol.luau"));
+        package_manifest_command.addFileInput(b.path("packaging/linux-assets/scripts/player_controller.luau"));
         package_manifest_command.addFileInput(b.path("packaging/README-linux.txt"));
         package_manifest_command.addFileInput(behavior_tool_binary.?);
         package_manifest_command.step.dependOn(&install_exe.step);
@@ -1485,6 +1502,7 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.step.dependOn(&install_scene_source_template.step);
         package_manifest_command.step.dependOn(&install_script_source_template.step);
         package_manifest_command.step.dependOn(&install_linux_behavior_source.step);
+        package_manifest_command.step.dependOn(&install_linux_player_behavior_source.step);
         package_manifest_command.step.dependOn(&install_linux_package_readme.step);
         package_manifest_command.step.dependOn(behavior_tool_install_artifact_step.?);
         const install_package_manifest = b.addInstallFile(package_manifest, "SHA256SUMS");

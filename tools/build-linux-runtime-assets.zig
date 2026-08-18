@@ -235,6 +235,8 @@ test "Linux product scene and behavior package preserve their frozen disk ABI" {
     try std.testing.expectEqualSlices(u8, "KSCN", scene[0..4]);
     try std.testing.expectEqualSlices(u8, "KSCP", script[0..4]);
     try std.testing.expectEqual(@as(u32, 2), readU32(script[4..8]));
+    try std.testing.expectEqual(@as(u32, 2), readU32(script[12..16]));
+    try std.testing.expectEqual(@as(u32, 2), readU32(script[16..20]));
 }
 
 test "shipped audio sources are canonical Runtime artifacts" {

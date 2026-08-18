@@ -70,7 +70,12 @@
         "textureId": 1
       },
       "player": { "moveSpeed": 180.0 },
-      "behaviors": []
+      "behaviors": [
+        {
+          "scriptId": 2,
+          "parameters": { "speed": 180.0 }
+        }
+      ]
     }
   ]
 }

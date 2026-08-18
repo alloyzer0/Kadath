@@ -38,6 +38,9 @@ struct KadathLuauInstance
     size_t parameter_count = 0;
     double position_x = 0.0;
     double position_y = 0.0;
+    int32_t move_x = 0;
+    int32_t move_y = 0;
+    bool input_context_active = false;
     KadathLuauTranslateCommand pending_commands[KADATH_LUAU_MAX_COMMAND_COUNT] = {};
     size_t pending_command_count = 0;
 };
@@ -205,6 +208,18 @@ static int self_translate(lua_State* state)
     return 0;
 }
 
+static int input_move_axis(lua_State* state)
+{
+    auto* instance = instance_from_upvalue(state);
+    if (instance == nullptr || !instance->input_context_active) {
+        luaL_error(state, "behavior input is unavailable outside a hook");
+        return 0;
+    }
+    lua_pushnumber(state, instance->move_x);
+    lua_pushnumber(state, instance->move_y);
+    return 2;
+}
+
 static void remove_forbidden_globals(lua_State* state)
 {
     lua_pushnil(state);
@@ -248,12 +263,18 @@ static int validate_behavior_table(lua_State* state, int table_index, char* erro
 static int install_environment(KadathLuauInstance* instance, char* error_buffer, size_t error_buffer_size)
 {
     lua_State* state = instance->thread;
-    lua_createtable(state, 0, 1);
+    lua_createtable(state, 0, 2);
     lua_createtable(state, 0, 1);
     lua_pushlightuserdata(state, instance);
     lua_pushcclosure(state, parameter_number, "number", 1);
     lua_setfield(state, -2, "number");
     lua_setfield(state, -2, "parameter");
+    lua_createtable(state, 0, 1);
+    lua_pushlightuserdata(state, instance);
+    lua_pushcclosure(state, input_move_axis, "move_axis", 1);
+    lua_setfield(state, -2, "move_axis");
+    lua_setreadonly(state, -1, true);
+    lua_setfield(state, -2, "input");
     lua_setreadonly(state, -1, true);
     lua_setglobal(state, "kadath");
 
@@ -309,6 +330,7 @@ static int run_hook(
     double dt_seconds,
     double position_x,
     double position_y,
+    const KadathLuauInputSnapshot& input_snapshot,
     KadathLuauTranslateCommand* commands,
     size_t command_capacity,
     size_t* command_count,
@@ -317,8 +339,22 @@ static int run_hook(
 {
     if (instance == nullptr || command_count == nullptr)
         return 0;
+    *command_count = 0;
     instance->position_x = position_x;
     instance->position_y = position_y;
+    instance->move_x = input_snapshot.move_x;
+    instance->move_y = input_snapshot.move_y;
+    instance->input_context_active = true;
+    struct InputContextGuard
+    {
+        KadathLuauInstance* instance;
+        ~InputContextGuard()
+        {
+            instance->move_x = 0;
+            instance->move_y = 0;
+            instance->input_context_active = false;
+        }
+    } input_context_guard{instance};
     instance->pending_command_count = 0;
     lua_State* state = instance->thread;
     lua_settop(state, 0);
@@ -327,7 +363,6 @@ static int run_hook(
     if (lua_isnil(state, -1))
     {
         lua_pop(state, 2);
-        *command_count = 0;
         return 1;
     }
     if (!lua_isfunction(state, -1))
@@ -531,7 +566,8 @@ extern "C" int kadath_luau_instance_on_start(
     char* error_buffer,
     size_t error_buffer_size)
 {
-    return run_hook(instance, "on_start", false, 0.0, position_x, position_y, commands, command_capacity, command_count, error_buffer, error_buffer_size);
+    const KadathLuauInputSnapshot input_snapshot{};
+    return run_hook(instance, "on_start", false, 0.0, position_x, position_y, input_snapshot, commands, command_capacity, command_count, error_buffer, error_buffer_size);
 }
 
 extern "C" int kadath_luau_instance_fixed_update(
@@ -539,11 +575,20 @@ extern "C" int kadath_luau_instance_fixed_update(
     double dt_seconds,
     double position_x,
     double position_y,
+    const KadathLuauInputSnapshot* input_snapshot,
     KadathLuauTranslateCommand* commands,
     size_t command_capacity,
     size_t* command_count,
     char* error_buffer,
     size_t error_buffer_size)
 {
-    return run_hook(instance, "fixed_update", true, dt_seconds, position_x, position_y, commands, command_capacity, command_count, error_buffer, error_buffer_size);
+    if (command_count != nullptr)
+        *command_count = 0;
+    if (input_snapshot == nullptr || input_snapshot->move_x < -1 || input_snapshot->move_x > 1 ||
+        input_snapshot->move_y < -1 || input_snapshot->move_y > 1)
+    {
+        write_error(error_buffer, error_buffer_size, "behavior input axes must be -1, 0, or 1");
+        return 0;
+    }
+    return run_hook(instance, "fixed_update", true, dt_seconds, position_x, position_y, *input_snapshot, commands, command_capacity, command_count, error_buffer, error_buffer_size);
 }

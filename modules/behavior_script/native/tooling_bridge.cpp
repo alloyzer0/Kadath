@@ -136,6 +136,9 @@ declare kadath: {
     parameter: {
         number: (name: string, options: { default: number, min: number, max: number }) -> number,
     },
+    input: {
+        move_axis: () -> (number, number),
+    },
 }
 )";
 
@@ -529,6 +532,12 @@ static int parameter_number(lua_State* state)
     return 1;
 }
 
+static int input_move_axis(lua_State* state)
+{
+    luaL_error(state, "behavior input is unavailable during tooling execution");
+    return 0;
+}
+
 static void remove_forbidden_globals(lua_State* state)
 {
     lua_pushnil(state);
@@ -730,12 +739,17 @@ static bool run_pipeline(
     lua_callbacks(state.get())->interrupt = interrupt_callback;
     ToolingContext context;
     context.result = &output.compiled;
-    lua_createtable(state.get(), 0, 1);
+    lua_createtable(state.get(), 0, 2);
     lua_createtable(state.get(), 0, 1);
     lua_pushlightuserdata(state.get(), &context);
     lua_pushcclosure(state.get(), parameter_number, "number", 1);
     lua_setfield(state.get(), -2, "number");
     lua_setfield(state.get(), -2, "parameter");
+    lua_createtable(state.get(), 0, 1);
+    lua_pushcfunction(state.get(), input_move_axis, "move_axis");
+    lua_setfield(state.get(), -2, "move_axis");
+    lua_setreadonly(state.get(), -1, true);
+    lua_setfield(state.get(), -2, "input");
     lua_setreadonly(state.get(), -1, true);
     lua_setglobal(state.get(), "kadath");
 

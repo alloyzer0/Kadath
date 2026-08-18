@@ -695,6 +695,8 @@ internal static class Program
         Assert(string.Equals(validation.State, "valid", StringComparison.OrdinalIgnoreCase), "real service project_validate failed");
         var projectSnapshot = await client.GetProjectSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var behaviorContract = await client.GetBehaviorContractSnapshotAsync(new BehaviorContractSnapshotParameters(projectName)).ConfigureAwait(false);
+        var patrolContract = behaviorContract.Entries.Single(entry => entry.ScriptId == 1 && entry.SourcePath == "scripts/patrol.luau");
+        var playerControllerContract = behaviorContract.Entries.Single(entry => entry.ScriptId == 2 && entry.SourcePath == "scripts/player_controller.luau");
         var hierarchySnapshot = await client.GetHierarchySnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var assetSnapshot = await client.GetAssetCatalogSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var publicationSnapshot = await client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, "debug")).ConfigureAwait(false);
@@ -704,14 +706,14 @@ internal static class Program
             && projectSnapshot.Scene.Textures.Any(texture => texture.TextureId == 3)
             && projectSnapshot.Scene.HazardTextureId == 3
             && projectSnapshot.Scene.Objects is { Count: 5 }
-            && projectSnapshot.Scene.Objects.Count(value => value.Behaviors is { Count: > 0 }) == 2,
+            && projectSnapshot.Scene.Objects.Count(value => value.Behaviors is { Count: > 0 }) == 3,
             "real service scene v5 snapshot mismatch");
         Assert(projectSnapshot.Script.SchemaVersion == 2
             && projectSnapshot.Script.GoalPosition.Length == 0
             && projectSnapshot.Script.GoalVelocity.Length == 0
-            && projectSnapshot.Script.Dependencies is { Count: 1 }
-            && projectSnapshot.Script.Dependencies[0].ScriptId == 1
-            && projectSnapshot.Script.Dependencies[0].Source == "scripts/patrol.luau",
+            && projectSnapshot.Script.Dependencies is { Count: 2 }
+            && projectSnapshot.Script.Dependencies.Any(entry => entry.ScriptId == 1 && entry.Source == "scripts/patrol.luau")
+            && projectSnapshot.Script.Dependencies.Any(entry => entry.ScriptId == 2 && entry.Source == "scripts/player_controller.luau"),
             "real service script v2 snapshot mismatch");
         Assert(hierarchySnapshot.Nodes.Any(node => node.Kind == "SceneBehavior")
             && hierarchySnapshot.Nodes.Any(node => node.Kind == "ScriptDependency"),
@@ -719,11 +721,14 @@ internal static class Program
         Assert(assetSnapshot.CatalogVersion == 1 && assetSnapshot.ItemCount == assetSnapshot.Items.Length, "real service asset snapshot mismatch");
         Assert(projectSnapshot.AuthoringRevision.Length == 64, "real service authoring revision mismatch");
         Assert(behaviorContract.State == "ready"
-            && behaviorContract.Entries.Length == 1
-            && behaviorContract.Entries[0].ScriptId == 1
-            && behaviorContract.Entries[0].Parameters.Any(parameter => parameter.Name == "speed"
+            && behaviorContract.Entries.Length == 2
+            && patrolContract.Parameters.Any(parameter => parameter.Name == "speed"
                 && parameter.Type == "number"
                 && parameter.DefaultValue == 80
+                && parameter.Minimum == 0
+                && parameter.Maximum == 1000)
+            && playerControllerContract.Parameters.Any(parameter => parameter.Name == "speed"
+                && parameter.DefaultValue == 180
                 && parameter.Minimum == 0
                 && parameter.Maximum == 1000)
             && behaviorContract.AuthoringRevision == projectSnapshot.AuthoringRevision,
@@ -741,6 +746,12 @@ internal static class Program
             && sourceDocument.Source.Contains("fixed_update", StringComparison.Ordinal)
             && sourceDocument.AuthoringRevision == projectSnapshot.AuthoringRevision,
             "real service script source read failed");
+        var playerControllerSource = await client.GetScriptSourceAsync(
+            new ScriptSourceQueryParameters(projectName, 2)).ConfigureAwait(false);
+        Assert(playerControllerSource.SourcePath == "scripts/player_controller.luau"
+            && playerControllerSource.Source.Contains("kadath.input.move_axis", StringComparison.Ordinal)
+            && playerControllerSource.AuthoringRevision == projectSnapshot.AuthoringRevision,
+            "real service Player controller source read failed");
         var sourcePath = Path.Combine(project.ProjectDirectory, sourceDocument.SourcePath);
         var sourceBytesBeforeAnalysis = File.ReadAllBytes(sourcePath);
         var validAnalysis = await client.AnalyzeScriptSourceAsync(new ScriptSourceAnalyzeParameters(
@@ -823,55 +834,55 @@ internal static class Program
             projectName, sourceUndone.Revision, "scripts/chase.luau")).ConfigureAwait(false);
         Assert(scriptAssetCreated.Operation == "create"
             && scriptAssetCreated.State == "succeeded"
-            && scriptAssetCreated.Asset == new ScriptAssetIdentity(2, "scripts/chase.luau")
-            && scriptAssetCreated.SourceDocument is { ScriptId: 2, SourcePath: "scripts/chase.luau" }
-            && scriptAssetCreated.ProjectSnapshot.Script.Dependencies is { Count: 2 }
-            && scriptAssetCreated.HierarchySnapshot.Nodes.Count(node => node.Kind == "ScriptDependency") == 2
+            && scriptAssetCreated.Asset == new ScriptAssetIdentity(3, "scripts/chase.luau")
+            && scriptAssetCreated.SourceDocument is { ScriptId: 3, SourcePath: "scripts/chase.luau" }
+            && scriptAssetCreated.ProjectSnapshot.Script.Dependencies is { Count: 3 }
+            && scriptAssetCreated.HierarchySnapshot.Nodes.Count(node => node.Kind == "ScriptDependency") == 3
             && scriptAssetCreated.AssetCatalogSnapshot.ItemCount == assetSnapshot.ItemCount,
             "real service script asset create failed");
         var createdSource = scriptAssetCreated.SourceDocument?.Source
             ?? throw new InvalidOperationException("created Script Asset source document missing");
         var editedCreatedSource = createdSource + "\n-- lifecycle interleaved source edit\n";
         var scriptAssetSourceEdited = await client.EditScriptSourceAsync(new ScriptSourceEditParameters(
-            projectName, scriptAssetCreated.Revision, 2, editedCreatedSource)).ConfigureAwait(false);
+            projectName, scriptAssetCreated.Revision, 3, editedCreatedSource)).ConfigureAwait(false);
         var scriptAssetRenamed = await client.RenameScriptAssetAsync(new ScriptAssetRenameParameters(
-            projectName, scriptAssetSourceEdited.Revision, 2, "scripts/enemy_chase.luau")).ConfigureAwait(false);
+            projectName, scriptAssetSourceEdited.Revision, 3, "scripts/enemy_chase.luau")).ConfigureAwait(false);
         Assert(scriptAssetRenamed.Operation == "rename"
-            && scriptAssetRenamed.Asset == new ScriptAssetIdentity(2, "scripts/enemy_chase.luau")
+            && scriptAssetRenamed.Asset == new ScriptAssetIdentity(3, "scripts/enemy_chase.luau")
             && scriptAssetRenamed.SourceDocument is { SourcePath: "scripts/enemy_chase.luau" }
             && scriptAssetRenamed.SourceDocument.Source == editedCreatedSource
-            && scriptAssetRenamed.ProjectSnapshot.Script.Dependencies?.Single(value => value.ScriptId == 2).Source == "scripts/enemy_chase.luau",
+            && scriptAssetRenamed.ProjectSnapshot.Script.Dependencies?.Single(value => value.ScriptId == 3).Source == "scripts/enemy_chase.luau",
             "real service script asset rename failed");
         var scriptAssetDeleted = await client.DeleteScriptAssetAsync(new ScriptAssetDeleteParameters(
-            projectName, scriptAssetRenamed.Revision, 2)).ConfigureAwait(false);
+            projectName, scriptAssetRenamed.Revision, 3)).ConfigureAwait(false);
         Assert(scriptAssetDeleted.Operation == "delete"
             && scriptAssetDeleted.SourceDocument is null
-            && scriptAssetDeleted.ProjectSnapshot.Script.Dependencies is { Count: 1 }
-            && scriptAssetDeleted.HierarchySnapshot.Nodes.Count(node => node.Kind == "ScriptDependency") == 1
+            && scriptAssetDeleted.ProjectSnapshot.Script.Dependencies is { Count: 2 }
+            && scriptAssetDeleted.HierarchySnapshot.Nodes.Count(node => node.Kind == "ScriptDependency") == 2
             && scriptAssetDeleted.AssetCatalogSnapshot.ItemCount == assetSnapshot.ItemCount,
             "real service script asset delete failed");
         var scriptAssetDeleteUndone = await client.UndoScriptAssetAsync(new ScriptAssetUndoParameters(
             projectName, scriptAssetDeleted.Revision)).ConfigureAwait(false);
         Assert(scriptAssetDeleteUndone.Operation == "undo"
-            && scriptAssetDeleteUndone.Asset == new ScriptAssetIdentity(2, "scripts/enemy_chase.luau")
+            && scriptAssetDeleteUndone.Asset == new ScriptAssetIdentity(3, "scripts/enemy_chase.luau")
             && scriptAssetDeleteUndone.SourceDocument?.Source == editedCreatedSource,
             "real service script asset delete undo failed");
         var scriptAssetRenameUndone = await client.UndoScriptAssetAsync(new ScriptAssetUndoParameters(
             projectName, scriptAssetDeleteUndone.Revision)).ConfigureAwait(false);
-        Assert(scriptAssetRenameUndone.Asset == new ScriptAssetIdentity(2, "scripts/chase.luau")
+        Assert(scriptAssetRenameUndone.Asset == new ScriptAssetIdentity(3, "scripts/chase.luau")
             && scriptAssetRenameUndone.SourceDocument?.Source == editedCreatedSource,
             "real service script asset rename undo failed");
         var scriptAssetSourceUndone = await client.UndoScriptSourceAsync(new ScriptSourceUndoParameters(
             projectName, scriptAssetRenameUndone.Revision)).ConfigureAwait(false);
-        Assert(scriptAssetSourceUndone.SourceDocument.ScriptId == 2
+        Assert(scriptAssetSourceUndone.SourceDocument.ScriptId == 3
             && scriptAssetSourceUndone.SourceDocument.Source == createdSource
             && scriptAssetSourceUndone.UndoDepth == 0,
             "Script Source undo did not survive interleaved Script Asset lifecycle operations");
         var scriptAssetCreateUndone = await client.UndoScriptAssetAsync(new ScriptAssetUndoParameters(
             projectName, scriptAssetSourceUndone.Revision)).ConfigureAwait(false);
-        Assert(scriptAssetCreateUndone.Asset == new ScriptAssetIdentity(2, "scripts/chase.luau")
+        Assert(scriptAssetCreateUndone.Asset == new ScriptAssetIdentity(3, "scripts/chase.luau")
             && scriptAssetCreateUndone.SourceDocument is null
-            && scriptAssetCreateUndone.ProjectSnapshot.Script.Dependencies is { Count: 1 }
+            && scriptAssetCreateUndone.ProjectSnapshot.Script.Dependencies is { Count: 2 }
             && scriptAssetCreateUndone.Revision == sourceUndone.Revision,
             "real service script asset create undo failed");
         try
@@ -885,9 +896,16 @@ internal static class Program
         {
             _ = await client.DeleteScriptAssetAsync(new ScriptAssetDeleteParameters(
                 projectName, scriptAssetCreateUndone.Revision, 1)).ConfigureAwait(false);
-            throw new InvalidOperationException("last Script Asset deletion unexpectedly succeeded");
+            throw new InvalidOperationException("in-use Script Asset deletion unexpectedly succeeded");
         }
-        catch (EditorRpcException exception) when (exception.Code == "script_asset_last_dependency") { }
+        catch (EditorRpcException exception) when (exception.Code == "script_asset_in_use") { }
+        try
+        {
+            _ = await client.DeleteScriptAssetAsync(new ScriptAssetDeleteParameters(
+                projectName, scriptAssetCreateUndone.Revision, 2)).ConfigureAwait(false);
+            throw new InvalidOperationException("Player controller Script Asset deletion unexpectedly succeeded");
+        }
+        catch (EditorRpcException exception) when (exception.Code == "script_asset_in_use") { }
         try
         {
             _ = await client.UndoScriptAssetAsync(new ScriptAssetUndoParameters(

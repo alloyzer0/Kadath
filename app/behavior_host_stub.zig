@@ -2,6 +2,11 @@ const std = @import("std");
 const content_identity = @import("content_identity.zig");
 const scene_api = @import("scene.zig");
 
+pub const InputSnapshot = struct {
+    move_x: i32 = 0,
+    move_y: i32 = 0,
+};
+
 pub const TranslationBatch = struct {
     deltas: [scene_api.max_scene_object_count][2]f64 = [_][2]f64{.{ 0, 0 }} ** scene_api.max_scene_object_count,
     object_count: usize = 0,
@@ -34,7 +39,7 @@ pub const Runtime = struct {
         return error.UnsupportedBehaviorRuntime;
     }
 
-    pub fn runFixed(_: *Runtime, _: *const scene_api.Scene, _: []const [2]f32, _: f32) !TranslationBatch {
+    pub fn runFixed(_: *Runtime, _: *const scene_api.Scene, _: []const [2]f32, _: f32, _: InputSnapshot) !TranslationBatch {
         return error.UnsupportedBehaviorRuntime;
     }
 };

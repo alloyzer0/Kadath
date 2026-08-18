@@ -118,11 +118,12 @@ internal static class Program
             RequireBehaviorSignatures(restored.ProjectSnapshot, expectedBehaviors, "authoring undo");
 
             Require(avaloniaViewModel.IsBehaviorContractReady
-                && avaloniaViewModel.AvailableBehaviorContracts.Count == 1,
+                && avaloniaViewModel.AvailableBehaviorContracts.Count == 2,
                 "Avalonia did not project the Behavior Contract catalog");
             var bindingGoalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
             avaloniaViewModel.SelectedSceneObject = bindingGoalDraft;
-            avaloniaViewModel.SelectedBehaviorContract = avaloniaViewModel.AvailableBehaviorContracts[0];
+            avaloniaViewModel.SelectedBehaviorContract = avaloniaViewModel.AvailableBehaviorContracts.Single(
+                entry => entry.ScriptId == 1 && entry.SourcePath == "scripts/patrol.luau");
             Require(avaloniaViewModel.CanAddBehaviorBinding, "Avalonia did not enable a valid behavior binding candidate");
             avaloniaViewModel.AddBehaviorBinding();
             var bindingDraft = avaloniaViewModel.SelectedBehaviorBinding
@@ -152,8 +153,9 @@ internal static class Program
         Console.WriteLine("workflow_behavior_binding_authoring=ok");
 
         Require(openedProject.Script.SchemaVersion == 2, "Avalonia script source workflow requires a Script v2 project");
-        var scriptDependency = openedProject.Script.Dependencies?.FirstOrDefault()
-            ?? throw new InvalidOperationException("Opened Script v2 project exposes no source dependency.");
+        var scriptDependency = openedProject.Script.Dependencies?.SingleOrDefault(
+            dependency => dependency.ScriptId == 2 && dependency.Source == "scripts/player_controller.luau")
+            ?? throw new InvalidOperationException("Opened Script v2 project does not expose the Player controller dependency.");
         var scriptHierarchyLabel = avaloniaViewModel.HierarchyItems.Single(label =>
             label.Contains($"script.dependencies[{scriptDependency.ScriptId}]", StringComparison.Ordinal));
         avaloniaViewModel.SelectedHierarchyItem = scriptHierarchyLabel;
@@ -163,6 +165,8 @@ internal static class Program
             "selected script source document");
         var originalSourceDocument = workspace.ScriptSource.Document
             ?? throw new InvalidOperationException("Selected script source document is missing.");
+        Require(originalSourceDocument.Source.Contains("kadath.input.move_axis", StringComparison.Ordinal),
+            "Avalonia did not load the Player controller input source.");
         var projectDirectory = Path.GetFullPath(opened.ProjectDirectory);
         var projectPrefix = projectDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var sourcePath = Path.GetFullPath(Path.Combine(projectDirectory, originalSourceDocument.SourcePath));
@@ -268,7 +272,7 @@ internal static class Program
 
             Require(avaloniaViewModel.CanCreateScriptAsset, "Avalonia did not enable Script Asset create for a clean Script v2 project");
             var createdAsset = await avaloniaViewModel.CreateScriptAssetForCurrentProjectAsync(cancellationToken);
-            Require(createdAsset.Asset.ScriptId > 1
+            Require(createdAsset.Asset.ScriptId == 3
                 && createdAsset.Asset.SourcePath == lifecycleSourcePath
                 && File.Exists(lifecycleSourceFile)
                 && avaloniaViewModel.SelectedScriptSourceId == createdAsset.Asset.ScriptId
@@ -391,8 +395,9 @@ internal static class Program
             Require(avaloniaViewModel.CanRemoveBehaviorBinding, "bound Script Asset could not be removed before deletion");
             avaloniaViewModel.RemoveBehaviorBinding();
             var unboundAsset = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
-            Require(unboundAsset.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId).Behaviors is { Count: 0 },
-                "Avalonia did not remove the Script Asset binding before deletion");
+            Require(unboundAsset.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId).Behaviors is { Count: 1 } remainingBehaviors
+                    && remainingBehaviors.Single().ScriptId == scriptDependency.ScriptId,
+                "Avalonia did not remove the Script Asset binding while preserving the Player controller");
 
             var deletedAsset = await avaloniaViewModel.DeleteScriptAssetForCurrentProjectAsync(cancellationToken);
             Require(deletedAsset.Asset.ScriptId == createdAsset.Asset.ScriptId
@@ -421,8 +426,9 @@ internal static class Program
                     .Behaviors?.Any(value => value.ScriptId == createdAsset.Asset.ScriptId) == true,
                 "Avalonia lifecycle undo did not restore the pre-rename source path");
             var undoBind = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
-            Require(undoBind.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId).Behaviors is { Count: 0 },
-                "interleaved Authoring undo did not restore the pre-binding Scene state");
+            Require(undoBind.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == lifecycleObject.ObjectId).Behaviors is { Count: 1 } restoredBehaviors
+                    && restoredBehaviors.Single().ScriptId == scriptDependency.ScriptId,
+                "interleaved Authoring undo did not restore the pre-binding Player controller state");
             var sourceUndone = await avaloniaViewModel.UndoScriptSourceForCurrentProjectAsync(cancellationToken);
             Require(sourceUndone.SourceDocument.Source == createdAsset.SourceDocument?.Source
                 && workspace.ScriptSource.UndoDepth == 0,
@@ -606,8 +612,9 @@ internal static class Program
             "Avalonia did not project the atomic Runtime initial identity");
         Console.WriteLine("workflow_preview_initial_loaded=ok");
 
-        var createdScriptDependency = workspace.ProjectSnapshot.Value?.Script.Dependencies?.FirstOrDefault()
-            ?? throw new InvalidOperationException("Created Script v2 project exposes no source dependency.");
+        var createdScriptDependency = workspace.ProjectSnapshot.Value?.Script.Dependencies?.SingleOrDefault(
+            dependency => dependency.ScriptId == 2 && dependency.Source == "scripts/player_controller.luau")
+            ?? throw new InvalidOperationException("Created Script v2 project does not expose the Player controller dependency.");
         var createdScriptHierarchyLabel = avaloniaViewModel.HierarchyItems.Single(label =>
             label.Contains($"script.dependencies[{createdScriptDependency.ScriptId}]", StringComparison.Ordinal));
         avaloniaViewModel.SelectedHierarchyItem = createdScriptHierarchyLabel;

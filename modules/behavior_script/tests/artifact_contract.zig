@@ -108,3 +108,17 @@ test "KSCP v2 rejects an incompatible Luau identity" {
     defer std.testing.allocator.free(encoded);
     try std.testing.expectError(error.UnsupportedScriptArtifact, artifact.parse(encoded, "luau-other"));
 }
+
+test "KSCP v2 rejects Host Interface v1 artifacts after the input contract change" {
+    const entries = [_]artifact.BuildEntry{.{
+        .script_id = 1,
+        .source_name = "scripts/patrol.luau",
+        .source_sha256 = [_]u8{0x88} ** 32,
+        .parameters = &.{},
+        .bytecode = "bytecode",
+    }};
+    const encoded = try artifact.encode(std.testing.allocator, "luau-0.732-decb2d0", &entries);
+    defer std.testing.allocator.free(encoded);
+    std.mem.writeInt(u32, encoded[12..16], 1, .little);
+    try std.testing.expectError(error.UnsupportedScriptArtifact, artifact.parse(encoded, "luau-0.732-decb2d0"));
+}

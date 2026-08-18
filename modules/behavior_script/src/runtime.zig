@@ -10,6 +10,10 @@ pub const Diagnostic = common.Diagnostic;
 pub const ParameterValue = common.ParameterValue;
 pub const TranslateCommand = common.TranslateCommand;
 pub const CommandBuffer = common.CommandBuffer;
+pub const InputSnapshot = struct {
+    move_x: i32 = 0,
+    move_y: i32 = 0,
+};
 pub const max_parameter_count = common.max_parameter_count;
 pub const max_object_id_bytes = common.max_object_id_bytes;
 pub const max_entry_count = artifact.max_entry_count;
@@ -205,10 +209,11 @@ pub const ActiveSet = struct {
         return self.commandSlice();
     }
 
-    pub fn runFixed(self: *ActiveSet, dt_seconds: f32, snapshots: []const ObjectSnapshot) !void {
+    pub fn runFixed(self: *ActiveSet, dt_seconds: f32, snapshots: []const ObjectSnapshot, input: InputSnapshot) !void {
         if (!std.math.isFinite(dt_seconds) or dt_seconds < 0) return error.InvalidFixedDelta;
         self.command_intent_count = 0;
         self.failure_count = 0;
+        try validateInputSnapshot(input);
         for (self.bindings[0..self.binding_count], 0..) |*optional_binding, binding_index| {
             const binding = &optional_binding.*.?;
             if (!binding.enabled) continue;
@@ -218,7 +223,7 @@ pub const ActiveSet = struct {
                 continue;
             };
             var diagnostic = Diagnostic{};
-            const commands = binding.instance.fixedUpdate(dt_seconds, snapshot.position, &binding.commands, &diagnostic) catch |err| {
+            const commands = binding.instance.fixedUpdate(dt_seconds, snapshot.position, input, &binding.commands, &diagnostic) catch |err| {
                 binding.enabled = false;
                 self.recordFailure(binding_index, err, diagnostic.slice());
                 continue;
@@ -291,6 +296,12 @@ fn findSnapshot(snapshots: []const ObjectSnapshot, object_id: []const u8) ?Objec
         if (std.mem.eql(u8, snapshot.object_id, object_id)) return snapshot;
     }
     return null;
+}
+
+fn validateInputSnapshot(input: InputSnapshot) !void {
+    if (input.move_x < -1 or input.move_x > 1 or input.move_y < -1 or input.move_y > 1) {
+        return error.InvalidBehaviorInputSnapshot;
+    }
 }
 
 pub const Package = struct {
@@ -425,17 +436,18 @@ pub const Instance = struct {
         output: *CommandBuffer,
         diagnostic: *Diagnostic,
     ) ![]const TranslateCommand {
-        return self.run(false, 0.0, position, output, diagnostic);
+        return self.run(false, 0.0, position, .{}, output, diagnostic);
     }
 
     pub fn fixedUpdate(
         self: *Instance,
         dt_seconds: f32,
         position: [2]f32,
+        input: InputSnapshot,
         output: *CommandBuffer,
         diagnostic: *Diagnostic,
     ) ![]const TranslateCommand {
-        return self.run(true, dt_seconds, position, output, diagnostic);
+        return self.run(true, dt_seconds, position, input, output, diagnostic);
     }
 
     fn run(
@@ -443,10 +455,12 @@ pub const Instance = struct {
         fixed_update: bool,
         dt_seconds: f32,
         position: [2]f32,
+        input: InputSnapshot,
         output: *CommandBuffer,
         diagnostic: *Diagnostic,
     ) ![]const TranslateCommand {
         var native_commands: [common.max_command_count]c.KadathLuauTranslateCommand = undefined;
+        var native_input = c.KadathLuauInputSnapshot{ .move_x = input.move_x, .move_y = input.move_y };
         var command_count: usize = 0;
         diagnostic.clear();
         const succeeded = if (fixed_update)
@@ -455,6 +469,7 @@ pub const Instance = struct {
                 dt_seconds,
                 position[0],
                 position[1],
+                &native_input,
                 &native_commands,
                 native_commands.len,
                 &command_count,

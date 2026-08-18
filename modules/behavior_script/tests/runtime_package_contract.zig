@@ -21,7 +21,8 @@ const patrol_source =
     \\        self:translate(1, 0)
     \\    end,
     \\    fixed_update = function(self: Kadath.Object, dt: number)
-    \\        self:translate(0, speed * direction * dt)
+    \\        local move_x, move_y = kadath.input.move_axis()
+    \\        self:translate(move_x, move_y + speed * direction * dt)
     \\        direction = -direction
     \\    end,
     \\}
@@ -67,12 +68,12 @@ test "Runtime Package creates isolated binding instances from one entry" {
     var second = &prepared.bindings[1].?;
     var first_commands: runtime.CommandBuffer = undefined;
     var second_commands: runtime.CommandBuffer = undefined;
-    const first_tick = try first.instance.fixedUpdate(0.5, .{ 0, 10 }, &first_commands, &diagnostic);
-    const second_tick = try second.instance.fixedUpdate(0.5, .{ 0, 20 }, &second_commands, &diagnostic);
+    const first_tick = try first.instance.fixedUpdate(0.5, .{ 0, 10 }, .{}, &first_commands, &diagnostic);
+    const second_tick = try second.instance.fixedUpdate(0.5, .{ 0, 20 }, .{}, &second_commands, &diagnostic);
     try std.testing.expectApproxEqAbs(@as(f64, 5), first_tick[0].dy, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 10), second_tick[0].dy, 0.0001);
-    const first_reverse = try first.instance.fixedUpdate(0.5, .{ 0, 15 }, &first_commands, &diagnostic);
-    const second_reverse = try second.instance.fixedUpdate(0.5, .{ 0, 30 }, &second_commands, &diagnostic);
+    const first_reverse = try first.instance.fixedUpdate(0.5, .{ 0, 15 }, .{}, &first_commands, &diagnostic);
+    const second_reverse = try second.instance.fixedUpdate(0.5, .{ 0, 30 }, .{}, &second_commands, &diagnostic);
     try std.testing.expectApproxEqAbs(@as(f64, -5), first_reverse[0].dy, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, -10), second_reverse[0].dy, 0.0001);
 }
@@ -137,15 +138,25 @@ test "ActiveSet preserves binding order and tick-start snapshots" {
     try std.testing.expectEqualStrings("hazard-1", active.commandObjectId(start_commands[0]));
     try std.testing.expectEqualStrings("hazard-2", active.commandObjectId(start_commands[1]));
 
+    try std.testing.expectError(error.InvalidBehaviorInputSnapshot, active.runFixed(0.5, &.{
+        .{ .object_id = "hazard-1", .position = .{ 0, 10 } },
+        .{ .object_id = "hazard-2", .position = .{ 0, 20 } },
+    }, .{ .move_x = 2 }));
+    try std.testing.expectEqual(@as(usize, 0), active.commandSlice().len);
+    try std.testing.expect(active.bindingEnabled(0));
+    try std.testing.expect(active.bindingEnabled(1));
+
     try active.runFixed(0.5, &.{
         .{ .object_id = "hazard-1", .position = .{ 0, 10 } },
         .{ .object_id = "hazard-2", .position = .{ 0, 20 } },
-    });
+    }, .{ .move_x = 1 });
     const commands = active.commandSlice();
     try std.testing.expectEqual(@as(usize, 2), commands.len);
     try std.testing.expectEqualStrings("hazard-1", active.commandObjectId(commands[0]));
+    try std.testing.expectEqual(@as(f64, 1), commands[0].dx);
     try std.testing.expectApproxEqAbs(@as(f64, 5), commands[0].dy, 0.0001);
     try std.testing.expectEqualStrings("hazard-2", active.commandObjectId(commands[1]));
+    try std.testing.expectEqual(@as(f64, 1), commands[1].dx);
     try std.testing.expectApproxEqAbs(@as(f64, 10), commands[1].dy, 0.0001);
 }
 
@@ -165,7 +176,7 @@ test "ActiveSet disables one failed binding and continues the rest" {
     var active = prepared.activate();
     defer active.deinit();
 
-    try active.runFixed(0.5, &.{.{ .object_id = "hazard-2", .position = .{ 0, 20 } }});
+    try active.runFixed(0.5, &.{.{ .object_id = "hazard-2", .position = .{ 0, 20 } }}, .{});
     try std.testing.expectEqual(@as(usize, 1), active.failureSlice().len);
     try std.testing.expectEqualStrings("MissingBehaviorObjectSnapshot", active.failureSlice()[0].errorName());
     try std.testing.expect(!active.bindingEnabled(0));
@@ -173,7 +184,55 @@ test "ActiveSet disables one failed binding and continues the rest" {
     try std.testing.expectEqual(@as(usize, 1), active.commandSlice().len);
     try std.testing.expectEqualStrings("hazard-2", active.commandObjectId(active.commandSlice()[0]));
 
-    try active.runFixed(0.5, &.{.{ .object_id = "hazard-2", .position = .{ 0, 30 } }});
+    try active.runFixed(0.5, &.{.{ .object_id = "hazard-2", .position = .{ 0, 30 } }}, .{});
     try std.testing.expectEqual(@as(usize, 0), active.failureSlice().len);
     try std.testing.expectEqual(@as(usize, 1), active.commandSlice().len);
+}
+
+test "ActiveSet clears a failed hook context before the next binding reads input" {
+    const source =
+        \\--!strict
+        \\return {
+        \\    fixed_update = function(self: Kadath.Object, dt: number)
+        \\        local move_x, move_y = kadath.input.move_axis()
+        \\        if self:id() == "hazard-1" then error("injected failure") end
+        \\        self:translate(move_x + dt - dt, move_y)
+        \\    end,
+        \\}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "scripts", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scripts/patrol.luau", .data = source });
+    var snapshot = try manifest.loadSnapshot(std.testing.io, std.testing.allocator, tmp.dir, source_manifest);
+    defer snapshot.deinit();
+    var build_diagnostic = builder.Diagnostic{};
+    var built = try builder.build(std.testing.allocator, &snapshot, &build_diagnostic);
+    defer built.deinit();
+    var runtime_diagnostic = runtime.Diagnostic{};
+    var package = try runtime.Package.init(
+        std.testing.allocator,
+        built.bytes,
+        runtime.default_asset_memory_limit,
+        runtime.default_interrupt_limit,
+        &runtime_diagnostic,
+    );
+    defer package.deinit();
+    var prepared = try package.prepareBindings(&.{
+        .{ .script_id = 7, .object_id = "hazard-1", .position = .{ 0, 10 } },
+        .{ .script_id = 7, .object_id = "hazard-2", .position = .{ 0, 20 } },
+    }, &runtime_diagnostic);
+    defer prepared.deinit();
+    var active = prepared.activate();
+    defer active.deinit();
+
+    try active.runFixed(0.5, &.{
+        .{ .object_id = "hazard-1", .position = .{ 0, 10 } },
+        .{ .object_id = "hazard-2", .position = .{ 0, 20 } },
+    }, .{ .move_x = -1, .move_y = 1 });
+    try std.testing.expectEqual(@as(usize, 1), active.failureSlice().len);
+    try std.testing.expectEqual(@as(usize, 1), active.commandSlice().len);
+    try std.testing.expectEqualStrings("hazard-2", active.commandObjectId(active.commandSlice()[0]));
+    try std.testing.expectEqual(@as(f64, -1), active.commandSlice()[0].dx);
+    try std.testing.expectEqual(@as(f64, 1), active.commandSlice()[0].dy);
 }

@@ -6,6 +6,12 @@ const c = @cImport({
     @cInclude("kadath_luau.h");
 });
 
+test "Behavior input snapshot preserves its public C layout" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(c.KadathLuauInputSnapshot));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(c.KadathLuauInputSnapshot, "move_x"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(c.KadathLuauInputSnapshot, "move_y"));
+}
+
 const patrol_source =
     \\local speed = kadath.parameter.number("speed", { default = 80, min = 0, max = 1000 })
     \\local direction = 1
@@ -31,14 +37,15 @@ test "Luau tooling extracts bounded number schema" {
     try std.testing.expect(compiled.bytecode.len > 0);
 }
 
-test "Luau Analysis accepts the Kadath Object type namespace" {
+test "Luau Analysis accepts the Kadath Object and input host namespaces" {
     const typed_source =
         \\--!strict
         \\local speed = kadath.parameter.number("speed", { default = 80, min = 0, max = 1000 })
         \\return {
         \\    fixed_update = function(self: Kadath.Object, dt: number)
+        \\        local move_x, move_y = kadath.input.move_axis()
         \\        local position = self:position()
-        \\        if self:id() ~= "" then self:translate(0, speed * dt + position.y - position.y) end
+        \\        if self:id() ~= "" then self:translate(move_x, move_y + speed * dt + position.y - position.y) end
         \\    end,
         \\}
     ;
@@ -46,6 +53,19 @@ test "Luau Analysis accepts the Kadath Object type namespace" {
     var compiled = try tooling.compile(std.testing.allocator, typed_source, "typed.luau", &diagnostic);
     defer compiled.deinit();
     try std.testing.expectEqual(@as(u8, 1), compiled.parameter_count);
+}
+
+test "Luau tooling rejects top-level input reads as tooling execution errors" {
+    var failure = tooling.Diagnostic{};
+    const result = try tooling.analyze(
+        "--!strict\nlocal move_x, move_y = kadath.input.move_axis()\nreturn {}",
+        "top-level-input.luau",
+        &failure,
+    );
+    try std.testing.expectEqual(tooling.AnalysisState.invalid, result.state);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnosticSlice().len);
+    try std.testing.expectEqual(tooling.DiagnosticStage.tooling_execution, result.diagnosticSlice()[0].stage);
+    try std.testing.expectEqual(tooling.DiagnosticCode.tooling_execution_error, result.diagnosticSlice()[0].code);
 }
 
 test "Luau Analysis rejects type errors and forbidden globals" {
@@ -290,14 +310,169 @@ test "Luau runtime isolates binding closure and parameter values" {
     defer second.deinit();
 
     var commands: runtime.CommandBuffer = undefined;
-    const first_tick = try first.fixedUpdate(0.5, .{ 0, 10 }, &commands, &diagnostic);
+    const first_tick = try first.fixedUpdate(0.5, .{ 0, 10 }, .{}, &commands, &diagnostic);
     try std.testing.expectEqual(@as(usize, 1), first_tick.len);
     try std.testing.expectApproxEqAbs(@as(f64, 5), first_tick[0].dy, 0.0001);
-    const first_second_tick = try first.fixedUpdate(0.5, .{ 0, 15 }, &commands, &diagnostic);
+    const first_second_tick = try first.fixedUpdate(0.5, .{ 0, 15 }, .{}, &commands, &diagnostic);
     try std.testing.expectApproxEqAbs(@as(f64, -5), first_second_tick[0].dy, 0.0001);
-    const second_tick = try second.fixedUpdate(0.5, .{ 0, 10 }, &commands, &diagnostic);
+    const second_tick = try second.fixedUpdate(0.5, .{ 0, 10 }, .{}, &commands, &diagnostic);
     try std.testing.expectApproxEqAbs(@as(f64, 10), second_tick[0].dy, 0.0001);
     try std.testing.expect(asset.memoryUsed() > 0);
+}
+
+test "Luau runtime exposes one validated input snapshot only during hooks" {
+    const source =
+        \\local calls = 0
+        \\return {
+        \\    on_start = function(self)
+        \\        local move_x, move_y = kadath.input.move_axis()
+        \\        self:translate(move_x, move_y)
+        \\    end,
+        \\    fixed_update = function(self, dt)
+        \\        calls += 1
+        \\        local move_x, move_y = kadath.input.move_axis()
+        \\        self:translate(move_x + calls, move_y + dt - dt)
+        \\    end,
+        \\}
+    ;
+    var diagnostic = tooling.Diagnostic{};
+    var compiled = try tooling.compile(std.testing.allocator, source, "input-host.luau", &diagnostic);
+    defer compiled.deinit();
+    var asset = try runtime.Asset.init(compiled.bytecode, 2 * 1024 * 1024, 100_000, &diagnostic);
+    defer asset.deinit();
+    var instance = try asset.createInstance("player", &.{}, &diagnostic);
+    defer instance.deinit();
+
+    var commands: runtime.CommandBuffer = undefined;
+    const start_commands = try instance.onStart(.{ 0, 0 }, &commands, &diagnostic);
+    try std.testing.expectEqual(@as(usize, 1), start_commands.len);
+    try std.testing.expectEqual(@as(f64, 0), start_commands[0].dx);
+    try std.testing.expectEqual(@as(f64, 0), start_commands[0].dy);
+
+    var invalid_commands: [1]c.KadathLuauTranslateCommand = undefined;
+    var invalid_count: usize = 123;
+    var error_buffer: [256]u8 = undefined;
+    const native_asset = c.kadath_luau_asset_create(
+        compiled.bytecode.ptr,
+        compiled.bytecode.len,
+        2 * 1024 * 1024,
+        100_000,
+        &error_buffer,
+        error_buffer.len,
+    ) orelse return error.TestUnexpectedResult;
+    defer c.kadath_luau_asset_destroy(native_asset);
+    const object_id = "player";
+    const native_instance = c.kadath_luau_instance_create(
+        native_asset,
+        object_id.ptr,
+        object_id.len,
+        null,
+        0,
+        &error_buffer,
+        error_buffer.len,
+    ) orelse return error.TestUnexpectedResult;
+    defer c.kadath_luau_instance_destroy(native_instance);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.kadath_luau_instance_fixed_update(
+            native_instance,
+            1.0 / 60.0,
+            0,
+            0,
+            null,
+            &invalid_commands,
+            invalid_commands.len,
+            &invalid_count,
+            &error_buffer,
+            error_buffer.len,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), invalid_count);
+
+    invalid_count = 123;
+    const invalid_input = c.KadathLuauInputSnapshot{ .move_x = 2, .move_y = 0 };
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.kadath_luau_instance_fixed_update(
+            native_instance,
+            1.0 / 60.0,
+            0,
+            0,
+            &invalid_input,
+            &invalid_commands,
+            invalid_commands.len,
+            &invalid_count,
+            &error_buffer,
+            error_buffer.len,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), invalid_count);
+
+    const native_input = c.KadathLuauInputSnapshot{ .move_x = 1, .move_y = -1 };
+    try std.testing.expectEqual(
+        @as(c_int, 1),
+        c.kadath_luau_instance_fixed_update(
+            native_instance,
+            1.0 / 60.0,
+            0,
+            0,
+            &native_input,
+            &invalid_commands,
+            invalid_commands.len,
+            &invalid_count,
+            &error_buffer,
+            error_buffer.len,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), invalid_count);
+    try std.testing.expectEqual(@as(f64, 2), invalid_commands[0].dx);
+    try std.testing.expectEqual(@as(f64, -1), invalid_commands[0].dy);
+
+    invalid_count = 123;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.kadath_luau_instance_fixed_update(
+            native_instance,
+            1.0 / 60.0,
+            0,
+            0,
+            null,
+            &invalid_commands,
+            invalid_commands.len,
+            &invalid_count,
+            &error_buffer,
+            error_buffer.len,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), invalid_count);
+
+    try std.testing.expectEqual(
+        @as(c_int, 1),
+        c.kadath_luau_instance_fixed_update(
+            native_instance,
+            1.0 / 60.0,
+            0,
+            0,
+            &native_input,
+            &invalid_commands,
+            invalid_commands.len,
+            &invalid_count,
+            &error_buffer,
+            error_buffer.len,
+        ),
+    );
+    try std.testing.expectEqual(@as(f64, 3), invalid_commands[0].dx);
+
+    const fixed_commands = try instance.fixedUpdate(
+        1.0 / 60.0,
+        .{ 0, 0 },
+        .{ .move_x = 1, .move_y = -1 },
+        &commands,
+        &diagnostic,
+    );
+    try std.testing.expectEqual(@as(usize, 1), fixed_commands.len);
+    try std.testing.expectEqual(@as(f64, 2), fixed_commands[0].dx);
+    try std.testing.expectEqual(@as(f64, -1), fixed_commands[0].dy);
 }
 
 test "Luau tooling rejects invalid behavior contract" {
@@ -353,7 +528,7 @@ test "Luau runtime interrupts runaway hooks" {
     var instance = try asset.createInstance("hazard-1", &.{}, &diagnostic);
     defer instance.deinit();
     var commands: runtime.CommandBuffer = undefined;
-    try std.testing.expectError(error.BehaviorHookFailed, instance.fixedUpdate(1.0 / 60.0, .{ 0, 0 }, &commands, &diagnostic));
+    try std.testing.expectError(error.BehaviorHookFailed, instance.fixedUpdate(1.0 / 60.0, .{ 0, 0 }, .{}, &commands, &diagnostic));
     try std.testing.expect(std.mem.indexOf(u8, diagnostic.slice(), "budget") != null);
 }
 

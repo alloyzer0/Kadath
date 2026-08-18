@@ -7,6 +7,7 @@ const behavior_host = switch (builtin.os.tag) {
 const content_identity = @import("content_identity.zig");
 const audio_api = @import("audio");
 const game = @import("game.zig");
+const player_movement_ownership = @import("player_movement_ownership.zig");
 const runtime_texture_registry = @import("runtime_texture_registry.zig");
 const scene_api = @import("scene.zig");
 const scene_generation_api = @import("scene_generation.zig");
@@ -375,7 +376,7 @@ pub const Host = struct {
         self.script_tick +|= 1;
     }
 
-    fn runBehaviorFixed(self: *Host, dt_seconds: f32) !void {
+    fn runBehaviorFixed(self: *Host, dt_seconds: f32, input: InputSnapshot) !void {
         if (!self.behavior_runtime.isLoaded()) return;
         var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
         const ordered = try self.generation.extractSprites(&sprites);
@@ -385,6 +386,7 @@ pub const Host = struct {
             &self.scene,
             positions[0..ordered.len],
             dt_seconds,
+            .{ .move_x = input.move_x, .move_y = input.move_y },
         );
         try self.generation.applyTranslationDeltas(batch.slice());
     }
@@ -561,13 +563,20 @@ pub const Host = struct {
                 std.log.info("Game session lost: timer expired", .{});
             }
             const step_input = if (self.session.acceptsInput()) input else InputSnapshot{};
-            try self.generation.stepFixed(@floatCast(fixed_dt_seconds), .{
+            const routed_input = player_movement_ownership.route(&self.scene, .{
                 .move_x = step_input.move_x,
                 .move_y = step_input.move_y,
             });
+            try self.generation.stepFixed(@floatCast(fixed_dt_seconds), .{
+                .move_x = routed_input.world.move_x,
+                .move_y = routed_input.world.move_y,
+            });
             if (self.session.acceptsInput()) {
                 if (self.scene.schemaVersion == scene_api.current_schema_version) {
-                    try self.runBehaviorFixed(@floatCast(fixed_dt_seconds));
+                    try self.runBehaviorFixed(@floatCast(fixed_dt_seconds), .{
+                        .move_x = @intCast(routed_input.behaviors.move_x),
+                        .move_y = @intCast(routed_input.behaviors.move_y),
+                    });
                 } else {
                     self.runScriptFixed(@floatCast(fixed_dt_seconds));
                 }

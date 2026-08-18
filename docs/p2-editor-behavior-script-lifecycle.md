@@ -32,6 +32,11 @@
 - v1 Hook 脚本仍保留原有 `GoalPosition` / `GoalVelocity` 投影；v2 行为脚本不伪造 Hook 指令，相关数组为空。
 - v2 项目的 `AuthoringRevision` 使用场景字节哈希和完整脚本依赖集合修订，而不是只哈希 `script.json`。
 - Behavior Tool 在提取参数和校验返回表时会执行 Luau 顶层代码；tooling VM 必须同时施加 2 MiB 内存上限和 100000 次中断预算，失控脚本只能使本次发布失败，不得无限占用 Editor Service。
+- Behavior Host Interface v2 新增 `kadath.input.move_axis() -> (number, number)`；它只在 Hook 期间读取当前 fixed-step 的不可变规范化输入，`on_start` 固定观察 `0,0`，顶层 Tooling 执行调用必须失败。
+- Native `KadathLuauInputSnapshot` 由调用方拥有、仅在 `kadath_luau_instance_fixed_update` 调用期间借用；null 或超出 `-1 / 0 / 1` 的轴值必须在 Luau 与 Command Buffer 产生副作用前失败，Hook 退出和失败路径均清除活动输入上下文。
+- Scene v5 Player 存在任意 Behavior Binding 时，Host 把 World 的移动输入清零并把原始 gated input 交给全部 Behavior Binding；无 Binding 或 Scene v4 时继续由 Native World 移动，脚本失败不得隐式恢复 Native fallback。
+- 默认 Linux 产品固定包含 `scriptId=1 / patrol.luau` 与 `scriptId=2 / player_controller.luau`，Player 绑定后者且保留 `moveSpeed=180`；因此默认项目中新建 Script Asset 的最小可用 ID 为 `3`。
+- KSCP 物理格式保持 v2，但 `host_interface_version` 推进到 `2`；Runtime 与 Editor 必须拒绝 Host v1 artifact 并要求重新 Bake，不能降级运行或推进 Preview loaded identity。
 
 ## 实现位置
 
@@ -42,6 +47,9 @@
 - Avalonia Scene 对象草稿、v4/v5 边界与行为绑定无损回传：`editor/Kadath.Editor.Avalonia/ViewModels/SceneObjectDraftViewModel.cs`、`editor/Kadath.Editor.Avalonia/ViewModels/AvaloniaEditorViewModel.cs`
 - Avalonia 行为脚本源码状态、命令与界面：`editor/Kadath.Editor.ViewModels/EditorScriptSourceViewModel.cs`、`editor/Kadath.Editor.ViewModels/EditorWorkspaceViewModel.cs`、`editor/Kadath.Editor.Avalonia/ViewModels/AvaloniaEditorViewModel.cs`、`editor/Kadath.Editor.Avalonia/Views/MainWindow.axaml`
 - Native 结构化诊断 ABI 与 Luau 共享管线：`modules/behavior_script/native/kadath_luau.h`、`modules/behavior_script/native/tooling_bridge.cpp`、`modules/behavior_script/src/tooling.zig`
+- Behavior Input Native Runtime Adapter、Tooling 类型和 Host version：`modules/behavior_script/native/runtime_bridge.cpp`、`modules/behavior_script/native/tooling_bridge.cpp`、`modules/behavior_script/src/runtime.zig`、`modules/behavior_script/src/artifact.zig`
+- Player movement ownership 与 Host 输入路由：`app/player_movement_ownership.zig`、`app/host.zig`、`app/behavior_host.zig`
+- 默认 Player Controller、Scene Binding 与 Linux package：`packaging/linux-assets/scripts/player_controller.luau`、`packaging/linux-assets/preview.scene.json`、`packaging/linux-assets/preview.script.json`、`build.zig`
 - 单帧 stdin/stdout 分析 Adapter：`tools/behavior-script-tool.zig`
 - 未保存缓冲区校验、受控 Tool 解析、进程超时与协议验证：`editor/Kadath.Editor.Workspace/WorkspaceScriptDiagnosticsModel.cs`
 - typed RPC、后台 Host 生命周期与 Service 路由：`editor/Kadath.Editor.Protocol/Contracts.cs`、`editor/Kadath.Editor.Core/IEditorSession.cs`、`editor/Kadath.Editor.Service/EditorRpcHost.cs`、`editor/Kadath.Editor.Service/WorkspaceEditorBackend.cs`
@@ -59,6 +67,10 @@
 
 - Workspace Contract Verifier：`verification=ok`
 - Service Contract Verifier：`verification=ok`
+- Native/Behavior Runtime contract 已覆盖 Tooling 类型可见、顶层调用失败、`on_start=0,0`、null/越界输入零输出、同一步多 Binding 共享输入、失败 Hook 上下文清理，以及 Host v1 artifact 拒绝。
+- Player movement ownership contract 已覆盖 Scene v4、Scene v5 无 Player Binding、Scene v5 任意 Player Binding 三条路由；多 Binding 继续按 Scene 顺序产生 additive translation，脚本失败保持 fail-closed。
+- 默认产品已迁移到两个 Script v2 dependency 和 Host Interface v2；Linux XCB 真实按键通过 `player_controller.luau` 驱动 Player 到达 Goal，并保留 Won 状态、Audio Cue 与 Patrol Hazard 行为。
+- Workspace、真实 stdio Service、Client、Avalonia headless 与 Xvfb 工作流均按 `scriptId/sourcePath` 选择两个 Behavior Contract；Player Controller 源码读取、in-use 删除保护、下一资产 ID `3` 和绑定保留均已验证。
 - 行为项目创建后可被 `ReadProjectAsync` 和 `ReadHierarchyAsync` 读取。
 - Hierarchy 会展示 `ScriptDependency`、`SceneBehavior` 和 `BehaviorParameter` 节点。
 - 依赖缺失、创建中途失败和所有权清理边界保持失败闭环。
@@ -89,4 +101,4 @@
 
 本阶段已提供 Avalonia 基础 Luau 源码编辑器、未保存缓冲区结构化诊断和单资产 Create/Rename/Delete/Undo，但不包含语法高亮、自动补全、LSP、调试器、多标签页、文件夹树、批量操作或诊断 range 波浪线；这些能力仍是后续独立切片。
 诊断通过不授权保存、Bake 或 Runtime reload；保存后热发布继续由既有 opt-in Live Bake/Preview Watch 链路负责。
-当前候选的验收边界是 Linux 上的共享 ViewModel、Avalonia 编译资源、真实 stdio RPC 源码工作流与现有产品矩阵；跨平台窗口验收不属于本候选边界。
+当前候选的验收边界是 Linux 上的 Host Interface v2、Player movement ownership、共享 ViewModel、Avalonia 编译资源、真实 stdio RPC/Xvfb 源码工作流与现有产品矩阵；不包含完整 Input Action、键位配置、鼠标、手柄、多玩家输入或新的输入 Hook。跨平台窗口验收不属于本候选边界。
