@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const behavior_host = switch (builtin.os.tag) {
-    .linux => @import("behavior_host.zig"),
+    // Windows 与 Linux 的 native x86_64 构建图都已接入完整 Luau Runtime，产品 Host 不得退回拒绝加载的 stub。
+    .windows, .linux => @import("behavior_host.zig"),
     else => @import("behavior_host_stub.zig"),
 };
 const content_identity = @import("content_identity.zig");
