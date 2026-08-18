@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Kadath.Runtime.Windows.ContractVerifier.ContractVerifier</AssemblyName>
+    <RootNamespace>Kadath.Runtime.Windows.ContractVerifier.ContractVerifier</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Kadath.Runtime.Windows.ContractVerifier/Kadath.Runtime.Windows.ContractVerifier.csproj" />
+    <Compile Include="../VerifierInfrastructure/VerifierWindowsDirectoryIdentity.cs" Link="VerifierInfrastructure/VerifierWindowsDirectoryIdentity.cs" />
+  </ItemGroup>
+</Project>

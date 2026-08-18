@@ -1,116 +1,192 @@
-Kadath Runtime Package (Windows x64)
-====================================
+Kadath Windows Runtime 包（KSCP v2 exact-18）
+============================================
 
-启动方式
+运行目录
 --------
-1. 保持本目录结构不变。
-2. 进入 bin 目录并运行 kadath.exe；也可以直接双击 bin\kadath.exe。
-3. 预览工具可使用 kadath.exe --scene assets\scenes\preview.scene --script assets\scripts\preview.script 启动场景和受限脚本 Hook。
 
-纹理资产
---------
-分发包固定包含两对 Renderer2D 纹理：`assets\renderer2d\test.png` → `test.texture` 与 `assets\renderer2d\goal.png` → `goal.texture`。无论 Runtime executable 使用 Zig `Debug` 或 `ReleaseSafe`，安装阶段都以 release texture profile 生成两份 KDAT v2 mip chain；Runtime 只消费 KDAT，不直接解码 PNG/PPM。默认 player/hazard 使用 TextureId 1（test），goal 使用 TextureId 2（goal），同一 frame 按 goal、hazard、player 顺序逐 sprite 绑定纹理。`bin\kadath-runtime-build-profile.json` 的 raw JSON root 必须是 Object，且属性名称大小写敏感、唯一并恰好为十一项：`Version`、`Optimize`、`TextureProfile`、`RuntimeExeSha256`、`TextureSourceSha256`、`TextureArtifactSha256`、`SecondaryTextureSourceSha256`、`SecondaryTextureArtifactSha256`、`VertexShaderSourceSha256`、`FragmentShaderSourceSha256` 与 `BuildPreflightSidecarSha256`。正式 Runtime/archive gate 要求 `Version` 为 JSON number 2，其余十项为 JSON string；普通 no-sidecar developer marker 仅允许 `BuildPreflightSidecarSha256=null`，不能通过正式 gate。marker 不记录绝对路径或其 hash。
-preflight sidecar 是 UTF-8 JSON：`Version=1`、UTC O-format `GeneratedAtUtc`，`PackageRoot`、`TaskLocalCacheDirectory`、`GlobalCacheDirectory` 为当次三个 canonical 本地绝对路径，并且 `PackageRootAbsentBefore`、`TaskLocalCacheAbsentBefore`、`GlobalCacheAbsentBefore` 均为 JSON boolean `true`。sidecar 必须位于三根与 Inner 之外，并在三根创建前写入；`GeneratedAtUtc` 与 sidecar `LastWriteTimeUtc` 的绝对差不得超过 2 秒，且二者都不得晚于任一 build root creation time 加 2 秒。最终 Runtime package 必须以 `-Druntime-preflight-sidecar=<absolute-sidecar>` 构建；build graph 校验 sidecar roots/timestamps 与 Zig 实际 install/local/global-cache roots，marker 记录 sidecar SHA-256。不传该 option 的普通开发构建会记录 null，不能归档或用于 Runtime 像素验收。
-Runtime verifier 还要求独立的 strict UTF-8 JSON build-command evidence v1，字段恰好为 `Version`、`Executable`、`Arguments`、`WorkingDirectory`、`StartedAtUtc`、`EndedAtUtc`、`ExitCode`、`PackageRoot`、`TaskLocalCacheDirectory`、`GlobalCacheDirectory`。`Executable` 必须是当前 `Get-Command zig -CommandType Application` 的 canonical absolute Source，`WorkingDirectory` 必须 canonical exact 等于干净的 Inner `KadathRoot`，UTC O-format 时间必须满足 start <= end，exit 必须为 0，三个 root 必须与 verifier 调用一致。`Arguments` 精确冻结为 `build package -Doptimize=<Debug|ReleaseSafe> --prefix <package> --cache-dir <local-cache> --global-cache-dir <global-cache> -Druntime-preflight-sidecar=<sidecar>`；参数顺序、大小写和值均不得变化，且必须与 mandatory `-ExpectedOptimize Debug|ReleaseSafe` 一致。
-`tools\verify-texture-png-runtime.ps1` 的 `BuildCommandEvidencePath`、`PreflightSidecarPath` 与 `ExpectedOptimize` 为 mandatory。普通模式直接验证 fresh original package；ReleaseSafe archive extract 模式必须同时传入 `-BuildIdentityPackageRoot <original-release-package>` 与 `-ArchiveManifestPath <manifest.sha256>`，先证明 extract、original 与 manifest 的完整 15 项身份相同，再从 extract 启动 Runtime。非 extract 模式禁止只传其中一个参数。verifier 在启动前及最终退出后，对 exe、marker、两对 PNG/KDAT、两个 shader source、sidecar 和 command evidence记录稳定 `RelativePath`、`Length`、小写 `Sha256`、Windows Volume/File ID；extract 模式还锁定 original 的关键身份与 archive manifest。同字节原子替换也会拒绝。任一 pre-launch gate 失败时，stderr 恰好包含一行 `runtime_start_attempted=false`；Runtime start 已尝试后的失败不得输出该行。
+本包面向原生 Windows x64。包根目录记为 `<package-root>`，Runtime 的工作目录固定为
+`<package-root>\bin`，入口为 `bin\kadath.exe`。请保持 `bin`、`bin\assets` 与
+`behavior-tools` 的相对位置不变。
 
-运行前置
---------
-- Windows x64
-- 支持 Vulkan 的 GPU 与已安装的 Vulkan 显卡驱动
-- 不需要安装 Zig、Cargo/Rust、MinGW 或 Vulkan SDK
+```text
+cd <package-root>\bin
+kadath.exe
+```
 
-目录约束
---------
-bin\kadath.exe 使用同目录下的 assets 读取两份 KDAT 纹理和 WAV 反馈音效（完整路径为 bin\assets）。
-开发侧 `packaging\archive-runtime.ps1` 只接受 sidecar-bound `ReleaseSafe` exact-eleven v2 package；Debug marker、null/非小写 64-hex `BuildPreflightSidecarSha256`、任一 secondary 文件缺失或 marker 与包内 exe/四个 texture payload、clean shader identity 不一致，均必须在首次归档写入前拒绝。clean package、ZIP entry、extract 与 `manifest.sha256` 均固定为 15 项。archive 先以 `FileShare.Read` retained handles 冻结完整 source set，经 marker gate 后复制到 owned staging，再从 staging 生成确定性 ZIP；成功后重新验证 live PackageRoot。`tools\verify-runtime-archive.ps1 -PackageRoot <release-package> -EvidenceDirectory <new-root>` 覆盖两个输出路径的可复现哈希、manifest/ZIP/extract 一致性、held-handle mutation、secondary 缺失/篡改、reparse 拒绝和失败回滚。所有 pre-write gate 失败时 stderr 恰好包含一行 `archive_write_started=false`。
-移动 exe 时必须同时保留 assets 目录及其相对位置。分发 Runtime 默认消费 `assets\scenes\preview.scene`（当前写入 KSCN Scene Artifact v4 对象表，兼容读取 v1/v2/v3）；源文件 `assets\scenes\preview.scene.json` 仅用于 Editor 导入和重新构建。运行中按 F5 可显式重载 authoring project 的 JSON 场景；Runtime 默认消费 `assets\scripts\preview.script`（KSCP Script Artifact v1）；源文件 `assets\scripts\preview.script.json` 仅用于 Editor authoring、重新导入和 JSON reload；按 F6 可事务式重载脚本文档，Scene restart/reload 仍会重新进入 `on_start`。Preview Launcher 可用 `-ReloadScriptAfterMilliseconds` 发送自动验证命令，也可用 `-WatchChanges` 开启文件轮询、debounce 和自动 Scene/Script reload（默认 100ms 轮询、250ms debounce）。需要机器可读响应时增加 `-StructuredStatus`，Launcher 会通过 WM_APP requestId 发送 reload，并输出 JSONL v1 的 ready、received、completed 和 stopping 事件。薄 GUI 可从仓库工具目录启动：`pwsh -NoProfile -File tools\editor-gui.ps1 -PackageRoot <package> -ProjectName <name>`；GUI 继续复用 Authoring CLI 和 Preview Launcher，不改变 Runtime 边界。Project Model v1、Hierarchy Snapshot v2、Asset Catalog Snapshot v1、Scene Object typed Inspector 和真实 GUI workflow smoke 可使用仓库工具 `tools\verify-editor-gui-workflow.ps1 -PackageRoot <package>` 验证；资产目录也可用 `tools\verify-editor-asset-catalog.ps1 -PackageRoot <package>` 独立验证。GUI 不写 Runtime 状态、资产文件或直接编辑 JSON。Asset Tool Command v1 可用 `pwsh -NoProfile -File tools\editor-asset-tool.ps1 -Action Import -SourceRoot <source-assets> -StagingDirectory <new-staging> [-DryRun]` 生成隔离 staging 与 `asset-tool.manifest.json`；命令拒绝覆盖 `bin\assets`，不代表已完成真实 importer/baker。独立 verifier 为 `tools\verify-editor-asset-tool.ps1 -SourceRoot <source-assets>`。已验证的 staging 可使用 `pwsh -NoProfile -File tools\editor-asset-promote.ps1 -StagingDirectory <staging> -DestinationRoot <new-candidate> -Profile debug|release [-DryRun]` 生成候选资产包和 `bin\asset-promotion.manifest.json`；Promotion 拒绝覆盖现有 `bin\assets`，候选目录不包含 Runtime exe。Build Contract v1 可用 `pwsh -NoProfile -File tools\editor-asset-build-contract.ps1 -CandidateRoot <candidate> -ContractDirectory <new-contract> -Profile debug|release [-DryRun]` 生成 `asset-build.contract.json`，显式记录 artifact type、工具版本和 importer/baker 状态；Script JSON -> KSCP Script Artifact v1 与 Scene JSON -> KSCN Scene Artifact v4 已由 build 安装阶段自动执行；Texture Importer 的 P3 PPM/PNG 私有 source Adapter 支持 KDAT Texture Artifact v1/v2（debug base-only；release mipmap profile）；当前固定 build/install 仅从 test.png 生成 release KDAT v2。RIFF PCM WAV→Canonical PCM WAV Artifact v1 已由 build 安装阶段自动执行，独立 verifier 分别为 `tools\verify-editor-texture-importer.ps1` 和 `tools\verify-editor-audio-importer.ps1`。Runtime 对纹理、音频、场景和脚本分别消费 release `test.texture`、`*.audio.wav`、`preview.scene` 与 `preview.script` 派生 artifact；源文件保留用于 Catalog、GUI authoring 和重新导入。KDAT v2 的 mip chain 会由 Resource→Renderer2D→Vulkan RHI 完整上传，release 默认请求 `smooth_mipmap_anisotropic` sampler policy（linear min/mag/mip、LOD 0..N-1、支持设备上 4x anisotropy；不支持时降级为 `smooth_mipmap`）；可用 `tools\verify-texture-mip-upload.ps1 -PackageRoot <package>` 验证。
+运行真实窗口需要可用的 Windows 桌面会话、Vulkan 驱动和音频设备。构建工具只用于生成、
+归档和验证产品包；运行 `bin\kadath.exe` 本身不要求安装 Zig 或 .NET SDK。
 
-Scene importer/baker 可用 `pwsh -NoProfile -File tools\editor-scene-importer.ps1 -SourcePath <scene.json> -DestinationPath <new.scene> -Profile debug|release [-DryRun]` 执行，独立 verifier 为 `tools\verify-editor-scene-importer.ps1`。Script importer/baker 可用 tools\editor-script-importer.ps1 执行，独立 verifier 为 tools\verify-editor-script-importer.ps1；Runtime 证据 verifier 为 tools\verify-script-artifact-runtime.ps1。GUI 项目仍保持 JSON authoring 与热重载边界，不直接编辑或覆盖 package/bin/assets。
+产品 artifact 契约
+-----------------
 
-P2-Multi-Texture-01 固定投影勘误：上段遗留的“固定 build/install 仅从 test.png 生成”描述已经失效；当前 build/install 同时从 `test.png` 与 `goal.png` 生成 release KDAT v2，Runtime 同时消费 `test.texture` 与 `goal.texture`，`tools\verify-texture-mip-upload.ps1` 必须验证两个不同 texture handles。
+- `bin\assets\scenes\preview.scene.json` 是 Scene authoring 源，
+  `bin\assets\scenes\preview.scene` 是 Runtime 消费的 KSCN v5 artifact。
+- `bin\assets\scripts\preview.script.json` 声明 Script v2 项目，
+  `bin\assets\scripts\preview.script` 是 Runtime 消费的 KSCP v2 artifact。
+- KSCP v2 固定使用 Host Interface v2。包中保留两个参与构建的 Luau 源：
+  `patrol.luau` 与 `player_controller.luau`。
+- `behavior-tools\kadath-behavior-tool.exe` 负责 Script v2 manifest、Luau 分析与
+  KSCP v2 构建；Runtime 只加载已经生成的 `preview.script`。
+- PNG/WAV 是可审计源；KDAT texture 与 canonical audio artifact 是 Runtime 资产。
 
-当前包不包含安装器、自动更新、代码签名或跨平台运行时。
+KSCP v2 Windows 包必须恰好包含以下 18 个普通文件，归档路径使用 `/`：
 
-Live Bake / Watch（Editor 工具）
--------------------------------
-项目 Preview 可显式启用 artifact-first live workflow：
-  pwsh -NoProfile -File tools\editor-author.ps1 -Action Preview -PackageRoot <package> -ProjectName <name> -LiveBake -WatchChanges -StructuredStatus
+```text
+README.txt
+behavior-tools/kadath-behavior-tool.exe
+bin/assets/audio/lost.audio.wav
+bin/assets/audio/lost.wav
+bin/assets/audio/won.audio.wav
+bin/assets/audio/won.wav
+bin/assets/renderer2d/goal.png
+bin/assets/renderer2d/goal.texture
+bin/assets/renderer2d/test.png
+bin/assets/renderer2d/test.texture
+bin/assets/scenes/preview.scene
+bin/assets/scenes/preview.scene.json
+bin/assets/scripts/patrol.luau
+bin/assets/scripts/player_controller.luau
+bin/assets/scripts/preview.script
+bin/assets/scripts/preview.script.json
+bin/kadath-runtime-build-profile.json
+bin/kadath.exe
+```
 
-`-LiveBake` 会在 Runtime 启动前把项目 `scene.json` / `script.json` bake 到 `bin\projects\<name>\.kadath\derived\scene.scene` 与 `script.script`，并将 Runtime 参数只在内存中切换到派生 artifact。`-WatchChanges` 继续控制是否持续监听；不传时只执行启动 bake。默认 profile 为 debug，可用 `-BakeProfile release` 显式选择。
+缺失文件、未知 extra、PDB、目录链接或文件 reparse point 都会使产品门禁失败。
 
-`.live-bake.manifest.json` 记录 source/artifact SHA-256、相对路径、格式和工具版本。source hash 与 manifest 匹配时复用 artifact；运行中 bake 失败会输出 `live_bake_failed`，保留最近成功 artifact/manifest，且不发送 reload。成功时依次输出 `live_bake_completed`、`command_requested(source=live_bake)` 和 `command_response`。live 派生目录不进入 Asset Catalog、promotion、archive，也不得写入 `bin\assets`。 P2-M4-27A 继续输出 runtime_reload_requested，随后按 Runtime 终态输出 runtime_reload_acknowledged、runtime_reload_failed 或 runtime_reload_stale；旧 command_response 保持兼容。
+Kadath.Editor.Toolchain 原生 CLI
+------------------------------
 
-GUI 的 `Live Bake` 复选框默认关闭；与默认开启的“自动监听”同时选中即可启用 live bake/watch。独立 adapter verifier：
-  pwsh -NoProfile -File tools\verify-editor-live-bake.ps1 -PackageRoot <package>
+先发布原生 .NET Toolchain；后续命令中的路径均应替换为 canonical 本地绝对路径：
 
-Editor Service / Avalonia Client（P2-M4-26A—P2-M4-27A）
--------------------------------------------------
-Editor Service 是 Avalonia/CLI/兼容 WinForms 共用的本地编排层，使用 stdio JSONL，不监听网络端口：
-  dotnet editor\Kadath.Editor.Service\bin\Debug\net8.0\Kadath.Editor.Service.dll --kadath-root <KadathRoot>
+```text
+dotnet publish editor\Kadath.Editor.Toolchain\Kadath.Editor.Toolchain.csproj -c Release --no-self-contained -p:NuGetAudit=false -o <toolchain-output>
+```
 
-客户端先接收 `hello` 并发送 `hello_ack`，再使用 `get_capabilities`、`project_open`、`project_validate`、`bake_start`、`watch_start` / `watch_stop`、`preview_start` / `preview_stop` 和 `shutdown`。Service 内部复用现有 importer/live-bake/Preview adapter，前端不需要知道 staging、manifest、WM_APP 或 Runtime 参数。
+当前 Windows 产品使用以下五类入口。
 
-P2-M4-26B—P2-M4-27A 的共享组件：
-- `editor\Kadath.Editor.Client`：stdio transport、typed request correlation、迟到 response 丢弃、严格 event sequence、EOF/shutdown/dispose 关闭通知；
-- `editor\Kadath.Editor.ViewModels`：Project/Authoring/Publication/Bake/Watch/Preview 状态、最小 Bake Changes target、artifact retention、capability gating 和 UI dispatcher；
-- `editor\Kadath.Editor.Avalonia`：Desktop 壳、Live Bake/Watch、external-window Preview 状态和事件日志；Live Bake/Watch 默认关闭并保持 opt-in，View 不直接读取 JSON、artifact 或 PowerShell。
+资产导入：
 
-构建整个 Editor solution：
-  dotnet build editor\Kadath.Editor.sln --no-restore -m:1 -p:NuGetAudit=false
+```text
+dotnet <toolchain-output>\Kadath.Editor.Toolchain.dll import <texture|audio|scene> <source> <destination> --profile <debug|release> --no-overwrite
+```
 
-启动桌面客户端：
-  dotnet run --project editor\Kadath.Editor.Avalonia\Kadath.Editor.Avalonia.csproj
+Behavior Script 由 `kadath-behavior-tool.exe` 构建，不经过通用资产导入入口。
 
-受限离线构建在项目内关闭 NuGet vulnerability feed 与 Avalonia 用户级 telemetry 写入；联网 CI 可显式重新开启 NuGet audit。自动 smoke 不打开可见桌面窗口：
-  pwsh -NoProfile -File tools\verify-editor-avalonia.ps1 -EditorRoot <KadathRoot>\editor
-  pwsh -NoProfile -File tools\verify-editor-avalonia-workflow.ps1 -PackageRoot <package>
-  pwsh -NoProfile -File editor\verify-editor-client-service.ps1 -PackageRoot <package>
+ReleaseSafe cold-build preflight：
 
-真实 Avalonia workflow smoke 跨越共享 Client/Workspace 和 Editor Service，验证 open、snapshot/publication、authoring、Bake Changes、watch start/stop、带 Live Bake/Watch 的 Preview external-window、Runtime source/artifact revision acknowledgement、texture import 和 shutdown。26A wire workflow 仍可独立验证：
-  pwsh -NoProfile -File tools\verify-editor-rpc-workflow.ps1 -PackageRoot <package>
+```text
+dotnet <toolchain-output>\Kadath.Editor.Toolchain.dll preflight <package-root> <local-cache> <global-cache> <sidecar> --no-overwrite
+```
 
-各命令/事件的外部 wire contract 与共享 module seam 独立记录在工作区 docs\superpowers\contracts\p2-m4-26\README.md；Runtime reload acknowledgement 扩展单独记录在 docs\superpowers\contracts\p2-m4-27\README.md。变更字段、事件、错误码、关闭/retention/stale 语义或兼容策略时必须同步对应契约和 verifier。
+PNG 源快照；正常产品构建关闭验证 barrier 与 fault：
 
-Preview v1 只公布 `external-window` surface 元数据，不通过 RPC 传送像素。`shared-texture` / `frame-stream` 尚未实现。26C 已通过 `project_snapshot`、`hierarchy_snapshot`、`asset_catalog_snapshot`、`publication_snapshot` 将真实 project model、8 节点 hierarchy 和当前 fixture 的 10 项 asset catalog 投影到 Avalonia；查询为只读，失败保留 Workspace 最近成功快照。现有 PowerShell/WinForms 入口继续可用，正式 package、`bin\assets`、Asset Catalog、promotion 和 archive 不因 Service、Avalonia 或 live bake 改变。
-P2-M4-26C/26D/26E Snapshot、Authoring Transaction 与 Publication State 验证：在仓库根 Kadath 下执行 dotnet build editor\Kadath.Editor.sln --no-restore -m:1 -p:NuGetAudit=false、dotnet run --project editor\Kadath.Editor.Workspace.ContractVerifier --no-build、dotnet run --project editor\Kadath.Editor.Client.ContractVerifier --no-build、pwsh -NoProfile -File tools\verify-editor-authoring-transaction.ps1 -PackageRoot (Resolve-Path zig-out).Path、pwsh -NoProfile -File editor\verify-editor-client-service.ps1 -PackageRoot (Resolve-Path zig-out).Path -RealServiceOnly 和 pwsh -NoProfile -File tools\verify-editor-avalonia-workflow.ps1 -PackageRoot (Resolve-Path zig-out).Path。四类只读 Snapshot 与 Service Apply/Undo 已由原生 .NET Workspace Module 执行，不再为这些路径启动 PowerShell；外部字段、版本、事件、错误码和路径边界见 ..\docs\superpowers\contracts\p2-m4-26\snapshot-queries-v1.md、authoring-transactions-v1.md、publication-snapshot-v1.md 与 publication-state-seam-v1.md。
-P2-M4-26D Authoring Transactions
---------------------------------
-Editor Service 的 authoring 写入只允许通过独立的 `authoring_apply` / `authoring_undo` RPC；Avalonia 不直接编辑 JSON。Apply/Undo 必须携带 Project Snapshot 的 `authoringRevision`（64-hex SHA-256），stale revision 返回 `authoring_revision_conflict`，非法 vector/TextureId patch 返回 `invalid_authoring_patch`。原生 `WorkspaceAuthoringModel` 在 Scene/Script source pair 上执行 staging、TOCTOU 检查、逐文件原子替换和失败回滚，直接返回同一次 committed state 的 Project/Hierarchy Snapshot；Service 在当前 session 保留最多 32 条 undo。失败、冲突或空 undo 不覆盖最近成功内容。
+```text
+dotnet <toolchain-output>\Kadath.Editor.Toolchain.dll snapshot <source> <destination> --barrier - --fault - --no-overwrite
+```
 
-Authoring mutation 只作用于 `bin\projects\<name>\scene.json` / `script.json`，不写 `.kadath\derived`、`bin\assets`、Asset Catalog、promotion candidate 或 package archive；Apply 成功也不会隐式 bake/reload。正式 package 构建和 archive 仍沿用既有 release 流程。独立外部契约见 `..\docs\superpowers\contracts\p2-m4-26\authoring-transactions-v1.md`、`authoring-apply-v1.md` 与 `authoring-undo-v1.md`；独立 verifier：
-  pwsh -NoProfile -File tools\verify-editor-authoring-transaction.ps1 -PackageRoot <package>
+Runtime build profile：
 
-真实 Avalonia workflow smoke 额外覆盖 `workflow_authoring_apply=ok` 与 `workflow_authoring_undo=ok`。26D 稳定事务契约不因 26E 改变。
+```text
+dotnet <toolchain-output>\Kadath.Editor.Toolchain.dll build-profile <runtime> <texture-source> <texture-artifact> <secondary-source> <secondary-artifact> <vertex-shader> <fragment-shader> ReleaseSafe <package-root> <local-cache> <global-cache> <sidecar> <destination> --no-overwrite
+```
 
-P2 Editor Native Project Lifecycle
-----------------------------------
-Editor Service 的 `project_create`、`project_open` 与 `project_validate` 已由原生 `WorkspaceProjectLifecycleModel` 执行，不再为这三条产品路径启动 `editor-author.ps1`。Create 固定读取包内 `bin\assets\scenes\preview.scene.json` 与 `bin\assets\scripts\preview.script.json`，使用原子 claim、CreateNew 文件写入和 owned-only cleanup；Open、Validate 与 Authoring commit 共用严格 JSON、路径和 reparse-point 校验。旧 CLI 与 WinForms 入口仍可继续调用 `editor-author.ps1`。
+KSCP v2 Runtime 归档；正常产品构建关闭验证 barrier：
 
-P2-M4-26E Publication State / Bake Changes
-------------------------------------------
-`publication_snapshot` 只读比较 source JSON、`.kadath\derived` manifest 和 KSCN/KSCP artifact，返回 Scene/Script 的 `current`、`source_dirty`、`missing`、`artifact_invalid` 或 `profile_mismatch`。Avalonia 的 `Bake Changes` 使用共享 Workspace 选择最小 Scene/Script/Both target；Service Watch 或 Preview Live Bake + Watch 运行时，手动 bake 被禁用/拒绝，避免交错提交。
+```text
+dotnet <toolchain-output>\Kadath.Editor.Toolchain.dll archive <package-root> <new-output-dir> <new-extract-dir> <kadath-root> --policy kscp-v2 --barrier - --no-overwrite
+```
 
-Bake Changes 只执行 source → derived，不隐式 Runtime reload；失败保留最近成功 artifact。正式 `bin\assets`、catalog、promotion 和 archive 保持不变。Publication ReadModel 由 `Kadath.Editor.Workspace.ContractVerifier` 验证。
+`preflight` 生成 strict UTF-8、无 BOM、单行并以换行结束的 v1 exact-eight sidecar。
+`build-profile` 生成同样编码约束的 v2 exact-eleven marker，并把 Runtime、两组 PNG/KDAT、
+两份 shader 与 sidecar 的 SHA-256 绑定到本次 ReleaseSafe 构建。`snapshot` 在读取期间持有
+源文件身份，并以 `CreateNew`、`Flush(true)` 和 no-replace 提交结果。
 
-Editor Service 的手动 Bake 与 Watch 自动 Bake 已由原生 `WorkspacePublicationModel` 执行：共享严格 Scene/Script codec，写入 KSCN v4/KSCP v1，并按 Scene → Script → manifest 顺序提交和失败回滚。Service 不再为这些产品路径启动 `editor-live-bake.ps1`；该脚本与两个 importer 脚本继续作为旧 CLI/WinForms/Preview Launcher 兼容入口及 byte-parity oracle 保留。
+Windows 构包、归档与产品验证
+--------------------------
 
-真实 Avalonia workflow 额外覆盖 `workflow_publication_missing=ok`、`workflow_publication_dirty=ok` 与 `workflow_bake_changes=ok`。外部 wire/module 契约见 `..\docs\superpowers\contracts\p2-m4-26\publication-snapshot-v1.md` 和 `publication-state-seam-v1.md`。
-P2 Editor Texture Import
-------------------------
-Avalonia 的 Assets 标签页提供“导入纹理”面板，输入外部 `.png` / `.ppm` 源路径、目标 asset name 和 debug/release profile 后，通过 typed Client 调用 Editor Service 的 `texture_import`；GUI 不直接串联 Asset Tool、Promotion、Build Contract 或目录清理脚本。成功后 Workspace 返回新的 `AssetCatalogSnapshot`，Avalonia 立即刷新 Assets 投影并选中新导入的 `assets\renderer2d\*.texture`，可继续用于 Scene texture assignment。
+`<package-root>`、`<local-cache>` 与 `<global-cache>` 必须在 preflight 前都不存在、彼此不包含，
+`<sidecar>` 也必须与三者分离。每次 cold package、archive 或 Runtime 产品验证都应使用一组
+全新路径，并先执行上面的 `preflight` 命令。
 
-真实 Avalonia workflow 额外覆盖 `workflow_texture_import=ok`，并在验证后清理本次 owned imported artifact，避免污染 package fixture。外部行为与失败边界见工作区 `docs\superpowers\specs\2026-08-05-p2-editor-texture-import-01-contract-discovery.md`。
-P2-M4-27A Preview Runtime Reload Acknowledgement
-------------------------------------------------
-Preview Launcher 为 Scene/Script 独立关联 Runtime requestId、source SHA-256、live-bake artifact SHA-256/bytes 与 completion。Editor Service 在保留 preview_status 的同时，对外发布 preview_reload_requested、preview_reload_acknowledged、preview_reload_failed、preview_reload_stale。只有 acknowledged 推进 Runtime loaded revision；rejected/timeout 保留最近 acknowledged identity；旧 requestId 的迟到响应只记 stale。
+仅生成 exact-18 产品目录：
 
-Avalonia 的 Runtime sync 状态与兼容 WinForms 日志消费同一语义。该扩展不新增 Runtime IPC，继续使用 reload_scene / reload_script；不改变正式 bin\assets、catalog、promotion、archive 或 Bake Changes 的 source → derived 边界。验证：
+```text
+zig build package -Doptimize=ReleaseSafe --prefix <package-root> --cache-dir <local-cache> --global-cache-dir <global-cache> -Druntime-preflight-sidecar=<sidecar>
+```
 
-  dotnet run --project editor\Kadath.Editor.Client.ContractVerifier --no-build
-  pwsh -NoProfile -File tools\verify-preview-protocol-quality.ps1 -PackageRoot <package>
-  pwsh -NoProfile -File tools\verify-editor-rpc-workflow.ps1 -PackageRoot <package>
-  pwsh -NoProfile -File tools\verify-editor-avalonia-workflow.ps1 -PackageRoot <package>
-  pwsh -NoProfile -File tools\verify-editor-gui-workflow.ps1 -PackageRoot <package>
+在同一 build graph 中生成产品目录、确定性 ZIP、SHA-256 manifest，并终验 clean extract：
 
-关键输出为 preview_reload_ack_state=ok、runtime_reload_ack=ok、preview_reload_ack=ok、workflow_preview_reload_ack=ok 与 workflow_reload_acknowledged=2。外部 wire/module 契约见 ..\docs\superpowers\contracts\p2-m4-27\README.md。
+```text
+zig build archive-windows-runtime -Doptimize=ReleaseSafe --prefix <package-root> --cache-dir <local-cache> --global-cache-dir <global-cache> -Druntime-preflight-sidecar=<sidecar> -Druntime-archive-output-dir=<new-output-dir> -Druntime-archive-extract-dir=<new-extract-dir>
+```
+
+归档输出目录只允许生成 `kadath-runtime-win-x64.zip` 与 `manifest.sha256`。ZIP entry 顺序、
+时间戳和内容固定；package、ZIP、manifest 与 extract 必须保持同一 18 文件身份。
+
+在真实 Windows HWND/Vulkan/Audio 环境执行产品 verifier：
+
+```text
+zig build verify-windows-runtime -Doptimize=ReleaseSafe --prefix <package-root> --cache-dir <local-cache> --global-cache-dir <global-cache> -Druntime-preflight-sidecar=<sidecar> -Dwindows-runtime-evidence-dir=<new-evidence-dir>
+```
+
+该入口用于检查真实窗口启动、像素、输入、Restart、Player 脚本移动、Won、Audio Cue、关闭
+与有界清理；环境是否满足和验证是否成功，以当次退出码及 evidence 目录为准。
+
+Editor 与 Toolchain 原生 .NET ContractVerifier
+---------------------------------------------
+
+先以目标配置构建整个 Editor solution：
+
+```text
+dotnet build editor\Kadath.Editor.sln -c <Debug|Release> -p:NuGetAudit=false
+```
+
+随后以同一配置执行各原生 verifier：
+
+```text
+dotnet run --project editor\Kadath.Editor.Workspace.ContractVerifier\Kadath.Editor.Workspace.ContractVerifier.csproj -c <Debug|Release> --no-build
+dotnet run --project editor\Kadath.Editor.Service.ContractVerifier\Kadath.Editor.Service.ContractVerifier.csproj -c <Debug|Release> --no-build
+dotnet run --project editor\Kadath.Editor.Client.ContractVerifier\Kadath.Editor.Client.ContractVerifier.csproj -c <Debug|Release> --no-build
+dotnet run --project editor\Kadath.Editor.Toolchain.ContractVerifier\Kadath.Editor.Toolchain.ContractVerifier.csproj -c <Debug|Release> --no-build -- <kadath-root>
+dotnet run --project editor\Kadath.Runtime.Windows.ContractVerifier.ContractVerifier\Kadath.Runtime.Windows.ContractVerifier.ContractVerifier.csproj -c <Debug|Release> --no-build -- <package-root>
+```
+
+Runtime contract verifier 以无窗口故障注入确认 exact-18、未知 extra/PDB、Host Interface v2、
+ReleaseSafe sidecar 与 JSONL 失败分类；它不能替代真实 HWND/Vulkan 产品验证。
+
+Client 到真实 stdio Service 的受控验证入口：
+
+```text
+dotnet run --project editor\Kadath.Editor.Client.ContractVerifier\Kadath.Editor.Client.ContractVerifier.csproj -c <Debug|Release> --no-build -- --real-service-only <service-dll> <kadath-root> <package-root>
+```
+
+其中 `<service-dll>` 对应
+`editor\Kadath.Editor.Service\bin\<Debug|Release>\net8.0\Kadath.Editor.Service.dll`。
+
+Avalonia 的资源 smoke 与原生 Windows workflow：
+
+```text
+dotnet run --project editor\Kadath.Editor.Avalonia\Kadath.Editor.Avalonia.csproj -c <Debug|Release> --no-build -- --headless-smoke
+dotnet run --project editor\Kadath.Editor.Avalonia\Kadath.Editor.Avalonia.csproj -c <Debug|Release> --no-build -- --workflow-smoke-owned <kadath-root> <package-root>
+```
+
+`--workflow-smoke-owned` 只在 package 的受控 projects 目录内创建唯一 fixture，并负责验证其
+所有权后清理。headless smoke 只验证资源和共享 ViewModel 接线，不能替代真实 Windows workflow
+或 Runtime HWND/Vulkan 验证。
+
+no-replace 与 fail-closed 语义
+-----------------------------
+
+- Toolchain 输出、sidecar、归档输出目录、extract 目录和 evidence 目录都必须是新目标；已有文件
+  或目录会在覆盖前被拒绝。
+- importer、snapshot、profile 与 archive 都先验证路径边界、reparse 状态和输入身份；任一不满足
+  都不会发布新的产品身份。
+- archive 在首次产品写入前失败时输出 `archive_write_started=false`，且不推进 output 或 extract。
+- archive 只从 retained handles 复制到自身拥有的 staging；验证期间发生替换或篡改时，操作失败，
+  cleanup 只删除已证明属于本次事务的对象，不删除 replacement 或外来对象。
+- 只有 exact-18、ReleaseSafe profile/hash gate、manifest、ZIP、extract 与最终 live package 复验全部
+  成功后，归档事务才算完成；未知 extra 和 PDB 一律 fail-closed。
+
+本文件定义当前产品入口与判定契约，不代表任何具体机器已经完成验收。每次结果应以实际命令、
+首个因果错误、退出码以及生成的 manifest/evidence 为准。

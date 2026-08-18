@@ -22,4 +22,9 @@
     <ProjectReference Include="..\Kadath.Editor.ViewModels\Kadath.Editor.ViewModels.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\VerifierInfrastructure\VerifierWindowsDirectoryIdentity.cs"
+             Link="VerifierInfrastructure\VerifierWindowsDirectoryIdentity.cs" />
+  </ItemGroup>
+
 </Project>

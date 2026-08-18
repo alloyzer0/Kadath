@@ -1,5 +1,186 @@
 const std = @import("std");
 
+const BehaviorScriptGraph = struct {
+    native_step: *std.Build.Step,
+    artifact_module: *std.Build.Module,
+    manifest_module: *std.Build.Module,
+    package_builder_module: *std.Build.Module,
+    runtime_module: *std.Build.Module,
+    scene_binding_module: *std.Build.Module,
+    tooling_module: *std.Build.Module,
+    tool: *std.Build.Step.Compile,
+    tool_install_step: *std.Build.Step,
+    tool_binary: std.Build.LazyPath,
+};
+
+fn addBehaviorScriptGraph(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    exe: *std.Build.Step.Compile,
+    exe_module: *std.Build.Module,
+) BehaviorScriptGraph {
+    const behavior_build_type = if (optimize == .Debug) "Debug" else "Release";
+    const behavior_build_dir = b.pathFromRoot(b.fmt(
+        ".zig-cache/behavior-script-{s}-{s}",
+        .{ @tagName(target.result.os.tag), @tagName(optimize) },
+    ));
+    const behavior_configure = b.addSystemCommand(&.{
+        "cmake",
+        "-G",
+        "Ninja",
+        "-S",
+        b.pathFromRoot("modules/behavior_script/native"),
+        "-B",
+        behavior_build_dir,
+        b.fmt("-DCMAKE_BUILD_TYPE={s}", .{behavior_build_type}),
+        b.fmt("-DCMAKE_C_COMPILER={s}", .{b.graph.zig_exe}),
+        "-DCMAKE_C_COMPILER_ARG1=cc",
+        b.fmt("-DCMAKE_CXX_COMPILER={s}", .{b.graph.zig_exe}),
+        "-DCMAKE_CXX_COMPILER_ARG1=c++",
+        "-DLUAU_BUILD_CLI=OFF",
+        "-DLUAU_BUILD_TESTS=OFF",
+        "-DLUAU_BUILD_WEB=OFF",
+    });
+    const behavior_native_build = b.addSystemCommand(&.{
+        "cmake",
+        "--build",
+        behavior_build_dir,
+        "--parallel",
+        "8",
+        "--target",
+        "kadath_luau_runtime",
+        "kadath_luau_tooling",
+    });
+    behavior_native_build.step.dependOn(&behavior_configure.step);
+
+    const common_module = b.createModule(.{
+        .root_source_file = b.path("modules/behavior_script/src/common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const artifact_module = b.createModule(.{
+        .root_source_file = b.path("modules/behavior_script/src/artifact.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    artifact_module.addImport("behavior_common", common_module);
+    const manifest_module = b.createModule(.{
+        .root_source_file = b.path("modules/behavior_script/src/manifest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    manifest_module.addImport("behavior_common", common_module);
+
+    const runtime_module = b.createModule(.{
+        .root_source_file = b.path("modules/behavior_script/src/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    runtime_module.addIncludePath(b.path("modules/behavior_script/native"));
+    runtime_module.addIncludePath(b.path("abi"));
+    runtime_module.addImport("behavior_common", common_module);
+    runtime_module.addImport("behavior_artifact", artifact_module);
+    runtime_module.addLibraryPath(.{ .cwd_relative = behavior_build_dir });
+    runtime_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ behavior_build_dir, "luau" }) });
+    runtime_module.linkSystemLibrary("kadath_luau_runtime", .{ .preferred_link_mode = .static });
+    runtime_module.linkSystemLibrary("Luau.VM", .{ .preferred_link_mode = .static });
+    runtime_module.linkSystemLibrary("Luau.Common", .{ .preferred_link_mode = .static });
+
+    const scene_binding_module = b.createModule(.{
+        .root_source_file = b.path("modules/behavior_script/src/scene_binding.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    scene_binding_module.addImport("behavior_common", common_module);
+    scene_binding_module.addImport("behavior_artifact", artifact_module);
+    scene_binding_module.addImport("behavior_runtime", runtime_module);
+
+    const tooling_module = b.createModule(.{
+        .root_source_file = b.path("modules/behavior_script/src/tooling.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    tooling_module.addIncludePath(b.path("modules/behavior_script/native"));
+    tooling_module.addIncludePath(b.path("abi"));
+    tooling_module.addImport("behavior_common", common_module);
+    tooling_module.addLibraryPath(.{ .cwd_relative = behavior_build_dir });
+    tooling_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ behavior_build_dir, "luau" }) });
+    tooling_module.linkSystemLibrary("kadath_luau_tooling", .{ .preferred_link_mode = .static });
+    tooling_module.linkSystemLibrary("Luau.Analysis", .{ .preferred_link_mode = .static });
+    tooling_module.linkSystemLibrary("Luau.Config", .{ .preferred_link_mode = .static });
+    tooling_module.linkSystemLibrary("Luau.Compiler", .{ .preferred_link_mode = .static });
+    tooling_module.linkSystemLibrary("Luau.Ast", .{ .preferred_link_mode = .static });
+    tooling_module.linkSystemLibrary("Luau.Bytecode", .{ .preferred_link_mode = .static });
+    tooling_module.linkSystemLibrary("Luau.VM", .{ .preferred_link_mode = .static });
+    tooling_module.linkSystemLibrary("Luau.Common", .{ .preferred_link_mode = .static });
+
+    const package_builder_module = b.createModule(.{
+        .root_source_file = b.path("modules/behavior_script/src/package_builder.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    package_builder_module.addImport("behavior_common", common_module);
+    package_builder_module.addImport("behavior_artifact", artifact_module);
+    package_builder_module.addImport("behavior_manifest", manifest_module);
+    package_builder_module.addImport("behavior_tooling", tooling_module);
+
+    const behavior_tool_module = b.createModule(.{
+        .root_source_file = b.path("tools/behavior-script-tool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    behavior_tool_module.addImport("behavior_manifest", manifest_module);
+    behavior_tool_module.addImport("behavior_package_builder", package_builder_module);
+    behavior_tool_module.addImport("behavior_tooling", tooling_module);
+    const behavior_tool = b.addExecutable(.{
+        .name = "kadath-behavior-tool",
+        .root_module = behavior_tool_module,
+    });
+    behavior_tool.step.dependOn(&behavior_native_build.step);
+    const behavior_tool_build_step = b.step("build-behavior-script-tool", "Build the native Luau behavior Publication adapter");
+    behavior_tool_build_step.dependOn(&behavior_tool.step);
+    const behavior_tool_install = b.addInstallArtifact(behavior_tool, .{
+        .dest_dir = .{ .override = .prefix },
+        .dest_sub_path = if (target.result.os.tag == .windows)
+            "behavior-tools/kadath-behavior-tool.exe"
+        else
+            "behavior-tools/kadath-behavior-tool",
+        .pdb_dir = .disabled,
+    });
+    const behavior_tool_install_step = b.step("install-behavior-script-tool", "Install the native Luau behavior Publication adapter");
+    behavior_tool_install_step.dependOn(&behavior_tool_install.step);
+
+    // Host、Package Builder 与 Editor Adapter 共用同一组 Luau native 产物和 ABI module。
+    exe_module.addImport("behavior_artifact", artifact_module);
+    exe_module.addImport("behavior_runtime", runtime_module);
+    exe_module.addImport("behavior_scene_binding", scene_binding_module);
+    exe.step.dependOn(&behavior_native_build.step);
+
+    return .{
+        .native_step = &behavior_native_build.step,
+        .artifact_module = artifact_module,
+        .manifest_module = manifest_module,
+        .package_builder_module = package_builder_module,
+        .runtime_module = runtime_module,
+        .scene_binding_module = scene_binding_module,
+        .tooling_module = tooling_module,
+        .tool = behavior_tool,
+        .tool_install_step = &behavior_tool_install.step,
+        .tool_binary = behavior_tool.getEmittedBin(),
+    };
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -173,7 +354,24 @@ pub fn build(b: *std.Build) void {
     var behavior_scene_binding_mod: ?*std.Build.Module = null;
     var behavior_tooling_mod: ?*std.Build.Module = null;
     var behavior_tool_install_artifact_step: ?*std.Build.Step = null;
+    var behavior_tool_executable: ?*std.Build.Step.Compile = null;
     var behavior_tool_binary: ?std.Build.LazyPath = null;
+    const behavior_supported = target.query.isNative() and
+        target.result.cpu.arch == .x86_64 and
+        (target.result.os.tag == .windows or target.result.os.tag == .linux);
+    if (behavior_supported) {
+        const behavior = addBehaviorScriptGraph(b, target, optimize, exe, exe_mod);
+        behavior_native_step = behavior.native_step;
+        behavior_artifact_mod = behavior.artifact_module;
+        behavior_manifest_mod = behavior.manifest_module;
+        behavior_package_builder_mod = behavior.package_builder_module;
+        behavior_runtime_mod = behavior.runtime_module;
+        behavior_scene_binding_mod = behavior.scene_binding_module;
+        behavior_tooling_mod = behavior.tooling_module;
+        behavior_tool_executable = behavior.tool;
+        behavior_tool_install_artifact_step = behavior.tool_install_step;
+        behavior_tool_binary = behavior.tool_binary;
+    }
     if (target.result.os.tag == .windows) {
         const rust_target = switch (target.result.cpu.arch) {
             .x86_64 => "x86_64-pc-windows-gnu",
@@ -240,145 +438,6 @@ pub fn build(b: *std.Build) void {
         async_texture_test_mod.linkSystemLibrary("ws2_32", .{});
     } else if (target.result.os.tag == .linux and target.result.cpu.arch == .x86_64) {
         exe.each_lib_rpath = false;
-        const behavior_build_type = if (optimize == .Debug) "Debug" else "Release";
-        const behavior_build_dir = b.pathFromRoot(b.fmt(".zig-cache/behavior-script-{s}", .{@tagName(optimize)}));
-        const behavior_configure = b.addSystemCommand(&.{
-            "cmake",
-            "-S",
-            b.pathFromRoot("modules/behavior_script/native"),
-            "-B",
-            behavior_build_dir,
-            b.fmt("-DCMAKE_BUILD_TYPE={s}", .{behavior_build_type}),
-            b.fmt("-DCMAKE_C_COMPILER={s}", .{b.pathFromRoot("tools/zig-cc.sh")}),
-            b.fmt("-DCMAKE_CXX_COMPILER={s}", .{b.pathFromRoot("tools/zig-cxx.sh")}),
-            "-DLUAU_BUILD_CLI=OFF",
-            "-DLUAU_BUILD_TESTS=OFF",
-            "-DLUAU_BUILD_WEB=OFF",
-        });
-        const behavior_native_build = b.addSystemCommand(&.{
-            "cmake",
-            "--build",
-            behavior_build_dir,
-            "--parallel",
-            "8",
-            "--target",
-            "kadath_luau_runtime",
-            "kadath_luau_tooling",
-        });
-        behavior_native_build.step.dependOn(&behavior_configure.step);
-        behavior_native_step = &behavior_native_build.step;
-
-        const common_module = b.createModule(.{
-            .root_source_file = b.path("modules/behavior_script/src/common.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const artifact_module = b.createModule(.{
-            .root_source_file = b.path("modules/behavior_script/src/artifact.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        artifact_module.addImport("behavior_common", common_module);
-        behavior_artifact_mod = artifact_module;
-        const manifest_module = b.createModule(.{
-            .root_source_file = b.path("modules/behavior_script/src/manifest.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        manifest_module.addImport("behavior_common", common_module);
-        behavior_manifest_mod = manifest_module;
-        const runtime_module = b.createModule(.{
-            .root_source_file = b.path("modules/behavior_script/src/runtime.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        });
-        runtime_module.addIncludePath(b.path("modules/behavior_script/native"));
-        runtime_module.addIncludePath(b.path("abi"));
-        runtime_module.addImport("behavior_common", common_module);
-        runtime_module.addImport("behavior_artifact", artifact_module);
-        runtime_module.addLibraryPath(.{ .cwd_relative = behavior_build_dir });
-        runtime_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ behavior_build_dir, "luau" }) });
-        runtime_module.linkSystemLibrary("kadath_luau_runtime", .{ .preferred_link_mode = .static });
-        runtime_module.linkSystemLibrary("Luau.VM", .{ .preferred_link_mode = .static });
-        runtime_module.linkSystemLibrary("Luau.Common", .{ .preferred_link_mode = .static });
-        behavior_runtime_mod = runtime_module;
-        const scene_binding_module = b.createModule(.{
-            .root_source_file = b.path("modules/behavior_script/src/scene_binding.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        });
-        scene_binding_module.addImport("behavior_common", common_module);
-        scene_binding_module.addImport("behavior_artifact", artifact_module);
-        scene_binding_module.addImport("behavior_runtime", runtime_module);
-        behavior_scene_binding_mod = scene_binding_module;
-
-        const tooling_module = b.createModule(.{
-            .root_source_file = b.path("modules/behavior_script/src/tooling.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        });
-        tooling_module.addIncludePath(b.path("modules/behavior_script/native"));
-        tooling_module.addIncludePath(b.path("abi"));
-        tooling_module.addImport("behavior_common", common_module);
-        tooling_module.addLibraryPath(.{ .cwd_relative = behavior_build_dir });
-        tooling_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ behavior_build_dir, "luau" }) });
-        tooling_module.linkSystemLibrary("kadath_luau_tooling", .{ .preferred_link_mode = .static });
-        tooling_module.linkSystemLibrary("Luau.Analysis", .{ .preferred_link_mode = .static });
-        tooling_module.linkSystemLibrary("Luau.Config", .{ .preferred_link_mode = .static });
-        tooling_module.linkSystemLibrary("Luau.Compiler", .{ .preferred_link_mode = .static });
-        tooling_module.linkSystemLibrary("Luau.Ast", .{ .preferred_link_mode = .static });
-        tooling_module.linkSystemLibrary("Luau.Bytecode", .{ .preferred_link_mode = .static });
-        tooling_module.linkSystemLibrary("Luau.VM", .{ .preferred_link_mode = .static });
-        tooling_module.linkSystemLibrary("Luau.Common", .{ .preferred_link_mode = .static });
-        behavior_tooling_mod = tooling_module;
-        const package_builder_module = b.createModule(.{
-            .root_source_file = b.path("modules/behavior_script/src/package_builder.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        });
-        package_builder_module.addImport("behavior_common", common_module);
-        package_builder_module.addImport("behavior_artifact", artifact_module);
-        package_builder_module.addImport("behavior_manifest", manifest_module);
-        package_builder_module.addImport("behavior_tooling", tooling_module);
-        behavior_package_builder_mod = package_builder_module;
-        const behavior_tool_module = b.createModule(.{
-            .root_source_file = b.path("tools/behavior-script-tool.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        });
-        behavior_tool_module.addImport("behavior_manifest", manifest_module);
-        behavior_tool_module.addImport("behavior_package_builder", package_builder_module);
-        behavior_tool_module.addImport("behavior_tooling", tooling_module);
-        const behavior_tool = b.addExecutable(.{
-            .name = "kadath-behavior-tool",
-            .root_module = behavior_tool_module,
-        });
-        behavior_tool.step.dependOn(&behavior_native_build.step);
-        const behavior_tool_build_step = b.step("build-behavior-script-tool", "Build the native Luau behavior Publication adapter");
-        behavior_tool_build_step.dependOn(&behavior_tool.step);
-        const behavior_tool_install = b.addInstallArtifact(behavior_tool, .{
-            .dest_dir = .{ .override = .prefix },
-            .dest_sub_path = "behavior-tools/kadath-behavior-tool",
-        });
-        behavior_tool_install_artifact_step = &behavior_tool_install.step;
-        behavior_tool_binary = behavior_tool.getEmittedBin();
-        const behavior_tool_install_step = b.step("install-behavior-script-tool", "Install the native Luau behavior Publication adapter");
-        behavior_tool_install_step.dependOn(behavior_tool_install_artifact_step.?);
-        exe_mod.addImport("behavior_artifact", artifact_module);
-        exe_mod.addImport("behavior_runtime", runtime_module);
-        exe_mod.addImport("behavior_scene_binding", scene_binding_module);
-        exe.step.dependOn(&behavior_native_build.step);
-
         const rust_target = switch (target.result.cpu.arch) {
             .x86_64 => "x86_64-unknown-linux-gnu",
             else => @panic("P2-Linux-Window-01 supports only x86_64 Linux Rust linking"),
@@ -412,7 +471,7 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("m", .{});
         exe.root_module.linkSystemLibrary("dl", .{});
     }
-    const install_exe = b.addInstallArtifact(exe, .{});
+    const install_exe = b.addInstallArtifact(exe, .{ .pdb_dir = .disabled });
     b.getInstallStep().dependOn(&install_exe.step);
     const preview_status_tests = b.addTest(.{
         .root_module = preview_status_mod,
@@ -812,369 +871,33 @@ pub fn build(b: *std.Build) void {
     }
 
     // 分发目录以 bin 为运行工作目录，资产必须与 exe 保持稳定的相对位置。
+    // Editor Toolchain 的 publish 输出由 Zig cache 拥有；snapshot/import/profile 共用同一原生 .NET 入口。
+    const editor_toolchain_build = b.addSystemCommand(&.{ "dotnet", "publish" });
+    // dotnet 会读取 ProjectReference 的传递源码；Run 的目录参数不会递归进入 cache manifest，因此必须每次发布。
+    editor_toolchain_build.has_side_effects = true;
+    editor_toolchain_build.addFileArg(b.path("editor/Kadath.Editor.Toolchain/Kadath.Editor.Toolchain.csproj"));
+    editor_toolchain_build.addArgs(&.{ "-c", "Release", "--no-self-contained", "-p:NuGetAudit=false", "--nologo" });
+    editor_toolchain_build.addPrefixedDirectoryArg("-p:KadathToolchainSourceRoot=", b.path("editor/Kadath.Editor.Toolchain"));
+    editor_toolchain_build.addPrefixedDirectoryArg("-p:KadathWorkspaceSourceRoot=", b.path("editor/Kadath.Editor.Workspace"));
+    editor_toolchain_build.addPrefixedDirectoryArg("-p:KadathProtocolSourceRoot=", b.path("editor/Kadath.Editor.Protocol"));
+    editor_toolchain_build.addFileInput(b.path("editor/Directory.Build.props"));
+    editor_toolchain_build.addArg("-o");
+    const editor_toolchain_output = editor_toolchain_build.addOutputDirectoryArg("editor-toolchain");
+    const editor_toolchain_dll = editor_toolchain_output.path(b, "Kadath.Editor.Toolchain.dll");
+
     const texture_source_snapshot_test_barrier = b.option(
         []const u8,
         "texture-source-snapshot-test-barrier",
         "Verifier-only absolute empty directory used to pause after the PNG source snapshot",
     );
-    const texture_source_snapshot_script =
-        \\$sourcePath, $barrierPath, $faultMode, $destination = $args
-        \\$ErrorActionPreference = 'Stop'
-        \\Set-StrictMode -Version Latest
-        \\if ($null -eq ('Kadath.TextureSourceSnapshot.Native' -as [type])) {
-        \\    Add-Type -TypeDefinition @'
-        \\using System;
-        \\using System.ComponentModel;
-        \\using System.IO;
-        \\using System.Runtime.InteropServices;
-        \\using Microsoft.Win32.SafeHandles;
-        \\namespace Kadath.TextureSourceSnapshot
-        \\{
-        \\    public sealed class OwnedFile
-        \\    {
-        \\        public string Path { get; private set; }
-        \\        public FileStream Stream { get; private set; }
-        \\        public string VolumeFileId { get; private set; }
-        \\        internal OwnedFile(string path, FileStream stream, string volumeFileId)
-        \\        {
-        \\            Path = path;
-        \\            Stream = stream;
-        \\            VolumeFileId = volumeFileId;
-        \\        }
-        \\        public void CloseStream()
-        \\        {
-        \\            if (Stream != null) {
-        \\                Stream.Dispose();
-        \\                Stream = null;
-        \\            }
-        \\        }
-        \\    }
-        \\    public static class Native
-        \\    {
-        \\        [StructLayout(LayoutKind.Sequential)]
-        \\        private struct ByHandleFileInformation
-        \\        {
-        \\            public uint FileAttributes;
-        \\            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
-        \\            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
-        \\            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
-        \\            public uint VolumeSerialNumber;
-        \\            public uint FileSizeHigh;
-        \\            public uint FileSizeLow;
-        \\            public uint NumberOfLinks;
-        \\            public uint FileIndexHigh;
-        \\            public uint FileIndexLow;
-        \\        }
-        \\        [DllImport("kernel32.dll", SetLastError = true)]
-        \\        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation information);
-        \\        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        \\        private static extern SafeFileHandle CreateFile(
-        \\            string fileName,
-        \\            uint desiredAccess,
-        \\            uint shareMode,
-        \\            IntPtr securityAttributes,
-        \\            uint creationDisposition,
-        \\            uint flagsAndAttributes,
-        \\            IntPtr templateFile);
-        \\        [DllImport("kernel32.dll", SetLastError = true)]
-        \\        private static extern bool SetFileInformationByHandle(
-        \\            SafeFileHandle handle,
-        \\            FileInformationByHandleClass fileInformationClass,
-        \\            ref FileDispositionInformation fileInformation,
-        \\            uint bufferSize);
-        \\        private enum FileInformationByHandleClass
-        \\        {
-        \\            FileDispositionInfo = 4,
-        \\        }
-        \\        [StructLayout(LayoutKind.Sequential)]
-        \\        private struct FileDispositionInformation
-        \\        {
-        \\            [MarshalAs(UnmanagedType.Bool)]
-        \\            public bool DeleteFile;
-        \\        }
-        \\        private const uint DeleteAccess = 0x00010000;
-        \\        private const uint FileReadAttributesAccess = 0x00000080;
-        \\        private const uint GenericWriteAccess = 0x40000000;
-        \\        private const uint CreateNew = 1;
-        \\        private const uint OpenExisting = 3;
-        \\        private const uint FileAttributeNormal = 0x00000080;
-        \\        public static string GetVolumeFileId(SafeFileHandle handle)
-        \\        {
-        \\            if (handle == null || handle.IsInvalid) throw new InvalidOperationException("Owned temporary handle is invalid.");
-        \\            ByHandleFileInformation information;
-        \\            if (!GetFileInformationByHandle(handle, out information)) throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFileInformationByHandle failed.");
-        \\            ulong fileIndex = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
-        \\            return information.VolumeSerialNumber.ToString("x8") + ":" + fileIndex.ToString("x16");
-        \\        }
-        \\        private static void MarkHandleForDelete(SafeFileHandle handle)
-        \\        {
-        \\            if (handle == null || handle.IsInvalid) throw new InvalidOperationException("Owned temporary handle is invalid.");
-        \\            FileDispositionInformation disposition = new FileDispositionInformation { DeleteFile = true };
-        \\            if (!SetFileInformationByHandle(
-        \\                handle,
-        \\                FileInformationByHandleClass.FileDispositionInfo,
-        \\                ref disposition,
-        \\                (uint)Marshal.SizeOf(typeof(FileDispositionInformation)))) {
-        \\                throw new Win32Exception(Marshal.GetLastWin32Error(), "SetFileInformationByHandle(FileDispositionInfo) failed.");
-        \\            }
-        \\        }
-        \\        public static OwnedFile CreateNewOwnedFile(string path, bool injectFileIdBeforeReturnFailure)
-        \\        {
-        \\            SafeFileHandle handle = null;
-        \\            FileStream stream = null;
-        \\            try
-        \\            {
-        \\                // 原 owning handle 从 CreateNew 起同时持有 WRITE 与 DELETE；异常路径绝不按 path 重新打开。
-        \\                handle = CreateFile(
-        \\                    path,
-        \\                    GenericWriteAccess | DeleteAccess | FileReadAttributesAccess,
-        \\                    0,
-        \\                    IntPtr.Zero,
-        \\                    CreateNew,
-        \\                    FileAttributeNormal,
-        \\                    IntPtr.Zero);
-        \\                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateFile(CreateNew) for owned snapshot failed.");
-        \\                string volumeFileId = GetVolumeFileId(handle);
-        \\                if (injectFileIdBeforeReturnFailure) throw new InvalidOperationException("Injected snapshot file-id-before-return failure.");
-        \\                stream = new FileStream(handle, FileAccess.Write);
-        \\                OwnedFile owned = new OwnedFile(path, stream, volumeFileId);
-        \\                stream = null;
-        \\                return owned;
-        \\            }
-        \\            catch (Exception primary)
-        \\            {
-        \\                Exception cleanupFailure = null;
-        \\                try {
-        \\                    if (handle != null && !handle.IsInvalid) MarkHandleForDelete(handle);
-        \\                } catch (Exception cleanup) {
-        \\                    cleanupFailure = cleanup;
-        \\                }
-        \\                try {
-        \\                    if (stream != null) stream.Dispose();
-        \\                    else if (handle != null) handle.Dispose();
-        \\                } catch (Exception cleanup) {
-        \\                    cleanupFailure = cleanupFailure == null ? cleanup : new AggregateException(cleanupFailure, cleanup);
-        \\                }
-        \\                if (cleanupFailure != null) throw new AggregateException("CreateNew owned snapshot cleanup failed.", primary, cleanupFailure);
-        \\                throw;
-        \\            }
-        \\        }
-        \\        public static void DeleteIfVolumeFileIdMatches(string path, string expectedVolumeFileId)
-        \\        {
-        \\            if (String.IsNullOrWhiteSpace(expectedVolumeFileId)) throw new ArgumentException("A recorded File ID is required.", "expectedVolumeFileId");
-        \\            using (SafeFileHandle handle = CreateFile(
-        \\                path,
-        \\                DeleteAccess | FileReadAttributesAccess,
-        \\                0,
-        \\                IntPtr.Zero,
-        \\                OpenExisting,
-        \\                FileAttributeNormal,
-        \\                IntPtr.Zero))
-        \\            {
-        \\                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateFile for owned snapshot cleanup failed.");
-        \\                if (!String.Equals(GetVolumeFileId(handle), expectedVolumeFileId, StringComparison.Ordinal)) {
-        \\                    throw new InvalidOperationException("Refusing to delete a replaced snapshot object.");
-        \\                }
-        \\                MarkHandleForDelete(handle);
-        \\            }
-        \\        }
-        \\    }
-        \\}
-        \\'@
-        \\}
-        \\function Assert-NoWin32DevicePath([string]$path, [string]$name) {
-        \\    if ([string]::IsNullOrWhiteSpace($path)) { throw "$name cannot be empty" }
-        \\    $windowsSpelling = $path.Replace('/', '\\')
-        \\    if ($windowsSpelling.StartsWith('\\', [StringComparison]::Ordinal) -or $windowsSpelling.StartsWith('\??\', [StringComparison]::Ordinal)) { throw "$name cannot use UNC/device syntax: $path" }
-        \\}
-        \\function Assert-NoReparsePointInExistingPath([string]$path, [string]$name) {
-        \\    Assert-NoWin32DevicePath $path $name
-        \\    $full = [IO.Path]::GetFullPath($path)
-        \\    $root = [IO.Path]::GetPathRoot($full)
-        \\    $relative = [IO.Path]::GetRelativePath($root, $full)
-        \\    $current = $root
-        \\    if (((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$name root cannot be a reparse point: $current" }
-        \\    foreach ($segment in $relative.Split([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar), [StringSplitOptions]::RemoveEmptyEntries)) {
-        \\        $current = Join-Path $current $segment
-        \\        if (-not (Test-Path -LiteralPath $current)) { break }
-        \\        $item = Get-Item -LiteralPath $current -Force
-        \\        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$name cannot traverse a reparse point: $current" }
-        \\    }
-        \\}
-        \\function Get-CanonicalAbsolutePath([string]$path, [string]$name) {
-        \\    Assert-NoWin32DevicePath $path $name
-        \\    if (-not [IO.Path]::IsPathFullyQualified($path)) { throw "$name must be fully qualified: $path" }
-        \\    $full = [IO.Path]::GetFullPath($path)
-        \\    if (-not $path.Equals($full, [StringComparison]::OrdinalIgnoreCase)) { throw "$name must use its canonical absolute spelling: $path" }
-        \\    Assert-NoReparsePointInExistingPath $full $name
-        \\    return $full
-        \\}
-        \\function Resolve-CanonicalDirectory([string]$path, [string]$name) {
-        \\    $full = Get-CanonicalAbsolutePath $path $name
-        \\    if (-not (Test-Path -LiteralPath $full -PathType Container)) { throw "$name must be an existing directory: $full" }
-        \\    $item = Get-Item -LiteralPath $full -Force
-        \\    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$name cannot be a reparse point: $full" }
-        \\    return (Resolve-Path -LiteralPath $full).Path
-        \\}
-        \\function Resolve-CanonicalFile([string]$path, [string]$name) {
-        \\    $full = Get-CanonicalAbsolutePath $path $name
-        \\    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "$name must be an existing regular file: $full" }
-        \\    $item = Get-Item -LiteralPath $full -Force
-        \\    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$name cannot be a reparse point: $full" }
-        \\    return (Resolve-Path -LiteralPath $full).Path
-        \\}
-        \\function Test-DirectoryContains([string]$parent, [string]$candidate) {
-        \\    $normalizedParent = $parent.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-        \\    $normalizedCandidate = $candidate.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-        \\    if ($normalizedParent.Equals($normalizedCandidate, [StringComparison]::OrdinalIgnoreCase)) { return $true }
-        \\    return $normalizedCandidate.StartsWith($normalizedParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
-        \\}
-        \\function Get-BytesHash([byte[]]$bytes) { return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant() }
-        \\function New-OwnedFile([string]$path, [bool]$injectFileIdBeforeReturnFailure = $false) {
-        \\    # C# helper 在原 CreateNew handle 仍打开时完成 File ID/对象分配；任何 return 前异常先 Delete disposition 再关闭。
-        \\    return [Kadath.TextureSourceSnapshot.Native]::CreateNewOwnedFile($path, $injectFileIdBeforeReturnFailure)
-        \\}
-        \\function Write-OwnedFileDurable([object]$owned, [byte[]]$bytes, [string]$mode = '-') {
-        \\    if ($null -eq $owned -or $null -eq $owned.Stream) { throw 'Owned temporary stream is unavailable' }
-        \\    $stream = $owned.Stream
-        \\    try {
-        \\        if ($mode -ceq 'snapshot-partial-write-before-flush') {
-        \\            # verifier 专用：留下部分 bytes 后在 Flush 前失败，回归覆盖不完整临时文件的 File ID cleanup。
-        \\            $partialLength = [Math]::Max(1, [Math]::Min($bytes.Length - 1, 7))
-        \\            $stream.Write($bytes, 0, $partialLength)
-        \\            throw 'Injected snapshot partial-write-before-flush failure'
-        \\        }
-        \\        $stream.Write($bytes, 0, $bytes.Length)
-        \\        $stream.Flush($true)
-        \\    } finally {
-        \\        $owned.CloseStream()
-        \\    }
-        \\}
-        \\function Remove-OwnedTemporary([string]$path, [string]$expectedVolumeFileId) {
-        \\    if (-not (Test-Path -LiteralPath $path)) { return }
-        \\    if ([string]::IsNullOrWhiteSpace($expectedVolumeFileId)) { throw "Refusing to delete snapshot path without a recorded File ID: $path" }
-        \\    Assert-NoReparsePointInExistingPath $path 'Owned snapshot file'
-        \\    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Refusing to delete a non-file snapshot path: $path" }
-        \\    # 身份比对与 FileDispositionInfo 删除标记固定在同一 DELETE 句柄上，关闭后才完成删除，避免路径二次解析竞态。
-        \\    [Kadath.TextureSourceSnapshot.Native]::DeleteIfVolumeFileIdMatches($path, $expectedVolumeFileId)
-        \\}
-        \\$barrier = $null
-        \\if ($faultMode -cne '-' -and $faultMode -cne 'snapshot-file-id-before-return' -and $faultMode -cne 'snapshot-partial-write-before-flush' -and $faultMode -cne 'snapshot-replace-before-cleanup') { throw "Unknown snapshot verifier fault mode: $faultMode" }
-        \\if ($barrierPath -cne '-') {
-        \\    Assert-NoWin32DevicePath $barrierPath 'Snapshot test barrier'
-        \\    if (-not [IO.Path]::IsPathFullyQualified($barrierPath)) { throw 'Snapshot test barrier must be fully qualified' }
-        \\    $barrier = [IO.Path]::GetFullPath($barrierPath)
-        \\    if (-not $barrierPath.Equals($barrier, [StringComparison]::OrdinalIgnoreCase)) { throw 'Snapshot test barrier must use its canonical absolute spelling' }
-        \\    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-        \\    Assert-NoReparsePointInExistingPath $temporaryRoot 'System temporary root'
-        \\    if (-not (Test-DirectoryContains $temporaryRoot $barrier) -or $temporaryRoot.Equals($barrier, [StringComparison]::OrdinalIgnoreCase)) { throw 'Snapshot test barrier must be below the system temporary root' }
-        \\    Assert-NoReparsePointInExistingPath $barrier 'Snapshot test barrier'
-        \\    if (-not (Test-Path -LiteralPath $barrier -PathType Container)) { throw 'Snapshot test barrier must be an existing directory' }
-        \\    $barrierItem = Get-Item -LiteralPath $barrier -Force
-        \\    if (($barrierItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Snapshot test barrier cannot be a reparse point' }
-        \\    if (@(Get-ChildItem -LiteralPath $barrier -Force).Count -ne 0) { throw 'Snapshot test barrier must start empty' }
-        \\}
-        \\[byte[]]$sourceBytes = $null
-        \\$sourceStream = $null
-        \\try {
-        \\    # 关键快照边界：打开 handle 前先锁定 canonical regular/non-reparse source。
-        \\    $sourcePath = Resolve-CanonicalFile $sourcePath 'Texture source'
-        \\    $sourceStream = [IO.File]::Open($sourcePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-        \\    [long]$sourceLength = $sourceStream.Length
-        \\    if ($sourceLength -le 0 -or $sourceLength -ge 8MB) { throw 'Texture source snapshot must contain 1..(8 MiB - 1) bytes' }
-        \\    $sourceBytes = [byte[]]::new([int]$sourceLength)
-        \\    $offset = 0
-        \\    while ($offset -lt $sourceBytes.Length) {
-        \\        $read = $sourceStream.Read($sourceBytes, $offset, $sourceBytes.Length - $offset)
-        \\        if ($read -eq 0) { throw 'Texture source ended during snapshot read' }
-        \\        $offset += $read
-        \\    }
-        \\    if ($sourceStream.ReadByte() -ne -1) { throw 'Texture source grew during snapshot read' }
-        \\} finally {
-        \\    if ($null -ne $sourceStream) { $sourceStream.Dispose() }
-        \\}
-        \\$sourceHash = Get-BytesHash $sourceBytes
-        \\$destination = Get-CanonicalAbsolutePath $destination 'Texture source snapshot destination'
-        \\$destinationParent = Split-Path -Parent $destination
-        \\Assert-NoReparsePointInExistingPath $destinationParent 'Texture source snapshot output parent before create'
-        \\if (-not (Test-Path -LiteralPath $destinationParent)) { New-Item -ItemType Directory -Path $destinationParent | Out-Null }
-        \\$destinationParent = Resolve-CanonicalDirectory $destinationParent 'Texture source snapshot output parent after create'
-        \\if (Test-Path -LiteralPath $destination) { throw "Texture source snapshot destination already exists: $destination" }
-        \\$snapshotTemporary = Join-Path $destinationParent ('.kadath-texture-source-snapshot-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
-        \\$snapshotTemporaryOwned = $null
-        \\$destinationVolumeFileId = $null
-        \\$readyTemporary = $null
-        \\$readyTemporaryOwned = $null
-        \\$readyTemporaryBytes = $null
-        \\$replacementTemporary = $null
-        \\$replacementTemporaryOwned = $null
-        \\$destinationCommitted = $false
-        \\$snapshotSucceeded = $false
-        \\try {
-        \\    $snapshotTemporaryOwned = New-OwnedFile $snapshotTemporary ($faultMode -ceq 'snapshot-file-id-before-return')
-        \\    Write-OwnedFileDurable $snapshotTemporaryOwned $sourceBytes $faultMode
-        \\    if ($faultMode -ceq 'snapshot-replace-before-cleanup') {
-        \\        # 同字节 replacement 专门证明 cleanup 不能退化为 length/hash/path：替换后 File ID 必须不同。
-        \\        $replacementTemporary = Join-Path $destinationParent ('.kadath-texture-source-replacement-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
-        \\        $replacementTemporaryOwned = New-OwnedFile $replacementTemporary
-        \\        Write-OwnedFileDurable $replacementTemporaryOwned $sourceBytes
-        \\        [IO.File]::Replace($replacementTemporary, $snapshotTemporary, $null, $true)
-        \\        throw 'Injected snapshot replace-before-cleanup failure'
-        \\    }
-        \\    if ((Get-FileHash -LiteralPath $snapshotTemporary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sourceHash) { throw 'Durable texture source snapshot hash mismatch' }
-        \\    $moveParent = Resolve-CanonicalDirectory $destinationParent 'Texture source snapshot output parent before move'
-        \\    if (-not $moveParent.Equals($destinationParent, [StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $destination)) { throw 'Texture source snapshot destination changed before no-replace move' }
-        \\    [IO.File]::Move($snapshotTemporary, $destination, $false)
-        \\    $destinationCommitted = $true
-        \\    $destinationVolumeFileId = $snapshotTemporaryOwned.VolumeFileId
-        \\    $committedDestination = Resolve-CanonicalFile $destination 'Committed texture source snapshot'
-        \\    if ((Get-Item -LiteralPath $committedDestination -Force).Length -ne $sourceBytes.Length -or (Get-FileHash -LiteralPath $committedDestination -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sourceHash) { throw 'Committed texture source snapshot identity mismatch' }
-        \\    if ($null -ne $barrier) {
-        \\        Assert-NoReparsePointInExistingPath $barrier 'Snapshot test barrier before ready'
-        \\        $readyPath = Join-Path $barrier 'ready.json'
-        \\        $releasePath = Join-Path $barrier 'release'
-        \\        if ((Test-Path -LiteralPath $readyPath) -or (Test-Path -LiteralPath $releasePath)) { throw 'Snapshot test barrier contains a pre-existing control path' }
-        \\        $readyDocument = [ordered]@{ Version = 1; Length = [long]$sourceBytes.Length; Sha256 = $sourceHash }
-        \\        $readyTemporaryBytes = [Text.UTF8Encoding]::new($false).GetBytes(($readyDocument | ConvertTo-Json -Compress) + "`n")
-        \\        $readyTemporary = Join-Path $barrier ('.ready-{0}.tmp' -f [Guid]::NewGuid().ToString('N'))
-        \\        $readyTemporaryOwned = New-OwnedFile $readyTemporary
-        \\        Write-OwnedFileDurable $readyTemporaryOwned $readyTemporaryBytes
-        \\        [IO.File]::Move($readyTemporary, $readyPath, $false)
-        \\        $wait = [Diagnostics.Stopwatch]::StartNew()
-        \\        while ($true) {
-        \\            if (Test-Path -LiteralPath $releasePath) {
-        \\                Assert-NoReparsePointInExistingPath $barrier 'Snapshot test barrier before release'
-        \\                if (-not (Test-Path -LiteralPath $releasePath -PathType Leaf)) { throw 'Snapshot test barrier release must be a regular file' }
-        \\                $release = Get-Item -LiteralPath $releasePath -Force
-        \\                if (($release.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $release.Length -ne 0) { throw 'Snapshot test barrier release must be zero-length and non-reparse' }
-        \\                break
-        \\            }
-        \\            if ($wait.ElapsedMilliseconds -ge 30000) { throw 'Timed out waiting for snapshot test barrier release' }
-        \\            Start-Sleep -Milliseconds 25
-        \\        }
-        \\    }
-        \\    $snapshotSucceeded = $true
-        \\} finally {
-        \\    # cleanup 必须全部尝试：destination rollback 优先，单项失败不得短路其它 owned temp。
-        \\    $cleanupErrors = [Collections.Generic.List[Exception]]::new()
-        \\    try {
-        \\        if ($destinationCommitted -and -not $snapshotSucceeded) { Remove-OwnedTemporary $destination $destinationVolumeFileId }
-        \\    } catch { $cleanupErrors.Add($_.Exception) }
-        \\    try {
-        \\        if ($null -ne $snapshotTemporaryOwned) { Remove-OwnedTemporary $snapshotTemporary $snapshotTemporaryOwned.VolumeFileId }
-        \\    } catch { $cleanupErrors.Add($_.Exception) }
-        \\    try {
-        \\        if ($null -ne $replacementTemporaryOwned) { Remove-OwnedTemporary $replacementTemporary $replacementTemporaryOwned.VolumeFileId }
-        \\    } catch { $cleanupErrors.Add($_.Exception) }
-        \\    try {
-        \\        if ($null -ne $readyTemporaryOwned) { Remove-OwnedTemporary $readyTemporary $readyTemporaryOwned.VolumeFileId }
-        \\    } catch { $cleanupErrors.Add($_.Exception) }
-        \\    if ($cleanupErrors.Count -eq 1) { throw $cleanupErrors[0] }
-        \\    if ($cleanupErrors.Count -gt 1) { throw [AggregateException]::new('Texture source snapshot cleanup failures', $cleanupErrors) }
-        \\}
-    ;
-    const texture_source_snapshot_command = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-CommandWithArgs", texture_source_snapshot_script });
+    // 源快照由 Toolchain 持有源句柄并以 CreateNew + durable no-replace 方式提交。
+    const texture_source_snapshot_command = b.addSystemCommand(&.{"dotnet"});
+    texture_source_snapshot_command.step.dependOn(&editor_toolchain_build.step);
+    texture_source_snapshot_command.addFileArg(editor_toolchain_dll);
+    texture_source_snapshot_command.addArg("snapshot");
     texture_source_snapshot_command.addFileArg(b.path("assets/renderer2d/test.png"));
+    const texture_source_snapshot = texture_source_snapshot_command.addOutputFileArg("test.png");
+    texture_source_snapshot_command.addArg("--barrier");
     if (texture_source_snapshot_test_barrier) |barrier_path| {
         texture_source_snapshot_command.addArg(barrier_path);
     } else {
@@ -1185,20 +908,26 @@ pub fn build(b: *std.Build) void {
         "texture-source-snapshot-test-fault",
         "Verifier-only snapshot fault injection for pre-return, partial-write cleanup, or same-byte replacement refusal",
     );
+    texture_source_snapshot_command.addArg("--fault");
     if (texture_source_snapshot_test_fault) |fault_mode| {
         texture_source_snapshot_command.addArg(fault_mode);
     } else {
         texture_source_snapshot_command.addArg("-");
     }
-    const texture_source_snapshot = texture_source_snapshot_command.addOutputFileArg("test.png");
+    texture_source_snapshot_command.addArg("--no-overwrite");
 
     const secondary_texture_source_snapshot_test_barrier = b.option(
         []const u8,
         "secondary-texture-source-snapshot-test-barrier",
         "Verifier-only absolute empty directory used to pause after the secondary PNG source snapshot",
     );
-    const secondary_texture_source_snapshot_command = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-CommandWithArgs", texture_source_snapshot_script });
+    const secondary_texture_source_snapshot_command = b.addSystemCommand(&.{"dotnet"});
+    secondary_texture_source_snapshot_command.step.dependOn(&editor_toolchain_build.step);
+    secondary_texture_source_snapshot_command.addFileArg(editor_toolchain_dll);
+    secondary_texture_source_snapshot_command.addArg("snapshot");
     secondary_texture_source_snapshot_command.addFileArg(b.path("assets/renderer2d/goal.png"));
+    const secondary_texture_source_snapshot = secondary_texture_source_snapshot_command.addOutputFileArg("goal.png");
+    secondary_texture_source_snapshot_command.addArg("--barrier");
     if (secondary_texture_source_snapshot_test_barrier) |barrier_path| {
         secondary_texture_source_snapshot_command.addArg(barrier_path);
     } else {
@@ -1209,12 +938,13 @@ pub fn build(b: *std.Build) void {
         "secondary-texture-source-snapshot-test-fault",
         "Verifier-only secondary snapshot fault injection for pre-return, partial-write cleanup, or same-byte replacement refusal",
     );
+    secondary_texture_source_snapshot_command.addArg("--fault");
     if (secondary_texture_source_snapshot_test_fault) |fault_mode| {
         secondary_texture_source_snapshot_command.addArg(fault_mode);
     } else {
         secondary_texture_source_snapshot_command.addArg("-");
     }
-    const secondary_texture_source_snapshot = secondary_texture_source_snapshot_command.addOutputFileArg("goal.png");
+    secondary_texture_source_snapshot_command.addArg("--no-overwrite");
 
     const install_assets = b.addInstallDirectory(.{
         .source_dir = b.path("assets"),
@@ -1230,43 +960,47 @@ pub fn build(b: *std.Build) void {
     install_secondary_texture_source_snapshot.step.dependOn(&install_assets.step);
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_secondary_texture_source_snapshot.step);
     // Importer/Baker 在安装阶段从 PNG 源生成确定性 KDAT；Zig optimize 不改变 release texture profile。
-    const texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
-    texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
-    texture_import.addArg("-SourcePath");
+    const texture_import = b.addSystemCommand(&.{"dotnet"});
+    texture_import.step.dependOn(&editor_toolchain_build.step);
+    texture_import.addFileArg(editor_toolchain_dll);
+    texture_import.addArgs(&.{ "import", "texture" });
     texture_import.addFileArg(texture_source_snapshot);
-    texture_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const texture_artifact = texture_import.addOutputFileArg("test.texture");
+    texture_import.addArgs(&.{ "--profile", "release", "--no-overwrite" });
     const install_texture_artifact = b.addInstallFile(texture_artifact, "bin/assets/renderer2d/test.texture");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_texture_artifact.step);
-    const secondary_texture_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
-    secondary_texture_import.addFileArg(b.path("tools/editor-texture-importer.ps1"));
-    secondary_texture_import.addArg("-SourcePath");
+    const secondary_texture_import = b.addSystemCommand(&.{"dotnet"});
+    secondary_texture_import.step.dependOn(&editor_toolchain_build.step);
+    secondary_texture_import.addFileArg(editor_toolchain_dll);
+    secondary_texture_import.addArgs(&.{ "import", "texture" });
     secondary_texture_import.addFileArg(secondary_texture_source_snapshot);
-    secondary_texture_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const secondary_texture_artifact = secondary_texture_import.addOutputFileArg("goal.texture");
+    secondary_texture_import.addArgs(&.{ "--profile", "release", "--no-overwrite" });
     const install_secondary_texture_artifact = b.addInstallFile(secondary_texture_artifact, "bin/assets/renderer2d/goal.texture");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_secondary_texture_artifact.step);
     // 两个音频 artifact 独立构建，任一失败都会阻止 install/package 完成。
-    const audio_import_won = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
-    audio_import_won.addFileArg(b.path("tools/editor-audio-importer.ps1"));
-    audio_import_won.addArg("-SourcePath");
+    const audio_import_won = b.addSystemCommand(&.{"dotnet"});
+    audio_import_won.step.dependOn(&editor_toolchain_build.step);
+    audio_import_won.addFileArg(editor_toolchain_dll);
+    audio_import_won.addArgs(&.{ "import", "audio" });
     audio_import_won.addFileArg(b.path("assets/audio/won.wav"));
-    audio_import_won.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const won_audio_artifact = audio_import_won.addOutputFileArg("won.audio.wav");
+    audio_import_won.addArgs(&.{ "--profile", "release", "--no-overwrite" });
     const install_won_audio_artifact = b.addInstallFile(won_audio_artifact, "bin/assets/audio/won.audio.wav");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_won_audio_artifact.step);
 
-    const audio_import_lost = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
-    audio_import_lost.addFileArg(b.path("tools/editor-audio-importer.ps1"));
-    audio_import_lost.addArg("-SourcePath");
+    const audio_import_lost = b.addSystemCommand(&.{"dotnet"});
+    audio_import_lost.step.dependOn(&editor_toolchain_build.step);
+    audio_import_lost.addFileArg(editor_toolchain_dll);
+    audio_import_lost.addArgs(&.{ "import", "audio" });
     audio_import_lost.addFileArg(b.path("assets/audio/lost.wav"));
-    audio_import_lost.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
     const lost_audio_artifact = audio_import_lost.addOutputFileArg("lost.audio.wav");
+    audio_import_lost.addArgs(&.{ "--profile", "release", "--no-overwrite" });
     const install_lost_audio_artifact = b.addInstallFile(lost_audio_artifact, "bin/assets/audio/lost.audio.wav");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_lost_audio_artifact.step);
 
-    const product_scene_source = if (linux_package_supported)
-        b.path("packaging/linux-assets/preview.scene.json")
+    const product_scene_source = if (behavior_supported)
+        b.path("packaging/runtime-assets/preview.scene.json")
     else
         b.path("assets/scenes/preview.scene.json");
     const install_scene_source_template = b.addInstallFile(product_scene_source, "bin/assets/scenes/preview.scene.json");
@@ -1274,32 +1008,57 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_scene_source_template.step);
 
     // Scene 源 JSON 作为 Editor Create 模板保留；安装包同时生成 Runtime 消费的 KSCN artifact。
-    const scene_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
-    scene_import.addFileArg(b.path("tools/editor-scene-importer.ps1"));
-    scene_import.addArg("-SourcePath");
-    scene_import.addFileArg(b.path("assets/scenes/preview.scene.json"));
-    scene_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
+    const scene_import = b.addSystemCommand(&.{"dotnet"});
+    scene_import.step.dependOn(&editor_toolchain_build.step);
+    scene_import.addFileArg(editor_toolchain_dll);
+    scene_import.addArgs(&.{ "import", "scene" });
+    scene_import.addFileArg(product_scene_source);
     const scene_artifact = scene_import.addOutputFileArg("preview.scene");
+    scene_import.addArgs(&.{ "--profile", "release", "--no-overwrite" });
     const install_scene_artifact = b.addInstallFile(scene_artifact, "bin/assets/scenes/preview.scene");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_scene_artifact.step);
 
-    const product_script_source = if (linux_package_supported)
-        b.path("packaging/linux-assets/preview.script.json")
+    const product_script_source = if (behavior_supported)
+        b.path("packaging/runtime-assets/script.json")
     else
         b.path("assets/scripts/preview.script.json");
     const install_script_source_template = b.addInstallFile(product_script_source, "bin/assets/scripts/preview.script.json");
     if (target.result.os.tag == .windows) install_script_source_template.step.dependOn(&install_assets.step);
     b.getInstallStep().dependOn(&install_script_source_template.step);
 
-    // Script 源 JSON 作为 Editor Create 模板保留；安装包同时生成 Runtime 消费的 KSCP v1 artifact。
-    const script_import = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
-    script_import.addFileArg(b.path("tools/editor-script-importer.ps1"));
-    script_import.addArg("-SourcePath");
-    script_import.addFileArg(b.path("assets/scripts/preview.script.json"));
-    script_import.addArgs(&.{ "-Profile", "release", "-DestinationPath" });
-    const script_artifact = script_import.addOutputFileArg("preview.script");
+    // 支持 Behavior 的原生平台由同一个 Luau Tooling/Package Builder 生成 KSCP v2；旧平台保留 v1 兼容输入。
+    const script_artifact = if (behavior_supported) artifact: {
+        const behavior_script_import = b.addRunArtifact(behavior_tool_executable.?);
+        behavior_script_import.addArg("--project-root");
+        behavior_script_import.addDirectoryArg(b.path("packaging/runtime-assets"));
+        behavior_script_import.addArgs(&.{ "--manifest", "script.json", "--output" });
+        break :artifact behavior_script_import.addOutputFileArg("preview.script");
+    } else artifact: {
+        const legacy_script_import = b.addSystemCommand(&.{"dotnet"});
+        legacy_script_import.step.dependOn(&editor_toolchain_build.step);
+        legacy_script_import.addFileArg(editor_toolchain_dll);
+        legacy_script_import.addArgs(&.{ "import", "script" });
+        legacy_script_import.addFileArg(product_script_source);
+        const output = legacy_script_import.addOutputFileArg("preview.script");
+        legacy_script_import.addArgs(&.{ "--profile", "release", "--no-overwrite" });
+        break :artifact output;
+    };
     const install_script_artifact = b.addInstallFile(script_artifact, "bin/assets/scripts/preview.script");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_script_artifact.step);
+
+    if (target.result.os.tag == .windows and behavior_supported) {
+        const install_patrol_behavior_source = b.addInstallFile(
+            b.path("packaging/runtime-assets/scripts/patrol.luau"),
+            "bin/assets/scripts/patrol.luau",
+        );
+        const install_player_behavior_source = b.addInstallFile(
+            b.path("packaging/runtime-assets/scripts/player_controller.luau"),
+            "bin/assets/scripts/player_controller.luau",
+        );
+        b.getInstallStep().dependOn(&install_patrol_behavior_source.step);
+        b.getInstallStep().dependOn(&install_player_behavior_source.step);
+        b.getInstallStep().dependOn(behavior_tool_install_artifact_step.?);
+    }
 
     const install_package_readme = b.addInstallFile(
         b.path("packaging/README.txt"),
@@ -1313,71 +1072,12 @@ pub fn build(b: *std.Build) void {
         "runtime-preflight-sidecar",
         "Absolute path to the operator-created PNG Runtime pre-build witness",
     );
-    const runtime_build_profile_script =
-        \\$runtimePath, $texturePath, $textureArtifactPath, $secondaryTexturePath, $secondaryTextureArtifactPath, $vertexPath, $fragmentPath, $optimize, $packageRoot, $localCacheRoot, $globalCacheRoot, $preflightPath, $destination = $args
-        \\$ErrorActionPreference = 'Stop'
-        \\function Get-CanonicalLocalPath([string]$path, [string]$name) {
-        \\    if ([string]::IsNullOrWhiteSpace($path) -or -not [IO.Path]::IsPathFullyQualified($path)) { throw "$name must be an absolute local path" }
-        \\    $windowsSpelling = $path.Replace('/', '\\')
-        \\    if ($windowsSpelling.StartsWith('\\\\', [StringComparison]::Ordinal) -or $windowsSpelling.StartsWith('\\??\\', [StringComparison]::Ordinal)) { throw "$name cannot use UNC/device syntax" }
-        \\    return [IO.Path]::GetFullPath($windowsSpelling).TrimEnd('\\').ToLowerInvariant()
-        \\}
-        \\$preflightSha256 = $null
-        \\if ($preflightPath -cne '-') {
-        \\    [byte[]]$preflightBytes = [IO.File]::ReadAllBytes($preflightPath)
-        \\    if ($preflightBytes.Length -eq 0 -or $preflightBytes.Length -gt 65536) { throw 'Runtime preflight sidecar must contain 1..65536 bytes' }
-        \\    $preflightSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($preflightBytes)).ToLowerInvariant()
-        \\    $preflightJson = [Text.UTF8Encoding]::new($false, $true).GetString($preflightBytes)
-        \\    $preflight = $preflightJson | ConvertFrom-Json
-        \\    $jsonDocument = [System.Text.Json.JsonDocument]::Parse($preflightJson)
-        \\    try { $generatedAtText = $jsonDocument.RootElement.GetProperty('GeneratedAtUtc').GetString() } finally { $jsonDocument.Dispose() }
-        \\    $generatedAt = [DateTimeOffset]::MinValue
-        \\    if ([int]$preflight.Version -ne 1 -or [string]::IsNullOrWhiteSpace($generatedAtText) -or -not [DateTimeOffset]::TryParseExact($generatedAtText, 'O', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$generatedAt) -or $generatedAt.Offset -ne [TimeSpan]::Zero) { throw 'Runtime preflight sidecar has an invalid v1 GeneratedAtUtc' }
-        \\    if (($preflight.PackageRootAbsentBefore -isnot [bool]) -or -not $preflight.PackageRootAbsentBefore -or ($preflight.TaskLocalCacheAbsentBefore -isnot [bool]) -or -not $preflight.TaskLocalCacheAbsentBefore -or ($preflight.GlobalCacheAbsentBefore -isnot [bool]) -or -not $preflight.GlobalCacheAbsentBefore) { throw 'Runtime preflight sidecar must witness all roots absent before build' }
-        \\    $rootPairs = @(
-        \\        @([string]$preflight.PackageRoot, $packageRoot, 'PackageRoot'),
-        \\        @([string]$preflight.TaskLocalCacheDirectory, $localCacheRoot, 'TaskLocalCacheDirectory'),
-        \\        @([string]$preflight.GlobalCacheDirectory, $globalCacheRoot, 'GlobalCacheDirectory')
-        \\    )
-        \\    foreach ($pair in $rootPairs) {
-        \\        $claimed = Get-CanonicalLocalPath $pair[0] "Preflight $($pair[2])"
-        \\        $actual = Get-CanonicalLocalPath $pair[1] "Build $($pair[2])"
-        \\        if (-not $pair[0].Equals($claimed, [StringComparison]::OrdinalIgnoreCase) -or $claimed -cne $actual) { throw "Runtime preflight $($pair[2]) does not match the Zig build graph" }
-        \\    }
-        \\    $sidecarInfo = Get-Item -LiteralPath $preflightPath -Force
-        \\    $timestampTolerance = [TimeSpan]::FromSeconds(2)
-        \\    if ([math]::Abs(($generatedAt.UtcDateTime - $sidecarInfo.LastWriteTimeUtc).TotalSeconds) -gt $timestampTolerance.TotalSeconds) { throw 'Runtime preflight GeneratedAtUtc and sidecar LastWriteTimeUtc differ by more than 2 seconds' }
-        \\    foreach ($rootPath in @($packageRoot, $localCacheRoot, $globalCacheRoot)) {
-        \\        if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { throw "Zig build graph root does not exist before marker generation: $rootPath" }
-        \\        $rootInfo = Get-Item -LiteralPath $rootPath -Force
-        \\        $latestWitnessTime = $rootInfo.CreationTimeUtc + $timestampTolerance
-        \\        if ($generatedAt.UtcDateTime -gt $latestWitnessTime -or $sidecarInfo.LastWriteTimeUtc -gt $latestWitnessTime) { throw "Runtime preflight witness is newer than a build graph root: $rootPath" }
-        \\    }
-        \\}
-        \\$document = [ordered]@{
-        \\    Version = 2
-        \\    Optimize = $optimize
-        \\    TextureProfile = 'release'
-        \\    RuntimeExeSha256 = (Get-FileHash -LiteralPath $runtimePath -Algorithm SHA256).Hash.ToLowerInvariant()
-        \\    TextureSourceSha256 = (Get-FileHash -LiteralPath $texturePath -Algorithm SHA256).Hash.ToLowerInvariant()
-        \\    TextureArtifactSha256 = (Get-FileHash -LiteralPath $textureArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        \\    SecondaryTextureSourceSha256 = (Get-FileHash -LiteralPath $secondaryTexturePath -Algorithm SHA256).Hash.ToLowerInvariant()
-        \\    SecondaryTextureArtifactSha256 = (Get-FileHash -LiteralPath $secondaryTextureArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        \\    VertexShaderSourceSha256 = (Get-FileHash -LiteralPath $vertexPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        \\    FragmentShaderSourceSha256 = (Get-FileHash -LiteralPath $fragmentPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        \\    BuildPreflightSidecarSha256 = $preflightSha256
-        \\}
-        \\$temporary = "$destination.tmp-$([Guid]::NewGuid().ToString('N'))"
-        \\try {
-        \\    $json = ($document | ConvertTo-Json -Compress) + "`n"
-        \\    [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
-        \\    [IO.File]::Move($temporary, $destination, $false)
-        \\} finally {
-        \\    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-        \\}
-    ;
-    const runtime_build_profile_command = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-CommandWithArgs", runtime_build_profile_script });
+    // Build profile 由 Toolchain 生成严格 exact-eleven v2 JSON，并保持 sidecar 身份门禁。
+    const runtime_build_profile_command = b.addSystemCommand(&.{"dotnet"});
     runtime_build_profile_command.step.dependOn(&install_exe.step);
+    runtime_build_profile_command.step.dependOn(&editor_toolchain_build.step);
+    runtime_build_profile_command.addFileArg(editor_toolchain_dll);
+    runtime_build_profile_command.addArg("build-profile");
     runtime_build_profile_command.addFileArg(exe.getEmittedBin());
     runtime_build_profile_command.addFileArg(texture_source_snapshot);
     runtime_build_profile_command.addFileArg(texture_artifact);
@@ -1395,6 +1095,7 @@ pub fn build(b: *std.Build) void {
         runtime_build_profile_command.addArg("-");
     }
     const runtime_build_profile = runtime_build_profile_command.addOutputFileArg("kadath-runtime-build-profile.json");
+    runtime_build_profile_command.addArg("--no-overwrite");
     const install_runtime_build_profile = b.addInstallFile(runtime_build_profile, "bin/kadath-runtime-build-profile.json");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_runtime_build_profile.step);
     if (linux_package_supported) {
@@ -1421,8 +1122,8 @@ pub fn build(b: *std.Build) void {
         });
         package_assets.step.dependOn(behavior_native_step.?);
         const package_assets_run = b.addRunArtifact(package_assets);
-        package_assets_run.addFileInput(b.path("packaging/linux-assets/scripts/patrol.luau"));
-        package_assets_run.addFileInput(b.path("packaging/linux-assets/scripts/player_controller.luau"));
+        package_assets_run.addFileInput(b.path("packaging/runtime-assets/scripts/patrol.luau"));
+        package_assets_run.addFileInput(b.path("packaging/runtime-assets/scripts/player_controller.luau"));
         const linux_texture_artifact = package_assets_run.addOutputFileArg("test.texture");
         const linux_secondary_texture_artifact = package_assets_run.addOutputFileArg("goal.texture");
         const linux_won_audio_artifact = package_assets_run.addOutputFileArg("won.audio.wav");
@@ -1456,11 +1157,11 @@ pub fn build(b: *std.Build) void {
         const install_linux_scene_artifact = b.addInstallFile(linux_scene_artifact, "bin/assets/scenes/preview.scene");
         const install_linux_script_artifact = b.addInstallFile(linux_script_artifact, "bin/assets/scripts/preview.script");
         const install_linux_behavior_source = b.addInstallFile(
-            b.path("packaging/linux-assets/scripts/patrol.luau"),
+            b.path("packaging/runtime-assets/scripts/patrol.luau"),
             "bin/assets/scripts/patrol.luau",
         );
         const install_linux_player_behavior_source = b.addInstallFile(
-            b.path("packaging/linux-assets/scripts/player_controller.luau"),
+            b.path("packaging/runtime-assets/scripts/player_controller.luau"),
             "bin/assets/scripts/player_controller.luau",
         );
         const install_linux_package_readme = b.addInstallFile(b.path("packaging/README-linux.txt"), "README.txt");
@@ -1488,8 +1189,8 @@ pub fn build(b: *std.Build) void {
         package_manifest_command.addFileInput(linux_script_artifact);
         package_manifest_command.addFileInput(product_scene_source);
         package_manifest_command.addFileInput(product_script_source);
-        package_manifest_command.addFileInput(b.path("packaging/linux-assets/scripts/patrol.luau"));
-        package_manifest_command.addFileInput(b.path("packaging/linux-assets/scripts/player_controller.luau"));
+        package_manifest_command.addFileInput(b.path("packaging/runtime-assets/scripts/patrol.luau"));
+        package_manifest_command.addFileInput(b.path("packaging/runtime-assets/scripts/player_controller.luau"));
         package_manifest_command.addFileInput(b.path("packaging/README-linux.txt"));
         package_manifest_command.addFileInput(behavior_tool_binary.?);
         package_manifest_command.step.dependOn(&install_exe.step);
@@ -1549,6 +1250,57 @@ pub fn build(b: *std.Build) void {
         verify_linux_package_step.dependOn(&unsupported_linux_package.step);
     } else {
         package_step.dependOn(b.getInstallStep());
+    }
+
+    if (target.query.isNative() and target.result.cpu.arch == .x86_64 and target.result.os.tag == .windows) {
+        const archive_output_dir = b.option(
+            []const u8,
+            "runtime-archive-output-dir",
+            "Absolute new directory for the Windows Runtime ZIP and manifest",
+        ) orelse b.pathFromRoot(".kadath-runtime-archive");
+        const archive_extract_dir = b.option(
+            []const u8,
+            "runtime-archive-extract-dir",
+            "Absolute new directory for the verified Windows Runtime extraction",
+        ) orelse b.pathFromRoot(".kadath-runtime-extract");
+        const archive_barrier = b.option(
+            []const u8,
+            "runtime-archive-test-barrier",
+            "Verifier-only absolute empty directory used to pause a retained package snapshot",
+        );
+        const archive_windows_command = b.addSystemCommand(&.{"dotnet"});
+        archive_windows_command.step.dependOn(package_step);
+        archive_windows_command.step.dependOn(&editor_toolchain_build.step);
+        archive_windows_command.addFileArg(editor_toolchain_dll);
+        archive_windows_command.addArgs(&.{ "archive", b.install_path, archive_output_dir, archive_extract_dir });
+        archive_windows_command.addDirectoryArg(b.path("."));
+        archive_windows_command.addArgs(&.{ "--policy", "kscp-v2", "--barrier" });
+        if (archive_barrier) |barrier| archive_windows_command.addArg(barrier) else archive_windows_command.addArg("-");
+        archive_windows_command.addArg("--no-overwrite");
+        const archive_windows_step = b.step(
+            "archive-windows-runtime",
+            "Create and verify the sidecar-bound ReleaseSafe Windows Runtime archive",
+        );
+        archive_windows_step.dependOn(&archive_windows_command.step);
+
+        const runtime_window_evidence = b.option(
+            []const u8,
+            "windows-runtime-evidence-dir",
+            "Absolute new directory for Windows HWND/Vulkan product evidence",
+        ) orelse b.pathFromRoot(".kadath-windows-runtime-evidence");
+        const verify_windows_runtime_command = b.addSystemCommand(&.{ "dotnet", "run", "--project" });
+        // verifier 依赖 Win32 与当前 package，显式 step 不参与普通 test/package 的 headless 路径。
+        verify_windows_runtime_command.has_side_effects = true;
+        verify_windows_runtime_command.addFileArg(b.path(
+            "editor/Kadath.Runtime.Windows.ContractVerifier/Kadath.Runtime.Windows.ContractVerifier.csproj",
+        ));
+        verify_windows_runtime_command.addArgs(&.{ "-c", "Release", "--", b.install_path, runtime_window_evidence });
+        verify_windows_runtime_command.step.dependOn(package_step);
+        const verify_windows_runtime_step = b.step(
+            "verify-windows-runtime",
+            "Verify real Windows HWND/Vulkan pixels, input, audio, and bounded cleanup",
+        );
+        verify_windows_runtime_step.dependOn(&verify_windows_runtime_command.step);
     }
 
     const run_cmd = b.addRunArtifact(exe);

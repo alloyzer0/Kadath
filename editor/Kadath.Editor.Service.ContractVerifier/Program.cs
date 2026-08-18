@@ -15,12 +15,21 @@ internal static class Program
         TimeSpan.FromMilliseconds(100),
         TimeSpan.FromMilliseconds(350));
 
-    public static async Task<int> Main()
+    public static async Task<int> Main(string[] args)
     {
-        if (!OperatingSystem.IsLinux())
+        // fake Runtime 与 verifier 共用同一个托管入口，避免测试能力被 shell 或宿主平台绑死。
+        if (args is ["--fake-runtime", .. var runtimeArguments])
         {
-            Console.WriteLine("verification=skipped_non_linux");
-            return 0;
+            return await ManagedFakeRuntime.RunAsync(runtimeArguments).ConfigureAwait(false);
+        }
+        if (args is ["--fake-child"])
+        {
+            return await ManagedFakeRuntime.RunChildAsync().ConfigureAwait(false);
+        }
+        if (args.Length != 0)
+        {
+            Console.Error.WriteLine("verification=failed: unsupported verifier arguments");
+            return 1;
         }
 
         var root = Path.Combine(Path.GetTempPath(), $"kadath-native-preview-{Guid.NewGuid():N}");
@@ -196,7 +205,7 @@ internal static class Program
         var stopwatch = Stopwatch.StartNew();
         await controller.StopAsync();
         Require(stopwatch.Elapsed < TimeSpan.FromSeconds(2), "bounded stop exceeded verifier limit");
-        await WaitUntilAsync(() => !Directory.Exists($"/proc/{childProcessId}"), TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => !IsProcessAlive(childProcessId), TimeSpan.FromSeconds(2));
         var stopped = await events.WaitAsync("preview_stopped");
         Require(stopped.Data.GetProperty("requested").GetBoolean(), "killed runtime stop was not requested");
     }
@@ -217,14 +226,11 @@ internal static class Program
         var bin = Path.Combine(packageRoot, "bin");
         var project = Path.Combine(bin, "projects", "demo");
         Directory.CreateDirectory(project);
-        var runtimePath = Path.Combine(bin, "fake-runtime.sh");
+        var runtimeExecutable = InstallManagedFakeRuntime(bin);
         var scenePath = Path.Combine(project, "scene.json");
         var scriptPath = Path.Combine(project, "script.json");
         var configPath = Path.Combine(project, "preview.json");
         var childPidPath = Path.Combine(packageRoot, "child.pid");
-        File.WriteAllText(runtimePath, FakeRuntimeScript, new UTF8Encoding(false));
-        if (!OperatingSystem.IsLinux()) throw new PlatformNotSupportedException("Native Preview verifier requires Linux.");
-        File.SetUnixFileMode(runtimePath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         File.WriteAllText(scenePath, """
         {"schemaVersion":3,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"player":{"position":[312,130],"size":[320,240],"color":[1,1,1,1],"moveSpeed":180,"textureId":1},"goal":{"position":[700,200],"size":[96,96],"color":[1,0.75,0.1,1],"textureId":1},"hazard":{"position":[650,280],"size":[96,96],"color":[0.95,0.2,0.2,1],"patrolMinY":245,"patrolMaxY":330,"patrolSpeed":80,"textureId":1}}
         """, new UTF8Encoding(false));
@@ -236,10 +242,11 @@ internal static class Program
             schemaVersion = 1,
             runtime = new
             {
-                executable = "bin/fake-runtime.sh",
+                executable = $"bin/{runtimeExecutable}",
                 workingDirectory = "bin",
                 arguments = new[]
                 {
+                    "--fake-runtime",
                     mode,
                     childPidPath,
                     "--scene",
@@ -257,6 +264,48 @@ internal static class Program
             Path.Combine(project, ".kadath", "derived", ".live-bake.manifest.json"));
     }
 
+    private static string InstallManagedFakeRuntime(string destinationDirectory)
+    {
+        var executableName = OperatingSystem.IsWindows()
+            ? "Kadath.Editor.Service.ContractVerifier.exe"
+            : "Kadath.Editor.Service.ContractVerifier";
+        var sourceDirectory = AppContext.BaseDirectory;
+        var sourceExecutable = Path.Combine(sourceDirectory, executableName);
+        if (!File.Exists(sourceExecutable))
+        {
+            throw new FileNotFoundException("Managed fake Runtime apphost was not built.", sourceExecutable);
+        }
+
+        // apphost、runtimeconfig 与依赖程序集必须保持同目录，复制完整输出集合可保持普通 dotnet build 可运行。
+        foreach (var source in Directory.EnumerateFiles(sourceDirectory))
+        {
+            File.Copy(source, Path.Combine(destinationDirectory, Path.GetFileName(source)), overwrite: false);
+        }
+
+        var installedExecutable = Path.Combine(destinationDirectory, executableName);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(installedExecutable,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        }
+        return executableName;
+    }
+
+    private static bool IsProcessAlive(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
     private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout)
     {
         var deadline = DateTimeOffset.UtcNow + timeout;
@@ -271,99 +320,6 @@ internal static class Program
     {
         if (!condition) throw new InvalidOperationException(message);
     }
-
-    private const string FakeRuntimeScript = """
-    #!/bin/sh
-    mode="$1"
-    child_pid_path="$2"
-    shift 2
-    scene_path=""
-    script_path=""
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --scene) scene_path="$2"; shift 2 ;;
-            --script) script_path="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-    sequence=1
-    delayed_scene=""
-    emit() {
-        printf '%s\n' "$1"
-    }
-    command_value() {
-        printf '%s' "$1" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p'
-    }
-    request_value() {
-        printf '%s' "$1" | sed -n 's/.*"requestId":\([0-9][0-9]*\).*/\1/p'
-    }
-    emit 'not-json'
-    emit 'info: fake runtime stdout'
-    emit '{"schemaVersion":1,"sequence":1,"event":"unknown_status"}'
-    printf '%s\n' 'fake runtime stderr' >&2
-    if [ "$mode" = "startup_fail" ]; then
-        emit '{"schemaVersion":1,"sequence":2,"event":"runtime_failed","phase":"startup","errorCode":"fake_startup_failure"}'
-        exit 3
-    fi
-    if [ "$mode" = "source" ]; then
-        emit '{"schemaVersion":1,"sequence":2,"event":"runtime_ready","initialLoaded":{"scene":{"kind":"source_document","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","bytes":5},"script":{"kind":"source_document","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","bytes":6}}}'
-    elif [ "$mode" = "artifact_missing" ] || [ "$mode" = "artifact_mismatch" ]; then
-        sleep 0.4
-        scene_hash=$(sha256sum "$scene_path" | cut -d ' ' -f 1)
-        script_hash=$(sha256sum "$script_path" | cut -d ' ' -f 1)
-        scene_bytes=$(wc -c < "$scene_path" | tr -d ' ')
-        script_bytes=$(wc -c < "$script_path" | tr -d ' ')
-        emit "{\"schemaVersion\":1,\"sequence\":2,\"event\":\"runtime_ready\",\"initialLoaded\":{\"scene\":{\"kind\":\"artifact\",\"sha256\":\"$scene_hash\",\"bytes\":$scene_bytes},\"script\":{\"kind\":\"artifact\",\"sha256\":\"$script_hash\",\"bytes\":$script_bytes}}}"
-    else
-        emit '{"schemaVersion":1,"sequence":2,"event":"runtime_ready","initialLoaded":{"scene":{"kind":"built_in"},"script":{"kind":"built_in"}}}'
-    fi
-    if [ "$mode" = "self_exit" ]; then
-        sleep 0.1
-        exit 7
-    fi
-    if [ "$mode" = "hang" ]; then
-        sleep 300 &
-        printf '%s' "$!" > "$child_pid_path"
-    fi
-    while IFS= read -r line; do
-        command=$(command_value "$line")
-        request_id=$(request_value "$line")
-        if [ "$command" = "reload_script" ]; then
-            if [ "$mode" = "timeout" ]; then
-                continue
-            fi
-            if [ "$mode" = "reject" ]; then
-                emit "{\"schemaVersion\":1,\"sequence\":3,\"event\":\"command_completed\",\"requestId\":$request_id,\"command\":\"reload_script\",\"result\":\"rejected\",\"errorCode\":\"fake_reject\"}"
-            else
-                emit "{\"schemaVersion\":1,\"sequence\":3,\"event\":\"command_completed\",\"requestId\":$request_id,\"command\":\"reload_script\",\"result\":\"succeeded\"}"
-            fi
-            continue
-        fi
-        if [ "$command" = "reload_scene" ]; then
-            if [ "$mode" = "stale" ] && [ -z "$delayed_scene" ]; then
-                delayed_scene="$request_id"
-                (
-                    sleep 0.45
-                    emit "{\"schemaVersion\":1,\"sequence\":5,\"event\":\"command_completed\",\"requestId\":$request_id,\"command\":\"reload_scene\",\"result\":\"succeeded\"}"
-                ) &
-            else
-                emit "{\"schemaVersion\":1,\"sequence\":4,\"event\":\"command_completed\",\"requestId\":$request_id,\"command\":\"reload_scene\",\"result\":\"succeeded\"}"
-            fi
-            continue
-        fi
-        if [ "$command" = "shutdown" ]; then
-            if [ "$mode" = "hang" ]; then
-                continue
-            fi
-            emit "{\"schemaVersion\":1,\"sequence\":6,\"event\":\"command_completed\",\"requestId\":$request_id,\"command\":\"shutdown\",\"result\":\"succeeded\"}"
-            emit '{"schemaVersion":1,"sequence":7,"event":"runtime_stopping","reason":"control_shutdown"}'
-            exit 0
-        fi
-    done
-    if [ "$mode" = "hang" ]; then
-        while :; do sleep 300; done
-    fi
-    """;
 
     private sealed record PreviewFixture(
         string PackageRoot,

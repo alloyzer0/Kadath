@@ -26,6 +26,22 @@ internal static class Program
             WorkflowSmokeAsync(args[1], args[2], args[3], args[4]).GetAwaiter().GetResult();
             return;
         }
+        if (args.Length == 3 && string.Equals(args[0], "--workflow-smoke-owned", StringComparison.Ordinal))
+        {
+            AvaloniaWorkflowFixture.VerifyCleanupOwnershipContract(args[1], args[2]);
+            Console.WriteLine("workflow_fixture_ownership=ok");
+            using (var fixture = AvaloniaWorkflowFixture.Create(args[1], args[2]))
+            {
+                WorkflowSmokeAsync(
+                    fixture.KadathRoot,
+                    fixture.PackageRoot,
+                    fixture.OpenProjectName,
+                    fixture.CreatedProjectName,
+                    fixture).GetAwaiter().GetResult();
+            }
+            Console.WriteLine("workflow_fixture_cleanup=ok");
+            return;
+        }
 
 
         BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
@@ -39,7 +55,8 @@ internal static class Program
         string kadathRootArgument,
         string packageRootArgument,
         string openProjectName,
-        string createdProjectName)
+        string createdProjectName,
+        AvaloniaWorkflowFixture? ownershipFixture = null)
     {
         var kadathRoot = Path.GetFullPath(kadathRootArgument);
         var packageRoot = Path.GetFullPath(packageRootArgument);
@@ -489,6 +506,8 @@ internal static class Program
         {
             avaloniaViewModel.ProjectName = createdProjectName;
             created = await avaloniaViewModel.CreateProjectForCurrentInputAsync(cancellationToken);
+            // project_create 成功返回就是 created project 的最近所有权边界，不能延迟到 Dispose 猜测认领。
+            ownershipFixture?.ClaimCreatedProject(created.ProjectDirectory);
         }
         finally { workspace.Project.PropertyChanged -= ObserveCreatedSession; }
 

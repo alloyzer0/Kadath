@@ -49,7 +49,7 @@
 - Native 结构化诊断 ABI 与 Luau 共享管线：`modules/behavior_script/native/kadath_luau.h`、`modules/behavior_script/native/tooling_bridge.cpp`、`modules/behavior_script/src/tooling.zig`
 - Behavior Input Native Runtime Adapter、Tooling 类型和 Host version：`modules/behavior_script/native/runtime_bridge.cpp`、`modules/behavior_script/native/tooling_bridge.cpp`、`modules/behavior_script/src/runtime.zig`、`modules/behavior_script/src/artifact.zig`
 - Player movement ownership 与 Host 输入路由：`app/player_movement_ownership.zig`、`app/host.zig`、`app/behavior_host.zig`
-- 默认 Player Controller、Scene Binding 与 Linux package：`packaging/linux-assets/scripts/player_controller.luau`、`packaging/linux-assets/preview.scene.json`、`packaging/linux-assets/preview.script.json`、`build.zig`
+- 默认 Player Controller、Scene Binding 与跨平台 Runtime package：`packaging/runtime-assets/scripts/player_controller.luau`、`packaging/runtime-assets/preview.scene.json`、`packaging/runtime-assets/script.json`、`build.zig`
 - 单帧 stdin/stdout 分析 Adapter：`tools/behavior-script-tool.zig`
 - 未保存缓冲区校验、受控 Tool 解析、进程超时与协议验证：`editor/Kadath.Editor.Workspace/WorkspaceScriptDiagnosticsModel.cs`
 - typed RPC、后台 Host 生命周期与 Service 路由：`editor/Kadath.Editor.Protocol/Contracts.cs`、`editor/Kadath.Editor.Core/IEditorSession.cs`、`editor/Kadath.Editor.Service/EditorRpcHost.cs`、`editor/Kadath.Editor.Service/WorkspaceEditorBackend.cs`

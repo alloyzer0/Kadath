@@ -553,9 +553,9 @@ internal static class BehaviorPublicationVerifier
         File.WriteAllText(Path.Combine(projectDirectory, "script.json"), ScriptManifestJson, Encoding.UTF8);
         File.WriteAllText(Path.Combine(projectDirectory, "scripts", "patrol.luau"), InitialLuau, new UTF8Encoding(false));
         File.WriteAllText(Path.Combine(projectDirectory, "preview.json"),
-            """{"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","projects/demo/scene.json","--script","projects/demo/script.json"]}}""",
+            $$$"""{"schemaVersion":1,"runtime":{"executable":"{{{VerifierPlatform.RuntimeRelativePath}}}","workingDirectory":"bin","arguments":["--scene","projects/demo/scene.json","--script","projects/demo/script.json"]}}""",
             Encoding.UTF8);
-        File.WriteAllBytes(Path.Combine(root, "bin", "kadath"), [0]);
+        File.WriteAllBytes(Path.Combine(root, VerifierPlatform.RuntimeRelativePath), [0]);
         return new ProjectSessionInfo(root, "demo", projectDirectory,
             Path.Combine(projectDirectory, "scene.json"),
             Path.Combine(projectDirectory, "script.json"),

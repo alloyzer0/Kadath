@@ -16,8 +16,11 @@ internal static class Program
         try
         {
             var project = CreateFixture(root);
+            VerifyStrictTexturePngCodec(root);
             var readModel = new WorkspaceReadModel();
             var before = TreeIdentity(root);
+            await VerifyRetainedTextureSnapshotAsync(project, root);
+            Require(before == TreeIdentity(root), "retained texture snapshot probe modified the fixture tree");
 
             var model = await readModel.ReadProjectAsync(project, default);
             Require(model.ModelVersion == 1 && model.Scene.SchemaVersion == 3 && model.Scene.Textures?.Count == 3 && model.Scene.Objects?.Count == 3, "project snapshot mismatch");
@@ -94,20 +97,22 @@ internal static class Program
             File.WriteAllBytes(manifestPath, originalManifest);
 
             var derived = Path.Combine(project.ProjectDirectory, ".kadath", "derived");
-            var realDerived = Path.Combine(project.ProjectDirectory, ".kadath", "derived-real");
-            Directory.Move(derived, realDerived);
-            Directory.CreateSymbolicLink(derived, realDerived);
-            await ExpectWorkspaceFailureAsync(() => readModel.ReadPublicationAsync(project, "debug", default), WorkspaceReadFailureKind.Input);
-            Directory.Delete(derived);
-            Directory.Move(realDerived, derived);
+            await VerifierReparseFixture.WithDirectoryReplacementAsync(
+                derived,
+                () => ExpectWorkspaceFailureAsync(
+                    () => readModel.ReadPublicationAsync(project, "debug", default),
+                    WorkspaceReadFailureKind.Input));
 
             var assetRoot = Path.Combine(root, "bin", "assets");
             var externalAsset = Path.Combine(root, "external.asset");
             var linkedAsset = Path.Combine(assetRoot, "linked.asset");
             File.WriteAllText(externalAsset, "external", Encoding.UTF8);
-            File.CreateSymbolicLink(linkedAsset, externalAsset);
-            await ExpectWorkspaceFailureAsync(() => readModel.ReadAssetsAsync(project, default), WorkspaceReadFailureKind.Input);
-            File.Delete(linkedAsset);
+            await VerifierReparseFixture.WithFileAliasAsync(
+                linkedAsset,
+                externalAsset,
+                () => ExpectWorkspaceFailureAsync(
+                    () => readModel.ReadAssetsAsync(project, default),
+                    WorkspaceReadFailureKind.Input));
             File.Delete(externalAsset);
 
             var overflowAssets = Path.Combine(assetRoot, "overflow");
@@ -216,12 +221,11 @@ internal static class Program
         await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [716, 216]), default), WorkspaceAuthoringFailureKind.Input);
         File.Move(missingScript, project.ScriptPath);
 
-        var realScene = project.ScenePath + ".real";
-        File.Move(project.ScenePath, realScene);
-        File.CreateSymbolicLink(project.ScenePath, realScene);
-        await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [717, 217]), default), WorkspaceAuthoringFailureKind.Input);
-        File.Delete(project.ScenePath);
-        File.Move(realScene, project.ScenePath);
+        await VerifierReparseFixture.WithFileReplacementAsync(
+            project.ScenePath,
+            () => ExpectAuthoringFailureAsync(
+                () => authoring.ApplyAsync(project, commit.Revision, new AuthoringPatch(SceneGoalPosition: [717, 217]), default),
+                WorkspaceAuthoringFailureKind.Input));
 
         var undone = await authoring.UndoAsync(project, commit.Revision, commit.UndoToken!, default);
         Require(undone.State == "succeeded"
@@ -304,7 +308,7 @@ internal static class Program
         Directory.CreateDirectory(Path.Combine(assets, "renderer2d"));
         Directory.CreateDirectory(Path.Combine(assets, "audio"));
         Directory.CreateDirectory(projectDirectory);
-        File.WriteAllBytes(Path.Combine(root, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), [0]);
+        File.WriteAllBytes(Path.Combine(root, VerifierPlatform.RuntimeRelativePath), [0]);
         File.WriteAllBytes(Path.Combine(assets, "renderer2d", "test.texture"), [1, 2, 3]);
         File.WriteAllBytes(Path.Combine(assets, "renderer2d", "goal.texture"), [4, 5]);
         File.WriteAllBytes(Path.Combine(assets, "audio", "lost.wav"), [6]);
@@ -318,8 +322,8 @@ internal static class Program
         File.WriteAllText(scriptPath, """
         {"schemaVersion":1,"instructions":[{"hook":"on_start","op":"set_goal_position","value":[680,200]},{"hook":"fixed_update","op":"move_goal_velocity","value":[-12,0]}]}
         """, Encoding.UTF8);
-        File.WriteAllText(previewPath, """
-        {"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","projects/demo/scene.json","--script","projects/demo/script.json"]}}
+        File.WriteAllText(previewPath, $$$"""
+        {"schemaVersion":1,"runtime":{"executable":"{{{VerifierPlatform.RuntimeRelativePath}}}","workingDirectory":"bin","arguments":["--scene","projects/demo/scene.json","--script","projects/demo/script.json"]}}
         """, Encoding.UTF8);
         return new ProjectSessionInfo(root, "demo", projectDirectory, scenePath, scriptPath, previewPath, 1);
     }
@@ -328,7 +332,8 @@ internal static class Program
     {
         var model = new WorkspacePreviewModel(new WorkspacePublicationModel());
         var direct = await model.PrepareAsync(new PreviewStartParameters(project.PreviewPath, project.PackageRoot), default);
-        Require(direct.ExecutablePath == Path.Combine(project.PackageRoot, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), "preview executable mismatch");
+        var expectedExecutable = Path.GetFullPath(Path.Combine(project.PackageRoot, VerifierPlatform.RuntimeRelativePath));
+        Require(direct.ExecutablePath == expectedExecutable, "preview executable mismatch");
         Require(direct.RuntimeArguments[^4..].SequenceEqual(["--preview-status", "jsonl-v1", "--preview-control", "jsonl-v1"]), "preview protocol arguments mismatch");
         Require(direct.SceneInputPath == project.ScenePath && direct.ScriptInputPath == project.ScriptPath && direct.InitialBake is null, "direct preview inputs mismatch");
 
@@ -447,27 +452,185 @@ internal static class Program
 
     private static void WritePngRgbaFixture(string path, byte[] rgba)
     {
+        File.WriteAllBytes(path, BuildPng(
+            ("IHDR", BuildIhdr(1, 1, 6)),
+            ("IDAT", CompressZlib([0, .. rgba])),
+            ("IEND", [])));
+    }
+
+    private static byte[] BuildPng(params (string Type, byte[] Data)[] chunks)
+    {
         using var output = new MemoryStream();
         output.Write([137, 80, 78, 71, 13, 10, 26, 10]);
-        WritePngChunk(output, "IHDR", BuildIhdr(1, 1));
+        foreach (var chunk in chunks) WritePngChunk(output, chunk.Type, chunk.Data);
+        return output.ToArray();
+    }
+
+    private static byte[] CompressZlib(byte[] inflated)
+    {
         using var compressed = new MemoryStream();
         using (var zlib = new ZLibStream(compressed, CompressionLevel.Optimal, leaveOpen: true))
         {
-            zlib.WriteByte(0);
-            zlib.Write(rgba);
+            zlib.Write(inflated);
         }
-        WritePngChunk(output, "IDAT", compressed.ToArray());
-        WritePngChunk(output, "IEND", []);
-        File.WriteAllBytes(path, output.ToArray());
+        return compressed.ToArray();
     }
 
-    private static byte[] BuildIhdr(int width, int height)
+    private static void VerifyStrictTexturePngCodec(string root)
+    {
+        var fixtureRoot = Path.Combine(root, "strict-texture-fixtures");
+        Directory.CreateDirectory(fixtureRoot);
+        var ihdrRgba = BuildIhdr(1, 1, 6);
+        var rgbaZlib = CompressZlib([0, 9, 8, 7, 255]);
+        var validSource = Path.Combine(fixtureRoot, "valid.png");
+        WritePngRgbaFixture(validSource, [9, 8, 7, 255]);
+        Require(
+            WorkspaceTextureImportModel.EncodeSourceFile(validSource, "debug").AsSpan(20).SequenceEqual(new byte[] { 9, 8, 7, 255 }),
+            "strict PNG valid fixture mismatch");
+
+        var rgbSource = Path.Combine(fixtureRoot, "valid-rgb.png");
+        File.WriteAllBytes(rgbSource, BuildPng(
+            ("IHDR", BuildIhdr(1, 1, 2)),
+            ("IDAT", CompressZlib([0, 6, 5, 4])),
+            ("IEND", [])));
+        Require(
+            WorkspaceTextureImportModel.EncodeSourceFile(rgbSource, "debug").AsSpan(20).SequenceEqual(new byte[] { 6, 5, 4, 255 }),
+            "strict PNG RGB8 expansion mismatch");
+
+        var filtersSource = Path.Combine(fixtureRoot, "filters-0-through-4.png");
+        var filteredPixels = new byte[]
+        {
+            10, 20, 30, 40,
+            15, 25, 35, 45,
+            20, 30, 40, 50,
+            30, 40, 50, 60,
+            40, 50, 60, 70
+        };
+        // 1px 宽 fixture 给五行分别应用 filter 0..4；编码值是按 PNG predictor 独立推导的固定 oracle。
+        var filteredRows = new byte[]
+        {
+            0, 10, 20, 30, 40,
+            1, 15, 25, 35, 45,
+            2, 5, 5, 5, 5,
+            3, 20, 25, 30, 35,
+            4, 10, 10, 10, 10
+        };
+        File.WriteAllBytes(filtersSource, BuildPng(
+            ("IHDR", BuildIhdr(1, 5, 6)),
+            ("IDAT", CompressZlib(filteredRows)),
+            ("IEND", [])));
+        Require(
+            WorkspaceTextureImportModel.EncodeSourceFile(filtersSource, "debug").AsSpan(20).SequenceEqual(filteredPixels),
+            "strict PNG filters 0..4 reconstruction mismatch");
+
+        var invalidCrc = File.ReadAllBytes(validSource);
+        // PNG signature 后首个 IHDR chunk 的最后一个 CRC 字节位于 offset 32。
+        invalidCrc[32] ^= 0xff;
+        ExpectInvalidPng(fixtureRoot, "invalid-crc", invalidCrc);
+        ExpectInvalidPng(fixtureRoot, "iend-trailing-byte", [.. File.ReadAllBytes(validSource), 0]);
+        ExpectInvalidPng(fixtureRoot, "duplicate-ihdr", BuildPng(
+            ("IHDR", ihdrRgba), ("IHDR", ihdrRgba), ("IDAT", rgbaZlib), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "unknown-critical", BuildPng(
+            ("IHDR", ihdrRgba), ("ABCD", []), ("IDAT", rgbaZlib), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "reserved-bit", BuildPng(
+            ("IHDR", ihdrRgba), ("abca", []), ("IDAT", rgbaZlib), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "apng", BuildPng(
+            ("IHDR", ihdrRgba), ("acTL", new byte[8]), ("IDAT", rgbaZlib), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "non-empty-iend", BuildPng(
+            ("IHDR", ihdrRgba), ("IDAT", rgbaZlib), ("IEND", [0])));
+        ExpectInvalidPng(fixtureRoot, "non-consecutive-idat", BuildPng(
+            ("IHDR", ihdrRgba),
+            ("IDAT", rgbaZlib[..2]),
+            ("tEXt", [97, 0]),
+            ("IDAT", rgbaZlib[2..]),
+            ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "ancillary-after-idat", BuildPng(
+            ("IHDR", ihdrRgba), ("IDAT", rgbaZlib), ("gAMA", new byte[4]), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "duplicate-ancillary", BuildPng(
+            ("IHDR", ihdrRgba), ("gAMA", new byte[4]), ("gAMA", new byte[4]), ("IDAT", rgbaZlib), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "conflicting-color-profile", BuildPng(
+            ("IHDR", ihdrRgba), ("iCCP", new byte[3]), ("sRGB", [0]), ("IDAT", rgbaZlib), ("IEND", [])));
+
+        var invalidHeader = rgbaZlib.ToArray();
+        invalidHeader[0] = 0;
+        ExpectInvalidPng(fixtureRoot, "invalid-zlib-header", BuildPng(
+            ("IHDR", ihdrRgba), ("IDAT", invalidHeader), ("IEND", [])));
+        var invalidAdler = rgbaZlib.ToArray();
+        invalidAdler[^1] ^= 0xff;
+        ExpectInvalidPng(fixtureRoot, "invalid-adler", BuildPng(
+            ("IHDR", ihdrRgba), ("IDAT", invalidAdler), ("IEND", [])));
+        var trailingDeflate = new byte[rgbaZlib.Length + 1];
+        Array.Copy(rgbaZlib, 0, trailingDeflate, 0, rgbaZlib.Length - 4);
+        trailingDeflate[rgbaZlib.Length - 4] = 0;
+        Array.Copy(rgbaZlib, rgbaZlib.Length - 4, trailingDeflate, rgbaZlib.Length - 3, 4);
+        ExpectInvalidPng(fixtureRoot, "trailing-deflate-body", BuildPng(
+            ("IHDR", ihdrRgba), ("IDAT", trailingDeflate), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "inflated-trailing-byte", BuildPng(
+            ("IHDR", ihdrRgba), ("IDAT", CompressZlib([0, 9, 8, 7, 255, 1])), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "inflated-truncated", BuildPng(
+            ("IHDR", ihdrRgba), ("IDAT", CompressZlib([0, 9, 8, 7])), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "invalid-filter", BuildPng(
+            ("IHDR", ihdrRgba), ("IDAT", CompressZlib([5, 9, 8, 7, 255])), ("IEND", [])));
+        ExpectInvalidPng(fixtureRoot, "pixel-budget", BuildPng(
+            ("IHDR", BuildIhdr(8192, 129, 6)), ("IDAT", rgbaZlib), ("IEND", [])));
+
+        var tooManyChunks = new List<(string Type, byte[] Data)> { ("IHDR", ihdrRgba) };
+        for (var index = 0; index < 126; index++) tooManyChunks.Add(("tEXt", [97, 0]));
+        tooManyChunks.Add(("IDAT", rgbaZlib));
+        tooManyChunks.Add(("IEND", []));
+        ExpectInvalidPng(fixtureRoot, "chunk-budget", BuildPng(tooManyChunks.ToArray()));
+        ExpectInvalidPng(fixtureRoot, "source-budget", new byte[8 * 1024 * 1024]);
+    }
+
+    private static async Task VerifyRetainedTextureSnapshotAsync(ProjectSessionInfo project, string root)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var source = Path.Combine(root, "strict-texture-fixtures", "valid.png");
+        var destination = Path.Combine(project.PackageRoot, "bin", "assets", "renderer2d", "retained-probe.texture");
+        var mutationBlocked = false;
+        var importer = new WorkspaceTextureImportModel(phase =>
+        {
+            if (phase != WorkspaceTextureImportPhase.AfterSourceLengthCaptured) return;
+            try
+            {
+                using var writer = new FileStream(source, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+                writer.WriteByte(0);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                mutationBlocked = true;
+            }
+        });
+        try
+        {
+            var imported = await importer.ImportAsync(
+                project,
+                new TextureImportParameters(null, source, "retained-probe", "debug"),
+                default);
+            Require(mutationBlocked && imported.State == "succeeded", "texture PNG snapshot handle did not retain read ownership");
+        }
+        finally
+        {
+            if (File.Exists(destination)) File.Delete(destination);
+        }
+    }
+
+    private static void ExpectInvalidPng(string root, string name, byte[] bytes)
+    {
+        var source = Path.Combine(root, $"{name}.png");
+        File.WriteAllBytes(source, bytes);
+        ExpectTextureEncodeFailure(
+            () => WorkspaceTextureImportModel.EncodeSourceFile(source, "debug"),
+            WorkspaceTextureImportFailureKind.InvalidSource);
+    }
+
+    private static byte[] BuildIhdr(int width, int height, byte colorType)
     {
         var data = new byte[13];
         BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(0, 4), (uint)width);
         BinaryPrimitives.WriteUInt32BigEndian(data.AsSpan(4, 4), (uint)height);
         data[8] = 8;
-        data[9] = 6;
+        data[9] = colorType;
         return data;
     }
 
@@ -476,9 +639,26 @@ internal static class Program
         Span<byte> length = stackalloc byte[4];
         BinaryPrimitives.WriteUInt32BigEndian(length, (uint)data.Length);
         output.Write(length);
-        output.Write(Encoding.ASCII.GetBytes(type));
+        var typeBytes = Encoding.ASCII.GetBytes(type);
+        output.Write(typeBytes);
         output.Write(data);
-        output.Write(new byte[4]);
+        var crcInput = new byte[typeBytes.Length + data.Length];
+        typeBytes.CopyTo(crcInput, 0);
+        data.CopyTo(crcInput, typeBytes.Length);
+        Span<byte> crc = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(crc, ComputePngCrc32(crcInput));
+        output.Write(crc);
+    }
+
+    private static uint ComputePngCrc32(ReadOnlySpan<byte> bytes)
+    {
+        uint crc = 0xffffffff;
+        foreach (var value in bytes)
+        {
+            crc ^= value;
+            for (var bit = 0; bit < 8; bit++) crc = (crc & 1) != 0 ? 0xedb88320 ^ (crc >> 1) : crc >> 1;
+        }
+        return crc ^ 0xffffffff;
     }
 
     private static void WriteArtifactsAndManifest(ProjectSessionInfo project)
@@ -558,6 +738,13 @@ internal static class Program
         try { await action(); }
         catch (WorkspaceTextureImportException exception) when (exception.Kind == kind) { return; }
         throw new InvalidOperationException($"Expected WorkspaceTextureImportException with kind {kind}.");
+    }
+
+    private static void ExpectTextureEncodeFailure(Func<byte[]> action, WorkspaceTextureImportFailureKind kind)
+    {
+        try { _ = action(); }
+        catch (WorkspaceTextureImportException exception) when (exception.Kind == kind) { return; }
+        throw new InvalidOperationException($"Expected texture encode failure with kind {kind}.");
     }
 
     private static void Require(bool condition, string message)

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("behavior_common");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -207,7 +208,7 @@ fn openSourceFile(io: std.Io, project_dir: std.Io.Dir, source_name: []const u8) 
 
     while (segments.next()) |segment| {
         if (segments.peek() == null) {
-            const file = current_dir.openFile(io, segment, .{
+            var file = current_dir.openFile(io, segment, .{
                 .allow_directory = false,
                 .follow_symlinks = false,
                 .resolve_beneath = true,
@@ -217,6 +218,9 @@ fn openSourceFile(io: std.Io, project_dir: std.Io.Dir, source_name: []const u8) 
                 error.IsDir => error.ScriptSourceNotFile,
                 else => |other| other,
             };
+            // Zig 0.16 在 Windows no-follow 路径上创建 overlapped HANDLE，却误标为 blocking；
+            // 修正公开 flag 后，Threaded IO 才会等待合法的 STATUS_PENDING，同时仍保持 reparse 拒绝。
+            if (builtin.os.tag == .windows) file.flags.nonblocking = true;
             if (owns_current_dir) current_dir.close(io);
             return file;
         }

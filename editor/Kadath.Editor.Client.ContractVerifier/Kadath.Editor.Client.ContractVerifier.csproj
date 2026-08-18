@@ -9,4 +9,8 @@
     <ProjectReference Include="..\Kadath.Editor.ViewModels\Kadath.Editor.ViewModels.csproj" />
     <ProjectReference Include="..\Kadath.Editor.Protocol\Kadath.Editor.Protocol.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\VerifierInfrastructure\VerifierWindowsDirectoryIdentity.cs"
+             Link="VerifierInfrastructure\VerifierWindowsDirectoryIdentity.cs" />
+  </ItemGroup>
 </Project>

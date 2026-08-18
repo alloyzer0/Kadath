@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const builder = @import("behavior_package_builder");
 const manifest = @import("behavior_manifest");
 const tooling = @import("behavior_tooling");
@@ -272,6 +273,8 @@ fn readManifest(
         .follow_symlinks = false,
         .resolve_beneath = true,
     });
+    // 与 Script source 读取一致：Windows no-follow HANDLE 是 overlapped，修正 Zig 0.16 的错误 flag。
+    if (builtin.os.tag == .windows) file.flags.nonblocking = true;
     defer file.close(io);
     const stat = try file.stat(io);
     if (stat.kind != .file) return error.ScriptManifestNotFile;

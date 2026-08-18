@@ -1,6 +1,5 @@
 using System.Buffers.Binary;
 using System.Globalization;
-using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -29,6 +28,7 @@ public sealed class WorkspaceTextureImportException : Exception
 
 internal enum WorkspaceTextureImportPhase
 {
+    AfterSourceLengthCaptured,
     BeforePromote
 }
 
@@ -51,6 +51,16 @@ public sealed class WorkspaceTextureImportModel
     public WorkspaceTextureImportModel() { }
 
     internal WorkspaceTextureImportModel(Action<WorkspaceTextureImportPhase>? phase) => _phase = phase;
+
+    internal static byte[] EncodeSourceFile(string sourcePath, string profile) => Execute(() =>
+    {
+        // 构建工具与 Editor 导入共用同一个 codec seam，避免两套 PNG/KDAT 规则再次漂移。
+        var normalizedProfile = NormalizeProfile(profile);
+        var source = ResolveSource(sourcePath);
+        var texture = DecodeSource(source);
+        var levels = BuildLevels(texture, normalizedProfile);
+        return BuildArtifact(texture, levels, normalizedProfile);
+    }, CancellationToken.None);
 
     public Task<TextureImportResult> ImportAsync(
         ProjectSessionInfo project,
@@ -81,7 +91,7 @@ public sealed class WorkspaceTextureImportModel
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        var texture = source.Extension == ".png" ? DecodePng(source.Path) : ParsePpm3(source.Path);
+        var texture = DecodeSource(source, () => _phase?.Invoke(WorkspaceTextureImportPhase.AfterSourceLengthCaptured));
         var levels = BuildLevels(texture, profile);
         var artifact = BuildArtifact(texture, levels, profile);
         var sha256 = Sha256(artifact);
@@ -159,7 +169,12 @@ public sealed class WorkspaceTextureImportModel
         }
     }
 
-    private static ImportedTexture ParsePpm3(string path)
+    private static WorkspaceTexturePixels DecodeSource(TextureSource source, Action? afterSnapshotLength = null) =>
+        source.Extension == ".png"
+            ? WorkspaceTexturePngCodec.DecodeFile(source.Path, afterSnapshotLength)
+            : ParsePpm3(source.Path);
+
+    private static WorkspaceTexturePixels ParsePpm3(string path)
     {
         RequireSourceBudget(path);
         var contents = File.ReadAllText(path, Encoding.UTF8);
@@ -184,144 +199,10 @@ public sealed class WorkspaceTextureImportModel
             }
             pixels[pixel * 4 + 3] = 255;
         }
-        return new ImportedTexture(width, height, pixels, "P3-PPM");
+        return new WorkspaceTexturePixels(width, height, pixels, "P3-PPM");
     }
 
-    private static ImportedTexture DecodePng(string path)
-    {
-        RequireSourceBudget(path);
-        var bytes = File.ReadAllBytes(path);
-        if (bytes.Length < 33 || !bytes.AsSpan(0, 8).SequenceEqual(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }))
-        {
-            throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG signature is invalid.");
-        }
-
-        int width = 0;
-        int height = 0;
-        byte bitDepth = 0;
-        byte colorType = 0;
-        byte interlace = 0;
-        var idat = new MemoryStream();
-        var offset = 8;
-        var sawIhdr = false;
-        var sawIend = false;
-        while (offset <= bytes.Length - 12)
-        {
-            var length = checked((int)BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(offset, 4)));
-            offset += 4;
-            if (length < 0 || offset + 4 + length + 4 > bytes.Length) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG chunk length is invalid.");
-            var type = Encoding.ASCII.GetString(bytes, offset, 4);
-            offset += 4;
-            var data = bytes.AsSpan(offset, length);
-            offset += length;
-            offset += 4;
-            switch (type)
-            {
-                case "IHDR":
-                    if (sawIhdr || length != 13) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG IHDR is invalid.");
-                    width = checked((int)BinaryPrimitives.ReadUInt32BigEndian(data[..4]));
-                    height = checked((int)BinaryPrimitives.ReadUInt32BigEndian(data[4..8]));
-                    bitDepth = data[8];
-                    colorType = data[9];
-                    interlace = data[12];
-                    sawIhdr = true;
-                    break;
-                case "IDAT":
-                    if (!sawIhdr || sawIend) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG chunk order is invalid.");
-                    idat.Write(data);
-                    break;
-                case "IEND":
-                    sawIend = true;
-                    break;
-            }
-            if (sawIend) break;
-        }
-        if (!sawIhdr || !sawIend || idat.Length == 0) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG is missing required chunks.");
-        if (width <= 0 || height <= 0) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG dimensions must be positive.");
-        if (bitDepth != 8 || colorType is not (2 or 6) || interlace != 0) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG v1 accepts only non-interlaced 8-bit RGB or RGBA.");
-        var pixelCount = CheckedPixelCount(width, height, "PNG");
-        var channels = colorType == 2 ? 3 : 4;
-        var stride = checked(width * channels);
-        var expectedInflated = checked((stride + 1) * height);
-        byte[] inflated;
-        idat.Position = 0;
-        try
-        {
-            inflated = InflateExactly(idat, expectedInflated);
-        }
-        catch (InvalidDataException exception)
-        {
-            throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG zlib payload is invalid.", exception);
-        }
-        if (inflated.Length != expectedInflated) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG decoded payload length is invalid.");
-        var rgba = new byte[checked(pixelCount * 4)];
-        var previous = new byte[stride];
-        var current = new byte[stride];
-        var inputOffset = 0;
-        for (var y = 0; y < height; y++)
-        {
-            var filter = inflated[inputOffset++];
-            Array.Copy(inflated, inputOffset, current, 0, stride);
-            inputOffset += stride;
-            Unfilter(current, previous, channels, filter);
-            for (var x = 0; x < width; x++)
-            {
-                var sourceOffset = x * channels;
-                var destinationOffset = ((y * width) + x) * 4;
-                rgba[destinationOffset] = current[sourceOffset];
-                rgba[destinationOffset + 1] = current[sourceOffset + 1];
-                rgba[destinationOffset + 2] = current[sourceOffset + 2];
-                rgba[destinationOffset + 3] = channels == 4 ? current[sourceOffset + 3] : (byte)255;
-            }
-            (previous, current) = (current, previous);
-        }
-        return new ImportedTexture(width, height, rgba, colorType == 2 ? "PNG-RGB8" : "PNG-RGBA8");
-    }
-
-    private static byte[] InflateExactly(Stream source, int expectedBytes)
-    {
-        using var zlib = new ZLibStream(source, CompressionMode.Decompress, leaveOpen: false);
-        var inflated = new byte[expectedBytes];
-        var offset = 0;
-        while (offset < inflated.Length)
-        {
-            var read = zlib.Read(inflated, offset, inflated.Length - offset);
-            if (read == 0) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG decoded payload ended before the expected length.");
-            offset += read;
-        }
-        if (zlib.ReadByte() != -1) throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG decoded payload exceeds the expected length.");
-        return inflated;
-    }
-
-    private static void Unfilter(byte[] current, byte[] previous, int bytesPerPixel, byte filter)
-    {
-        for (var index = 0; index < current.Length; index++)
-        {
-            var left = index >= bytesPerPixel ? current[index - bytesPerPixel] : 0;
-            var up = previous[index];
-            var upLeft = index >= bytesPerPixel ? previous[index - bytesPerPixel] : 0;
-            current[index] = filter switch
-            {
-                0 => current[index],
-                1 => unchecked((byte)(current[index] + left)),
-                2 => unchecked((byte)(current[index] + up)),
-                3 => unchecked((byte)(current[index] + ((left + up) / 2))),
-                4 => unchecked((byte)(current[index] + Paeth(left, up, upLeft))),
-                _ => throw Failure(WorkspaceTextureImportFailureKind.InvalidSource, "PNG scanline filter is invalid.")
-            };
-        }
-    }
-
-    private static int Paeth(int left, int up, int upLeft)
-    {
-        var estimate = left + up - upLeft;
-        var leftDistance = Math.Abs(estimate - left);
-        var upDistance = Math.Abs(estimate - up);
-        var upLeftDistance = Math.Abs(estimate - upLeft);
-        return leftDistance <= upDistance && leftDistance <= upLeftDistance ? left : upDistance <= upLeftDistance ? up : upLeft;
-    }
-
-    private static List<TextureLevel> BuildLevels(ImportedTexture texture, string profile)
+    private static List<TextureLevel> BuildLevels(WorkspaceTexturePixels texture, string profile)
     {
         var levels = new List<TextureLevel> { new(texture.Width, texture.Height, texture.Pixels) };
         if (profile == "debug") return levels;
@@ -356,7 +237,7 @@ public sealed class WorkspaceTextureImportModel
         return levels;
     }
 
-    private static byte[] BuildArtifact(ImportedTexture texture, IReadOnlyList<TextureLevel> levels, string profile)
+    private static byte[] BuildArtifact(WorkspaceTexturePixels texture, IReadOnlyList<TextureLevel> levels, string profile)
     {
         var release = profile == "release";
         var headerBytes = release ? TextureArtifactHeaderBytesMipmap : TextureArtifactHeaderBytesBase;
@@ -522,6 +403,5 @@ public sealed class WorkspaceTextureImportModel
         new(kind, message, innerException);
 
     private sealed record TextureSource(string Path, string Extension);
-    private sealed record ImportedTexture(int Width, int Height, byte[] Pixels, string SourceFormat);
     private sealed record TextureLevel(int Width, int Height, byte[] Pixels);
 }

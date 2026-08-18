@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Kadath.Editor.Toolchain.ContractVerifier</AssemblyName>
+    <RootNamespace>Kadath.Editor.Toolchain.ContractVerifier</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Kadath.Editor.Toolchain\Kadath.Editor.Toolchain.csproj" />
+  </ItemGroup>
+</Project>

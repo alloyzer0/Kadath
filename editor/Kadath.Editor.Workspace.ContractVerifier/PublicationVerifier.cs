@@ -26,8 +26,8 @@ internal static class PublicationVerifier
             var both = await model.BakeAsync(project, new BakeStartParameters("Both", "debug"), default);
             Require(both.State == "succeeded" && both.Target == "Both" && both.Profile == "debug", "Both publication result mismatch.");
             Require(both.SceneArtifactBytes == 314 && both.ScriptArtifactBytes == 48, "Publication artifact byte count mismatch.");
-            Require(both.SceneArtifactRevision == ExpectedSceneArtifactSha256, "Native KSCN output differs from the PowerShell importer oracle.");
-            Require(both.ScriptArtifactRevision == ExpectedScriptArtifactSha256, "Native KSCP output differs from the PowerShell importer oracle.");
+            Require(both.SceneArtifactRevision == ExpectedSceneArtifactSha256, "Native KSCN output differs from the frozen byte oracle.");
+            Require(both.ScriptArtifactRevision == ExpectedScriptArtifactSha256, "Native KSCP output differs from the frozen byte oracle.");
             Require(HashFile(Path.Combine(both.DerivedDirectory, "scene.scene")) == ExpectedSceneArtifactSha256, "Committed KSCN identity mismatch.");
             Require(HashFile(Path.Combine(both.DerivedDirectory, "script.script")) == ExpectedScriptArtifactSha256, "Committed KSCP identity mismatch.");
             Require(HashFile(packageSentinelPath) == packageSentinelIdentity, "Publication changed package assets outside the derived boundary.");
@@ -104,16 +104,20 @@ internal static class PublicationVerifier
             Require(commitCancelResult.State == "succeeded", "Cancellation interrupted an in-progress publication commit.");
             RequireNoTemporaries(commitCancelResult.DerivedDirectory);
 
+            var reparseRoot = root + "-reparse";
+            var reparseProject = CreateProject(reparseRoot);
+            var externalDirectory = root + "-reparse-external";
+            Directory.CreateDirectory(externalDirectory);
+            await VerifierReparseFixture.WithDirectoryAliasAsync(
+                Path.Combine(reparseProject.ProjectDirectory, ".kadath"),
+                externalDirectory,
+                () => ExpectFailureAsync(
+                    () => model.BakeAsync(reparseProject, new BakeStartParameters("Both", "debug"), default),
+                    WorkspacePublicationFailureKind.Validation));
+            Require(!Directory.EnumerateFileSystemEntries(externalDirectory).Any(), "Publication followed a derived-directory reparse point.");
+
             if (!OperatingSystem.IsWindows())
             {
-                var symlinkRoot = root + "-symlink";
-                var symlinkProject = CreateProject(symlinkRoot);
-                var externalDirectory = root + "-symlink-external";
-                Directory.CreateDirectory(externalDirectory);
-                Directory.CreateSymbolicLink(Path.Combine(symlinkProject.ProjectDirectory, ".kadath"), externalDirectory);
-                await ExpectFailureAsync(() => model.BakeAsync(symlinkProject, new BakeStartParameters("Both", "debug"), default), WorkspacePublicationFailureKind.Validation);
-                Require(!Directory.EnumerateFileSystemEntries(externalDirectory).Any(), "Publication followed a derived-directory symbolic link.");
-
                 var caseRoot = root + "-case";
                 var caseProject = CreateProject(caseRoot);
                 var mismatchedProject = caseProject with { ProjectDirectory = Path.Combine(caseRoot, "bin", "projects", "DEMO") };
@@ -141,7 +145,7 @@ internal static class PublicationVerifier
         var defaultV4Artifact = WorkspaceSceneCodec.EncodeSource(Encoding.UTF8.GetBytes(DefaultV4SceneJson));
         Require(defaultV4Artifact.Length == 444
             && Convert.ToHexString(SHA256.HashData(defaultV4Artifact)).ToLowerInvariant() == "988183e0a3b3d7f06f1f0fef3ab67634cdcc185aee7cd0cf92a4978a114058af",
-            "Native Scene v4 output differs from the shared PowerShell byte oracle.");
+            "Native Scene v4 output differs from the shared frozen byte oracle.");
         var invalidTextureLength = defaultV4Artifact.ToArray();
         BinaryPrimitives.WriteUInt32LittleEndian(invalidTextureLength.AsSpan(24, 4), uint.MaxValue);
         Expect<InvalidDataException>(() => WorkspaceSceneCodec.ValidateArtifact(invalidTextureLength));
@@ -287,10 +291,10 @@ internal static class PublicationVerifier
         Directory.CreateDirectory(projectDirectory);
         File.WriteAllText(Path.Combine(projectDirectory, "scene.json"), SceneJson, Encoding.UTF8);
         File.WriteAllText(Path.Combine(projectDirectory, "script.json"), ScriptJson, Encoding.UTF8);
-        File.WriteAllText(Path.Combine(projectDirectory, "preview.json"), """
-        {"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","projects/demo/scene.json","--script","projects/demo/script.json"]}}
+        File.WriteAllText(Path.Combine(projectDirectory, "preview.json"), $$$"""
+        {"schemaVersion":1,"runtime":{"executable":"{{{VerifierPlatform.RuntimeRelativePath}}}","workingDirectory":"bin","arguments":["--scene","projects/demo/scene.json","--script","projects/demo/script.json"]}}
         """, Encoding.UTF8);
-        File.WriteAllBytes(Path.Combine(root, "bin", "kadath"), [0]);
+        File.WriteAllBytes(Path.Combine(root, VerifierPlatform.RuntimeRelativePath), [0]);
         Directory.CreateDirectory(Path.Combine(root, "bin", "assets"));
         File.WriteAllText(Path.Combine(root, "bin", "assets", "publication-sentinel.keep"), "package-content", Encoding.UTF8);
         return new ProjectSessionInfo(root, "demo", projectDirectory,

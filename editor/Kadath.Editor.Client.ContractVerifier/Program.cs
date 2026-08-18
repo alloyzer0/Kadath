@@ -2,9 +2,11 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using Kadath.Editor.Client;
 using Kadath.Editor.Protocol;
+using Kadath.Editor.Verification;
 using Kadath.Editor.ViewModels;
 
 namespace Kadath.Editor.Client.ContractVerifier;
@@ -15,13 +17,14 @@ internal static class Program
     {
         try
         {
-            if (args.Length == 5 && args[0] == "--real-service-only")
+            if (args.Length is 4 or 5 && args[0] == "--real-service-only")
             {
-                await VerifyRealServiceAsync(args[1], args[2], args[3], args[4]);
+                await VerifyRealServiceAsync(args[1], args[2], args[3], args.Length == 5 ? args[4] : null);
                 Console.WriteLine("real_service_smoke=ok");
                 Console.WriteLine("verification=ok");
                 return 0;
             }
+            VerifyRealServiceFixtureOwnershipContract();
             await VerifyProjectCreateClientContractAsync();
             await VerifyProjectCreateCapabilityProjectionAsync();
             await VerifyProjectCreateWorkspaceProjectionAsync();
@@ -36,7 +39,12 @@ internal static class Program
                 await VerifyRealServiceAsync(args[0], args[1], args[2], args[3]);
                 Console.WriteLine("real_service_smoke=ok");
             }
-            else if (args.Length != 0) { throw new ArgumentException("Usage: [--real-service-only] <serviceDll> <kadathRoot> <packageRoot> <projectName>"); }
+            else if (args.Length != 0)
+            {
+                throw new ArgumentException(
+                    "Usage: --real-service-only <serviceDll> <kadathRoot> <packageRoot> [projectName] | "
+                    + "[<serviceDll> <kadathRoot> <packageRoot> <projectName>]");
+            }
             Console.WriteLine("editor_rpc_client=ok");
             Console.WriteLine("request_correlation=ok");
             Console.WriteLine("event_ordering=ok");
@@ -54,6 +62,7 @@ internal static class Program
             Console.WriteLine("script_diagnostics_state_machine=ok");
             Console.WriteLine("behavior_contract_refresh=ok");
             Console.WriteLine("script_asset_lifecycle_viewmodel=ok");
+            Console.WriteLine("real_service_fixture_ownership=ok");
             Console.WriteLine("viewmodel_state=ok");
             Console.WriteLine("verification=ok");
             return 0;
@@ -62,6 +71,125 @@ internal static class Program
         {
             Console.Error.WriteLine($"verification=failed: {exception}");
             return 1;
+        }
+    }
+
+    private static void VerifyRealServiceFixtureOwnershipContract()
+    {
+        // Volume/File ID 是本次 Windows 产品矩阵契约；非 Windows 保持既有 verifier 行为。
+        if (!OperatingSystem.IsWindows()) return;
+
+        var testRoot = Path.Combine(Path.GetTempPath(), $"kadath-client-owned-directory-{Guid.NewGuid():N}");
+        var packageRoot = Path.Combine(testRoot, "package");
+        var movedOwnedDirectory = Path.Combine(testRoot, "original-owned-project");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(packageRoot, "bin"));
+
+            var normalFixture = RealServiceProjectFixture.Prepare(packageRoot, "normal_cleanup_contract");
+            Directory.CreateDirectory(normalFixture.ProjectDirectory);
+            var normalDeepDirectory = Path.Combine(normalFixture.ProjectDirectory, "level-one", "level-two");
+            Directory.CreateDirectory(normalDeepDirectory);
+            File.WriteAllText(Path.Combine(normalDeepDirectory, "owned.sentinel"),
+                "every owned directory level must be deleted through its retained handle");
+            normalFixture.ClaimCreatedProject(normalFixture.ProjectDirectory);
+            normalFixture.Cleanup();
+            Assert(!Directory.Exists(normalFixture.ProjectDirectory), "verifier cleanup did not remove its unchanged owned directory");
+
+            var leasedDirectory = Path.Combine(testRoot, "lease-owned-project");
+            var leasedDirectoryMoveTarget = Path.Combine(testRoot, "lease-owned-project-moved");
+            Directory.CreateDirectory(leasedDirectory);
+            var leasedIdentity = VerifierWindowsDirectoryIdentity.Capture(leasedDirectory);
+            using (var deletionLease = leasedIdentity.AcquireDeletionLease(leasedDirectory))
+            {
+                Exception? moveRejection = null;
+                try { Directory.Move(leasedDirectory, leasedDirectoryMoveTarget); }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    moveRejection = exception;
+                }
+                Assert(moveRejection is not null,
+                    "verifier deletion lease allowed its owned directory to be replaced before deletion");
+                deletionLease.DeleteEmptyDirectory();
+            }
+            Assert(!Directory.Exists(leasedDirectory),
+                "verifier deletion lease did not remove its unchanged owned directory");
+
+            var nestedRaceRoot = Path.Combine(testRoot, "nested-race-owned-root");
+            var nestedRaceChild = Path.Combine(nestedRaceRoot, "child");
+            var foreignTarget = Path.Combine(testRoot, "foreign-junction-target");
+            var foreignJunctionSentinel = Path.Combine(foreignTarget, "foreign.sentinel");
+            Directory.CreateDirectory(nestedRaceChild);
+            Directory.CreateDirectory(foreignTarget);
+            File.WriteAllText(foreignJunctionSentinel, "foreign junction target must survive verifier cleanup");
+            var nestedRaceIdentity = VerifierWindowsDirectoryIdentity.Capture(nestedRaceRoot);
+            IDisposable? replacement = null;
+            Exception? nestedRaceRejection = null;
+            try
+            {
+                using var nestedRaceLease = nestedRaceIdentity.AcquireDeletionLease(nestedRaceRoot);
+                nestedRaceLease.DeleteOwnedDirectoryTree(candidate =>
+                {
+                    if (replacement is null && PathsEqual(candidate, nestedRaceChild))
+                        replacement = VerifierWindowsDirectoryLink.ReplaceDirectoryWithJunction(candidate, foreignTarget);
+                });
+            }
+            catch (Exception exception) when (
+                exception is IOException
+                    or InvalidOperationException
+                    or UnauthorizedAccessException
+                    or System.ComponentModel.Win32Exception)
+            {
+                nestedRaceRejection = exception;
+            }
+            finally
+            {
+                replacement?.Dispose();
+            }
+            Assert(nestedRaceRejection is not null,
+                "verifier cleanup accepted a child junction replacement after its attribute check");
+            Assert(File.Exists(foreignJunctionSentinel),
+                "verifier cleanup traversed a child junction replacement into a foreign target");
+
+            var replacementFixture = RealServiceProjectFixture.Prepare(packageRoot, "replacement_contract");
+            Directory.CreateDirectory(replacementFixture.ProjectDirectory);
+            replacementFixture.ClaimCreatedProject(replacementFixture.ProjectDirectory);
+
+            Directory.Move(replacementFixture.ProjectDirectory, movedOwnedDirectory);
+            Directory.CreateDirectory(replacementFixture.ProjectDirectory);
+            var foreignSentinel = Path.Combine(replacementFixture.ProjectDirectory, "foreign.sentinel");
+            File.WriteAllText(foreignSentinel, "foreign replacement must survive verifier cleanup");
+
+            Exception? rejection = null;
+            try { replacementFixture.Cleanup(); }
+            catch (Exception exception) when (exception is IOException or InvalidOperationException)
+            {
+                rejection = exception;
+            }
+
+            Assert(rejection is not null, "verifier cleanup accepted a same-path foreign directory replacement");
+            Assert(File.Exists(foreignSentinel), "verifier cleanup deleted a foreign replacement sentinel");
+
+            var reparseFixture = RealServiceProjectFixture.Prepare(packageRoot, "reparse_contract");
+            Directory.CreateDirectory(reparseFixture.ProjectDirectory);
+            var reparseSentinel = Path.Combine(reparseFixture.ProjectDirectory, "owned.sentinel");
+            File.WriteAllText(reparseSentinel, "junction target must survive rejected cleanup");
+            reparseFixture.ClaimCreatedProject(reparseFixture.ProjectDirectory);
+            Exception? reparseRejection = null;
+            VerifierWindowsDirectoryLink.WithDirectoryReplacement(reparseFixture.ProjectDirectory, () =>
+            {
+                try { reparseFixture.Cleanup(); }
+                catch (Exception exception) when (exception is IOException or InvalidOperationException)
+                {
+                    reparseRejection = exception;
+                }
+            });
+            Assert(reparseRejection is not null, "verifier cleanup accepted a reparse-backed owned directory path");
+            Assert(File.Exists(reparseSentinel), "verifier cleanup deleted a reparse target sentinel");
+        }
+        finally
+        {
+            if (Directory.Exists(testRoot)) Directory.Delete(testRoot, recursive: true);
         }
     }
 
@@ -647,13 +775,37 @@ internal static class Program
         await workspace.RefreshSnapshotsAsync("demo").ConfigureAwait(false);
     }
 
-    private static async Task VerifyRealServiceAsync(string serviceDll, string kadathRoot, string packageRoot, string projectName)
+    private static async Task VerifyRealServiceAsync(
+        string serviceDll,
+        string kadathRoot,
+        string packageRoot,
+        string? requestedProjectName)
     {
         serviceDll = Path.GetFullPath(serviceDll);
         kadathRoot = Path.GetFullPath(kadathRoot);
         packageRoot = Path.GetFullPath(packageRoot);
         if (!File.Exists(serviceDll)) { throw new FileNotFoundException("Editor Service DLL was not found.", serviceDll); }
 
+        var fixture = RealServiceProjectFixture.Prepare(packageRoot, requestedProjectName);
+        try
+        {
+            await VerifyRealServiceCoreAsync(serviceDll, kadathRoot, packageRoot, fixture).ConfigureAwait(false);
+        }
+        finally
+        {
+            // real-service-only 自己拥有并清理项目 fixture，调用方无需额外包装器托管生命周期。
+            fixture.Cleanup();
+            Console.WriteLine("real_service_fixture_cleanup=ok");
+        }
+    }
+
+    private static async Task VerifyRealServiceCoreAsync(
+        string serviceDll,
+        string kadathRoot,
+        string packageRoot,
+        RealServiceProjectFixture fixture)
+    {
+        var projectName = fixture.ProjectName;
         await using var transport = new StdioEditorRpcTransport(new EditorRpcProcessOptions(
             "dotnet",
             [serviceDll, "--kadath-root", kadathRoot],
@@ -682,13 +834,12 @@ internal static class Program
             "real service did not advertise script asset lifecycle commands");
         Assert(capabilities.Commands.Contains("behavior_contract_snapshot"),
             "real service did not advertise behavior_contract_snapshot");
-        var projectDirectory = Path.Combine(packageRoot, "bin", "projects", projectName);
-        if (!Directory.Exists(projectDirectory))
-        {
-            var created = await client.CreateProjectAsync(new ProjectCreateParameters(packageRoot, projectName)).ConfigureAwait(false);
-            Assert(created.ProjectName == projectName && Directory.Exists(created.ProjectDirectory),
-                "real service project_create did not materialize the controlled project");
-        }
+        var created = await client.CreateProjectAsync(new ProjectCreateParameters(packageRoot, projectName)).ConfigureAwait(false);
+        fixture.ClaimCreatedProject(created.ProjectDirectory);
+        Assert(created.ProjectName == projectName
+            && PathsEqual(created.ProjectDirectory, fixture.ProjectDirectory)
+            && Directory.Exists(fixture.ProjectDirectory),
+            "real service project_create did not materialize the controlled project");
         var project = await client.OpenProjectAsync(new ProjectOpenParameters(packageRoot, projectName)).ConfigureAwait(false);
         Assert(project.ProjectName == projectName, "real service project_open mismatch");
         var validation = await client.ValidateProjectAsync(new ProjectValidateParameters()).ConfigureAwait(false);
@@ -1042,6 +1193,128 @@ internal static class Program
         Console.WriteLine("authoring_history_ordering=ok");
         await client.ShutdownAsync().ConfigureAwait(false);
     }
+
+    private sealed class RealServiceProjectFixture
+    {
+        private static readonly Regex ProjectNamePattern = new(
+            "^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$",
+            RegexOptions.CultureInvariant);
+        private bool _ownsProjectDirectory;
+        private VerifierWindowsDirectoryIdentity? _ownedProjectDirectoryIdentity;
+
+        private RealServiceProjectFixture(string projectsRoot, string projectName, string projectDirectory)
+        {
+            ProjectsRoot = projectsRoot;
+            ProjectName = projectName;
+            ProjectDirectory = projectDirectory;
+        }
+
+        public string ProjectsRoot { get; }
+        public string ProjectName { get; }
+        public string ProjectDirectory { get; }
+
+        public static RealServiceProjectFixture Prepare(string packageRoot, string? requestedProjectName)
+        {
+            if (!Directory.Exists(packageRoot))
+                throw new DirectoryNotFoundException($"Package root was not found: {packageRoot}");
+            RejectReparsePoint(packageRoot, "Package root");
+
+            var binDirectory = Path.Combine(packageRoot, "bin");
+            if (!Directory.Exists(binDirectory))
+                throw new DirectoryNotFoundException($"Package bin directory was not found: {binDirectory}");
+            RejectReparsePoint(binDirectory, "Package bin directory");
+
+            // 默认名称同时包含进程号与随机后缀，允许 Debug/Release 并行运行而不共享 fixture。
+            var projectName = requestedProjectName ?? CreateUniqueProjectName();
+            if (!ProjectNamePattern.IsMatch(projectName))
+                throw new ArgumentException(
+                    "ProjectName must start with a letter or digit and contain at most 48 safe characters.",
+                    nameof(requestedProjectName));
+
+            var projectsRoot = Path.GetFullPath(Path.Combine(binDirectory, "projects"));
+            if (Directory.Exists(projectsRoot)) RejectReparsePoint(projectsRoot, "Projects directory");
+            var projectDirectory = Path.GetFullPath(Path.Combine(projectsRoot, projectName));
+            if (!Path.GetDirectoryName(projectDirectory)!.Equals(projectsRoot, PathComparison))
+                throw new InvalidOperationException("Verifier project path escaped the package projects directory.");
+            if (Directory.Exists(projectDirectory) || File.Exists(projectDirectory))
+                throw new InvalidOperationException($"Verifier refuses to reuse a pre-existing project directory: {projectDirectory}");
+
+            return new RealServiceProjectFixture(projectsRoot, projectName, projectDirectory);
+        }
+
+        private static string CreateUniqueProjectName()
+        {
+            var candidate = $"editor_service_{Environment.ProcessId}_{Guid.NewGuid():N}";
+            return candidate.Length <= 48 ? candidate : candidate[..48];
+        }
+
+        public void ClaimCreatedProject(string serviceProjectDirectory)
+        {
+            if (!PathsEqual(serviceProjectDirectory, ProjectDirectory) || !Directory.Exists(ProjectDirectory)) return;
+            RejectReparsePoint(ProjectDirectory, "Created project directory");
+            // 本迁移只冻结 Windows 产品路径；其它平台仍保留既有路径/reparse 防线。
+            _ownedProjectDirectoryIdentity = OperatingSystem.IsWindows()
+                ? VerifierWindowsDirectoryIdentity.Capture(ProjectDirectory)
+                : null;
+            _ownsProjectDirectory = true;
+        }
+
+        public void Cleanup()
+        {
+            if (!_ownsProjectDirectory) return;
+            if (File.Exists(ProjectDirectory) && !Directory.Exists(ProjectDirectory))
+                throw new IOException($"Verifier-owned project directory was replaced by a file: {ProjectDirectory}");
+            if (!Directory.Exists(ProjectDirectory)) return;
+            if (!Path.GetDirectoryName(Path.GetFullPath(ProjectDirectory))!.Equals(ProjectsRoot, PathComparison))
+                throw new InvalidOperationException("Verifier cleanup target escaped the package projects directory.");
+
+            if (OperatingSystem.IsWindows())
+            {
+                var identity = _ownedProjectDirectoryIdentity
+                    ?? throw new InvalidOperationException("Verifier-owned project has no captured Windows directory identity.");
+                using (var deletionLease = identity.AcquireDeletionLease(ProjectDirectory))
+                {
+                    // lease 覆盖 File ID 复验、reparse 检查、子项清空和 root handle 删除。
+                    deletionLease.DeleteOwnedDirectoryTree();
+                }
+            }
+            else
+            {
+                // 非 Windows 不宣告 File ID 原子删除，只保留既有路径/reparse 防线。
+                var pending = new Stack<DirectoryInfo>();
+                pending.Push(new DirectoryInfo(ProjectDirectory));
+                while (pending.TryPop(out var directory))
+                {
+                    RejectReparsePoint(directory.FullName, "Verifier-owned project directory");
+                    foreach (var entry in directory.EnumerateFileSystemInfos())
+                    {
+                        entry.Refresh();
+                        if ((entry.Attributes & FileAttributes.ReparsePoint) != 0 || entry.LinkTarget is not null)
+                            throw new InvalidOperationException($"Verifier-owned project contains a reparse point: {entry.FullName}");
+                        if (entry is DirectoryInfo child) pending.Push(child);
+                    }
+                }
+                Directory.Delete(ProjectDirectory, recursive: true);
+            }
+            if (Directory.Exists(ProjectDirectory) || File.Exists(ProjectDirectory))
+                throw new IOException($"Verifier-owned project cleanup did not remove: {ProjectDirectory}");
+        }
+
+        private static void RejectReparsePoint(string path, string name)
+        {
+            var information = Directory.Exists(path) ? (FileSystemInfo)new DirectoryInfo(path) : new FileInfo(path);
+            information.Refresh();
+            if ((information.Attributes & FileAttributes.ReparsePoint) != 0 || information.LinkTarget is not null)
+                throw new InvalidOperationException($"{name} cannot be a reparse point: {path}");
+        }
+    }
+
+    private static readonly StringComparison PathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
+
+    private static bool PathsEqual(string left, string right) =>
+        Path.GetFullPath(left).Equals(Path.GetFullPath(right), PathComparison);
 
     private static async Task VerifyClientAndViewModelsAsync()
     {
@@ -1723,26 +1996,26 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 await SendResponseAsync(id, analysis).ConfigureAwait(false);
                 break;
             case "script_source_read":
-            {
-                var scriptId = request.GetProperty("params").GetProperty("scriptId").GetUInt32();
-                var asset = _scriptAssets.Single(value => value.ScriptId == scriptId);
-                var document = NewScriptAssetDocument(asset);
-                await EmitEventAsync("script_source_read", document, id).ConfigureAwait(false);
-                await SendResponseAsync(id, document).ConfigureAwait(false);
-                break;
-            }
+                {
+                    var scriptId = request.GetProperty("params").GetProperty("scriptId").GetUInt32();
+                    var asset = _scriptAssets.Single(value => value.ScriptId == scriptId);
+                    var document = NewScriptAssetDocument(asset);
+                    await EmitEventAsync("script_source_read", document, id).ConfigureAwait(false);
+                    await SendResponseAsync(id, document).ConfigureAwait(false);
+                    break;
+                }
             case "script_asset_create":
             case "script_asset_rename":
             case "script_asset_delete":
             case "script_asset_undo":
-            {
-                var operation = method["script_asset_".Length..];
-                await EmitEventAsync($"{method}_started", new { projectName = _activeProjectName }, id).ConfigureAwait(false);
-                var result = ApplyScriptAssetMutation(operation, request);
-                await EmitEventAsync($"{method}_completed", result, id).ConfigureAwait(false);
-                await SendResponseAsync(id, result).ConfigureAwait(false);
-                break;
-            }
+                {
+                    var operation = method["script_asset_".Length..];
+                    await EmitEventAsync($"{method}_started", new { projectName = _activeProjectName }, id).ConfigureAwait(false);
+                    var result = ApplyScriptAssetMutation(operation, request);
+                    await EmitEventAsync($"{method}_completed", result, id).ConfigureAwait(false);
+                    await SendResponseAsync(id, result).ConfigureAwait(false);
+                    break;
+                }
             case "bake_start":
                 var bakeParameters = request.GetProperty("params");
                 var bakeTarget = bakeParameters.GetProperty("target").GetString() ?? "Both";
@@ -2024,53 +2297,53 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         switch (operation)
         {
             case "create":
-            {
-                var scriptId = Enumerable.Range(1, 64).Select(value => (uint)value).First(value => _scriptAssets.All(asset => asset.ScriptId != value));
-                asset = new ScriptAssetIdentity(scriptId, parameters.GetProperty("sourcePath").GetString() ?? "scripts/chase.luau");
-                _scriptAssetHistory.Push(CaptureScriptAssetHistory(asset));
-                _scriptAssets.Add(asset);
-                _scriptAssetSources[scriptId] = "--!strict\n\nreturn {\n    fixed_update = function(_self: Kadath.Object, _dt: number)\n    end,\n}\n";
-                _scriptAssetRevision = NextScriptAssetRevision();
-                sourceDocument = NewScriptAssetDocument(asset);
-                break;
-            }
+                {
+                    var scriptId = Enumerable.Range(1, 64).Select(value => (uint)value).First(value => _scriptAssets.All(asset => asset.ScriptId != value));
+                    asset = new ScriptAssetIdentity(scriptId, parameters.GetProperty("sourcePath").GetString() ?? "scripts/chase.luau");
+                    _scriptAssetHistory.Push(CaptureScriptAssetHistory(asset));
+                    _scriptAssets.Add(asset);
+                    _scriptAssetSources[scriptId] = "--!strict\n\nreturn {\n    fixed_update = function(_self: Kadath.Object, _dt: number)\n    end,\n}\n";
+                    _scriptAssetRevision = NextScriptAssetRevision();
+                    sourceDocument = NewScriptAssetDocument(asset);
+                    break;
+                }
             case "rename":
-            {
-                var scriptId = parameters.GetProperty("scriptId").GetUInt32();
-                var index = _scriptAssets.FindIndex(value => value.ScriptId == scriptId);
-                var previousAsset = _scriptAssets[index];
-                _scriptAssetHistory.Push(CaptureScriptAssetHistory(previousAsset));
-                asset = previousAsset with { SourcePath = parameters.GetProperty("sourcePath").GetString() ?? previousAsset.SourcePath };
-                _scriptAssets[index] = asset;
-                _scriptAssetRevision = NextScriptAssetRevision();
-                sourceDocument = NewScriptAssetDocument(asset);
-                break;
-            }
+                {
+                    var scriptId = parameters.GetProperty("scriptId").GetUInt32();
+                    var index = _scriptAssets.FindIndex(value => value.ScriptId == scriptId);
+                    var previousAsset = _scriptAssets[index];
+                    _scriptAssetHistory.Push(CaptureScriptAssetHistory(previousAsset));
+                    asset = previousAsset with { SourcePath = parameters.GetProperty("sourcePath").GetString() ?? previousAsset.SourcePath };
+                    _scriptAssets[index] = asset;
+                    _scriptAssetRevision = NextScriptAssetRevision();
+                    sourceDocument = NewScriptAssetDocument(asset);
+                    break;
+                }
             case "delete":
-            {
-                var scriptId = parameters.GetProperty("scriptId").GetUInt32();
-                asset = _scriptAssets.Single(value => value.ScriptId == scriptId);
-                _scriptAssetHistory.Push(CaptureScriptAssetHistory(asset));
-                _scriptAssets.RemoveAll(value => value.ScriptId == scriptId);
-                _scriptAssetSources.Remove(scriptId);
-                _scriptAssetRevision = NextScriptAssetRevision();
-                sourceDocument = null;
-                break;
-            }
+                {
+                    var scriptId = parameters.GetProperty("scriptId").GetUInt32();
+                    asset = _scriptAssets.Single(value => value.ScriptId == scriptId);
+                    _scriptAssetHistory.Push(CaptureScriptAssetHistory(asset));
+                    _scriptAssets.RemoveAll(value => value.ScriptId == scriptId);
+                    _scriptAssetSources.Remove(scriptId);
+                    _scriptAssetRevision = NextScriptAssetRevision();
+                    sourceDocument = null;
+                    break;
+                }
             case "undo":
-            {
-                var history = _scriptAssetHistory.Pop();
-                asset = history.Asset;
-                _scriptAssets.Clear();
-                _scriptAssets.AddRange(history.Assets);
-                _scriptAssetSources.Clear();
-                foreach (var pair in history.Sources) _scriptAssetSources.Add(pair.Key, pair.Value);
-                _scriptAssetRevision = history.Revision;
-                sourceDocument = _scriptAssets.Any(value => value.ScriptId == asset.ScriptId)
-                    ? NewScriptAssetDocument(_scriptAssets.Single(value => value.ScriptId == asset.ScriptId))
-                    : null;
-                break;
-            }
+                {
+                    var history = _scriptAssetHistory.Pop();
+                    asset = history.Asset;
+                    _scriptAssets.Clear();
+                    _scriptAssets.AddRange(history.Assets);
+                    _scriptAssetSources.Clear();
+                    foreach (var pair in history.Sources) _scriptAssetSources.Add(pair.Key, pair.Value);
+                    _scriptAssetRevision = history.Revision;
+                    sourceDocument = _scriptAssets.Any(value => value.ScriptId == asset.ScriptId)
+                        ? NewScriptAssetDocument(_scriptAssets.Single(value => value.ScriptId == asset.ScriptId))
+                        : null;
+                    break;
+                }
             default:
                 throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown Script Asset lifecycle operation.");
         }

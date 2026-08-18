@@ -24,8 +24,7 @@ internal static class ProjectLifecycleVerifier
             using (var preview = JsonDocument.Parse(File.ReadAllBytes(created.PreviewPath)))
             {
                 var runtime = preview.RootElement.GetProperty("runtime");
-                var expectedExecutable = OperatingSystem.IsWindows() ? "bin/kadath.exe" : "bin/kadath";
-                Require(runtime.GetProperty("executable").GetString() == expectedExecutable, "Create generated the wrong platform executable.");
+                Require(runtime.GetProperty("executable").GetString() == VerifierPlatform.RuntimeRelativePath, "Create generated the wrong platform executable.");
                 Require(runtime.GetProperty("workingDirectory").GetString() == "bin", "Create generated the wrong working directory.");
                 Require(runtime.GetProperty("arguments").EnumerateArray().Select(value => value.GetString()).SequenceEqual(
                     new[] { "--scene", "projects/created/scene.json", "--script", "projects/created/script.json" }), "Create generated the wrong source arguments.");
@@ -108,7 +107,7 @@ internal static class ProjectLifecycleVerifier
         Require(!Directory.Exists(Path.Combine(root, "bin", "projects", "invalid-template")), "Invalid template created a target directory.");
         File.WriteAllBytes(sceneTemplate, templates.Scene);
 
-        var runtimePath = Path.Combine(root, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath");
+        var runtimePath = Path.Combine(root, VerifierPlatform.RuntimeRelativePath);
         File.Delete(runtimePath);
         await ExpectLifecycleFailureAsync(
             () => new WorkspaceProjectLifecycleModel().CreateAsync(new ProjectCreateParameters(root, "missing-runtime"), default),
@@ -135,8 +134,8 @@ internal static class ProjectLifecycleVerifier
         await ExpectLifecycleFailureAsync(() => lifecycle.ValidateAsync(project, default), WorkspaceProjectLifecycleFailureKind.Validation);
         File.WriteAllBytes(project.ScenePath, originalScene);
 
-        File.WriteAllText(project.PreviewPath, """
-        {"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","../outside.json","--script","projects/created/script.json"]}}
+        File.WriteAllText(project.PreviewPath, $$$"""
+        {"schemaVersion":1,"runtime":{"executable":"{{{VerifierPlatform.RuntimeRelativePath}}}","workingDirectory":"bin","arguments":["--scene","../outside.json","--script","projects/created/script.json"]}}
         """, Encoding.UTF8);
         await ExpectLifecycleFailureAsync(() => lifecycle.ValidateAsync(project, default), WorkspaceProjectLifecycleFailureKind.Validation);
         File.WriteAllBytes(project.PreviewPath, originalPreview);
@@ -172,8 +171,8 @@ internal static class ProjectLifecycleVerifier
         }
 
         var originalPreview = File.ReadAllBytes(project.PreviewPath);
-        File.WriteAllText(project.PreviewPath, """
-        {"schemaVersion":1,"runtime":{"executable":"bin/kadath","workingDirectory":"bin","arguments":["--scene","../../outside.json","--script","projects/created/script.json"]}}
+        File.WriteAllText(project.PreviewPath, $$$"""
+        {"schemaVersion":1,"runtime":{"executable":"{{{VerifierPlatform.RuntimeRelativePath}}}","workingDirectory":"bin","arguments":["--scene","../../outside.json","--script","projects/created/script.json"]}}
         """, Encoding.UTF8);
         try
         {
@@ -281,15 +280,23 @@ internal static class ProjectLifecycleVerifier
         var projectName = "foreign-claim";
         var projectDirectory = Path.Combine(root, "bin", "projects", projectName);
         var claimPath = Path.Combine(projectDirectory, ".kadath-create-claim");
-        var lifecycle = new WorkspaceProjectLifecycleModel(phase =>
-        {
-            if (phase != WorkspaceProjectCreatePhase.BeforeCommit) return;
-            File.Delete(claimPath);
-            File.WriteAllText(claimPath, "foreign-owner", Encoding.UTF8);
-        });
+        var replacedClaim = false;
+        var lifecycle = new WorkspaceProjectLifecycleModel(
+            null,
+            (phase, path) =>
+            {
+                if (replacedClaim || phase != WorkspaceProjectCleanupPhase.BeforeClaimQuarantine || path != claimPath) return;
+
+                // Windows 的 FileShare.None 会在 BeforeCommit 期间合法阻止删除；只有 retained handle
+                // 释放后的 quarantine 缝隙才允许模拟外部接管，并继续验证失败清理不会误删 foreign owner。
+                replacedClaim = true;
+                File.Delete(claimPath);
+                File.WriteAllText(claimPath, "foreign-owner", Encoding.UTF8);
+            });
         await ExpectLifecycleFailureAsync(
             () => lifecycle.CreateAsync(new ProjectCreateParameters(root, projectName), default),
             WorkspaceProjectLifecycleFailureKind.Invariant);
+        Require(replacedClaim, "Foreign ownership fixture did not replace the released claim.");
         Require(File.ReadAllText(claimPath, Encoding.UTF8) == "foreign-owner", "Cleanup removed a foreign ownership claim.");
         Require(File.Exists(Path.Combine(projectDirectory, "scene.json")), "Cleanup removed Scene content after ownership loss.");
         Require(File.Exists(Path.Combine(projectDirectory, "script.json")), "Cleanup removed Script content after ownership loss.");
@@ -403,7 +410,7 @@ internal static class ProjectLifecycleVerifier
                 schemaVersion = 1,
                 runtime = new
                 {
-                    executable = "bin/kadath",
+                    executable = VerifierPlatform.RuntimeRelativePath,
                     workingDirectory = escapedWorkingDirectory,
                     arguments = new[]
                     {
@@ -428,78 +435,54 @@ internal static class ProjectLifecycleVerifier
 
     private static async Task VerifyReparseBoundariesAsync(string root, WorkspaceProjectLifecycleModel lifecycle, ProjectSessionInfo project)
     {
-        if (OperatingSystem.IsWindows()) return;
         var packageAlias = root + $".link-{Guid.NewGuid():N}";
-        Directory.CreateSymbolicLink(packageAlias, root);
-        try
-        {
-            await ExpectLifecycleFailureAsync(
+        await VerifierReparseFixture.WithDirectoryAliasAsync(
+            packageAlias,
+            root,
+            () => ExpectLifecycleFailureAsync(
                 () => lifecycle.OpenAsync(new ProjectOpenParameters(packageAlias, project.ProjectName), default),
-                WorkspaceProjectLifecycleFailureKind.Validation);
-        }
-        finally
-        {
-            Directory.Delete(packageAlias);
-        }
+                WorkspaceProjectLifecycleFailureKind.Validation));
 
-        await VerifyDirectorySymlinkFailureAsync(
+        await VerifyDirectoryReparseFailureAsync(
             Path.Combine(root, "bin"),
             () => lifecycle.OpenAsync(new ProjectOpenParameters(root, project.ProjectName), default));
-        await VerifyDirectorySymlinkFailureAsync(
+        await VerifyDirectoryReparseFailureAsync(
             Path.Combine(root, "bin", "projects"),
             () => lifecycle.OpenAsync(new ProjectOpenParameters(root, project.ProjectName), default));
-        await VerifyDirectorySymlinkFailureAsync(
+        await VerifyDirectoryReparseFailureAsync(
             project.ProjectDirectory,
             () => lifecycle.OpenAsync(new ProjectOpenParameters(root, project.ProjectName), default));
 
-        await VerifyFileSymlinkFailureAsync(project.ScenePath, () => lifecycle.ValidateAsync(project, default));
-        await VerifyFileSymlinkFailureAsync(project.ScriptPath, () => lifecycle.ValidateAsync(project, default));
-        await VerifyFileSymlinkFailureAsync(project.PreviewPath, () => lifecycle.ValidateAsync(project, default));
-        await VerifyFileSymlinkFailureAsync(Path.Combine(root, "bin", "kadath"), () => lifecycle.ValidateAsync(project, default));
+        await VerifyFileReparseFailureAsync(project.ScenePath, () => lifecycle.ValidateAsync(project, default));
+        await VerifyFileReparseFailureAsync(project.ScriptPath, () => lifecycle.ValidateAsync(project, default));
+        await VerifyFileReparseFailureAsync(project.PreviewPath, () => lifecycle.ValidateAsync(project, default));
+        await VerifyFileReparseFailureAsync(Path.Combine(root, VerifierPlatform.RuntimeRelativePath), () => lifecycle.ValidateAsync(project, default));
 
         var sceneTemplate = Path.Combine(root, "bin", "assets", "scenes", "preview.scene.json");
-        await VerifyFileSymlinkFailureAsync(
+        await VerifyFileReparseFailureAsync(
             sceneTemplate,
             () => lifecycle.CreateAsync(new ProjectCreateParameters(root, "scene-template-reparse"), default));
         var scriptTemplate = Path.Combine(root, "bin", "assets", "scripts", "preview.script.json");
-        await VerifyFileSymlinkFailureAsync(
+        await VerifyFileReparseFailureAsync(
             scriptTemplate,
             () => lifecycle.CreateAsync(new ProjectCreateParameters(root, "script-template-reparse"), default));
-        await VerifyDirectorySymlinkFailureAsync(
+        await VerifyDirectoryReparseFailureAsync(
             Path.Combine(root, "bin", "assets", "scenes"),
             () => lifecycle.CreateAsync(new ProjectCreateParameters(root, "scene-template-directory-reparse"), default));
     }
 
-    private static async Task VerifyFileSymlinkFailureAsync(string path, Func<Task> action)
+    private static async Task VerifyFileReparseFailureAsync(string path, Func<Task> action)
     {
-        var realPath = $"{path}.real-{Guid.NewGuid():N}";
-        File.Move(path, realPath);
-        File.CreateSymbolicLink(path, realPath);
-        try
-        {
-            await ExpectLifecycleFailureAsync(action, WorkspaceProjectLifecycleFailureKind.Validation);
-        }
-        finally
-        {
-            File.Delete(path);
-            File.Move(realPath, path);
-        }
+        await VerifierReparseFixture.WithFileReplacementAsync(
+            path,
+            () => ExpectLifecycleFailureAsync(action, WorkspaceProjectLifecycleFailureKind.Validation));
     }
 
-    private static async Task VerifyDirectorySymlinkFailureAsync(string path, Func<Task> action)
+    private static async Task VerifyDirectoryReparseFailureAsync(string path, Func<Task> action)
     {
-        var realPath = $"{path}.real-{Guid.NewGuid():N}";
-        Directory.Move(path, realPath);
-        Directory.CreateSymbolicLink(path, realPath);
-        try
-        {
-            await ExpectLifecycleFailureAsync(action, WorkspaceProjectLifecycleFailureKind.Validation);
-        }
-        finally
-        {
-            Directory.Delete(path);
-            Directory.Move(realPath, path);
-        }
+        await VerifierReparseFixture.WithDirectoryReplacementAsync(
+            path,
+            () => ExpectLifecycleFailureAsync(action, WorkspaceProjectLifecycleFailureKind.Validation));
     }
 
     private static TemplateBytes CreatePackage(string root)
@@ -515,16 +498,17 @@ internal static class ProjectLifecycleVerifier
         Directory.CreateDirectory(Path.Combine(root, "bin", "projects"));
         File.WriteAllBytes(Path.Combine(root, "bin", "assets", "scenes", "preview.scene.json"), scene);
         File.WriteAllBytes(Path.Combine(root, "bin", "assets", "scripts", "preview.script.json"), script);
-        File.WriteAllBytes(Path.Combine(root, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), [0]);
+        File.WriteAllBytes(Path.Combine(root, VerifierPlatform.RuntimeRelativePath), [0]);
         return new TemplateBytes(scene, script);
     }
 
     private static async Task VerifyBehaviorProjectLifecycleAsync(string root)
     {
         var packageRoot = Path.Combine(root, "behavior-package");
-        var productAssets = Path.Combine(Directory.GetCurrentDirectory(), "packaging", "linux-assets");
+        // Behavior v2 fixture 已提升为跨平台产品资产，Windows 不能再回读已退役的 Linux 专用快照。
+        var productAssets = Path.Combine(Directory.GetCurrentDirectory(), "packaging", "runtime-assets");
         var scene = File.ReadAllBytes(Path.Combine(productAssets, "preview.scene.json"));
-        var script = File.ReadAllBytes(Path.Combine(productAssets, "preview.script.json"));
+        var script = File.ReadAllBytes(Path.Combine(productAssets, "script.json"));
         var patrol = File.ReadAllBytes(Path.Combine(productAssets, "scripts", "patrol.luau"));
         var playerController = File.ReadAllBytes(Path.Combine(productAssets, "scripts", "player_controller.luau"));
         Directory.CreateDirectory(Path.Combine(packageRoot, "bin", "assets", "scenes"));
@@ -536,7 +520,8 @@ internal static class ProjectLifecycleVerifier
         File.WriteAllBytes(templateDependencyPath, patrol);
         var templatePlayerControllerPath = Path.Combine(packageRoot, "bin", "assets", "scripts", "player_controller.luau");
         File.WriteAllBytes(templatePlayerControllerPath, playerController);
-        File.WriteAllBytes(Path.Combine(packageRoot, "bin", OperatingSystem.IsWindows() ? "kadath.exe" : "kadath"), [0]);
+        File.WriteAllBytes(Path.Combine(packageRoot, VerifierPlatform.RuntimeRelativePath), [0]);
+        InstallBehaviorToolFixture(packageRoot);
 
         var lifecycle = new WorkspaceProjectLifecycleModel();
         var created = await lifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "behavior-created"), default);
@@ -756,6 +741,26 @@ internal static class ProjectLifecycleVerifier
             WorkspaceProjectLifecycleFailureKind.Validation);
         Require(!Directory.Exists(Path.Combine(packageRoot, "bin", "projects", "behavior-missing-source")),
             "Missing Script template dependency created a partial project.");
+    }
+
+    private static void InstallBehaviorToolFixture(string packageRoot)
+    {
+        var executable = OperatingSystem.IsWindows() ? "kadath-behavior-tool.exe" : "kadath-behavior-tool";
+        var overridePath = Environment.GetEnvironmentVariable("KADATH_BEHAVIOR_TOOL");
+        var installedPath = Path.Combine(Directory.GetCurrentDirectory(), "zig-out", "behavior-tools", executable);
+        var sourcePath = !string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath)
+            ? Path.GetFullPath(overridePath)
+            : installedPath;
+        if (!File.Exists(sourcePath))
+        {
+            throw new InvalidOperationException(
+                "Native Behavior Tool is missing; run zig build install-behavior-script-tool --prefix zig-out.");
+        }
+
+        // v2 fixture 必须像真实 package 一样携带原生工具，避免依赖调用进程偶然残留的环境变量。
+        var destinationDirectory = Path.Combine(packageRoot, "behavior-tools");
+        Directory.CreateDirectory(destinationDirectory);
+        File.Copy(sourcePath, Path.Combine(destinationDirectory, executable));
     }
 
     private static async Task VerifyScriptAssetLifecycleFailureMatrixAsync(

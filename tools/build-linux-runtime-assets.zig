@@ -138,7 +138,7 @@ fn buildSceneArtifact(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
 }
 
 fn buildScriptArtifact(io: std.Io, allocator: std.mem.Allocator, json: []const u8) ![]u8 {
-    var project_dir = try std.Io.Dir.cwd().openDir(io, "packaging/linux-assets", .{});
+    var project_dir = try std.Io.Dir.cwd().openDir(io, "packaging/runtime-assets", .{});
     defer project_dir.close(io);
     var snapshot = try behavior_manifest.loadSnapshot(io, allocator, project_dir, json);
     defer snapshot.deinit();
