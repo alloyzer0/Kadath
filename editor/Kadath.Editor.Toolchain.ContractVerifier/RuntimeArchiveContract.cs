@@ -14,10 +14,55 @@ internal static class RuntimeArchiveContract
         VerifyPrewriteFailures(sandbox, fixture);
         VerifyReparseRejected(sandbox, fixture);
         VerifyPreexistingOutputRetained(sandbox, fixture);
+        VerifyOwnedCleanupRejectsForeignEntryBeforeClaim(sandbox, fixture);
         VerifyOwnedCleanupRejectsDirectoryReplacement(sandbox, fixture);
         VerifyOwnedCleanupRejectsFileReplacement(sandbox, fixture);
         VerifyOwnedCleanupRejectsJunctionReplacement(sandbox, fixture);
         await VerifyRetainedHandleMutationAsync(sandbox, fixture).ConfigureAwait(false);
+    }
+
+    private static void VerifyOwnedCleanupRejectsForeignEntryBeforeClaim(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var root = sandbox.NewCase("archive-owned-cleanup-before-claim");
+        var output = Path.Combine(root, "output");
+        var extract = Path.Combine(root, "extract");
+        string? stagingRoot = null;
+        string? foreignSentinel = null;
+        Exception? failure = null;
+        try
+        {
+            var request = fixture.Request(
+                fixture.PackageRoot,
+                output,
+                extract,
+                afterPackageSnapshotCreatedForTesting: staging =>
+                {
+                    stagingRoot = staging;
+                    foreignSentinel = Path.Combine(staging, "foreign-before-claim.sentinel");
+                    File.WriteAllText(foreignSentinel, "foreign entry must never become owned", Encoding.UTF8);
+                });
+            _ = ToolchainRuntimeArchive.Execute(request);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        try
+        {
+            ContractAssert.Require(foreignSentinel is not null, "archive before-claim injection seam was not reached");
+            ContractAssert.Require(File.Exists(foreignSentinel),
+                "archive cleanup deleted a foreign entry inserted before ownership claim");
+            ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+                "archive accepted a foreign entry inserted before ownership claim");
+            ContractAssert.Require(!Directory.Exists(output) && !Directory.Exists(extract),
+                "archive before-claim failure advanced output/extract identity");
+        }
+        finally { DeleteVerifiedArchiveStagingRoot(stagingRoot); }
     }
 
     private static void VerifyReproducibleExactV2(ContractSandbox sandbox, RuntimePackageFixture fixture)

@@ -20,7 +20,8 @@ internal sealed record ToolchainRuntimeArchiveRequest(
     string KadathRoot,
     ToolchainRuntimePackagePolicy Policy,
     string? VerificationBarrierDirectory = null,
-    Action<string>? AfterOwnedCleanupEntryClassifiedForTesting = null);
+    Action<string>? AfterOwnedCleanupEntryClassifiedForTesting = null,
+    Action<string>? AfterPackageSnapshotCreatedForTesting = null);
 
 internal sealed record ToolchainRuntimeArchiveResult(
     string ArchivePath,
@@ -119,7 +120,7 @@ internal static class ToolchainRuntimeArchive
 
             stagingOwner = CreateOwnedRoot(staging, "Package snapshot", () => archiveWriteStarted = true);
             Exception? copyFailure = null;
-            try { sourceSnapshot.CopyTo(staging); }
+            try { sourceSnapshot.CopyTo(stagingOwner); }
             catch (Exception exception) { copyFailure = exception; }
             Exception? closeFailure = null;
             try { sourceSnapshot.CloseStreams(); }
@@ -131,7 +132,7 @@ internal static class ToolchainRuntimeArchive
                     closeFailure);
             if (copyFailure is not null) ExceptionDispatchInfo.Capture(copyFailure).Throw();
             if (closeFailure is not null) ExceptionDispatchInfo.Capture(closeFailure).Throw();
-            stagingOwner.ClaimCurrentTree();
+            request.AfterPackageSnapshotCreatedForTesting?.Invoke(staging);
 
             AssertReleasePackageDirectoryIdentity(
                 staging,
@@ -145,15 +146,12 @@ internal static class ToolchainRuntimeArchive
             var manifestPath = Path.Combine(output, "manifest.sha256");
             var stagingFiles = EnumeratePackageFileSet(staging);
             var manifest = BuildManifest(stagingFiles);
-            ToolchainDurableFile.WriteNew(manifestPath, manifest.Bytes);
-            outputOwner.ClaimCurrentTree();
-            WriteDeterministicArchive(archivePath, stagingFiles);
-            outputOwner.ClaimCurrentTree();
+            WriteOwnedFile(outputOwner, "manifest.sha256", manifest.Bytes);
+            WriteDeterministicArchive(outputOwner, "kadath-runtime-win-x64.zip", stagingFiles);
             ValidateArchiveEntries(archivePath, manifest.HashByRelativePath);
 
             extractOwner = CreateOwnedRoot(extract, "Extract directory");
-            ZipFile.ExtractToDirectory(archivePath, extract, overwriteFiles: false);
-            extractOwner.ClaimCurrentTree();
+            ExtractArchiveToOwnedDirectory(archivePath, extractOwner);
             ToolchainPathPolicy.RejectReparsePointInExistingPath(extract, "Extract directory");
             RejectReparseEntries(extract, "Extracted archive");
             var persistedManifest = ReadManifest(manifestPath);
@@ -182,6 +180,9 @@ internal static class ToolchainRuntimeArchive
                 "Package snapshot",
                 request.AfterOwnedCleanupEntryClassifiedForTesting);
             stagingOwner = null;
+            // 成功发布前固定最终树身份；未知 extra 或 replacement 不能被静默纳入产品结果。
+            outputOwner.VerifyClaimedTree();
+            extractOwner.VerifyClaimedTree();
             outputOwner.Release();
             outputOwner = null;
             extractOwner.Release();
@@ -412,16 +413,20 @@ internal static class ToolchainRuntimeArchive
         return new ManifestIdentity(StrictUtf8.GetBytes(text), map);
     }
 
-    private static void WriteDeterministicArchive(string archivePath, IReadOnlyList<PackageFileEntry> files)
+    private static void WriteOwnedFile(WindowsOwnedDirectory owner, string relativePath, ReadOnlySpan<byte> bytes)
     {
-        using var archiveStream = new FileStream(
-            archivePath,
-            FileMode.CreateNew,
-            FileAccess.ReadWrite,
-            FileShare.None,
-            1024 * 1024,
-            FileOptions.WriteThrough);
-        using (var archive = new ZipArchive(archiveStream, ZipArchiveMode.Create, leaveOpen: true))
+        using var file = owner.CreateFile(relativePath);
+        file.Stream.Write(bytes);
+        file.Stream.Flush(flushToDisk: true);
+    }
+
+    private static void WriteDeterministicArchive(
+        WindowsOwnedDirectory owner,
+        string relativePath,
+        IReadOnlyList<PackageFileEntry> files)
+    {
+        using var ownedArchive = owner.CreateFile(relativePath);
+        using (var archive = new ZipArchive(ownedArchive.Stream, ZipArchiveMode.Create, leaveOpen: true))
         {
             foreach (var file in files.OrderBy(file => file.RelativePath, StringComparer.Ordinal))
             {
@@ -432,7 +437,22 @@ internal static class ToolchainRuntimeArchive
                 input.CopyTo(output);
             }
         }
-        archiveStream.Flush(flushToDisk: true);
+        ownedArchive.Stream.Flush(flushToDisk: true);
+    }
+
+    private static void ExtractArchiveToOwnedDirectory(string archivePath, WindowsOwnedDirectory owner)
+    {
+        using var archive = ZipFile.OpenRead(archivePath);
+        foreach (var entry in archive.Entries)
+        {
+            if (string.IsNullOrEmpty(entry.Name))
+                throw new InvalidDataException($"Archive contains a directory entry: {entry.FullName}");
+            var relative = NormalizeArchiveRelativePath(entry.FullName);
+            using var output = owner.CreateFile(relative);
+            using var input = entry.Open();
+            input.CopyTo(output.Stream);
+            output.Stream.Flush(flushToDisk: true);
+        }
     }
 
     private static void ValidateArchiveEntries(string archivePath, IReadOnlyDictionary<string, string> expected)
@@ -686,33 +706,20 @@ internal static class ToolchainRuntimeArchive
             return bytes;
         }
 
-        internal void CopyTo(string snapshotRoot)
+        internal void CopyTo(WindowsOwnedDirectory snapshotOwner)
         {
             if (_streamsClosed) throw new InvalidOperationException("Package retained streams are already closed.");
             foreach (var file in Files)
             {
-                var destination = Path.Combine(snapshotRoot, file.RelativePath.Replace('/', Path.DirectorySeparatorChar));
-                var destinationParent = Path.GetDirectoryName(destination)
-                    ?? throw new IOException($"Package snapshot file has no parent: {file.RelativePath}");
-                Directory.CreateDirectory(destinationParent);
                 var source = _streamByRelative[file.RelativePath];
                 source.Position = 0;
-                using (var output = new FileStream(
-                           destination,
-                           FileMode.CreateNew,
-                           FileAccess.Write,
-                           FileShare.None,
-                           1024 * 1024,
-                           FileOptions.WriteThrough))
-                {
-                    source.CopyTo(output);
-                    output.Flush(flushToDisk: true);
-                }
+                using var output = snapshotOwner.CreateFile(file.RelativePath);
+                source.CopyTo(output.Stream);
+                output.Stream.Flush(flushToDisk: true);
                 var copiedIdentity = ReadStableIdentity(source);
                 if (!_identityByRelative[file.RelativePath].EqualsStable(copiedIdentity))
                     throw new InvalidDataException($"Package retained source changed while copying to the owned snapshot: {file.RelativePath}");
             }
-            RejectReparseEntries(snapshotRoot, "Package snapshot");
         }
 
         internal void AssertStable(string sourceRoot)

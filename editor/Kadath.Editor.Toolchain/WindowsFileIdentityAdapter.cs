@@ -44,7 +44,9 @@ internal sealed class WindowsOwnedFile : IDisposable
 internal sealed class WindowsOwnedDirectory : IDisposable
 {
     private SafeFileHandle? _handle;
-    private SortedDictionary<string, WindowsFileIdentity> _claimedTree =
+    private readonly SortedDictionary<string, WindowsFileIdentity> _claimedTree =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly SortedDictionary<string, WindowsOwnedDirectory> _ownedDirectories =
         new(StringComparer.OrdinalIgnoreCase);
 
     internal WindowsOwnedDirectory(string path, SafeFileHandle handle, WindowsFileIdentity identity)
@@ -77,37 +79,107 @@ internal sealed class WindowsOwnedDirectory : IDisposable
         _handle = null;
     }
 
-    internal void ClaimCurrentTree()
+    internal WindowsOwnedFile CreateFile(string relativePath)
     {
         VerifyPath();
-        var current = WindowsFileIdentityAdapter.CaptureRegularTree(Path);
-        foreach (var (relativePath, expectedIdentity) in _claimedTree)
+        var relative = NormalizeRelativePath(relativePath);
+        if (_claimedTree.ContainsKey(relative))
+            throw new IOException($"Owned directory entry was already created: {relative}");
+
+        var parent = System.IO.Path.GetDirectoryName(relative);
+        if (!string.IsNullOrEmpty(parent)) EnsureDirectory(parent);
+        var fullPath = System.IO.Path.Combine(Path, relative);
+        var owned = WindowsFileIdentityAdapter.CreateOwnedFile(fullPath);
+        try
         {
-            if (!current.TryGetValue(relativePath, out var actualIdentity) ||
-                !expectedIdentity.IsSameObject(actualIdentity) ||
-                expectedIdentity.IsDirectory != actualIdentity.IsDirectory ||
-                actualIdentity.IsReparsePoint)
-                throw new InvalidOperationException($"Owned directory child identity changed before claim refresh: {relativePath}");
+            // 文件只能在 CreateNew 原始句柄仍存活时进入所有权集合，禁止事后按路径认领。
+            _claimedTree.Add(relative, owned.Identity);
+            return owned;
         }
-        _claimedTree = current;
+        catch
+        {
+            owned.CloseStream();
+            WindowsFileIdentityAdapter.DeleteOwnedFileIfPresent(fullPath, owned.Identity);
+            throw;
+        }
+    }
+
+    internal void EnsureDirectory(string relativePath)
+    {
+        VerifyPath();
+        var relative = NormalizeRelativePath(relativePath);
+        var current = string.Empty;
+        foreach (var segment in relative.Split(System.IO.Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = string.IsNullOrEmpty(current)
+                ? segment
+                : System.IO.Path.Combine(current, segment);
+            if (_claimedTree.TryGetValue(current, out var existing))
+            {
+                if (!existing.IsDirectory || !_ownedDirectories.ContainsKey(current))
+                    throw new IOException($"Owned directory path conflicts with an existing file: {current}");
+                continue;
+            }
+
+            var fullPath = System.IO.Path.Combine(Path, current);
+            var owned = WindowsFileIdentityAdapter.CreateOwnedDirectory(fullPath);
+            try
+            {
+                // 目录的拒绝 delete-sharing 句柄保留到事务结束，父链在创建后不能被替换。
+                _claimedTree.Add(current, owned.Identity);
+                _ownedDirectories.Add(current, owned);
+            }
+            catch
+            {
+                owned.DeleteEmpty();
+                throw;
+            }
+        }
     }
 
     internal void DeleteClaimedTree(Action<string>? afterEntryClassifiedForTesting = null)
     {
-        VerifyPath();
-        WindowsFileIdentityAdapter.AssertRegularTreeMatches(Path, _claimedTree);
-        WindowsFileIdentityAdapter.DeleteClaimedTree(
-            Path,
-            _claimedTree,
-            afterEntryClassifiedForTesting);
+        VerifyClaimedTree();
+        // 先删除最深层文件，再通过从创建时持续持有的目录句柄删除空目录；全程不按路径猜测所有权。
+        foreach (var entry in _claimedTree
+                     .OrderByDescending(pair => PathDepth(pair.Key))
+                     .ThenBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var fullPath = System.IO.Path.Combine(Path, entry.Key);
+            afterEntryClassifiedForTesting?.Invoke(fullPath);
+            if (entry.Value.IsDirectory)
+            {
+                var owned = _ownedDirectories[entry.Key];
+                owned.VerifyPath();
+                if (Directory.EnumerateFileSystemEntries(fullPath).Any())
+                    throw new IOException($"Owned child directory is not empty after claimed descendants were removed: {fullPath}");
+                owned.DeleteEmpty();
+            }
+            else
+            {
+                WindowsFileIdentityAdapter.DeleteClaimedFile(fullPath, entry.Value);
+            }
+        }
+        _ownedDirectories.Clear();
         VerifyPath();
         if (Directory.EnumerateFileSystemEntries(Path).Any())
             throw new IOException($"Owned directory changed while clearing; retaining root: {Path}");
         DeleteEmpty();
     }
 
+    internal void VerifyClaimedTree()
+    {
+        VerifyPath();
+        WindowsFileIdentityAdapter.AssertRegularTreeMatches(Path, _claimedTree);
+    }
+
     internal void Release()
     {
+        foreach (var directory in _ownedDirectories
+                     .OrderByDescending(pair => PathDepth(pair.Key))
+                     .Select(pair => pair.Value))
+            directory.Release();
+        _ownedDirectories.Clear();
         _handle?.Dispose();
         _handle = null;
     }
@@ -118,6 +190,20 @@ internal sealed class WindowsOwnedDirectory : IDisposable
     {
         if (!identity.IsDirectory || identity.IsReparsePoint || !Identity.IsSameObject(identity))
             throw new InvalidOperationException("Owned directory identity changed or became reparse-backed.");
+    }
+
+    private static int PathDepth(string relativePath) =>
+        relativePath.Count(character => character is '\\' or '/') + 1;
+
+    private static string NormalizeRelativePath(string relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath) || System.IO.Path.IsPathRooted(relativePath))
+            throw new IOException($"Owned entry path must be a non-empty relative path: {relativePath}");
+        var normalized = relativePath.Replace(System.IO.Path.AltDirectorySeparatorChar, System.IO.Path.DirectorySeparatorChar);
+        if (normalized.Split(System.IO.Path.DirectorySeparatorChar).Any(segment =>
+                segment.Length == 0 || segment is "." or ".."))
+            throw new IOException($"Owned entry path contains an invalid segment: {relativePath}");
+        return normalized;
     }
 }
 
@@ -389,26 +475,14 @@ internal static class WindowsFileIdentityAdapter
         }
     }
 
-    internal static void DeleteClaimedTree(
-        string root,
-        IReadOnlyDictionary<string, WindowsFileIdentity> claimed,
-        Action<string>? afterEntryClassifiedForTesting)
+    internal static void DeleteClaimedFile(string path, WindowsFileIdentity claimedIdentity)
     {
-        foreach (var entry in claimed
-                     .OrderByDescending(pair => PathDepth(pair.Key))
-                     .ThenBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
-        {
-            var path = Path.Combine(root, entry.Key);
-            afterEntryClassifiedForTesting?.Invoke(path);
-            using var handle = OpenPathForOwnedDeletion(path, entry.Value);
-            if (entry.Value.IsDirectory && Directory.EnumerateFileSystemEntries(path).Any())
-                throw new IOException($"Owned child directory is not empty after claimed descendants were removed: {path}");
-            MarkDeleteOnClose(handle);
-        }
+        using var handle = OpenPathForOwnedDeletion(path, claimedIdentity);
+        var actual = GetIdentity(handle);
+        if (actual.IsDirectory)
+            throw new InvalidOperationException($"Refusing file cleanup through a directory handle: {path}");
+        MarkDeleteOnClose(handle);
     }
-
-    private static int PathDepth(string relativePath) =>
-        relativePath.Count(character => character is '\\' or '/') + 1;
 
     private static SafeFileHandle OpenPathForIdentity(string path)
     {
