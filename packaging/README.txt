@@ -187,6 +187,9 @@ no-replace 与 fail-closed 语义
   cleanup 只删除已证明属于本次事务的对象，不删除 replacement 或外来对象。
 - 只有 exact-18、ReleaseSafe profile/hash gate、manifest、ZIP、extract 与最终 live package 复验全部
   成功后，归档事务才算完成；未知 extra 和 PDB 一律 fail-closed。
+- output 与 extract 的全部目录在最终复验期间持有 Windows R oplock；一次原子确认所有 oplock
+  均未 break 的时刻是复合事务提交点。提交点前的成员新增、删除、大小或时间变化必须失败，
+  提交点后的外部变更属于调用方并发，不再由已完成事务清理。
 
 本文件定义当前产品入口与判定契约，不代表任何具体机器已经完成验收。每次结果应以实际命令、
 首个因果错误、退出码以及生成的 manifest/evidence 为准。

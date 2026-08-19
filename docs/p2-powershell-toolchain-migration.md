@@ -88,6 +88,7 @@ Runtime contract verifier 对 exact-18、未知 extra/PDB、Host Interface v2、
 - 首次 archive 产品写入前失败，stderr 必须包含且只包含一条 `archive_write_started=false` 见证行；不得推进 output 或 extract。
 - artifact、manifest、Preview loaded identity 和 Runtime 状态只在完整成功后推进。
 - owned cleanup 必须验证路径边界、reparse point 与真实文件身份；replacement 或 foreign claim 必须保留。
+- archive 对 output/extract 的全部目录持有 Windows R oplock；最终双树复验后，只有一次原子检查确认全部 oplock 未 break，事务才提交。提交前的成员变化必须 fail-closed。
 - Window verifier 的环境缺失单独报告 `BLOCKED_ENV`；Null RHI、解析器或交叉编译不得替代 Windows HWND/Vulkan PASS。
 - Runtime 启动已尝试后的失败保存首个因果错误、stdout/stderr、package identity、窗口/像素证据和最终清理状态。
 

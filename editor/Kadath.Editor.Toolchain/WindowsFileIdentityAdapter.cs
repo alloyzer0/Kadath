@@ -20,11 +20,17 @@ internal readonly record struct WindowsFileIdentity(
 internal sealed class WindowsOwnedFile : IDisposable
 {
     private FileStream? _stream;
+    private SafeFileHandle? _identityLease;
 
-    internal WindowsOwnedFile(string path, FileStream stream, WindowsFileIdentity identity)
+    internal WindowsOwnedFile(
+        string path,
+        FileStream stream,
+        WindowsFileIdentity identity,
+        SafeFileHandle? identityLease = null)
     {
         Path = path;
         _stream = stream;
+        _identityLease = identityLease;
         Identity = identity;
     }
 
@@ -38,6 +44,33 @@ internal sealed class WindowsOwnedFile : IDisposable
         _stream = null;
     }
 
+    internal void VerifyIdentityLease()
+    {
+        var lease = _identityLease;
+        if (lease is null || lease.IsInvalid || lease.IsClosed)
+            throw new InvalidOperationException("Owned file identity lease is unavailable.");
+        var actual = WindowsFileIdentityAdapter.GetIdentity(lease);
+        if (actual.IsDirectory || actual.IsReparsePoint || !Identity.IsSameObject(actual))
+            throw new InvalidOperationException($"Owned file identity lease changed: {Path}");
+    }
+
+    internal void DeleteThroughIdentityLease()
+    {
+        CloseStream();
+        VerifyIdentityLease();
+        var lease = _identityLease!;
+        WindowsFileIdentityAdapter.MarkDeleteOnClose(lease);
+        lease.Dispose();
+        _identityLease = null;
+    }
+
+    internal void ReleaseIdentityLease()
+    {
+        CloseStream();
+        _identityLease?.Dispose();
+        _identityLease = null;
+    }
+
     public void Dispose() => CloseStream();
 }
 
@@ -47,6 +80,8 @@ internal sealed class WindowsOwnedDirectory : IDisposable
     private readonly SortedDictionary<string, WindowsFileIdentity> _claimedTree =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly SortedDictionary<string, WindowsOwnedDirectory> _ownedDirectories =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly SortedDictionary<string, WindowsOwnedFile> _ownedFiles =
         new(StringComparer.OrdinalIgnoreCase);
 
     internal WindowsOwnedDirectory(string path, SafeFileHandle handle, WindowsFileIdentity identity)
@@ -89,17 +124,17 @@ internal sealed class WindowsOwnedDirectory : IDisposable
         var parent = System.IO.Path.GetDirectoryName(relative);
         if (!string.IsNullOrEmpty(parent)) EnsureDirectory(parent);
         var fullPath = System.IO.Path.Combine(Path, relative);
-        var owned = WindowsFileIdentityAdapter.CreateOwnedFile(fullPath);
+        var owned = WindowsFileIdentityAdapter.CreateOwnedFile(fullPath, retainIdentityLease: true);
         try
         {
             // 文件只能在 CreateNew 原始句柄仍存活时进入所有权集合，禁止事后按路径认领。
             _claimedTree.Add(relative, owned.Identity);
+            _ownedFiles.Add(relative, owned);
             return owned;
         }
         catch
         {
-            owned.CloseStream();
-            WindowsFileIdentityAdapter.DeleteOwnedFileIfPresent(fullPath, owned.Identity);
+            owned.DeleteThroughIdentityLease();
             throw;
         }
     }
@@ -157,10 +192,13 @@ internal sealed class WindowsOwnedDirectory : IDisposable
             }
             else
             {
-                WindowsFileIdentityAdapter.DeleteClaimedFile(fullPath, entry.Value);
+                var owned = _ownedFiles[entry.Key];
+                owned.VerifyIdentityLease();
+                owned.DeleteThroughIdentityLease();
             }
         }
         _ownedDirectories.Clear();
+        _ownedFiles.Clear();
         VerifyPath();
         if (Directory.EnumerateFileSystemEntries(Path).Any())
             throw new IOException($"Owned directory changed while clearing; retaining root: {Path}");
@@ -173,8 +211,17 @@ internal sealed class WindowsOwnedDirectory : IDisposable
         WindowsFileIdentityAdapter.AssertRegularTreeMatches(Path, _claimedTree);
     }
 
+    internal IEnumerable<string> EnumerateOwnedDirectoryPaths()
+    {
+        yield return Path;
+        foreach (var relativePath in _ownedDirectories.Keys)
+            yield return System.IO.Path.Combine(Path, relativePath);
+    }
+
     internal void Release()
     {
+        foreach (var file in _ownedFiles.Values) file.ReleaseIdentityLease();
+        _ownedFiles.Clear();
         foreach (var directory in _ownedDirectories
                      .OrderByDescending(pair => PathDepth(pair.Key))
                      .Select(pair => pair.Value))
@@ -207,6 +254,294 @@ internal sealed class WindowsOwnedDirectory : IDisposable
     }
 }
 
+internal sealed class WindowsDirectoryMutationGuardSet : IDisposable
+{
+    private const uint FsctlRequestOplock = 0x00090240;
+    private const uint OplockLevelCacheRead = 0x00000001;
+    private const uint RequestOplockInputFlagRequest = 0x00000001;
+    private const uint FileReadAttributesAccess = 0x00000080;
+    private const uint GenericReadAccess = 0x80000000;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint FileShareDelete = 0x00000004;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint FileFlagOverlapped = 0x40000000;
+    private const int ErrorIoPending = 997;
+    private const int ErrorNotFound = 1168;
+    private const uint WaitObject0 = 0;
+    private const uint WaitTimeout = 258;
+    private const uint WaitFailed = 0xffffffff;
+    private const uint OplockCancelTimeoutMilliseconds = 10_000;
+    private readonly List<Guard> _guards;
+    private bool _disposed;
+
+    private WindowsDirectoryMutationGuardSet(List<Guard> guards) => _guards = guards;
+
+    internal static WindowsDirectoryMutationGuardSet Acquire(IEnumerable<string> directoryPaths)
+    {
+        var paths = directoryPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (paths.Length is 0 or > 64)
+            throw new IOException($"Final directory mutation guard requires 1..64 directories, got {paths.Length}.");
+
+        var guards = new List<Guard>(paths.Length);
+        try
+        {
+            foreach (var path in paths) guards.Add(Guard.Acquire(path));
+            return new WindowsDirectoryMutationGuardSet(guards);
+        }
+        catch
+        {
+            foreach (var guard in guards) guard.Dispose();
+            throw;
+        }
+    }
+
+    internal void AssertUnbrokenAtCommitPoint()
+    {
+        if (_disposed) throw new InvalidOperationException("Directory mutation guard set is unavailable.");
+        var events = _guards.Select(guard => guard.EventHandle).ToArray();
+        // WAIT_ANY 的零超时检查提供一个同时观察全部目录 oplock 的提交线性化点。
+        var wait = WaitForMultipleObjects((uint)events.Length, events, waitAll: false, milliseconds: 0);
+        if (wait == WaitTimeout) return;
+        if (wait == WaitFailed)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Checking final directory mutation guards failed.");
+        if (wait >= WaitObject0 && wait < WaitObject0 + events.Length)
+            throw new IOException($"Final owned directory contents changed during verification: {_guards[(int)(wait - WaitObject0)].Path}");
+        throw new IOException($"Unexpected final directory mutation guard wait result: {wait}.");
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        foreach (var guard in _guards) guard.Dispose();
+        _guards.Clear();
+    }
+
+    private sealed class Guard : IDisposable
+    {
+        private SafeFileHandle? _directoryHandle;
+        private SafeWaitHandle? _eventHandle;
+        private IntPtr _inputBuffer;
+        private IntPtr _outputBuffer;
+        private IntPtr _overlappedBuffer;
+        private bool _disposed;
+
+        private Guard(
+            string path,
+            SafeFileHandle directoryHandle,
+            SafeWaitHandle eventHandle,
+            IntPtr inputBuffer,
+            IntPtr outputBuffer,
+            IntPtr overlappedBuffer)
+        {
+            Path = path;
+            _directoryHandle = directoryHandle;
+            _eventHandle = eventHandle;
+            _inputBuffer = inputBuffer;
+            _outputBuffer = outputBuffer;
+            _overlappedBuffer = overlappedBuffer;
+        }
+
+        internal string Path { get; }
+        internal IntPtr EventHandle => _eventHandle?.DangerousGetHandle()
+            ?? throw new InvalidOperationException("Directory mutation event is unavailable.");
+
+        internal static Guard Acquire(string path)
+        {
+            var directory = CreateFileW(
+                path,
+                GenericReadAccess | FileReadAttributesAccess,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero,
+                OpenExisting,
+                FileFlagBackupSemantics | FileFlagOpenReparsePoint | FileFlagOverlapped,
+                IntPtr.Zero);
+            if (directory.IsInvalid)
+            {
+                var error = Marshal.GetLastWin32Error();
+                directory.Dispose();
+                throw new Win32Exception(error, $"Opening final directory mutation guard failed: {path}");
+            }
+
+            SafeWaitHandle? eventHandle = null;
+            var inputBuffer = IntPtr.Zero;
+            var outputBuffer = IntPtr.Zero;
+            var overlappedBuffer = IntPtr.Zero;
+            try
+            {
+                var identity = WindowsFileIdentityAdapter.GetIdentity(directory);
+                if (!identity.IsDirectory || identity.IsReparsePoint)
+                    throw new IOException($"Final mutation guard requires a regular directory: {path}");
+
+                eventHandle = CreateEventW(IntPtr.Zero, manualReset: true, initialState: false, null);
+                if (eventHandle.IsInvalid)
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), $"Creating final directory mutation event failed: {path}");
+
+                var input = new RequestOplockInputBuffer
+                {
+                    StructureVersion = 1,
+                    StructureLength = checked((ushort)Marshal.SizeOf<RequestOplockInputBuffer>()),
+                    RequestedOplockLevel = OplockLevelCacheRead,
+                    Flags = RequestOplockInputFlagRequest
+                };
+                inputBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<RequestOplockInputBuffer>());
+                Marshal.StructureToPtr(input, inputBuffer, fDeleteOld: false);
+                var output = new RequestOplockOutputBuffer
+                {
+                    StructureVersion = 1,
+                    StructureLength = checked((ushort)Marshal.SizeOf<RequestOplockOutputBuffer>())
+                };
+                outputBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<RequestOplockOutputBuffer>());
+                Marshal.StructureToPtr(output, outputBuffer, fDeleteOld: false);
+                var overlapped = new OverlappedBuffer { EventHandle = eventHandle.DangerousGetHandle() };
+                overlappedBuffer = Marshal.AllocHGlobal(Marshal.SizeOf<OverlappedBuffer>());
+                Marshal.StructureToPtr(overlapped, overlappedBuffer, fDeleteOld: false);
+
+                var started = DeviceIoControl(
+                    directory,
+                    FsctlRequestOplock,
+                    inputBuffer,
+                    (uint)Marshal.SizeOf<RequestOplockInputBuffer>(),
+                    outputBuffer,
+                    (uint)Marshal.SizeOf<RequestOplockOutputBuffer>(),
+                    IntPtr.Zero,
+                    overlappedBuffer);
+                var startError = Marshal.GetLastWin32Error();
+                if (started)
+                    throw new IOException($"Final directory oplock completed before it could guard mutations: {path}");
+                if (startError != ErrorIoPending)
+                    throw new Win32Exception(startError, $"Requesting final directory oplock failed: {path}");
+
+                return new Guard(path, directory, eventHandle, inputBuffer, outputBuffer, overlappedBuffer);
+            }
+            catch
+            {
+                directory.Dispose();
+                eventHandle?.Dispose();
+                if (inputBuffer != IntPtr.Zero) Marshal.FreeHGlobal(inputBuffer);
+                if (outputBuffer != IntPtr.Zero) Marshal.FreeHGlobal(outputBuffer);
+                if (overlappedBuffer != IntPtr.Zero) Marshal.FreeHGlobal(overlappedBuffer);
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            var directory = _directoryHandle;
+            var eventHandle = _eventHandle;
+            if (directory is not null && !directory.IsClosed && _overlappedBuffer != IntPtr.Zero)
+            {
+                var cancelled = CancelIoEx(directory, _overlappedBuffer);
+                var cancelError = cancelled ? 0 : Marshal.GetLastWin32Error();
+                if (!cancelled && cancelError != ErrorNotFound)
+                {
+                    directory.Dispose();
+                    _directoryHandle = null;
+                }
+                var wait = WaitForSingleObject(
+                    eventHandle!.DangerousGetHandle(),
+                    OplockCancelTimeoutMilliseconds);
+                if (wait != WaitObject0)
+                {
+                    // 句柄关闭会继续取消请求；为避免异步内核写入已释放内存，超时时宁可保留小块缓冲区。
+                    directory.Dispose();
+                    _directoryHandle = null;
+                    return;
+                }
+            }
+            directory?.Dispose();
+            eventHandle?.Dispose();
+            if (_inputBuffer != IntPtr.Zero) Marshal.FreeHGlobal(_inputBuffer);
+            if (_outputBuffer != IntPtr.Zero) Marshal.FreeHGlobal(_outputBuffer);
+            if (_overlappedBuffer != IntPtr.Zero) Marshal.FreeHGlobal(_overlappedBuffer);
+            _directoryHandle = null;
+            _eventHandle = null;
+            _inputBuffer = IntPtr.Zero;
+            _outputBuffer = IntPtr.Zero;
+            _overlappedBuffer = IntPtr.Zero;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RequestOplockInputBuffer
+    {
+        internal ushort StructureVersion;
+        internal ushort StructureLength;
+        internal uint RequestedOplockLevel;
+        internal uint Flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RequestOplockOutputBuffer
+    {
+        internal ushort StructureVersion;
+        internal ushort StructureLength;
+        internal uint OriginalOplockLevel;
+        internal uint NewOplockLevel;
+        internal uint Flags;
+        internal uint AccessMode;
+        internal ushort ShareMode;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OverlappedBuffer
+    {
+        internal IntPtr Internal;
+        internal IntPtr InternalHigh;
+        internal uint Offset;
+        internal uint OffsetHigh;
+        internal IntPtr EventHandle;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle device,
+        uint ioControlCode,
+        IntPtr inputBuffer,
+        uint inputBufferSize,
+        IntPtr outputBuffer,
+        uint outputBufferSize,
+        IntPtr bytesReturned,
+        IntPtr overlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern SafeWaitHandle CreateEventW(
+        IntPtr eventAttributes,
+        [MarshalAs(UnmanagedType.Bool)] bool manualReset,
+        [MarshalAs(UnmanagedType.Bool)] bool initialState,
+        string? name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CancelIoEx(SafeFileHandle file, IntPtr overlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForMultipleObjects(
+        uint count,
+        [In] IntPtr[] handles,
+        [MarshalAs(UnmanagedType.Bool)] bool waitAll,
+        uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+}
+
 internal static class WindowsFileIdentityAdapter
 {
     internal const uint FileAttributeDirectory = 0x00000010;
@@ -234,13 +569,19 @@ internal static class WindowsFileIdentityAdapter
     private const int ErrorFileNotFound = 2;
     private const int ErrorPathNotFound = 3;
 
-    internal static FileStream OpenFrozenRead(string path)
+    internal static FileStream OpenFrozenRead(string path) => OpenFrozenRead(path, ownedIdentityLeasePresent: false);
+
+    internal static FileStream OpenOwnedFrozenRead(string path) => OpenFrozenRead(path, ownedIdentityLeasePresent: true);
+
+    private static FileStream OpenFrozenRead(string path, bool ownedIdentityLeasePresent)
     {
         EnsureWindows();
         var handle = CreateFileW(
             path,
             GenericReadAccess | FileReadAttributesAccess,
-            FileShareRead,
+            ownedIdentityLeasePresent
+                ? FileShareRead | FileShareWrite | FileShareDelete
+                : FileShareRead,
             IntPtr.Zero,
             OpenExisting,
             FileAttributeNormal | FileFlagOpenReparsePoint,
@@ -269,7 +610,8 @@ internal static class WindowsFileIdentityAdapter
     internal static WindowsOwnedFile CreateOwnedFile(
         string path,
         bool injectFileIdBeforeReturnFailure = false,
-        bool allowDeleteSharing = false)
+        bool allowDeleteSharing = false,
+        bool retainIdentityLease = false)
     {
         EnsureWindows();
         SafeFileHandle? handle = null;
@@ -280,7 +622,9 @@ internal static class WindowsFileIdentityAdapter
             handle = CreateFileW(
                 path,
                 GenericWriteAccess | DeleteAccess | FileReadAttributesAccess,
-                allowDeleteSharing ? FileShareDelete : 0,
+                retainIdentityLease
+                    ? FileShareRead
+                    : allowDeleteSharing ? FileShareDelete : 0,
                 IntPtr.Zero,
                 CreateNew,
                 FileAttributeNormal,
@@ -292,8 +636,19 @@ internal static class WindowsFileIdentityAdapter
             if (injectFileIdBeforeReturnFailure)
                 throw new InvalidOperationException("Injected snapshot file-id-before-return failure.");
 
-            stream = new FileStream(handle, FileAccess.Write);
-            var owned = new WindowsOwnedFile(path, stream, identity);
+            SafeFileHandle? identityLease = null;
+            if (retainIdentityLease)
+            {
+                // 写流关闭后仍由原始 CreateNew 句柄冻结对象；非 owning wrapper 只负责流式写入。
+                identityLease = handle;
+                var streamHandle = new SafeFileHandle(handle.DangerousGetHandle(), ownsHandle: false);
+                stream = new FileStream(streamHandle, FileAccess.Write);
+            }
+            else
+            {
+                stream = new FileStream(handle, FileAccess.Write);
+            }
+            var owned = new WindowsOwnedFile(path, stream, identity, identityLease);
             stream = null;
             handle = null;
             return owned;
@@ -475,15 +830,6 @@ internal static class WindowsFileIdentityAdapter
         }
     }
 
-    internal static void DeleteClaimedFile(string path, WindowsFileIdentity claimedIdentity)
-    {
-        using var handle = OpenPathForOwnedDeletion(path, claimedIdentity);
-        var actual = GetIdentity(handle);
-        if (actual.IsDirectory)
-            throw new InvalidOperationException($"Refusing file cleanup through a directory handle: {path}");
-        MarkDeleteOnClose(handle);
-    }
-
     private static SafeFileHandle OpenPathForIdentity(string path)
     {
         var handle = CreateFileW(
@@ -501,41 +847,6 @@ internal static class WindowsFileIdentityAdapter
             throw new Win32Exception(error, $"Opening owned tree entry identity failed: {path}");
         }
         return handle;
-    }
-
-    private static SafeFileHandle OpenPathForOwnedDeletion(
-        string path,
-        WindowsFileIdentity expectedIdentity)
-    {
-        var handle = CreateFileW(
-            path,
-            DeleteAccess | FileReadAttributesAccess,
-            FileShareRead | FileShareWrite,
-            IntPtr.Zero,
-            OpenExisting,
-            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
-            IntPtr.Zero);
-        if (handle.IsInvalid)
-        {
-            var error = Marshal.GetLastWin32Error();
-            handle.Dispose();
-            throw new Win32Exception(error, $"Opening claimed tree entry for deletion failed: {path}");
-        }
-
-        try
-        {
-            var actualIdentity = GetIdentity(handle);
-            if (!expectedIdentity.IsSameObject(actualIdentity) ||
-                expectedIdentity.IsDirectory != actualIdentity.IsDirectory ||
-                actualIdentity.IsReparsePoint)
-                throw new InvalidOperationException($"Refusing to delete a replaced claimed tree entry: {path}");
-            return handle;
-        }
-        catch
-        {
-            handle.Dispose();
-            throw;
-        }
     }
 
     internal static void MarkDeleteOnClose(SafeFileHandle handle)

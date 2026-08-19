@@ -21,7 +21,10 @@ internal sealed record ToolchainRuntimeArchiveRequest(
     ToolchainRuntimePackagePolicy Policy,
     string? VerificationBarrierDirectory = null,
     Action<string>? AfterOwnedCleanupEntryClassifiedForTesting = null,
-    Action<string>? AfterPackageSnapshotCreatedForTesting = null);
+    Action<string>? AfterPackageSnapshotCreatedForTesting = null,
+    Action<string, string>? BeforeFinalOwnedTreeVerificationForTesting = null,
+    Action<string, string>? BetweenFinalOwnedTreeVerificationsForTesting = null,
+    Action<string, string>? BeforeFinalDirectoryMutationCommitForTesting = null);
 
 internal sealed record ToolchainRuntimeArchiveResult(
     string ArchivePath,
@@ -139,7 +142,8 @@ internal static class ToolchainRuntimeArchive
                 requiredFiles,
                 request.Policy,
                 vertexShaderSha256,
-                fragmentShaderSha256);
+                fragmentShaderSha256,
+                ownedIdentityLeasesPresent: true);
 
             outputOwner = CreateOwnedRoot(output, "Output directory");
             var archivePath = Path.Combine(output, "kadath-runtime-win-x64.zip");
@@ -161,7 +165,12 @@ internal static class ToolchainRuntimeArchive
                 requiredFiles,
                 request.Policy,
                 vertexShaderSha256,
-                fragmentShaderSha256);
+                fragmentShaderSha256,
+                ownedIdentityLeasesPresent: true);
+
+            using var finalMutationGuards = WindowsDirectoryMutationGuardSet.Acquire(
+                outputOwner.EnumerateOwnedDirectoryPaths()
+                    .Concat(extractOwner.EnumerateOwnedDirectoryPaths()));
 
             // 终验 live package 与 shader，证明归档事务未推进漂移后的身份。
             sourceSnapshot.AssertStable(package);
@@ -172,17 +181,23 @@ internal static class ToolchainRuntimeArchive
                 requiredFiles,
                 request.Policy,
                 vertexShaderSha256,
-                fragmentShaderSha256);
+                fragmentShaderSha256,
+                ownedIdentityLeasesPresent: false);
 
-            var archiveSha256 = HashFile(archivePath);
+            var archiveSha256 = HashFile(archivePath, ownedIdentityLeasePresent: true);
             RemoveOwnedDirectory(
                 stagingOwner,
                 "Package snapshot",
                 request.AfterOwnedCleanupEntryClassifiedForTesting);
             stagingOwner = null;
-            // 成功发布前固定最终树身份；未知 extra 或 replacement 不能被静默纳入产品结果。
+            // 故障注入必须发生在提交线性化点之前；成功的最终双树校验即完成事务提交。
+            request.BeforeFinalOwnedTreeVerificationForTesting?.Invoke(output, extract);
             outputOwner.VerifyClaimedTree();
+            request.BetweenFinalOwnedTreeVerificationsForTesting?.Invoke(output, extract);
             extractOwner.VerifyClaimedTree();
+            request.BeforeFinalDirectoryMutationCommitForTesting?.Invoke(output, extract);
+            finalMutationGuards.AssertUnbrokenAtCommitPoint();
+            // 提交后只释放 SafeHandle 并构造已计算完成的结果，不再执行产品验证或可失败写入。
             outputOwner.Release();
             outputOwner = null;
             extractOwner.Release();
@@ -356,13 +371,14 @@ internal static class ToolchainRuntimeArchive
         IReadOnlyList<string> requiredFiles,
         ToolchainRuntimePackagePolicy policy,
         string vertexShaderSha256,
-        string fragmentShaderSha256)
+        string fragmentShaderSha256,
+        bool ownedIdentityLeasesPresent)
     {
         var files = EnumeratePackageFileSet(root);
         AssertExactFileSet(files.Select(file => file.RelativePath), requiredFiles, "Runtime package");
         var byRelative = files.ToDictionary(file => file.RelativePath, StringComparer.OrdinalIgnoreCase);
-        byte[] Read(string relative) => ReadFrozenBytes(byRelative[relative].FullPath);
-        string Hash(string relative) => HashFile(byRelative[relative].FullPath);
+        byte[] Read(string relative) => ReadFrozenBytes(byRelative[relative].FullPath, ownedIdentityLeasesPresent);
+        string Hash(string relative) => HashFile(byRelative[relative].FullPath, ownedIdentityLeasesPresent);
         ToolchainBuildProfile.AssertReleaseIdentity(
             Read("bin/kadath-runtime-build-profile.json"),
             Hash("bin/kadath.exe"),
@@ -408,7 +424,7 @@ internal static class ToolchainRuntimeArchive
     private static ManifestIdentity BuildManifest(IReadOnlyList<PackageFileEntry> files)
     {
         var map = new SortedDictionary<string, string>(StringComparer.Ordinal);
-        foreach (var file in files) map.Add(file.RelativePath, HashFile(file.FullPath));
+        foreach (var file in files) map.Add(file.RelativePath, HashFile(file.FullPath, ownedIdentityLeasePresent: true));
         var text = string.Concat(map.Select(entry => $"{entry.Value}  {entry.Key}\n"));
         return new ManifestIdentity(StrictUtf8.GetBytes(text), map);
     }
@@ -432,7 +448,7 @@ internal static class ToolchainRuntimeArchive
             {
                 var entry = archive.CreateEntry(file.RelativePath, CompressionLevel.Optimal);
                 entry.LastWriteTime = new DateTimeOffset(1980, 1, 1, 0, 0, 0, TimeSpan.Zero);
-                using var input = WindowsFileIdentityAdapter.OpenFrozenRead(file.FullPath);
+                using var input = WindowsFileIdentityAdapter.OpenOwnedFrozenRead(file.FullPath);
                 using var output = entry.Open();
                 input.CopyTo(output);
             }
@@ -442,7 +458,8 @@ internal static class ToolchainRuntimeArchive
 
     private static void ExtractArchiveToOwnedDirectory(string archivePath, WindowsOwnedDirectory owner)
     {
-        using var archive = ZipFile.OpenRead(archivePath);
+        using var archiveStream = WindowsFileIdentityAdapter.OpenOwnedFrozenRead(archivePath);
+        using var archive = new ZipArchive(archiveStream, ZipArchiveMode.Read, leaveOpen: false);
         foreach (var entry in archive.Entries)
         {
             if (string.IsNullOrEmpty(entry.Name))
@@ -457,7 +474,8 @@ internal static class ToolchainRuntimeArchive
 
     private static void ValidateArchiveEntries(string archivePath, IReadOnlyDictionary<string, string> expected)
     {
-        using var archive = ZipFile.OpenRead(archivePath);
+        using var archiveStream = WindowsFileIdentityAdapter.OpenOwnedFrozenRead(archivePath);
+        using var archive = new ZipArchive(archiveStream, ZipArchiveMode.Read, leaveOpen: false);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var actualOrder = new List<string>();
         foreach (var entry in archive.Entries)
@@ -478,7 +496,7 @@ internal static class ToolchainRuntimeArchive
 
     private static IReadOnlyDictionary<string, string> ReadManifest(string manifestPath)
     {
-        var bytes = ReadFrozenBytes(manifestPath);
+        var bytes = ReadFrozenBytes(manifestPath, ownedIdentityLeasePresent: true);
         string text;
         try { text = StrictUtf8.GetString(bytes); }
         catch (DecoderFallbackException exception) { throw new InvalidDataException("Archive manifest is not strict UTF-8.", exception); }
@@ -508,7 +526,7 @@ internal static class ToolchainRuntimeArchive
         {
             if (!expected.TryGetValue(file.RelativePath, out var hash))
                 throw new InvalidDataException($"Archive contains an unexpected extracted file: {file.RelativePath}");
-            if (HashFile(file.FullPath) != hash)
+            if (HashFile(file.FullPath, ownedIdentityLeasePresent: true) != hash)
                 throw new InvalidDataException($"Archive hash mismatch: {file.RelativePath}");
         }
     }
@@ -605,9 +623,11 @@ internal static class ToolchainRuntimeArchive
         ToolchainPathPolicy.ResolveExistingDirectory(parent, name);
     }
 
-    private static byte[] ReadFrozenBytes(string path)
+    private static byte[] ReadFrozenBytes(string path, bool ownedIdentityLeasePresent = false)
     {
-        using var stream = WindowsFileIdentityAdapter.OpenFrozenRead(path);
+        using var stream = ownedIdentityLeasePresent
+            ? WindowsFileIdentityAdapter.OpenOwnedFrozenRead(path)
+            : WindowsFileIdentityAdapter.OpenFrozenRead(path);
         if (stream.Length > int.MaxValue) throw new InvalidDataException($"Toolchain file is too large to buffer: {path}");
         var bytes = GC.AllocateUninitializedArray<byte>(checked((int)stream.Length));
         stream.ReadExactly(bytes);
@@ -615,9 +635,11 @@ internal static class ToolchainRuntimeArchive
         return bytes;
     }
 
-    private static string HashFile(string path)
+    private static string HashFile(string path, bool ownedIdentityLeasePresent = false)
     {
-        using var stream = WindowsFileIdentityAdapter.OpenFrozenRead(path);
+        using var stream = ownedIdentityLeasePresent
+            ? WindowsFileIdentityAdapter.OpenOwnedFrozenRead(path)
+            : WindowsFileIdentityAdapter.OpenFrozenRead(path);
         return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
 

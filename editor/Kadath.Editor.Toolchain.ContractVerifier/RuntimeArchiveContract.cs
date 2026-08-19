@@ -15,10 +15,300 @@ internal static class RuntimeArchiveContract
         VerifyReparseRejected(sandbox, fixture);
         VerifyPreexistingOutputRetained(sandbox, fixture);
         VerifyOwnedCleanupRejectsForeignEntryBeforeClaim(sandbox, fixture);
+        VerifySnapshotIdentityLeaseRejectsReplacement(sandbox, fixture);
+        VerifyFinalIdentityLeaseRejectsReplacement(sandbox, fixture);
+        VerifyFinalTreeRejectsForeignExtra(sandbox, fixture);
+        VerifyDirectoryMutationGuardRejectsInterScanExtra(sandbox, fixture);
+        VerifyDirectoryMutationGuardRejectsPostScanExtra(sandbox, fixture);
         VerifyOwnedCleanupRejectsDirectoryReplacement(sandbox, fixture);
         VerifyOwnedCleanupRejectsFileReplacement(sandbox, fixture);
         VerifyOwnedCleanupRejectsJunctionReplacement(sandbox, fixture);
         await VerifyRetainedHandleMutationAsync(sandbox, fixture).ConfigureAwait(false);
+    }
+
+    private static void VerifyDirectoryMutationGuardRejectsInterScanExtra(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var root = sandbox.NewCase("archive-final-inter-scan-extra");
+        var output = Path.Combine(root, "output");
+        var extract = Path.Combine(root, "extract");
+        string? foreignExtra = null;
+        Exception? failure = null;
+        try
+        {
+            var request = fixture.Request(
+                fixture.PackageRoot,
+                output,
+                extract,
+                betweenFinalOwnedTreeVerificationsForTesting: (ownedOutput, _) =>
+                {
+                    foreignExtra = Path.Combine(ownedOutput, "foreign-inter-scan-extra");
+                    File.WriteAllText(foreignExtra, "inter-scan foreign extra must break the transaction guard", Encoding.UTF8);
+                });
+            _ = ToolchainRuntimeArchive.Execute(request);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        ContractAssert.Require(foreignExtra is not null, "archive inter-scan extra seam was not reached");
+        ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+            "archive committed with an output extra inserted between final tree scans");
+        ContractAssert.Require(!ContainsWindowsError(failure, 32) &&
+            ContainsExceptionMessage(failure, "Final owned directory contents changed during verification"),
+            "archive inter-scan extra did not fail through the atomic directory mutation guard");
+        ContractAssert.Require(File.Exists(foreignExtra),
+            "archive cleanup deleted the foreign inter-scan extra");
+        ContractAssert.Require(!Directory.Exists(extract),
+            "archive inter-scan extra failure advanced the unaffected extract root");
+    }
+
+    private static void VerifyFinalTreeRejectsForeignExtra(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        foreach (var targetExtract in new[] { false, true })
+        {
+            var caseName = targetExtract ? "extract" : "output";
+            var root = sandbox.NewCase($"archive-final-{caseName}-extra");
+            var output = Path.Combine(root, "output");
+            var extract = Path.Combine(root, "extract");
+            string? foreignExtra = null;
+            Exception? failure = null;
+            try
+            {
+                var request = fixture.Request(
+                    fixture.PackageRoot,
+                    output,
+                    extract,
+                    beforeFinalOwnedTreeVerificationForTesting: (ownedOutput, ownedExtract) =>
+                    {
+                        foreignExtra = Path.Combine(targetExtract ? ownedExtract : ownedOutput, "foreign-final-extra");
+                        File.WriteAllText(foreignExtra, "foreign extra must remain outside the owned set", Encoding.UTF8);
+                    });
+                _ = ToolchainRuntimeArchive.Execute(request);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+
+            ContractAssert.Require(foreignExtra is not null, $"archive final {caseName} extra seam was not reached");
+            ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+                $"archive committed with a foreign final {caseName} extra");
+            ContractAssert.Require(!ContainsWindowsError(failure, 32) &&
+                ContainsExceptionMessage(failure, "gained or lost an entry"),
+                $"archive final {caseName} extra did not fail through exact-tree verification");
+            ContractAssert.Require(File.Exists(foreignExtra),
+                $"archive cleanup deleted the foreign final {caseName} extra");
+            ContractAssert.Require(
+                targetExtract ? !Directory.Exists(output) : !Directory.Exists(extract),
+                $"archive final {caseName} extra failure advanced the unaffected product root");
+        }
+    }
+
+    private static void VerifyDirectoryMutationGuardRejectsPostScanExtra(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var root = sandbox.NewCase("archive-final-post-scan-extra");
+        var output = Path.Combine(root, "output");
+        var extract = Path.Combine(root, "extract");
+        string? foreignExtra = null;
+        Exception? failure = null;
+        try
+        {
+            var request = fixture.Request(
+                fixture.PackageRoot,
+                output,
+                extract,
+                beforeFinalDirectoryMutationCommitForTesting: (_, ownedExtract) =>
+                {
+                    foreignExtra = Path.Combine(
+                        ownedExtract,
+                        "bin",
+                        "assets",
+                        "scripts",
+                        "foreign-post-scan-extra");
+                    File.WriteAllText(foreignExtra, "post-scan foreign extra must break the atomic guard", Encoding.UTF8);
+                });
+            _ = ToolchainRuntimeArchive.Execute(request);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        ContractAssert.Require(foreignExtra is not null, "archive post-scan extra seam was not reached");
+        ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+            "archive committed with an extract extra inserted after both final tree scans");
+        ContractAssert.Require(!ContainsWindowsError(failure, 32) &&
+            ContainsExceptionMessage(failure, "Final owned directory contents changed during verification"),
+            "archive post-scan extra did not fail through the atomic directory mutation guard");
+        ContractAssert.Require(File.Exists(foreignExtra),
+            "archive cleanup deleted the foreign post-scan extra");
+        ContractAssert.Require(!Directory.Exists(output),
+            "archive post-scan extra failure advanced the unaffected output root");
+    }
+
+    private static void VerifySnapshotIdentityLeaseRejectsReplacement(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var root = sandbox.NewCase("archive-snapshot-identity-lease");
+        var output = Path.Combine(root, "output");
+        var extract = Path.Combine(root, "extract");
+        var foreign = Path.Combine(root, "foreign-readme");
+        var detachedOwned = Path.Combine(root, "detached-owned-readme");
+        var foreignBytes = Encoding.UTF8.GetBytes("foreign snapshot file must never be archived or cleaned");
+        File.WriteAllBytes(foreign, foreignBytes);
+
+        var injected = false;
+        Exception? failure = null;
+        try
+        {
+            var request = fixture.Request(
+                fixture.PackageRoot,
+                output,
+                extract,
+                afterPackageSnapshotCreatedForTesting: staging =>
+                {
+                    injected = true;
+                    var readme = Path.Combine(staging, "README.txt");
+                    File.Move(readme, detachedOwned);
+                    File.Move(foreign, readme);
+                });
+            _ = ToolchainRuntimeArchive.Execute(request);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        try
+        {
+            ContractAssert.Require(injected, "archive snapshot identity replacement seam was not reached");
+            ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+                "archive accepted a snapshot file replacement after its write stream closed");
+            ContractAssert.Require(ContainsWindowsError(failure, 32),
+                "archive snapshot replacement did not fail through the retained sharing lease");
+            ContractAssert.Require(File.Exists(foreign) &&
+                File.ReadAllBytes(foreign).AsSpan().SequenceEqual(foreignBytes),
+                "archive moved or deleted the foreign snapshot replacement");
+            ContractAssert.Require(!Directory.Exists(output) && !Directory.Exists(extract),
+                "archive snapshot identity replacement failure advanced output/extract identity");
+        }
+        finally
+        {
+            if (File.Exists(detachedOwned)) File.Delete(detachedOwned);
+        }
+    }
+
+    private static void VerifyFinalIdentityLeaseRejectsReplacement(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        VerifyFinalIdentityLeaseRejectsReplacementCase(
+            sandbox,
+            fixture,
+            caseName: "output",
+            relativePath: "manifest.sha256",
+            targetExtract: false,
+            mutateContent: false);
+        VerifyFinalIdentityLeaseRejectsReplacementCase(
+            sandbox,
+            fixture,
+            caseName: "extract",
+            relativePath: "README.txt",
+            targetExtract: true,
+            mutateContent: false);
+        VerifyFinalIdentityLeaseRejectsReplacementCase(
+            sandbox,
+            fixture,
+            caseName: "output-content",
+            relativePath: "manifest.sha256",
+            targetExtract: false,
+            mutateContent: true);
+    }
+
+    private static void VerifyFinalIdentityLeaseRejectsReplacementCase(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture,
+        string caseName,
+        string relativePath,
+        bool targetExtract,
+        bool mutateContent)
+    {
+        var root = sandbox.NewCase($"archive-final-{caseName}-identity-lease");
+        var output = Path.Combine(root, "output");
+        var extract = Path.Combine(root, "extract");
+        var foreign = Path.Combine(root, $"foreign-{caseName}");
+        var detachedOwned = Path.Combine(root, $"detached-owned-{caseName}");
+        var foreignBytes = Encoding.UTF8.GetBytes($"foreign {caseName} file must never be committed");
+        File.WriteAllBytes(foreign, foreignBytes);
+
+        var injected = false;
+        Exception? failure = null;
+        try
+        {
+            var request = fixture.Request(
+                fixture.PackageRoot,
+                output,
+                extract,
+                beforeFinalOwnedTreeVerificationForTesting: (ownedOutput, ownedExtract) =>
+                {
+                    injected = true;
+                    var target = Path.Combine(targetExtract ? ownedExtract : ownedOutput, relativePath);
+                    if (mutateContent)
+                        File.WriteAllBytes(target, foreignBytes);
+                    else
+                    {
+                        File.Move(target, detachedOwned);
+                        File.Move(foreign, target);
+                    }
+                });
+            _ = ToolchainRuntimeArchive.Execute(request);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        try
+        {
+            ContractAssert.Require(injected, "archive final identity replacement seam was not reached");
+            ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+                $"archive committed after its final {caseName} identity was replaced");
+            ContractAssert.Require(ContainsWindowsError(failure, 32),
+                $"archive final {caseName} mutation did not fail through the retained sharing lease");
+            ContractAssert.Require(File.Exists(foreign) &&
+                File.ReadAllBytes(foreign).AsSpan().SequenceEqual(foreignBytes),
+                "archive moved or deleted the foreign final-identity replacement");
+            ContractAssert.Require(!Directory.Exists(output) && !Directory.Exists(extract),
+                "archive final identity replacement failure advanced output/extract identity");
+        }
+        finally
+        {
+            var target = Path.Combine(targetExtract ? extract : output, relativePath);
+            if (File.Exists(target) && !File.Exists(foreign)) File.Move(target, foreign);
+            if (File.Exists(detachedOwned))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                File.Move(detachedOwned, target, overwrite: true);
+            }
+        }
     }
 
     private static void VerifyOwnedCleanupRejectsForeignEntryBeforeClaim(
@@ -392,6 +682,26 @@ internal static class RuntimeArchiveContract
             current = current.Parent;
         }
         throw new InvalidOperationException($"Archive cleanup fixture did not find a controlled staging root: {path}");
+    }
+
+    private static bool ContainsWindowsError(Exception? exception, int errorCode)
+    {
+        if (exception is null) return false;
+        if ((exception.HResult & 0xffff) == errorCode) return true;
+        if (exception is AggregateException aggregate &&
+            aggregate.InnerExceptions.Any(inner => ContainsWindowsError(inner, errorCode)))
+            return true;
+        return ContainsWindowsError(exception.InnerException, errorCode);
+    }
+
+    private static bool ContainsExceptionMessage(Exception? exception, string fragment)
+    {
+        if (exception is null) return false;
+        if (exception.Message.Contains(fragment, StringComparison.Ordinal)) return true;
+        if (exception is AggregateException aggregate &&
+            aggregate.InnerExceptions.Any(inner => ContainsExceptionMessage(inner, fragment)))
+            return true;
+        return ContainsExceptionMessage(exception.InnerException, fragment);
     }
 
     private static void DeleteVerifiedArchiveStagingRoot(string? stagingRoot)

@@ -107,7 +107,10 @@ internal sealed class RuntimePackageFixture
         string extractDirectory,
         string? barrier = null,
         Action<string>? afterOwnedCleanupEntryClassifiedForTesting = null,
-        Action<string>? afterPackageSnapshotCreatedForTesting = null) =>
+        Action<string>? afterPackageSnapshotCreatedForTesting = null,
+        Action<string, string>? beforeFinalOwnedTreeVerificationForTesting = null,
+        Action<string, string>? betweenFinalOwnedTreeVerificationsForTesting = null,
+        Action<string, string>? beforeFinalDirectoryMutationCommitForTesting = null) =>
         new(
             packageRoot,
             outputDirectory,
@@ -116,7 +119,10 @@ internal sealed class RuntimePackageFixture
             ToolchainRuntimePackagePolicy.KscpV2,
             barrier,
             afterOwnedCleanupEntryClassifiedForTesting,
-            afterPackageSnapshotCreatedForTesting);
+            afterPackageSnapshotCreatedForTesting,
+            beforeFinalOwnedTreeVerificationForTesting,
+            betweenFinalOwnedTreeVerificationsForTesting,
+            beforeFinalDirectoryMutationCommitForTesting);
 
     internal static SortedDictionary<string, string> TreeIdentity(string root)
     {
