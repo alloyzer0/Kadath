@@ -44,6 +44,8 @@ internal sealed class WindowsOwnedFile : IDisposable
 internal sealed class WindowsOwnedDirectory : IDisposable
 {
     private SafeFileHandle? _handle;
+    private SortedDictionary<string, WindowsFileIdentity> _claimedTree =
+        new(StringComparer.OrdinalIgnoreCase);
 
     internal WindowsOwnedDirectory(string path, SafeFileHandle handle, WindowsFileIdentity identity)
     {
@@ -73,6 +75,35 @@ internal sealed class WindowsOwnedDirectory : IDisposable
         WindowsFileIdentityAdapter.MarkDeleteOnClose(handle);
         handle.Dispose();
         _handle = null;
+    }
+
+    internal void ClaimCurrentTree()
+    {
+        VerifyPath();
+        var current = WindowsFileIdentityAdapter.CaptureRegularTree(Path);
+        foreach (var (relativePath, expectedIdentity) in _claimedTree)
+        {
+            if (!current.TryGetValue(relativePath, out var actualIdentity) ||
+                !expectedIdentity.IsSameObject(actualIdentity) ||
+                expectedIdentity.IsDirectory != actualIdentity.IsDirectory ||
+                actualIdentity.IsReparsePoint)
+                throw new InvalidOperationException($"Owned directory child identity changed before claim refresh: {relativePath}");
+        }
+        _claimedTree = current;
+    }
+
+    internal void DeleteClaimedTree(Action<string>? afterEntryClassifiedForTesting = null)
+    {
+        VerifyPath();
+        WindowsFileIdentityAdapter.AssertRegularTreeMatches(Path, _claimedTree);
+        WindowsFileIdentityAdapter.DeleteClaimedTree(
+            Path,
+            _claimedTree,
+            afterEntryClassifiedForTesting);
+        VerifyPath();
+        if (Directory.EnumerateFileSystemEntries(Path).Any())
+            throw new IOException($"Owned directory changed while clearing; retaining root: {Path}");
+        DeleteEmpty();
     }
 
     internal void Release()
@@ -318,6 +349,119 @@ internal static class WindowsFileIdentityAdapter
             throw new Win32Exception(error, $"Opening directory identity failed: {path}");
         }
         return handle;
+    }
+
+    internal static SortedDictionary<string, WindowsFileIdentity> CaptureRegularTree(string root)
+    {
+        EnsureWindows();
+        var result = new SortedDictionary<string, WindowsFileIdentity>(StringComparer.OrdinalIgnoreCase);
+        var pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.TryPop(out var directory))
+        {
+            foreach (var path in Directory.EnumerateFileSystemEntries(directory))
+            {
+                using var handle = OpenPathForIdentity(path);
+                var identity = GetIdentity(handle);
+                if (identity.IsReparsePoint)
+                    throw new IOException($"Owned directory tree cannot contain a reparse point: {path}");
+                var relative = Path.GetRelativePath(root, path);
+                result.Add(relative, identity);
+                if (identity.IsDirectory) pending.Push(path);
+            }
+        }
+        return result;
+    }
+
+    internal static void AssertRegularTreeMatches(
+        string root,
+        IReadOnlyDictionary<string, WindowsFileIdentity> expected)
+    {
+        var current = CaptureRegularTree(root);
+        if (current.Count != expected.Count)
+            throw new InvalidOperationException("Owned directory tree gained or lost an entry before cleanup.");
+        foreach (var (relativePath, expectedIdentity) in expected)
+        {
+            if (!current.TryGetValue(relativePath, out var actualIdentity) ||
+                !expectedIdentity.IsSameObject(actualIdentity) ||
+                expectedIdentity.IsDirectory != actualIdentity.IsDirectory)
+                throw new InvalidOperationException($"Owned directory entry was replaced before cleanup: {relativePath}");
+        }
+    }
+
+    internal static void DeleteClaimedTree(
+        string root,
+        IReadOnlyDictionary<string, WindowsFileIdentity> claimed,
+        Action<string>? afterEntryClassifiedForTesting)
+    {
+        foreach (var entry in claimed
+                     .OrderByDescending(pair => PathDepth(pair.Key))
+                     .ThenBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var path = Path.Combine(root, entry.Key);
+            afterEntryClassifiedForTesting?.Invoke(path);
+            using var handle = OpenPathForOwnedDeletion(path, entry.Value);
+            if (entry.Value.IsDirectory && Directory.EnumerateFileSystemEntries(path).Any())
+                throw new IOException($"Owned child directory is not empty after claimed descendants were removed: {path}");
+            MarkDeleteOnClose(handle);
+        }
+    }
+
+    private static int PathDepth(string relativePath) =>
+        relativePath.Count(character => character is '\\' or '/') + 1;
+
+    private static SafeFileHandle OpenPathForIdentity(string path)
+    {
+        var handle = CreateFileW(
+            path,
+            FileReadAttributesAccess,
+            FileShareRead | FileShareWrite | FileShareDelete,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, $"Opening owned tree entry identity failed: {path}");
+        }
+        return handle;
+    }
+
+    private static SafeFileHandle OpenPathForOwnedDeletion(
+        string path,
+        WindowsFileIdentity expectedIdentity)
+    {
+        var handle = CreateFileW(
+            path,
+            DeleteAccess | FileReadAttributesAccess,
+            FileShareRead | FileShareWrite,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, $"Opening claimed tree entry for deletion failed: {path}");
+        }
+
+        try
+        {
+            var actualIdentity = GetIdentity(handle);
+            if (!expectedIdentity.IsSameObject(actualIdentity) ||
+                expectedIdentity.IsDirectory != actualIdentity.IsDirectory ||
+                actualIdentity.IsReparsePoint)
+                throw new InvalidOperationException($"Refusing to delete a replaced claimed tree entry: {path}");
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
     }
 
     internal static void MarkDeleteOnClose(SafeFileHandle handle)

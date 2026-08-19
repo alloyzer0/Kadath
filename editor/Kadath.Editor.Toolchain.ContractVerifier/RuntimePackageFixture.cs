@@ -105,14 +105,16 @@ internal sealed class RuntimePackageFixture
         string packageRoot,
         string outputDirectory,
         string extractDirectory,
-        string? barrier = null) =>
+        string? barrier = null,
+        Action<string>? afterOwnedCleanupEntryClassifiedForTesting = null) =>
         new(
             packageRoot,
             outputDirectory,
             extractDirectory,
             KadathRoot,
             ToolchainRuntimePackagePolicy.KscpV2,
-            barrier);
+            barrier,
+            afterOwnedCleanupEntryClassifiedForTesting);
 
     internal static SortedDictionary<string, string> TreeIdentity(string root)
     {

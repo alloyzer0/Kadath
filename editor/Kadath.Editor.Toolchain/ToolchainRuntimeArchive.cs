@@ -19,7 +19,8 @@ internal sealed record ToolchainRuntimeArchiveRequest(
     string ExtractDirectory,
     string KadathRoot,
     ToolchainRuntimePackagePolicy Policy,
-    string? VerificationBarrierDirectory = null);
+    string? VerificationBarrierDirectory = null,
+    Action<string>? AfterOwnedCleanupEntryClassifiedForTesting = null);
 
 internal sealed record ToolchainRuntimeArchiveResult(
     string ArchivePath,
@@ -130,6 +131,7 @@ internal static class ToolchainRuntimeArchive
                     closeFailure);
             if (copyFailure is not null) ExceptionDispatchInfo.Capture(copyFailure).Throw();
             if (closeFailure is not null) ExceptionDispatchInfo.Capture(closeFailure).Throw();
+            stagingOwner.ClaimCurrentTree();
 
             AssertReleasePackageDirectoryIdentity(
                 staging,
@@ -144,11 +146,14 @@ internal static class ToolchainRuntimeArchive
             var stagingFiles = EnumeratePackageFileSet(staging);
             var manifest = BuildManifest(stagingFiles);
             ToolchainDurableFile.WriteNew(manifestPath, manifest.Bytes);
+            outputOwner.ClaimCurrentTree();
             WriteDeterministicArchive(archivePath, stagingFiles);
+            outputOwner.ClaimCurrentTree();
             ValidateArchiveEntries(archivePath, manifest.HashByRelativePath);
 
             extractOwner = CreateOwnedRoot(extract, "Extract directory");
             ZipFile.ExtractToDirectory(archivePath, extract, overwriteFiles: false);
+            extractOwner.ClaimCurrentTree();
             ToolchainPathPolicy.RejectReparsePointInExistingPath(extract, "Extract directory");
             RejectReparseEntries(extract, "Extracted archive");
             var persistedManifest = ReadManifest(manifestPath);
@@ -172,7 +177,10 @@ internal static class ToolchainRuntimeArchive
                 fragmentShaderSha256);
 
             var archiveSha256 = HashFile(archivePath);
-            RemoveOwnedDirectory(stagingOwner, "Package snapshot");
+            RemoveOwnedDirectory(
+                stagingOwner,
+                "Package snapshot",
+                request.AfterOwnedCleanupEntryClassifiedForTesting);
             stagingOwner = null;
             outputOwner.Release();
             outputOwner = null;
@@ -547,25 +555,16 @@ internal static class ToolchainRuntimeArchive
         return relative;
     }
 
-    private static void RemoveOwnedDirectory(WindowsOwnedDirectory owner, string name)
+    private static void RemoveOwnedDirectory(
+        WindowsOwnedDirectory owner,
+        string name,
+        Action<string>? afterEntryClassifiedForTesting = null)
     {
-        owner.VerifyPath();
-        RejectReparseEntries(owner.Path, name);
-        foreach (var child in Directory.EnumerateFileSystemEntries(owner.Path).ToArray())
+        try { owner.DeleteClaimedTree(afterEntryClassifiedForTesting); }
+        catch (Exception exception)
         {
-            var attributes = File.GetAttributes(child);
-            if ((attributes & FileAttributes.ReparsePoint) != 0)
-                throw new InvalidDataException($"{name} contains a reparse point; refusing cleanup and retaining the owned root: {child}");
-            if ((attributes & FileAttributes.Directory) != 0) Directory.Delete(child, recursive: true);
-            else File.Delete(child);
+            throw new IOException($"{name} cleanup refused to delete an unowned or changed object.", exception);
         }
-        owner.VerifyPath();
-        if (Directory.EnumerateFileSystemEntries(owner.Path).Any())
-            throw new IOException($"{name} changed while clearing; refusing handle deletion and retaining the root: {owner.Path}");
-        var path = owner.Path;
-        owner.DeleteEmpty();
-        if (File.Exists(path) || Directory.Exists(path))
-            throw new IOException($"{name} path reappeared after handle deletion; refusing to delete the replacement: {path}");
     }
 
     private static void CleanupOwnedRoot(WindowsOwnedDirectory? owner, string name, List<Exception> failures)

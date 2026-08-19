@@ -14,6 +14,9 @@ internal static class RuntimeArchiveContract
         VerifyPrewriteFailures(sandbox, fixture);
         VerifyReparseRejected(sandbox, fixture);
         VerifyPreexistingOutputRetained(sandbox, fixture);
+        VerifyOwnedCleanupRejectsDirectoryReplacement(sandbox, fixture);
+        VerifyOwnedCleanupRejectsFileReplacement(sandbox, fixture);
+        VerifyOwnedCleanupRejectsJunctionReplacement(sandbox, fixture);
         await VerifyRetainedHandleMutationAsync(sandbox, fixture).ConfigureAwait(false);
     }
 
@@ -132,6 +135,230 @@ internal static class RuntimeArchiveContract
             File.ReadAllBytes(sentinel).AsSpan().SequenceEqual(sentinelBytes),
             "preexisting output rejection altered its sentinel");
         ContractAssert.Require(!Directory.Exists(extract), "preexisting output rejection advanced extract identity");
+    }
+
+    private static void VerifyOwnedCleanupRejectsDirectoryReplacement(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var root = sandbox.NewCase("archive-owned-cleanup-replacement");
+        var output = Path.Combine(root, "output");
+        var extract = Path.Combine(root, "extract");
+        var foreign = Path.Combine(root, "foreign-replacement");
+        var foreignSentinel = Path.Combine(foreign, "foreign.sentinel");
+        var detachedOwned = Path.Combine(root, "detached-owned-child");
+        Directory.CreateDirectory(foreign);
+        File.WriteAllText(foreignSentinel, "foreign replacement must survive archive cleanup", Encoding.UTF8);
+
+        string? replacedPath = null;
+        string? stagingRoot = null;
+        var injected = false;
+        Exception? failure = null;
+        try
+        {
+            var request = fixture.Request(
+                fixture.PackageRoot,
+                output,
+                extract,
+                afterOwnedCleanupEntryClassifiedForTesting: child =>
+                {
+                    if (injected || !Directory.Exists(child)) return;
+                    injected = true;
+                    replacedPath = child;
+                    stagingRoot = FindArchiveStagingRoot(child);
+                    Directory.Move(child, detachedOwned);
+                    Directory.Move(foreign, child);
+                });
+            _ = ToolchainRuntimeArchive.Execute(request);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+        finally
+        {
+            if (replacedPath is not null && Directory.Exists(replacedPath) && !Directory.Exists(foreign))
+                Directory.Move(replacedPath, foreign);
+            if (replacedPath is not null && Directory.Exists(detachedOwned))
+            {
+                if (stagingRoot is not null && Directory.Exists(stagingRoot))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(replacedPath)!);
+                    Directory.Move(detachedOwned, replacedPath);
+                }
+                else
+                    Directory.Delete(detachedOwned, recursive: true);
+            }
+            DeleteVerifiedArchiveStagingRoot(stagingRoot);
+        }
+
+        ContractAssert.Require(injected, "archive cleanup replacement seam was not reached");
+        ContractAssert.Require(File.Exists(foreignSentinel),
+            "archive cleanup deleted a foreign replacement sentinel");
+        ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+            "archive cleanup accepted a same-path foreign directory replacement");
+        ContractAssert.Require(!Directory.Exists(output) && !Directory.Exists(extract),
+            "archive cleanup replacement failure advanced output/extract identity");
+    }
+
+    private static void VerifyOwnedCleanupRejectsFileReplacement(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var root = sandbox.NewCase("archive-owned-cleanup-file-replacement");
+        var output = Path.Combine(root, "output");
+        var extract = Path.Combine(root, "extract");
+        var foreign = Path.Combine(root, "foreign-replacement.bin");
+        var foreignBytes = new byte[] { 0xde, 0xad, 0xbe, 0xef };
+        var detachedOwned = Path.Combine(root, "detached-owned-file");
+        File.WriteAllBytes(foreign, foreignBytes);
+
+        string? replacedPath = null;
+        string? stagingRoot = null;
+        var injected = false;
+        Exception? failure = null;
+        try
+        {
+            var request = fixture.Request(
+                fixture.PackageRoot,
+                output,
+                extract,
+                afterOwnedCleanupEntryClassifiedForTesting: child =>
+                {
+                    if (injected || !File.Exists(child)) return;
+                    injected = true;
+                    replacedPath = child;
+                    stagingRoot = FindArchiveStagingRoot(child);
+                    File.Move(child, detachedOwned);
+                    File.Move(foreign, child);
+                });
+            _ = ToolchainRuntimeArchive.Execute(request);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+        finally
+        {
+            if (replacedPath is not null && File.Exists(replacedPath) && !File.Exists(foreign))
+                File.Move(replacedPath, foreign);
+            if (replacedPath is not null && File.Exists(detachedOwned))
+            {
+                if (stagingRoot is not null && Directory.Exists(stagingRoot))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(replacedPath)!);
+                    File.Move(detachedOwned, replacedPath);
+                }
+                else
+                    File.Delete(detachedOwned);
+            }
+            DeleteVerifiedArchiveStagingRoot(stagingRoot);
+        }
+
+        ContractAssert.Require(injected, "archive file cleanup replacement seam was not reached");
+        ContractAssert.Require(File.Exists(foreign) && File.ReadAllBytes(foreign).AsSpan().SequenceEqual(foreignBytes),
+            "archive cleanup deleted a foreign file replacement");
+        ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+            "archive cleanup accepted a same-path foreign file replacement");
+        ContractAssert.Require(!Directory.Exists(output) && !Directory.Exists(extract),
+            "archive file cleanup replacement failure advanced output/extract identity");
+    }
+
+    private static void VerifyOwnedCleanupRejectsJunctionReplacement(
+        ContractSandbox sandbox,
+        RuntimePackageFixture fixture)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var root = sandbox.NewCase("archive-owned-cleanup-junction-replacement");
+        var output = Path.Combine(root, "output");
+        var extract = Path.Combine(root, "extract");
+        var external = Path.Combine(root, "external-target");
+        var externalSentinel = Path.Combine(external, "external.sentinel");
+        var detachedOwned = Path.Combine(root, "detached-owned-child");
+        Directory.CreateDirectory(external);
+        File.WriteAllText(externalSentinel, "junction target must survive archive cleanup", Encoding.UTF8);
+
+        string? replacedPath = null;
+        string? stagingRoot = null;
+        IDisposable? junction = null;
+        var injected = false;
+        Exception? failure = null;
+        try
+        {
+            var request = fixture.Request(
+                fixture.PackageRoot,
+                output,
+                extract,
+                afterOwnedCleanupEntryClassifiedForTesting: child =>
+                {
+                    if (injected || !Directory.Exists(child)) return;
+                    injected = true;
+                    replacedPath = child;
+                    stagingRoot = FindArchiveStagingRoot(child);
+                    Directory.Move(child, detachedOwned);
+                    junction = VerifierJunction.CreateDirectoryAlias(child, external);
+                });
+            _ = ToolchainRuntimeArchive.Execute(request);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+        finally
+        {
+            junction?.Dispose();
+            if (replacedPath is not null && Directory.Exists(detachedOwned))
+            {
+                if (stagingRoot is not null && Directory.Exists(stagingRoot))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(replacedPath)!);
+                    Directory.Move(detachedOwned, replacedPath);
+                }
+                else
+                    Directory.Delete(detachedOwned, recursive: true);
+            }
+            DeleteVerifiedArchiveStagingRoot(stagingRoot);
+        }
+
+        ContractAssert.Require(injected, "archive junction cleanup replacement seam was not reached");
+        ContractAssert.Require(File.Exists(externalSentinel),
+            "archive cleanup traversed a junction into an external target");
+        ContractAssert.Require(failure is ToolchainRuntimeArchiveException,
+            "archive cleanup accepted a junction replacement");
+        ContractAssert.Require(!Directory.Exists(output) && !Directory.Exists(extract),
+            "archive junction cleanup replacement failure advanced output/extract identity");
+    }
+
+    private static string FindArchiveStagingRoot(string path)
+    {
+        var expectedParent = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
+        var current = new DirectoryInfo(Path.GetFullPath(path));
+        while (current.Parent is not null)
+        {
+            if (current.Parent.FullName.TrimEnd(Path.DirectorySeparatorChar)
+                    .Equals(expectedParent, StringComparison.OrdinalIgnoreCase) &&
+                current.Name.StartsWith("kadath-runtime-archive-", StringComparison.Ordinal))
+                return current.FullName;
+            current = current.Parent;
+        }
+        throw new InvalidOperationException($"Archive cleanup fixture did not find a controlled staging root: {path}");
+    }
+
+    private static void DeleteVerifiedArchiveStagingRoot(string? stagingRoot)
+    {
+        if (stagingRoot is null || !Directory.Exists(stagingRoot)) return;
+        var expectedParent = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
+        var actualParent = Path.GetDirectoryName(stagingRoot)?.TrimEnd(Path.DirectorySeparatorChar);
+        ContractAssert.Require(
+            actualParent is not null && actualParent.Equals(expectedParent, StringComparison.OrdinalIgnoreCase) &&
+            Path.GetFileName(stagingRoot).StartsWith("kadath-runtime-archive-", StringComparison.Ordinal),
+            "archive cleanup fixture refused to remove an unexpected staging path");
+        Directory.Delete(stagingRoot, recursive: true);
     }
 
     private static async Task VerifyRetainedHandleMutationAsync(ContractSandbox sandbox, RuntimePackageFixture fixture)

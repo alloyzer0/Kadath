@@ -10,9 +10,26 @@ internal static class VerifierJunction
 {
     internal static void WithDirectoryAlias(string linkPath, string targetPath, Action action)
     {
+        using var alias = CreateDirectoryAlias(linkPath, targetPath);
+        action();
+    }
+
+    internal static IDisposable CreateDirectoryAlias(string linkPath, string targetPath)
+    {
         Create(linkPath, targetPath);
-        try { action(); }
-        finally { Delete(linkPath); }
+        return new JunctionLease(linkPath);
+    }
+
+    private sealed class JunctionLease(string path) : IDisposable
+    {
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (Directory.Exists(path)) Delete(path);
+        }
     }
 
     private static void Create(string linkPath, string targetPath)
