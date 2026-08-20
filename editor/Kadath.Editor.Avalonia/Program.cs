@@ -138,6 +138,8 @@ internal static class Program
                 && avaloniaViewModel.AvailableBehaviorContracts.Count == 2,
                 "Avalonia did not project the Behavior Contract catalog");
             var bindingGoalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
+            Require(bindingGoalDraft.Behaviors is [{ ScriptId: 2 }],
+                "Avalonia did not project the existing goal update binding");
             avaloniaViewModel.SelectedSceneObject = bindingGoalDraft;
             avaloniaViewModel.SelectedBehaviorContract = avaloniaViewModel.AvailableBehaviorContracts.Single(
                 entry => entry.ScriptId == 1 && entry.SourcePath == "scripts/patrol.luau");
@@ -150,7 +152,8 @@ internal static class Program
                 "Avalonia persisted a schema default as an explicit override");
             Require(avaloniaViewModel.CanRemoveBehaviorBinding, "Avalonia did not allow removing an optional goal binding");
             avaloniaViewModel.RemoveBehaviorBinding();
-            Require(bindingGoalDraft.Behaviors.Count == 0, "Avalonia did not remove the optional goal binding draft");
+            Require(bindingGoalDraft.Behaviors is [{ ScriptId: 2 }],
+                "Avalonia did not remove only the optional goal Patrol binding draft");
             avaloniaViewModel.AddBehaviorBinding();
             bindingDraft = avaloniaViewModel.SelectedBehaviorBinding!;
             var speedParameter = bindingDraft.Parameters.Single(parameter => parameter.Name == "speed");
@@ -159,11 +162,12 @@ internal static class Program
             speedParameter.ValueText = "120";
             var bound = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
             var boundGoal = bound.ProjectSnapshot.Scene.Objects!.Single(item => item.ObjectId == bindingGoalDraft.ObjectId);
-            Require(boundGoal.Behaviors?.Single().ScriptId == 1
-                && boundGoal.Behaviors.Single().Parameters?.Single() is { Name: "speed", Value: 120 },
+            Require(boundGoal.Behaviors is { Count: 2 }
+                && boundGoal.Behaviors.Single(value => value.ScriptId == 1).Parameters?.Single() is { Name: "speed", Value: 120 }
+                && boundGoal.Behaviors.Any(value => value.ScriptId == 2),
                 "Avalonia did not commit the behavior binding parameter override");
             var unbound = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
-            Require(unbound.ProjectSnapshot.Scene.Objects!.Single(item => item.ObjectId == bindingGoalDraft.ObjectId).Behaviors is { Count: 0 },
+            Require(unbound.ProjectSnapshot.Scene.Objects!.Single(item => item.ObjectId == bindingGoalDraft.ObjectId).Behaviors is [{ ScriptId: 2 }],
                 "Avalonia Undo did not restore the previous behavior binding collection");
         }
         Console.WriteLine("workflow_behavior_preservation=ok");
@@ -200,7 +204,7 @@ internal static class Program
                 "Avalonia did not expose the selected Script v2 source document");
 
             avaloniaViewModel.ScriptSourceText = originalSourceText + "\n-- Avalonia workflow source save\n";
-            var sceneHierarchyLabel = avaloniaViewModel.HierarchyItems.Single(label => label.Contains("scene.objects[goal]", StringComparison.Ordinal));
+            var sceneHierarchyLabel = avaloniaViewModel.HierarchyItems.Single(label => label.EndsWith("· scene.objects[goal]", StringComparison.Ordinal));
             avaloniaViewModel.SelectedHierarchyItem = sceneHierarchyLabel;
             Require(avaloniaViewModel.SelectedHierarchyItem == scriptHierarchyLabel,
                 "Avalonia allowed switching Hierarchy while script source changes were dirty");

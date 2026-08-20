@@ -550,7 +550,7 @@ internal static class ProjectLifecycleVerifier
         Require(snapshot.Script.Dependencies?.Select(value => (value.ScriptId, value.Source))
                 .SequenceEqual([(1u, "scripts/patrol.luau"), (2u, "scripts/player_controller.luau")]) == true,
             "Behavior ReadModel did not expose Script dependency metadata.");
-        Require(snapshot.Scene.Objects?.Single(value => value.ObjectId == "hazard-1").Behaviors?.Single().ScriptId == 1,
+        Require(snapshot.Scene.Objects?.Single(value => value.ObjectId == "hazard-1").Behaviors?.Single(value => value.ScriptId == 1).ScriptId == 1,
             "Behavior ReadModel did not expose Scene behavior bindings.");
         Require(snapshot.Scene.Objects?.Single(value => value.ObjectId == "player").Behaviors?.Single().ScriptId == 2,
             "Behavior ReadModel did not expose Player movement behavior ownership.");
@@ -585,12 +585,12 @@ internal static class ProjectLifecycleVerifier
             .Select(value => value.ObjectId == "hazard-1"
                 ? value with
                 {
-                    Behaviors = value.Behaviors?.Select(binding => binding with
+                    Behaviors = value.Behaviors?.Select(binding => binding.ScriptId == 1 ? binding with
                     {
                         Parameters = binding.Parameters?.Select(parameter => parameter.Name == "speed"
                             ? parameter with { Value = 96 }
                             : parameter).ToArray()
-                    }).ToArray()
+                    } : binding).ToArray()
                 }
                 : value)
             .Select(ToDefinition)
@@ -598,7 +598,7 @@ internal static class ProjectLifecycleVerifier
         var edit = await authoring.ApplyAsync(created, snapshot.AuthoringRevision,
             new AuthoringPatch(SceneObjects: editedObjects), default);
         Require(edit.State == "succeeded" && edit.ProjectSnapshot.Scene.SchemaVersion == 5
-            && edit.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == "hazard-1").Behaviors!.Single().Parameters!.Single(value => value.Name == "speed").Value == 96,
+            && edit.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == "hazard-1").Behaviors!.Single(value => value.ScriptId == 1).Parameters!.Single(value => value.Name == "speed").Value == 96,
             "Behavior Authoring did not preserve and update Scene v5 binding parameters.");
         using (var editedScene = JsonDocument.Parse(File.ReadAllBytes(created.ScenePath)))
         {
@@ -607,7 +607,7 @@ internal static class ProjectLifecycleVerifier
                 "Behavior Authoring serialized an invalid Scene v5 document.");
         }
         var undo = await authoring.UndoAsync(created, edit.Revision, edit.UndoToken!, default);
-        Require(undo.State == "succeeded" && undo.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == "hazard-1").Behaviors!.Single().Parameters!.Single(value => value.Name == "speed").Value == 80,
+        Require(undo.State == "succeeded" && undo.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == "hazard-1").Behaviors!.Single(value => value.ScriptId == 1).Parameters!.Single(value => value.Name == "speed").Value == 80,
             "Behavior Authoring undo did not restore the original binding parameters.");
 
         var sourceAuthoring = new WorkspaceScriptSourceAuthoringModel();

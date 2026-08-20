@@ -32,14 +32,14 @@ internal static class BehaviorPublicationVerifier
             var artifactPath = Path.Combine(initial.DerivedDirectory, "script.script");
             var artifact = File.ReadAllBytes(artifactPath);
             Require(BinaryPrimitives.ReadUInt32LittleEndian(artifact.AsSpan(4, 4)) == 2
-                && BinaryPrimitives.ReadUInt32LittleEndian(artifact.AsSpan(12, 4)) == 2,
-                "Publication did not produce KSCP v2 with Host Interface v2.");
-            var hostV1Artifact = artifact.ToArray();
-            BinaryPrimitives.WriteUInt32LittleEndian(hostV1Artifact.AsSpan(12, 4), 1);
+                && BinaryPrimitives.ReadUInt32LittleEndian(artifact.AsSpan(12, 4)) == 3,
+                "Publication did not produce KSCP v2 with Host Interface v3.");
+            var hostV2Artifact = artifact.ToArray();
+            BinaryPrimitives.WriteUInt32LittleEndian(hostV2Artifact.AsSpan(12, 4), 2);
             try
             {
-                _ = WorkspaceScriptCodec.ValidateArtifact(hostV1Artifact);
-                throw new InvalidOperationException("Editor parser accepted a Host Interface v1 artifact.");
+                _ = WorkspaceScriptCodec.ValidateArtifact(hostV2Artifact);
+                throw new InvalidOperationException("Editor parser accepted a Host Interface v2 artifact.");
             }
             catch (InvalidDataException) { }
             var artifactInfo = WorkspaceScriptCodec.ValidateArtifact(artifact);

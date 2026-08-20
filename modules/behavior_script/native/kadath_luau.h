@@ -16,6 +16,11 @@ extern "C" {
 #define KADATH_LUAU_MAX_OBJECT_ID_BYTES 63
 #define KADATH_LUAU_MAX_ANALYSIS_DIAGNOSTIC_COUNT 32
 #define KADATH_LUAU_MAX_ANALYSIS_MESSAGE_BYTES 1024
+#define KADATH_LUAU_HOST_INTERFACE_VERSION 3
+#define KADATH_LUAU_MAX_EVENT_NAME_BYTES 63
+#define KADATH_LUAU_MAX_EVENT_FIELD_COUNT 8
+#define KADATH_LUAU_MAX_EVENT_KEY_BYTES 31
+#define KADATH_LUAU_MAX_EVENT_STRING_BYTES 127
 
 typedef struct KadathLuauAsset KadathLuauAsset;
 typedef struct KadathLuauInstance KadathLuauInstance;
@@ -42,6 +47,97 @@ typedef struct KadathLuauInputSnapshot {
     int32_t move_x;
     int32_t move_y;
 } KadathLuauInputSnapshot;
+
+typedef enum KadathLuauObjectKind {
+    KADATH_LUAU_OBJECT_SPRITE = 1,
+    KADATH_LUAU_OBJECT_PLAYER = 2,
+    KADATH_LUAU_OBJECT_GOAL = 3,
+    KADATH_LUAU_OBJECT_PATROL_HAZARD = 4,
+} KadathLuauObjectKind;
+
+typedef struct KadathLuauObjectHandle {
+    uint64_t world_epoch;
+    uint64_t logical_generation;
+    uint32_t kind;
+    size_t object_id_length;
+    char object_id[KADATH_LUAU_MAX_OBJECT_ID_BYTES + 1];
+} KadathLuauObjectHandle;
+
+typedef enum KadathLuauEventValueKind {
+    KADATH_LUAU_EVENT_BOOLEAN = 1,
+    KADATH_LUAU_EVENT_NUMBER = 2,
+    KADATH_LUAU_EVENT_STRING = 3,
+    KADATH_LUAU_EVENT_OBJECT = 4,
+} KadathLuauEventValueKind;
+
+typedef struct KadathLuauEventValue {
+    uint32_t kind;
+    int32_t boolean_value;
+    double number_value;
+    const char* string_value;
+    size_t string_value_length;
+    KadathLuauObjectHandle object_value;
+} KadathLuauEventValue;
+
+typedef struct KadathLuauEventField {
+    const char* key;
+    size_t key_length;
+    KadathLuauEventValue value;
+} KadathLuauEventField;
+
+typedef struct KadathLuauPostedEvent {
+    KadathLuauObjectHandle target;
+    KadathLuauObjectHandle sender;
+    const char* name;
+    size_t name_length;
+    const KadathLuauEventField* fields;
+    size_t field_count;
+} KadathLuauPostedEvent;
+
+typedef enum KadathLuauEventDomain {
+    KADATH_LUAU_EVENT_DOMAIN_FIXED = 1,
+    KADATH_LUAU_EVENT_DOMAIN_FRAME = 2,
+} KadathLuauEventDomain;
+
+typedef struct KadathLuauEvent {
+    const char* name;
+    size_t name_length;
+    uint32_t domain;
+    uint32_t has_sender;
+    KadathLuauObjectHandle sender;
+    uint32_t has_other;
+    KadathLuauObjectHandle other;
+    const KadathLuauEventField* fields;
+    size_t field_count;
+} KadathLuauEvent;
+
+typedef int (*KadathLuauResolveObjectFn)(
+    void* userdata,
+    const char* object_id,
+    size_t object_id_length,
+    KadathLuauObjectHandle* out_object);
+typedef int (*KadathLuauGetObjectPositionFn)(
+    void* userdata,
+    const KadathLuauObjectHandle* object,
+    double* out_x,
+    double* out_y);
+typedef int (*KadathLuauSetObjectPositionFn)(
+    void* userdata,
+    const KadathLuauObjectHandle* object,
+    double x,
+    double y);
+typedef int (*KadathLuauPostEventFn)(void* userdata, const KadathLuauPostedEvent* event);
+
+typedef struct KadathLuauHostV3 {
+    uint32_t version;
+    uint32_t struct_size;
+    void* userdata;
+    uint64_t world_epoch;
+    KadathLuauResolveObjectFn resolve_object;
+    KadathLuauGetObjectPositionFn get_object_position;
+    KadathLuauSetObjectPositionFn set_object_position;
+    KadathLuauPostEventFn post_event;
+} KadathLuauHostV3;
 
 typedef struct KadathLuauCompileResult {
     uint8_t* bytecode;
@@ -172,6 +268,36 @@ int kadath_luau_instance_fixed_update(
     KadathLuauTranslateCommand* commands,
     size_t command_capacity,
     size_t* command_count,
+    char* error_buffer,
+    size_t error_buffer_size);
+
+int kadath_luau_instance_on_start_v3(
+    KadathLuauInstance* instance,
+    const KadathLuauHostV3* host,
+    char* error_buffer,
+    size_t error_buffer_size);
+
+int kadath_luau_instance_fixed_update_v3(
+    KadathLuauInstance* instance,
+    double dt_seconds,
+    const KadathLuauInputSnapshot* input_snapshot,
+    const KadathLuauHostV3* host,
+    char* error_buffer,
+    size_t error_buffer_size);
+
+int kadath_luau_instance_update_v3(
+    KadathLuauInstance* instance,
+    double dt_seconds,
+    const KadathLuauInputSnapshot* input_snapshot,
+    const KadathLuauHostV3* host,
+    char* error_buffer,
+    size_t error_buffer_size);
+
+int kadath_luau_instance_on_event_v3(
+    KadathLuauInstance* instance,
+    const KadathLuauEvent* event,
+    const KadathLuauInputSnapshot* input_snapshot,
+    const KadathLuauHostV3* host,
     char* error_buffer,
     size_t error_buffer_size);
 

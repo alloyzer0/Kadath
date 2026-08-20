@@ -31,8 +31,8 @@ Editor 诊断工具
 - `assets/renderer2d/test.texture`：TextureId 1；
 - `assets/renderer2d/goal.texture`：TextureId 2；
 - `assets/audio/won.audio.wav` 与 `lost.audio.wav`：规范 PCM WAV；
-- `assets/scenes/preview.scene`：KSCN v5，对两个 Patrol Hazard 和 Player 声明 Behavior Binding；
-- `assets/scripts/preview.script`：聚合 KSCP v2 / Host Interface v2，包含默认 `patrol.luau` 与 `player_controller.luau`；
+- `assets/scenes/preview.scene`：KSCN v5，对全部五个 source object 声明 Behavior Binding，用于证明 Player fixed movement、decoration frame update 与 contact/custom event；
+- `assets/scripts/preview.script`：聚合 KSCP v2 / Host Interface v3，包含默认 `patrol.luau` 与 `player_controller.luau`；
 - `assets/scenes/preview.scene.json`、`assets/scripts/preview.script.json`、`assets/scripts/patrol.luau` 与 `assets/scripts/player_controller.luau`：Linux 默认行为项目的 source dependency set，不是 Runtime 启动输入。
 
 完整性

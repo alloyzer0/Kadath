@@ -230,12 +230,12 @@ test "Linux product scene and behavior package preserve their frozen disk ABI" {
     const first_entry_bytes = readU32(scene[cursor..][0..4]);
     try std.testing.expectEqual(@as(u32, 1), readU32(scene[cursor + 4 ..][0..4]));
     try std.testing.expectEqual(@as(u32, "decoration-1".len), readU32(scene[cursor + 8 ..][0..4]));
-    try std.testing.expectEqual(@as(usize, 48 + "decoration-1".len), first_entry_bytes);
+    try std.testing.expectEqual(@as(usize, 48 + "decoration-1".len + 8 + 4 + "speed".len + 8), first_entry_bytes);
     try std.testing.expect(script.len > 48);
     try std.testing.expectEqualSlices(u8, "KSCN", scene[0..4]);
     try std.testing.expectEqualSlices(u8, "KSCP", script[0..4]);
     try std.testing.expectEqual(@as(u32, 2), readU32(script[4..8]));
-    try std.testing.expectEqual(@as(u32, 2), readU32(script[12..16]));
+    try std.testing.expectEqual(@as(u32, 3), readU32(script[12..16]));
     try std.testing.expectEqual(@as(u32, 2), readU32(script[16..20]));
 }
 

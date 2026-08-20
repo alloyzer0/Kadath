@@ -15,7 +15,12 @@
         "color": [0.45, 0.65, 1.0, 0.8],
         "textureId": 2
       },
-      "behaviors": []
+      "behaviors": [
+        {
+          "scriptId": 2,
+          "parameters": { "speed": 180.0 }
+        }
+      ]
     },
     {
       "objectId": "goal",
@@ -26,7 +31,12 @@
         "color": [1.0, 0.75, 0.1, 1.0],
         "textureId": 2
       },
-      "behaviors": []
+      "behaviors": [
+        {
+          "scriptId": 2,
+          "parameters": { "speed": 180.0 }
+        }
+      ]
     },
     {
       "objectId": "hazard-1",
@@ -41,6 +51,10 @@
         {
           "scriptId": 1,
           "parameters": { "minY": 245.0, "maxY": 330.0, "speed": 80.0 }
+        },
+        {
+          "scriptId": 2,
+          "parameters": { "speed": 180.0 }
         }
       ]
     },
@@ -57,6 +71,10 @@
         {
           "scriptId": 1,
           "parameters": { "minY": 380.0, "maxY": 460.0, "speed": 55.0 }
+        },
+        {
+          "scriptId": 2,
+          "parameters": { "speed": 180.0 }
         }
       ]
     },

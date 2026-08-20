@@ -239,9 +239,9 @@ internal sealed class PackageContract
         if (stream.Read(header) != header.Length
             || !header[..4].SequenceEqual("KSCP"u8)
             || BinaryPrimitives.ReadUInt32LittleEndian(header[4..8]) != 2
-            || BinaryPrimitives.ReadUInt32LittleEndian(header[12..16]) != 2)
+            || BinaryPrimitives.ReadUInt32LittleEndian(header[12..16]) != 3)
         {
-            throw Product("Behavior Script artifact must use KSCP v2 with Host Interface v2.");
+            throw Product("Behavior Script artifact must use KSCP v2 with Host Interface v3.");
         }
     }
 

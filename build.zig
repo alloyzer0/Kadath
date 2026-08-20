@@ -597,8 +597,33 @@ pub fn build(b: *std.Build) void {
         behavior_host_test_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
         behavior_host_test_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
         behavior_host_test_mod.addImport("behavior_scene_binding", behavior_scene_binding_mod.?);
+        behavior_host_test_mod.addImport("platform", platform_mod);
+        behavior_host_test_mod.addImport("world", world_mod);
         const behavior_host_tests = b.addTest(.{ .root_module = behavior_host_test_mod });
         behavior_host_tests.step.dependOn(native_step);
+        if (world_library_path) |library_path| {
+            behavior_host_tests.step.dependOn(world_cargo_step.?);
+            behavior_host_test_mod.addLibraryPath(.{ .cwd_relative = library_path });
+            behavior_host_test_mod.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+            if (target.result.os.tag == .windows) {
+                behavior_host_test_mod.addLibraryPath(.{ .cwd_relative = mingw_gcc_runtime_dir.? });
+                behavior_host_test_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
+                behavior_host_test_mod.linkSystemLibrary("kernel32", .{});
+                behavior_host_test_mod.linkSystemLibrary("dbghelp", .{});
+                behavior_host_test_mod.linkSystemLibrary("advapi32", .{});
+                behavior_host_test_mod.linkSystemLibrary("bcrypt", .{});
+                behavior_host_test_mod.linkSystemLibrary("ntdll", .{});
+                behavior_host_test_mod.linkSystemLibrary("userenv", .{});
+                behavior_host_test_mod.linkSystemLibrary("ws2_32", .{});
+            } else if (target.result.os.tag == .linux) {
+                behavior_host_test_mod.linkSystemLibrary("gcc_s", .{});
+                behavior_host_test_mod.linkSystemLibrary("util", .{});
+                behavior_host_test_mod.linkSystemLibrary("rt", .{});
+                behavior_host_test_mod.linkSystemLibrary("pthread", .{});
+                behavior_host_test_mod.linkSystemLibrary("m", .{});
+                behavior_host_test_mod.linkSystemLibrary("dl", .{});
+            }
+        }
         const behavior_host_test_run = b.addRunArtifact(behavior_host_tests);
         const behavior_tool_test_mod = b.createModule(.{
             .root_source_file = b.path("tools/behavior-script-tool.zig"),

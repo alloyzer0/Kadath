@@ -89,12 +89,8 @@ test "Scene Binding expands defaults and preserves source order" {
     var prepared = try set.prepare(&fixture.package, &diagnostic);
     defer prepared.deinit();
     try std.testing.expectEqual(@as(usize, 2), prepared.binding_count);
-    try std.testing.expectApproxEqAbs(@as(f64, 1), prepared.bindings[0].?.commands[0].dx, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f64, 9), prepared.bindings[0].?.commands[0].dy, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f64, 10), prepared.bindings[0].?.commands[1].dy, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f64, 2), prepared.bindings[1].?.commands[0].dx, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f64, 8), prepared.bindings[1].?.commands[0].dy, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f64, 80), prepared.bindings[1].?.commands[1].dy, 0.0001);
+    try std.testing.expectEqual(@as(u8, 0), prepared.bindings[0].?.command_count);
+    try std.testing.expectEqual(@as(u8, 0), prepared.bindings[1].?.command_count);
 }
 
 test "Scene Binding rejects invalid references and parameter overrides" {

@@ -23,7 +23,7 @@ kadath.exe
   `bin\assets\scenes\preview.scene` 是 Runtime 消费的 KSCN v5 artifact。
 - `bin\assets\scripts\preview.script.json` 声明 Script v2 项目，
   `bin\assets\scripts\preview.script` 是 Runtime 消费的 KSCP v2 artifact。
-- KSCP v2 固定使用 Host Interface v2。包中保留两个参与构建的 Luau 源：
+- KSCP v2 固定使用 Host Interface v3。包中保留两个参与构建的 Luau 源：
   `patrol.luau` 与 `player_controller.luau`。
 - `behavior-tools\kadath-behavior-tool.exe` 负责 Script v2 manifest、Luau 分析与
   KSCP v2 构建；Runtime 只加载已经生成的 `preview.script`。
@@ -152,7 +152,7 @@ dotnet run --project editor\Kadath.Editor.Toolchain.ContractVerifier\Kadath.Edit
 dotnet run --project editor\Kadath.Runtime.Windows.ContractVerifier.ContractVerifier\Kadath.Runtime.Windows.ContractVerifier.ContractVerifier.csproj -c <Debug|Release> --no-build -- <package-root>
 ```
 
-Runtime contract verifier 以无窗口故障注入确认 exact-18、未知 extra/PDB、Host Interface v2、
+Runtime contract verifier 以无窗口故障注入确认 exact-18、未知 extra/PDB、Host Interface v3、
 ReleaseSafe sidecar 与 JSONL 失败分类；它不能替代真实 HWND/Vulkan 产品验证。
 
 Client 到真实 stdio Service 的受控验证入口：

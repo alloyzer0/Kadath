@@ -11,7 +11,7 @@
 | 模块 | 拥有的职责 | 不拥有的职责 |
 |---|---|---|
 | `Kadath.Editor.Toolchain` | 严格 PNG/WAV/Scene codec 调用、源快照、cold-build preflight、build profile、Windows Runtime archive | Editor RPC、窗口像素、产品运行时规则 |
-| Zig Behavior Tooling | Script v2 清单、Luau 分析/编译、KSCP v2、Host Interface v2 | 文件归档、Editor UI |
+| Zig Behavior Tooling | Script v2 清单、Luau 分析/编译、KSCP v2、Host Interface v3 | 文件归档、Editor UI |
 | C# Workspace/Service | Project Create/Open/Validate、Catalog、Authoring、Publication、Preview 生命周期、真实 stdio RPC | Vulkan/Win32 像素判定 |
 | Avalonia | Windows 原生 Editor 工作流与 UI 投影 | 直接读写 Runtime 私有状态 |
 | `Kadath.Runtime.Windows.ContractVerifier` | 真实 HWND/Vulkan 像素、按键、Restart、Player 移动、Won、Audio Cue、WM_CLOSE、进程树清理及证据落盘 | 产品构建与 artifact 生成 |
@@ -80,7 +80,7 @@ dotnet run --project editor/Kadath.Runtime.Windows.ContractVerifier.ContractVeri
 dotnet run --project editor/Kadath.Runtime.Windows.ContractVerifier -c Release -- <package-root> <new-evidence-directory>
 ```
 
-Runtime contract verifier 对 exact-18、未知 extra/PDB、Host Interface v2、ReleaseSafe sidecar 与 JSONL 失败分类执行无窗口故障注入；它不能替代下一条真实 HWND/Vulkan 产品验证。`--workflow-smoke-owned` 自行创建唯一项目 fixture，复制 Script v2 声明的 Luau 依赖，并在 finally 中只清理本次受控目录。真实 stdio Client verifier 同样自己取得和验证 fixture 所有权，调用方不再托管清理。
+Runtime contract verifier 对 exact-18、未知 extra/PDB、Host Interface v3、ReleaseSafe sidecar 与 JSONL 失败分类执行无窗口故障注入；它不能替代下一条真实 HWND/Vulkan 产品验证。`--workflow-smoke-owned` 自行创建唯一项目 fixture，复制 Script v2 声明的 Luau 依赖，并在 finally 中只清理本次受控目录。真实 stdio Client verifier 同样自己取得和验证 fixture 所有权，调用方不再托管清理。
 
 ## 失败语义
 

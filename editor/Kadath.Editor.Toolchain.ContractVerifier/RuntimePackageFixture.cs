@@ -161,7 +161,7 @@ internal sealed class RuntimePackageFixture
         Encoding.ASCII.GetBytes("KSCP").CopyTo(artifact, 0);
         BinaryPrimitives.WriteUInt32LittleEndian(artifact.AsSpan(4, 4), 2);
         BinaryPrimitives.WriteUInt32LittleEndian(artifact.AsSpan(8, 4), 2);
-        BinaryPrimitives.WriteUInt32LittleEndian(artifact.AsSpan(12, 4), 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(artifact.AsSpan(12, 4), 3);
         BinaryPrimitives.WriteUInt32LittleEndian(artifact.AsSpan(16, 4), 1);
         BinaryPrimitives.WriteUInt32LittleEndian(artifact.AsSpan(20, 4), checked((uint)toolchain.Length));
         BinaryPrimitives.WriteUInt32LittleEndian(artifact.AsSpan(24, 4), checked((uint)payloadBytes));

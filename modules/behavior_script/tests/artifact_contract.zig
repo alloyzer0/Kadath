@@ -13,6 +13,7 @@ fn parameter(name: []const u8, default_value: f64, minimum: f64, maximum: f64) a
 }
 
 test "KSCP v2 round trips aggregate entries and identities" {
+    try std.testing.expectEqual(@as(u32, 3), artifact.host_interface_version);
     const patrol_parameters = [_]artifact.ParameterSchema{
         parameter("minY", 245, -100000, 100000),
         parameter("maxY", 330, -100000, 100000),
@@ -109,7 +110,7 @@ test "KSCP v2 rejects an incompatible Luau identity" {
     try std.testing.expectError(error.UnsupportedScriptArtifact, artifact.parse(encoded, "luau-other"));
 }
 
-test "KSCP v2 rejects Host Interface v1 artifacts after the input contract change" {
+test "KSCP v2 rejects Host Interface v2 artifacts after the object API change" {
     const entries = [_]artifact.BuildEntry{.{
         .script_id = 1,
         .source_name = "scripts/patrol.luau",
@@ -119,6 +120,6 @@ test "KSCP v2 rejects Host Interface v1 artifacts after the input contract chang
     }};
     const encoded = try artifact.encode(std.testing.allocator, "luau-0.732-decb2d0", &entries);
     defer std.testing.allocator.free(encoded);
-    std.mem.writeInt(u32, encoded[12..16], 1, .little);
+    std.mem.writeInt(u32, encoded[12..16], 2, .little);
     try std.testing.expectError(error.UnsupportedScriptArtifact, artifact.parse(encoded, "luau-0.732-decb2d0"));
 }

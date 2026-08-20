@@ -857,7 +857,7 @@ internal static class Program
             && projectSnapshot.Scene.Textures.Any(texture => texture.TextureId == 3)
             && projectSnapshot.Scene.HazardTextureId == 3
             && projectSnapshot.Scene.Objects is { Count: 5 }
-            && projectSnapshot.Scene.Objects.Count(value => value.Behaviors is { Count: > 0 }) == 3,
+            && projectSnapshot.Scene.Objects.Count(value => value.Behaviors is { Count: > 0 }) == 5,
             "real service scene v5 snapshot mismatch");
         Assert(projectSnapshot.Script.SchemaVersion == 2
             && projectSnapshot.Script.GoalPosition.Length == 0

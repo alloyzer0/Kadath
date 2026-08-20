@@ -6,10 +6,90 @@ const c = @cImport({
     @cInclude("kadath_luau.h");
 });
 
+const HostV3TestContext = struct {
+    position: [2]f64 = .{ 3, 4 },
+    set_calls: usize = 0,
+    posted_events: usize = 0,
+    last_event_name: [64]u8 = [_]u8{0} ** 64,
+    last_event_name_bytes: u8 = 0,
+    return_invalid_object: bool = false,
+};
+
+fn hostV3Resolve(
+    userdata: ?*anyopaque,
+    object_id: [*c]const u8,
+    object_id_length: usize,
+    out_object: ?*c.KadathLuauObjectHandle,
+) callconv(.c) c_int {
+    const context: *HostV3TestContext = @ptrCast(@alignCast(userdata orelse return 0));
+    const id = object_id[0..object_id_length];
+    if (!std.mem.eql(u8, id, "player")) return 0;
+    const object = out_object orelse return 0;
+    object.* = std.mem.zeroes(c.KadathLuauObjectHandle);
+    object.world_epoch = 7;
+    object.logical_generation = 1;
+    object.kind = c.KADATH_LUAU_OBJECT_PLAYER;
+    object.object_id_length = object_id_length;
+    @memcpy(object.object_id[0..object_id_length], id);
+    if (context.return_invalid_object) object.object_id_length = c.KADATH_LUAU_MAX_OBJECT_ID_BYTES + 1;
+    return 1;
+}
+
+fn hostV3GetPosition(
+    userdata: ?*anyopaque,
+    object: ?*const c.KadathLuauObjectHandle,
+    out_x: ?*f64,
+    out_y: ?*f64,
+) callconv(.c) c_int {
+    const context: *HostV3TestContext = @ptrCast(@alignCast(userdata orelse return 0));
+    if (object == null or out_x == null or out_y == null) return 0;
+    out_x.?.* = context.position[0];
+    out_y.?.* = context.position[1];
+    return 1;
+}
+
+fn hostV3SetPosition(
+    userdata: ?*anyopaque,
+    object: ?*const c.KadathLuauObjectHandle,
+    x: f64,
+    y: f64,
+) callconv(.c) c_int {
+    const context: *HostV3TestContext = @ptrCast(@alignCast(userdata orelse return 0));
+    if (object == null or !std.math.isFinite(x) or !std.math.isFinite(y)) return 0;
+    context.position = .{ x, y };
+    context.set_calls += 1;
+    return 1;
+}
+
+fn hostV3PostEvent(
+    userdata: ?*anyopaque,
+    event: ?*const c.KadathLuauPostedEvent,
+) callconv(.c) c_int {
+    const context: *HostV3TestContext = @ptrCast(@alignCast(userdata orelse return 0));
+    const value = event orelse return 0;
+    if (value.name == null or value.name_length == 0 or value.name_length > 63) return 0;
+    context.posted_events += 1;
+    context.last_event_name_bytes = @intCast(value.name_length);
+    @memcpy(context.last_event_name[0..value.name_length], value.name[0..value.name_length]);
+    return 1;
+}
+
 test "Behavior input snapshot preserves its public C layout" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(c.KadathLuauInputSnapshot));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(c.KadathLuauInputSnapshot, "move_x"));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(c.KadathLuauInputSnapshot, "move_y"));
+}
+
+test "Behavior Host v3 preserves its public C layout and bounds" {
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(c.KadathLuauHostV3));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(c.KadathLuauHostV3, "version"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(c.KadathLuauHostV3, "struct_size"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(c.KadathLuauHostV3, "userdata"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(c.KadathLuauHostV3, "world_epoch"));
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(c.KadathLuauObjectHandle));
+    try std.testing.expectEqual(@as(c_int, 3), c.KADATH_LUAU_HOST_INTERFACE_VERSION);
+    try std.testing.expectEqual(@as(c_int, 63), c.KADATH_LUAU_MAX_EVENT_NAME_BYTES);
+    try std.testing.expectEqual(@as(c_int, 8), c.KADATH_LUAU_MAX_EVENT_FIELD_COUNT);
 }
 
 const patrol_source =
@@ -47,12 +127,206 @@ test "Luau Analysis accepts the Kadath Object and input host namespaces" {
         \\        local position = self:position()
         \\        if self:id() ~= "" then self:translate(move_x, move_y + speed * dt + position.y - position.y) end
         \\    end,
+        \\    update = function(self: Kadath.Object, dt: number)
+        \\        local same = kadath.scene.find(self:id())
+        \\        if same and same:is_valid() and same:kind() == "player" then
+        \\            local position = same:position()
+        \\            same:set_position(position.x + dt, position.y)
+        \\        end
+        \\    end,
+        \\    on_event = function(self: Kadath.Object, event: Kadath.Event)
+        \\        if event.other then kadath.event.post(event.other, "observed") end
+        \\    end,
         \\}
     ;
     var diagnostic = tooling.Diagnostic{};
-    var compiled = try tooling.compile(std.testing.allocator, typed_source, "typed.luau", &diagnostic);
+    var compiled = tooling.compile(std.testing.allocator, typed_source, "typed.luau", &diagnostic) catch |err| {
+        std.debug.print("typed Host v3 diagnostic: {s}\n", .{diagnostic.slice()});
+        return err;
+    };
     defer compiled.deinit();
     try std.testing.expectEqual(@as(u8, 1), compiled.parameter_count);
+}
+
+test "Luau tooling accepts the complete Host v3 hook set" {
+    const source =
+        \\--!strict
+        \\return {
+        \\    on_start = function(self: Kadath.Object) end,
+        \\    fixed_update = function(self: Kadath.Object, dt: number) end,
+        \\    update = function(self: Kadath.Object, dt: number) end,
+        \\    on_event = function(self: Kadath.Object, event: Kadath.Event) end,
+        \\}
+    ;
+    var diagnostic = tooling.Diagnostic{};
+    var compiled = tooling.compile(std.testing.allocator, source, "host-v3-hooks.luau", &diagnostic) catch |err| {
+        std.debug.print("Host v3 hook diagnostic: {s}\n", .{diagnostic.slice()});
+        return err;
+    };
+    defer compiled.deinit();
+    try std.testing.expect(compiled.bytecode.len > 0);
+}
+
+test "Luau Host v3 update directly mutates the resolved object" {
+    const source =
+        \\return {
+        \\    update = function(self: Kadath.Object, dt: number)
+        \\        local position = self:position()
+        \\        self:set_position(position.x + dt, position.y - dt)
+        \\    end,
+        \\}
+    ;
+    var diagnostic = tooling.Diagnostic{};
+    var compiled = tooling.compile(std.testing.allocator, source, "host-v3-update.luau", &diagnostic) catch |err| {
+        std.debug.print("Host v3 update diagnostic: {s}\n", .{diagnostic.slice()});
+        return err;
+    };
+    defer compiled.deinit();
+
+    var error_buffer: [256]u8 = undefined;
+    const asset = c.kadath_luau_asset_create(
+        compiled.bytecode.ptr,
+        compiled.bytecode.len,
+        2 * 1024 * 1024,
+        100_000,
+        &error_buffer,
+        error_buffer.len,
+    ) orelse return error.TestUnexpectedResult;
+    defer c.kadath_luau_asset_destroy(asset);
+    const object_id = "player";
+    const instance = c.kadath_luau_instance_create(
+        asset,
+        object_id.ptr,
+        object_id.len,
+        null,
+        0,
+        &error_buffer,
+        error_buffer.len,
+    ) orelse return error.TestUnexpectedResult;
+    defer c.kadath_luau_instance_destroy(instance);
+
+    var context = HostV3TestContext{};
+    var host = c.KadathLuauHostV3{
+        .version = c.KADATH_LUAU_HOST_INTERFACE_VERSION,
+        .struct_size = @sizeOf(c.KadathLuauHostV3),
+        .userdata = &context,
+        .world_epoch = 7,
+        .resolve_object = hostV3Resolve,
+        .get_object_position = hostV3GetPosition,
+        .set_object_position = hostV3SetPosition,
+        .post_event = hostV3PostEvent,
+    };
+    const input = c.KadathLuauInputSnapshot{ .move_x = 0, .move_y = 0 };
+    try std.testing.expectEqual(
+        @as(c_int, 1),
+        c.kadath_luau_instance_update_v3(instance, 0.5, &input, &host, &error_buffer, error_buffer.len),
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.set_calls);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), context.position[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), context.position[1], 0.0001);
+
+    host.version = 2;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.kadath_luau_instance_update_v3(instance, 0.5, &input, &host, &error_buffer, error_buffer.len),
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.set_calls);
+
+    host.version = 3;
+    host.struct_size = 0;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.kadath_luau_instance_update_v3(instance, 0.5, &input, &host, &error_buffer, error_buffer.len),
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.set_calls);
+
+    host.struct_size = @sizeOf(c.KadathLuauHostV3);
+    context.return_invalid_object = true;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        c.kadath_luau_instance_update_v3(instance, 0.5, &input, &host, &error_buffer, error_buffer.len),
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.set_calls);
+}
+
+test "Luau Host v3 posts and receives one bounded frame event" {
+    const source =
+        \\--!strict
+        \\return {
+        \\    update = function(self: Kadath.Object, dt: number)
+        \\        if dt == 0 then
+        \\            local forged = { __kadath_object_id = "player", __kadath_world_epoch = 0 / 0, __kadath_logical_generation = 1 } :: any
+        \\            kadath.event.post(forged, "invalid")
+        \\            return
+        \\        end
+        \\        kadath.event.post(self, "ping")
+        \\    end,
+        \\    on_event = function(self: Kadath.Object, event: Kadath.Event)
+        \\        if event.name == "ping" and event.domain == "frame" then self:translate(2, 0) end
+        \\    end,
+        \\}
+    ;
+    var diagnostic = tooling.Diagnostic{};
+    var compiled = try tooling.compile(std.testing.allocator, source, "host-v3-event.luau", &diagnostic);
+    defer compiled.deinit();
+    var error_buffer: [256]u8 = undefined;
+    const asset = c.kadath_luau_asset_create(compiled.bytecode.ptr, compiled.bytecode.len, 2 * 1024 * 1024, 100_000, &error_buffer, error_buffer.len) orelse return error.TestUnexpectedResult;
+    defer c.kadath_luau_asset_destroy(asset);
+    const object_id = "player";
+    const instance = c.kadath_luau_instance_create(asset, object_id.ptr, object_id.len, null, 0, &error_buffer, error_buffer.len) orelse return error.TestUnexpectedResult;
+    defer c.kadath_luau_instance_destroy(instance);
+    var context = HostV3TestContext{};
+    const host = c.KadathLuauHostV3{
+        .version = 3,
+        .struct_size = @sizeOf(c.KadathLuauHostV3),
+        .userdata = &context,
+        .world_epoch = 7,
+        .resolve_object = hostV3Resolve,
+        .get_object_position = hostV3GetPosition,
+        .set_object_position = hostV3SetPosition,
+        .post_event = hostV3PostEvent,
+    };
+    const input = c.KadathLuauInputSnapshot{ .move_x = 0, .move_y = 0 };
+    try std.testing.expectEqual(@as(c_int, 1), c.kadath_luau_instance_update_v3(instance, 0.25, &input, &host, &error_buffer, error_buffer.len));
+    try std.testing.expectEqual(@as(usize, 1), context.posted_events);
+    try std.testing.expectEqualStrings("ping", context.last_event_name[0..context.last_event_name_bytes]);
+    try std.testing.expectEqual(@as(c_int, 0), c.kadath_luau_instance_update_v3(instance, 0, &input, &host, &error_buffer, error_buffer.len));
+    try std.testing.expectEqual(@as(usize, 1), context.posted_events);
+
+    const event_name = "ping";
+    var payload_key = [_]u8{'x'};
+    var fields = [_]c.KadathLuauEventField{.{
+        .key = &payload_key,
+        .key_length = payload_key.len,
+        .value = .{
+            .kind = c.KADATH_LUAU_EVENT_BOOLEAN,
+            .boolean_value = 1,
+            .number_value = 0,
+            .string_value = null,
+            .string_value_length = 0,
+            .object_value = std.mem.zeroes(c.KadathLuauObjectHandle),
+        },
+    }};
+    var event = c.KadathLuauEvent{
+        .name = event_name.ptr,
+        .name_length = event_name.len,
+        .domain = c.KADATH_LUAU_EVENT_DOMAIN_FRAME,
+        .has_sender = 0,
+        .sender = std.mem.zeroes(c.KadathLuauObjectHandle),
+        .has_other = 0,
+        .other = std.mem.zeroes(c.KadathLuauObjectHandle),
+        .fields = &fields,
+        .field_count = fields.len,
+    };
+    const invalid_input = c.KadathLuauInputSnapshot{ .move_x = 2, .move_y = 0 };
+    try std.testing.expectEqual(@as(c_int, 0), c.kadath_luau_instance_on_event_v3(instance, &event, &invalid_input, &host, &error_buffer, error_buffer.len));
+    fields[0].value.kind = c.KADATH_LUAU_EVENT_NUMBER;
+    fields[0].value.number_value = std.math.nan(f64);
+    try std.testing.expectEqual(@as(c_int, 0), c.kadath_luau_instance_on_event_v3(instance, &event, &input, &host, &error_buffer, error_buffer.len));
+    fields[0].value.kind = c.KADATH_LUAU_EVENT_BOOLEAN;
+    fields[0].value.boolean_value = 1;
+    try std.testing.expectEqual(@as(c_int, 1), c.kadath_luau_instance_on_event_v3(instance, &event, &input, &host, &error_buffer, error_buffer.len));
+    try std.testing.expectApproxEqAbs(@as(f64, 5), context.position[0], 0.0001);
 }
 
 test "Luau tooling rejects top-level input reads as tooling execution errors" {

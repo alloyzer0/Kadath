@@ -126,10 +126,25 @@ struct LuaStateDeleter
 };
 
 static constexpr const char* host_definition = R"(
+export type ObjectKind = "sprite" | "player" | "goal" | "patrol_hazard"
+
 export type Object = {
     id: (self: Object) -> string,
+    kind: (self: Object) -> ObjectKind,
+    is_valid: (self: Object) -> boolean,
     position: (self: Object) -> { x: number, y: number },
+    set_position: (self: Object, x: number, y: number) -> (),
     translate: (self: Object, dx: number, dy: number) -> (),
+}
+
+export type EventValue = boolean | number | string | Object
+export type EventPayload = { [string]: EventValue }
+export type Event = {
+    name: string,
+    domain: "fixed" | "frame",
+    sender: Object?,
+    other: Object?,
+    payload: EventPayload,
 }
 
 declare kadath: {
@@ -138,6 +153,12 @@ declare kadath: {
     },
     input: {
         move_axis: () -> (number, number),
+    },
+    scene: {
+        find: (object_id: string) -> Object?,
+    },
+    event: {
+        post: (target: Object, name: string, payload: EventPayload?) -> (),
     },
 }
 )";
@@ -572,7 +593,9 @@ static bool validate_behavior_table(lua_State* state, int table_index, std::stri
         const char* key = lua_tolstring(state, -2, &key_length);
         const bool allowed = key != nullptr &&
             ((key_length == 8 && std::memcmp(key, "on_start", 8) == 0) ||
-             (key_length == 12 && std::memcmp(key, "fixed_update", 12) == 0));
+             (key_length == 12 && std::memcmp(key, "fixed_update", 12) == 0) ||
+             (key_length == 6 && std::memcmp(key, "update", 6) == 0) ||
+             (key_length == 8 && std::memcmp(key, "on_event", 8) == 0));
         if (!allowed || !lua_isfunction(state, -1))
         {
             message = "behavior table contains an invalid hook";
@@ -678,6 +701,14 @@ static bool run_pipeline(
         return false;
     }
     frontend.globals.globalScope->importedTypeBindings["Kadath"]["Object"] = object_type->second;
+    const auto event_type = frontend.globals.globalScope->exportedTypeBindings.find("Event");
+    if (event_type == frontend.globals.globalScope->exportedTypeBindings.end())
+    {
+        Luau::freeze(frontend.globals.globalTypes);
+        write_error(error_buffer, error_buffer_size, "Kadath behavior Event type is unavailable");
+        return false;
+    }
+    frontend.globals.globalScope->importedTypeBindings["Kadath"]["Event"] = event_type->second;
     Luau::freeze(frontend.globals.globalTypes);
 
     const Luau::CheckResult analysis = frontend.check(file_resolver.module_name);

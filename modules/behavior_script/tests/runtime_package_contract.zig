@@ -134,9 +134,7 @@ test "ActiveSet preserves binding order and tick-start snapshots" {
     defer active.deinit();
 
     const start_commands = active.onStartCommands();
-    try std.testing.expectEqual(@as(usize, 2), start_commands.len);
-    try std.testing.expectEqualStrings("hazard-1", active.commandObjectId(start_commands[0]));
-    try std.testing.expectEqualStrings("hazard-2", active.commandObjectId(start_commands[1]));
+    try std.testing.expectEqual(@as(usize, 0), start_commands.len);
 
     try std.testing.expectError(error.InvalidBehaviorInputSnapshot, active.runFixed(0.5, &.{
         .{ .object_id = "hazard-1", .position = .{ 0, 10 } },

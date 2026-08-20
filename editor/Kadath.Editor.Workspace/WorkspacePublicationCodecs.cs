@@ -293,7 +293,7 @@ internal static class WorkspaceScriptCodec
     internal const string BehaviorFormat = "KSCP-SCRIPT-V2";
     private const int LegacyVersion = 1;
     private const int BehaviorVersion = 2;
-    private const int BehaviorHostInterfaceVersion = 2;
+    private const int BehaviorHostInterfaceVersion = 3;
     private const int BehaviorHeaderBytes = 60;
     private const int BehaviorEntryHeaderBytes = 84;
     private const int MaxBehaviorArtifactBytes = 16 * 1024 * 1024;

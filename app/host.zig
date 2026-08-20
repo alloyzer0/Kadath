@@ -277,6 +277,7 @@ pub const Host = struct {
             self.syncExternalResults();
             try self.syncWorldBounds();
             try self.runFixedUpdates(delta, events.input);
+            try self.runBehaviorUpdate(@floatCast(@min(@max(delta, 0.0), 0.25)), events.input);
             try self.extractRender();
 
             try self.submitRender();
@@ -338,7 +339,7 @@ pub const Host = struct {
     fn resetScript(self: *Host) !void {
         if (self.scene.schemaVersion == scene_api.current_schema_version) {
             if (!self.behavior_runtime.isLoaded()) return;
-            const batch = try self.behavior_runtime.onStart(&self.scene);
+            const batch = try self.behavior_runtime.onStart(&self.generation);
             try self.generation.applyTranslationDeltas(batch.slice());
             var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
             const ordered = try self.generation.extractSprites(&sprites);
@@ -379,17 +380,25 @@ pub const Host = struct {
 
     fn runBehaviorFixed(self: *Host, dt_seconds: f32, input: InputSnapshot) !void {
         if (!self.behavior_runtime.isLoaded()) return;
-        var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
-        const ordered = try self.generation.extractSprites(&sprites);
-        var positions: [scene_api.max_scene_object_count][2]f32 = undefined;
-        for (ordered, 0..) |sprite, index| positions[index] = sprite.position;
-        const batch = try self.behavior_runtime.runFixed(
-            &self.scene,
-            positions[0..ordered.len],
+        try self.behavior_runtime.runFixed(
+            &self.generation,
             dt_seconds,
             .{ .move_x = input.move_x, .move_y = input.move_y },
         );
-        try self.generation.applyTranslationDeltas(batch.slice());
+    }
+
+    fn runBehaviorUpdate(self: *Host, dt_seconds: f32, input: InputSnapshot) !void {
+        if (self.scene.schemaVersion != scene_api.current_schema_version or !self.behavior_runtime.isLoaded()) return;
+        const frame_input = if (self.session.acceptsInput()) input else InputSnapshot{};
+        try self.behavior_runtime.runUpdate(
+            &self.generation,
+            dt_seconds,
+            .{ .move_x = frame_input.move_x, .move_y = frame_input.move_y },
+        );
+        try self.behavior_runtime.finishFrame(
+            &self.generation,
+            .{ .move_x = frame_input.move_x, .move_y = frame_input.move_y },
+        );
     }
 
     fn disableScript(self: *Host, err: anyerror) void {
@@ -419,14 +428,15 @@ pub const Host = struct {
             return error.MissingScriptPath;
         };
         if (self.scene.schemaVersion == scene_api.current_schema_version) {
-            var candidate = (try behavior_host.loadWithIdentity(
+            var candidate = (try behavior_host.loadWithIdentityAtEpoch(
                 self.io,
                 std.heap.page_allocator,
                 path,
                 &self.scene,
+                self.behavior_runtime.worldEpoch(),
             )).value;
             errdefer candidate.deinit();
-            const batch = try candidate.onStart(&self.scene);
+            const batch = try candidate.onStart(&self.generation);
             try self.generation.applyTranslationDeltas(batch.slice());
             var previous = self.behavior_runtime;
             self.behavior_runtime = candidate;
@@ -479,8 +489,8 @@ pub const Host = struct {
         errdefer candidate_behavior.deinit();
         if (candidate.schemaVersion == scene_api.current_schema_version) {
             if (self.behavior_runtime.isLoaded()) {
-                candidate_behavior = try self.behavior_runtime.cloneForScene(std.heap.page_allocator, &candidate);
-                const batch = try candidate_behavior.onStart(&candidate);
+                candidate_behavior = try self.behavior_runtime.cloneForSceneReload(std.heap.page_allocator, &candidate);
+                const batch = try candidate_behavior.onStart(&replacement);
                 try replacement.applyTranslationDeltas(batch.slice());
             } else if (sceneHasBehaviors(&candidate)) {
                 return error.MissingScriptPath;
@@ -520,14 +530,18 @@ pub const Host = struct {
                 std.log.info("Game session restarted without behavior package", .{});
                 return;
             }
-            var candidate = try self.behavior_runtime.cloneForScene(std.heap.page_allocator, &self.scene);
+            var replacement = try scene_generation_api.SceneGeneration.prepare(self.scene, self.world_extent);
+            errdefer replacement.deinit();
+            var candidate = try self.behavior_runtime.cloneForRestart(std.heap.page_allocator, &self.scene);
             errdefer candidate.deinit();
-            const batch = try candidate.onStart(&self.scene);
-            try self.generation.reset();
-            try self.generation.applyTranslationDeltas(batch.slice());
-            var previous = self.behavior_runtime;
+            const batch = try candidate.onStart(&replacement);
+            try replacement.applyTranslationDeltas(batch.slice());
+            var previous_generation = self.generation;
+            var previous_behavior = self.behavior_runtime;
+            self.generation = replacement;
             self.behavior_runtime = candidate;
-            previous.deinit();
+            previous_generation.deinit();
+            previous_behavior.deinit();
         } else {
             try self.generation.reset();
             self.resetScript() catch |err| self.disableScript(err);
@@ -568,19 +582,29 @@ pub const Host = struct {
                 .move_x = step_input.move_x,
                 .move_y = step_input.move_y,
             });
+            if (self.scene.schemaVersion == scene_api.current_schema_version) {
+                try self.runBehaviorFixed(@floatCast(fixed_dt_seconds), .{
+                    .move_x = @intCast(routed_input.behaviors.move_x),
+                    .move_y = @intCast(routed_input.behaviors.move_y),
+                });
+            } else if (self.session.acceptsInput()) {
+                self.runScriptFixed(@floatCast(fixed_dt_seconds));
+            }
             try self.generation.stepFixed(@floatCast(fixed_dt_seconds), .{
                 .move_x = routed_input.world.move_x,
                 .move_y = routed_input.world.move_y,
             });
-            if (self.session.acceptsInput()) {
-                if (self.scene.schemaVersion == scene_api.current_schema_version) {
-                    try self.runBehaviorFixed(@floatCast(fixed_dt_seconds), .{
+            const contacts = try self.generation.observeContacts();
+            self.observeFixedContacts(contacts);
+            if (self.scene.schemaVersion == scene_api.current_schema_version and self.behavior_runtime.isLoaded()) {
+                try self.behavior_runtime.finishFixedStep(
+                    &self.generation,
+                    contacts.touching[0..self.scene.objects.count],
+                    .{
                         .move_x = @intCast(routed_input.behaviors.move_x),
                         .move_y = @intCast(routed_input.behaviors.move_y),
-                    });
-                } else {
-                    self.runScriptFixed(@floatCast(fixed_dt_seconds));
-                }
+                    },
+                );
             }
             self.accumulator_seconds -= fixed_dt_seconds;
         }
@@ -592,7 +616,9 @@ pub const Host = struct {
     fn extractRender(self: *Host) !void {
         const sprites = try self.generation.extractSprites(&self.render_sprites);
         self.render_count = sprites.len;
-        const contacts = try self.generation.observeContacts();
+    }
+
+    fn observeFixedContacts(self: *Host, contacts: scene_generation_api.SceneContacts) void {
         if (self.session.observeHazardContact(contacts.hazard != null)) {
             self.audio.play(.lost);
             const hazard = contacts.hazard.?;

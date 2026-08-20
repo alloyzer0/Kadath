@@ -14,6 +14,7 @@ pub const SceneContacts = struct {
     player_entity: world_api.EntityId,
     hazard: ?SceneContactTarget = null,
     goal: ?SceneContactTarget = null,
+    touching: [scene_api.max_scene_object_count]bool = [_]bool{false} ** scene_api.max_scene_object_count,
 };
 
 const HazardState = struct {
@@ -169,17 +170,20 @@ pub const SceneGeneration = struct {
         for (self.hazards[0..self.hazard_count]) |hazard| {
             const hazard_body = bodyForEntity(ordered, hazard.entity) orelse return error.WorldProducedNoHazardSprite;
             if (collision.queryContact(player, hazard_body) != null) {
-                contacts.hazard = .{
-                    .object_index = hazard.object_index,
-                    .object_id = self.scene.objects.entries[hazard.object_index].objectId,
-                    .entity = hazard.entity,
-                };
-                break;
+                contacts.touching[hazard.object_index] = true;
+                if (contacts.hazard == null) {
+                    contacts.hazard = .{
+                        .object_index = hazard.object_index,
+                        .object_id = self.scene.objects.entries[hazard.object_index].objectId,
+                        .entity = hazard.entity,
+                    };
+                }
             }
         }
         const goal_entity = self.goalEntity();
         const goal = bodyForEntity(ordered, goal_entity) orelse return error.WorldProducedNoGoalSprite;
         if (collision.queryContact(player, goal) != null) {
+            contacts.touching[self.goal_index] = true;
             contacts.goal = .{
                 .object_index = self.goal_index,
                 .object_id = self.scene.objects.entries[self.goal_index].objectId,
@@ -198,6 +202,10 @@ pub const SceneGeneration = struct {
         return self.entity_by_object[self.player_index];
     }
 
+    pub fn playerObjectIndex(self: *const SceneGeneration) usize {
+        return self.player_index;
+    }
+
     pub fn goalEntity(self: *const SceneGeneration) world_api.EntityId {
         return self.entity_by_object[self.goal_index];
     }
@@ -205,6 +213,44 @@ pub const SceneGeneration = struct {
     pub fn entityForObject(self: *const SceneGeneration, object_index: usize) ?world_api.EntityId {
         if (object_index >= self.scene.objects.count) return null;
         return self.entity_by_object[object_index];
+    }
+
+    pub fn objectIndex(self: *const SceneGeneration, object_id: []const u8) ?usize {
+        for (self.scene.objects.slice(), 0..) |object, index| {
+            if (@import("std").mem.eql(u8, object.objectId.slice(), object_id)) return index;
+        }
+        return null;
+    }
+
+    pub fn objectKind(self: *const SceneGeneration, object_index: usize) ?scene_api.ObjectKind {
+        if (object_index >= self.scene.objects.count) return null;
+        return self.scene.objects.entries[object_index].kind;
+    }
+
+    pub fn objectPosition(self: *const SceneGeneration, object_index: usize) ![2]f32 {
+        if (object_index >= self.scene.objects.count) return error.UnknownSceneObject;
+        var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+        const ordered = try self.extractOrdered(&sprites);
+        return ordered[object_index].position;
+    }
+
+    pub fn setObjectPosition(self: *SceneGeneration, object_index: usize, position: [2]f32) !void {
+        if (object_index >= self.scene.objects.count) return error.UnknownSceneObject;
+        if (!@import("std").math.isFinite(position[0]) or !@import("std").math.isFinite(position[1])) {
+            return error.InvalidBehaviorPosition;
+        }
+        if (object_index == self.goal_index) {
+            try self.setGoalPosition(position);
+            return;
+        }
+        try self.world.setSpritePosition(self.entity_by_object[object_index], position);
+        const actual = try self.objectPosition(object_index);
+        for (self.hazards[0..self.hazard_count]) |*hazard| {
+            if (hazard.object_index == object_index) {
+                hazard.y = actual[1];
+                break;
+            }
+        }
     }
 
     pub fn objectIdForEntity(self: *const SceneGeneration, entity: world_api.EntityId) ?scene_api.ObjectId {
