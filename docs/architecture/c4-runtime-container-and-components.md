@@ -175,10 +175,12 @@ graph TD
 | Scene candidate Runtime state prepare/commit/abort | Zig Host/SceneGeneration | Rust Runtime Core；Zig Host 保留跨 Module 外层编排 | Object Authority |
 | restart Runtime object replacement | Zig Host/SceneGeneration | Rust Runtime Core | Object Authority |
 | fixed/frame structure queue | Zig BehaviorHost | Rust Runtime Core | Phase Commit |
-| 对象、实例、结构、事件预算 | Zig BehaviorHost/Registry | Rust Runtime Core | Phase Commit |
+| Runtime Object 物理存储上限（128 records） | Zig Registry | Rust Runtime Core | Object Authority |
+| Behavior Instance、结构、事件与跨资源 admission（256/64/64） | Zig BehaviorHost/Registry | Rust Runtime Core | Phase Commit；Object Authority 增量期间继续由 Zig `BehaviorHost` 唯一持有 |
 | collision/contact | Zig SceneGeneration/Contact | Rust Runtime Core | Gameplay |
 | GameSession / demo gameplay | Zig Host/SceneGeneration | Rust Runtime Core | Gameplay |
-| Render extraction | Rust World + Zig ordering | Rust snapshot → Zig Renderer | Gameplay |
+| Object Authority active read view → 现有 `RenderSprite` 投影 | Rust World + Zig ordering | Rust Runtime Core read view → Zig `SceneGeneration` projection | Object Authority 临时 Adapter seam |
+| 最终 Render extraction | Rust World + Zig ordering | Rust render snapshot → Zig Renderer | Gameplay；建立后删除上述 Zig projection |
 | Runtime 调用时机 | Zig Host | Zig Host | 不迁移 |
 | Editor authoring/read-model | C# | C# | 不迁移 |
 | Behavior source | Luau | Luau | 不迁移 |

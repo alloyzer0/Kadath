@@ -5,7 +5,7 @@ const content_identity = @import("content_identity.zig");
 const scene_adapter = @import("behavior_scene_adapter.zig");
 const scene_api = @import("scene.zig");
 const scene_generation_api = @import("scene_generation.zig");
-const runtime_object_registry = @import("runtime_object_registry.zig");
+const runtime_core = @import("runtime_core");
 
 pub const InputSnapshot = behavior_runtime.InputSnapshot;
 
@@ -14,6 +14,31 @@ const max_event_drain_generation: u8 = 8;
 const max_structural_requests_per_domain: usize = 64;
 const max_structural_generation: u8 = 8;
 const max_exact_luau_world_epoch: u64 = 9_007_199_254_740_991;
+
+const BehaviorAdmission = struct {
+    admitted_count: usize = 0,
+
+    fn init(scene: *const scene_api.Scene) !BehaviorAdmission {
+        var count: usize = 0;
+        for (scene.objects.slice()) |object| {
+            count = std.math.add(usize, count, object.behaviors.count) catch return error.BehaviorInstanceCapacityExceeded;
+        }
+        if (count > behavior_runtime.max_binding_count) return error.BehaviorInstanceCapacityExceeded;
+        return .{ .admitted_count = count };
+    }
+
+    fn reserve(self: *BehaviorAdmission, count: usize) !void {
+        if (count > behavior_runtime.max_binding_count - self.admitted_count) {
+            return error.BehaviorInstanceCapacityExceeded;
+        }
+        self.admitted_count += count;
+    }
+
+    fn release(self: *BehaviorAdmission, count: usize) void {
+        std.debug.assert(count <= self.admitted_count);
+        self.admitted_count -= count;
+    }
+};
 
 const StoredEventValue = struct {
     kind: u32 = 0,
@@ -102,7 +127,9 @@ const StructuralOrigin = struct {
 
 const StructuralRequest = struct {
     operation: StructuralOperation = .spawn,
-    handle: runtime_object_registry.Handle = .{ .slot = 0, .logical_generation = 0 },
+    handle: scene_generation_api.RuntimeHandle = std.mem.zeroes(scene_generation_api.RuntimeHandle),
+    destroy_disposition: ?runtime_core.DestroyDisposition = null,
+    behavior_count: u8 = 0,
     generation: u8 = 0,
     sequence: u64 = 0,
     origin: StructuralOrigin = .{},
@@ -125,11 +152,18 @@ const StructuralQueue = struct {
             additional_count <= std.math.maxInt(u64) - self.next_sequence;
     }
 
-    fn append(self: *StructuralQueue, operation: StructuralOperation, handle: runtime_object_registry.Handle, generation: u8) bool {
+    fn append(
+        self: *StructuralQueue,
+        operation: StructuralOperation,
+        handle: scene_generation_api.RuntimeHandle,
+        generation: u8,
+        behavior_count: u8,
+    ) bool {
         if (!self.canAppend(generation)) return false;
         self.requests[self.count] = .{
             .operation = operation,
             .handle = handle,
+            .behavior_count = behavior_count,
             .generation = generation,
             .sequence = self.next_sequence,
             .origin = self.current_origin,
@@ -148,7 +182,9 @@ const StructuralQueue = struct {
         const previous_origin = self.current_origin;
         defer self.current_origin = previous_origin;
         self.current_origin = request.origin;
-        return self.append(request.operation, request.handle, request.generation);
+        if (!self.append(request.operation, request.handle, request.generation, request.behavior_count)) return false;
+        self.requests[self.count - 1].destroy_disposition = request.destroy_disposition;
+        return true;
     }
 };
 
@@ -171,7 +207,7 @@ fn structuralObserver(queue: *StructuralQueue) behavior_runtime.ActiveSet.Bindin
 }
 
 pub const TranslationBatch = struct {
-    deltas: [runtime_object_registry.max_runtime_object_count][2]f64 = [_][2]f64{.{ 0, 0 }} ** runtime_object_registry.max_runtime_object_count,
+    deltas: [runtime_core.max_object_count][2]f64 = [_][2]f64{.{ 0, 0 }} ** runtime_core.max_object_count,
     object_count: usize = 0,
 
     pub fn slice(self: *const TranslationBatch) []const [2]f64 {
@@ -190,6 +226,7 @@ pub const Runtime = struct {
     package: ?*behavior_runtime.Package = null,
     active: ?*behavior_runtime.ActiveSet = null,
     world_epoch: u64 = 1,
+    admission: BehaviorAdmission = .{},
     fixed_events: ?*EventQueue = null,
     frame_events: ?*EventQueue = null,
     fixed_structural: ?*StructuralQueue = null,
@@ -236,11 +273,14 @@ pub const Runtime = struct {
         const frame_events = self.frame_events orelse return error.BehaviorRuntimeNotLoaded;
         const mutable_generation: *scene_generation_api.SceneGeneration = @constCast(generation);
         try self.prepareTransientBindings(mutable_generation);
-        var handles: [runtime_object_registry.max_runtime_object_count]runtime_object_registry.Handle = undefined;
-        const ordered = mutable_generation.runtime_objects.activeHandles(&handles);
-        var initial_positions: [runtime_object_registry.max_runtime_object_count][2]f32 = undefined;
+        var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
+        const ordered = try mutable_generation.activeHandles(&handles);
+        var initial_positions: [runtime_core.max_object_count][2]f32 = undefined;
         var context = try OverlayHostContext.init(mutable_generation, self.world_epoch);
-        for (ordered, 0..) |handle, index| initial_positions[index] = context.positions[handle.slot];
+        for (ordered, 0..) |handle, index| {
+            const object_index = mutable_generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
+            initial_positions[index] = context.positions[object_index];
+        }
         var host = overlayNativeHost(&context);
         try active.runStartV4(&host);
         for (context.events.events[0..context.events.count]) |event| {
@@ -250,10 +290,11 @@ pub const Runtime = struct {
         }
         var batch = TranslationBatch{ .object_count = ordered.len };
         for (ordered, 0..) |handle, index| {
+            const object_index = mutable_generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
             const position = initial_positions[index];
             batch.deltas[index] = .{
-                context.positions[handle.slot][0] - position[0],
-                context.positions[handle.slot][1] - position[1],
+                context.positions[object_index][0] - position[0],
+                context.positions[object_index][1] - position[1],
             };
         }
         return batch;
@@ -263,13 +304,16 @@ pub const Runtime = struct {
         const package = self.package orelse return error.BehaviorRuntimeNotLoaded;
         const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
         var diagnostic = behavior_runtime.Diagnostic{};
-        var handles: [runtime_object_registry.max_runtime_object_count]runtime_object_registry.Handle = undefined;
-        for (generation.runtime_objects.activeHandles(&handles)) |handle| {
+        var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
+        for (try generation.activeHandles(&handles)) |handle| {
             const record = generation.runtimeObject(handle) orelse continue;
             if (record.source_index != null or record.behavior_count == 0 or active.containsObject(record.object_id.slice())) continue;
+            try self.admission.reserve(record.behavior_count);
+            errdefer self.admission.release(record.behavior_count);
             const prototype_index = record.prototype_index orelse return error.InvalidRuntimeObjectActivation;
             const prototype = &generation.scene.prototypes.entries[prototype_index];
-            const normalized = try scene_adapter.normalizePrototype(&package.parsed, prototype, record.object_id.slice(), try generation.objectPosition(handle.slot));
+            const object_index = generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
+            const normalized = try scene_adapter.normalizePrototype(&package.parsed, prototype, record.object_id.slice(), try generation.objectPosition(object_index));
             var prepared = try normalized.prepare(package, &diagnostic);
             errdefer prepared.deinit();
             try active.appendPrepared(&prepared);
@@ -290,6 +334,7 @@ pub const Runtime = struct {
             .world_epoch = self.world_epoch,
             .events = fixed_events,
             .structural = fixed_structural,
+            .admission = &self.admission,
         };
         var host = directNativeHost(&context);
         try active.runFixedV4Observed(dt_seconds, input, &host, structuralObserver(fixed_structural));
@@ -310,6 +355,7 @@ pub const Runtime = struct {
             .world_epoch = self.world_epoch,
             .events = frame_events,
             .structural = frame_structural,
+            .admission = &self.admission,
         };
         var host = directNativeHost(&context);
         try active.runUpdateV4Observed(dt_seconds, input, &host, structuralObserver(frame_structural));
@@ -403,6 +449,7 @@ pub const Runtime = struct {
                 .world_epoch = self.world_epoch,
                 .events = queue,
                 .structural = structural,
+                .admission = &self.admission,
                 .post_generation = event.generation +| 1,
                 .structural_generation = 1,
             };
@@ -454,7 +501,7 @@ pub const Runtime = struct {
                     if (record.state != .pending_spawn) continue;
                     const package = self.package orelse return error.BehaviorRuntimeNotLoaded;
                     const prototype_index = record.prototype_index orelse {
-                        generation.runtime_objects.discardTransient(request.handle) catch {};
+                        self.discardAdmittedReservation(generation, request);
                         reportStructuralFailure(active, request, error.InvalidRuntimeObjectActivation, null);
                         continue;
                     };
@@ -462,13 +509,13 @@ pub const Runtime = struct {
                     const object_id = record.object_id;
                     const position = record.sprite.position;
                     const normalized = scene_adapter.normalizePrototype(&package.parsed, prototype, object_id.slice(), position) catch |err| {
-                        generation.runtime_objects.discardTransient(request.handle) catch {};
+                        self.discardAdmittedReservation(generation, request);
                         reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
                         continue;
                     };
                     var diagnostic = behavior_runtime.Diagnostic{};
                     var prepared = normalized.prepare(package, &diagnostic) catch |err| {
-                        generation.runtime_objects.discardTransient(request.handle) catch {};
+                        self.discardAdmittedReservation(generation, request);
                         logDiagnostic("Dynamic Behavior binding preparation failed", err, diagnostic.slice());
                         reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
                         continue;
@@ -476,7 +523,7 @@ pub const Runtime = struct {
                     var candidate = prepared.activate();
                     const activation_context = self.allocator.create(ActivationHostContext) catch |err| {
                         candidate.deinit();
-                        generation.runtime_objects.discardTransient(request.handle) catch {};
+                        self.discardAdmittedReservation(generation, request);
                         reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
                         continue;
                     };
@@ -486,10 +533,11 @@ pub const Runtime = struct {
                         self.world_epoch,
                         events,
                         queue,
+                        &self.admission,
                         request.generation +| 1,
                     ) catch |err| {
                         candidate.deinit();
-                        generation.runtime_objects.discardTransient(request.handle) catch {};
+                        self.discardAdmittedReservation(generation, request);
                         reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
                         continue;
                     };
@@ -497,52 +545,53 @@ pub const Runtime = struct {
                     candidate.runStartV4Observed(&activation_host, structuralObserver(&activation_context.candidate_structural)) catch |err| {
                         candidate.deinit();
                         activation_context.rollback();
-                        generation.runtime_objects.discardTransient(request.handle) catch {};
+                        self.discardAdmittedReservation(generation, request);
                         std.log.warn("Dynamic Behavior on_start failed: sequence={d}, error={s}", .{ request.sequence, @errorName(err) });
                         continue;
                     };
-                    active.appendActive(&candidate) catch |err| {
+                    if (candidate.binding_count > active.bindings.len - active.binding_count) {
                         candidate.deinit();
                         activation_context.rollback();
-                        generation.runtime_objects.discardTransient(request.handle) catch {};
-                        reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
+                        self.discardAdmittedReservation(generation, request);
+                        reportStructuralFailure(active, request, error.BehaviorBindingCountExceeded, prototype.prototypeId.slice());
                         continue;
-                    };
-                    generation.activateTransient(request.handle) catch |err| {
-                        active.removeObject(object_id.slice());
+                    }
+                    activation_context.commitCore(request.handle) catch |err| {
+                        candidate.deinit();
                         activation_context.rollback();
-                        generation.runtime_objects.discardTransient(request.handle) catch {};
+                        self.discardAdmittedReservation(generation, request);
                         reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
                         continue;
                     };
-                    activation_context.commit() catch |err| {
-                        active.removeObject(object_id.slice());
-                        generation.requestTransientDestroy(request.handle) catch {};
-                        generation.commitTransientDestroy(request.handle) catch {};
-                        activation_context.rollback();
-                        reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
-                        continue;
-                    };
+                    active.appendActive(&candidate) catch unreachable;
+                    activation_context.publish();
                 },
                 .destroy => {
-                    var record = generation.runtime_objects.resolveForCommit(request.handle) orelse continue;
-                    if (record.state == .active) {
-                        generation.requestTransientDestroy(request.handle) catch continue;
-                        record = generation.runtime_objects.resolveForCommit(request.handle) orelse continue;
+                    const object_id = runtime_core.objectIdSlice(&request.handle);
+                    switch (request.destroy_disposition orelse continue) {
+                        .cancelled_pending_spawn => self.admission.release(request.behavior_count),
+                        .awaiting_finalize => {
+                            generation.commitTransientDestroy(request.handle) catch |err| {
+                                reportStructuralFailure(active, request, err, object_id);
+                                return err;
+                            };
+                            active.removeObject(object_id);
+                            self.admission.release(request.behavior_count);
+                        },
                     }
-                    if (record.state != .pending_destroy) continue;
-                    var object_id: [scene_api.max_object_id_bytes]u8 = undefined;
-                    const object_id_bytes = record.object_id.slice().len;
-                    @memcpy(object_id[0..object_id_bytes], record.object_id.slice());
-                    generation.commitTransientDestroy(request.handle) catch |err| {
-                        reportStructuralFailure(active, request, err, object_id[0..object_id_bytes]);
-                        return err;
-                    };
-                    active.removeObject(object_id[0..object_id_bytes]);
                 },
             }
         }
         queue.clear();
+    }
+
+    fn discardAdmittedReservation(
+        self: *Runtime,
+        generation: *scene_generation_api.SceneGeneration,
+        request: StructuralRequest,
+    ) void {
+        generation.discardTransient(request.handle) catch {};
+        self.admission.release(request.behavior_count);
     }
 };
 
@@ -566,14 +615,15 @@ fn reportStructuralFailure(
 const OverlayHostContext = struct {
     generation: *scene_generation_api.SceneGeneration,
     world_epoch: u64,
-    positions: [runtime_object_registry.max_runtime_object_count][2]f32 = [_][2]f32{.{ 0, 0 }} ** runtime_object_registry.max_runtime_object_count,
-    present: [runtime_object_registry.max_runtime_object_count]bool = [_]bool{false} ** runtime_object_registry.max_runtime_object_count,
+    positions: [runtime_core.max_object_count][2]f32 = [_][2]f32{.{ 0, 0 }} ** runtime_core.max_object_count,
+    present: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
     events: EventQueue = .{},
 
     fn init(generation: *scene_generation_api.SceneGeneration, world_epoch: u64) !OverlayHostContext {
         var context = OverlayHostContext{ .generation = generation, .world_epoch = world_epoch };
-        for (generation.runtime_objects.records, 0..) |record, index| {
-            if (record.state != .active) continue;
+        var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
+        for (try generation.activeHandles(&handles)) |handle| {
+            const index = generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
             context.present[index] = true;
             context.positions[index] = try generation.objectPosition(index);
         }
@@ -586,6 +636,7 @@ const DirectHostContext = struct {
     world_epoch: u64,
     events: *EventQueue,
     structural: *StructuralQueue,
+    admission: *BehaviorAdmission,
     post_generation: u8 = 0,
     structural_generation: u8 = 0,
 };
@@ -595,11 +646,15 @@ const ActivationHostContext = struct {
     world_epoch: u64,
     target_events: *EventQueue,
     target_structural: *StructuralQueue,
-    positions: [runtime_object_registry.max_runtime_object_count][2]f32 = [_][2]f32{.{ 0, 0 }} ** runtime_object_registry.max_runtime_object_count,
-    present: [runtime_object_registry.max_runtime_object_count]bool = [_]bool{false} ** runtime_object_registry.max_runtime_object_count,
-    destroyed: [runtime_object_registry.max_runtime_object_count]bool = [_]bool{false} ** runtime_object_registry.max_runtime_object_count,
+    admission: *BehaviorAdmission,
+    positions: [runtime_core.max_object_count][2]f32 = [_][2]f32{.{ 0, 0 }} ** runtime_core.max_object_count,
+    present: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
+    destroyed: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
     candidate_events: EventQueue = .{},
     candidate_structural: StructuralQueue = .{},
+    canceled_structural: [max_structural_requests_per_domain]bool = [_]bool{false} ** max_structural_requests_per_domain,
+    accepted_structural_count: usize = 0,
+    core_committed: bool = false,
     structural_generation: u8,
 
     fn init(
@@ -607,6 +662,7 @@ const ActivationHostContext = struct {
         world_epoch: u64,
         target_events: *EventQueue,
         target_structural: *StructuralQueue,
+        admission: *BehaviorAdmission,
         structural_generation: u8,
     ) !ActivationHostContext {
         var context = ActivationHostContext{
@@ -614,10 +670,12 @@ const ActivationHostContext = struct {
             .world_epoch = world_epoch,
             .target_events = target_events,
             .target_structural = target_structural,
+            .admission = admission,
             .structural_generation = structural_generation,
         };
-        for (generation.runtime_objects.records, 0..) |record, index| {
-            if (record.state == .stale or record.state == .pending_destroy) continue;
+        var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
+        for (try generation.visibleHandles(&handles)) |handle| {
+            const index = generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
             context.present[index] = true;
             context.positions[index] = try generation.objectPosition(index);
         }
@@ -627,63 +685,94 @@ const ActivationHostContext = struct {
     fn rollback(self: *ActivationHostContext) void {
         for (self.candidate_structural.requests[0..self.candidate_structural.count]) |request| {
             if (request.operation != .spawn) continue;
-            self.generation.runtime_objects.discardTransient(request.handle) catch {};
+            self.generation.discardTransient(request.handle) catch {};
+            self.admission.release(request.behavior_count);
         }
     }
 
-    fn commit(self: *ActivationHostContext) !void {
+    fn commitCore(self: *ActivationHostContext, root_handle: scene_generation_api.RuntimeHandle) !void {
         if (self.target_events.count + self.candidate_events.count > self.target_events.events.len) return error.BehaviorEventQueueOverflow;
-        var canceled = [_]bool{false} ** max_structural_requests_per_domain;
         for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, destroy_index| {
             if (request.operation != .destroy) continue;
             for (self.candidate_structural.requests[0..destroy_index], 0..) |candidate, spawn_index| {
                 if (candidate.operation != .spawn or
-                    candidate.handle.slot != request.handle.slot or
-                    candidate.handle.logical_generation != request.handle.logical_generation) continue;
-                canceled[spawn_index] = true;
-                canceled[destroy_index] = true;
+                    !runtime_core.sameObjectRef(candidate.handle, request.handle)) continue;
+                self.canceled_structural[spawn_index] = true;
+                self.canceled_structural[destroy_index] = true;
                 break;
             }
         }
-        if (!self.target_structural.canAppendCount(self.candidate_structural.count)) return error.BehaviorStructuralQueueOverflow;
+        self.accepted_structural_count = 0;
         for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, request_index| {
-            if (!canceled[request_index] and request.generation > max_structural_generation) {
+            if (self.canceled_structural[request_index]) continue;
+            self.accepted_structural_count += 1;
+            if (request.generation > max_structural_generation) {
                 return error.BehaviorStructuralQueueOverflow;
             }
-            if (!canceled[request_index] and request.operation == .destroy) {
-                const record = self.generation.runtime_objects.resolveForCommit(request.handle) orelse return error.InvalidRuntimeObjectDestroy;
+            if (request.operation == .destroy) {
+                const record = self.generation.runtimeObject(request.handle) orelse return error.InvalidRuntimeObjectDestroy;
                 if (record.source_index != null or (record.state != .pending_spawn and record.state != .active)) {
                     return error.InvalidRuntimeObjectDestroy;
                 }
             }
         }
-        for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, request_index| {
-            if (!canceled[request_index] or request.operation != .spawn) continue;
-            self.generation.runtime_objects.discardTransient(request.handle) catch return error.InvalidRuntimeObjectDestroy;
-        }
-        var position_updates: [runtime_object_registry.max_runtime_object_count]scene_generation_api.ObjectPositionUpdate = undefined;
+        if (!self.target_structural.canAppendCount(self.accepted_structural_count)) return error.BehaviorStructuralQueueOverflow;
+        var position_updates: [runtime_core.max_object_count]scene_generation_api.ObjectPositionUpdate = undefined;
         var position_update_count: usize = 0;
         for (self.present, 0..) |is_present, index| {
-            if (!is_present or self.destroyed[index]) continue;
+            if (!is_present) continue;
             position_updates[position_update_count] = .{
                 .object_index = @intCast(index),
                 .position = self.positions[index],
             };
             position_update_count += 1;
         }
-        try self.generation.applyObjectPositionsAtomically(position_updates[0..position_update_count]);
+        var commands: [max_structural_requests_per_domain + 1]scene_generation_api.ActivationCommand = undefined;
+        var command_request_index: [max_structural_requests_per_domain + 1]?usize = [_]?usize{null} ** (max_structural_requests_per_domain + 1);
+        var dispositions: [max_structural_requests_per_domain + 1]?runtime_core.DestroyDisposition = [_]?runtime_core.DestroyDisposition{null} ** (max_structural_requests_per_domain + 1);
+        var command_count: usize = 1;
+        commands[0] = .{ .activate = root_handle };
+        for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, request_index| {
+            if (self.canceled_structural[request_index]) {
+                if (request.operation == .spawn) {
+                    commands[command_count] = .{ .discard_reservation = request.handle };
+                    command_request_index[command_count] = request_index;
+                    command_count += 1;
+                }
+                continue;
+            }
+            if (request.operation == .destroy) {
+                commands[command_count] = .{ .request_destroy = request.handle };
+                command_request_index[command_count] = request_index;
+                command_count += 1;
+            }
+        }
+        try self.generation.commitActivation(
+            position_updates[0..position_update_count],
+            commands[0..command_count],
+            dispositions[0..command_count],
+        );
+        for (command_request_index[0..command_count], 0..) |maybe_request_index, command_index| {
+            const request_index = maybe_request_index orelse continue;
+            if (self.candidate_structural.requests[request_index].operation == .destroy) {
+                self.candidate_structural.requests[request_index].destroy_disposition = dispositions[command_index];
+            }
+        }
+        self.core_committed = true;
+    }
+
+    fn publish(self: *ActivationHostContext) void {
+        std.debug.assert(self.core_committed);
         for (self.candidate_events.events[0..self.candidate_events.count]) |event| {
             self.target_events.events[self.target_events.count] = event;
             self.target_events.count += 1;
         }
-        for (self.candidate_structural.requests[0..self.candidate_structural.count]) |request| {
-            if (!self.target_structural.appendRequest(request)) {
-                return error.BehaviorStructuralQueueOverflow;
-            }
-        }
         for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, request_index| {
-            if (canceled[request_index] or request.operation != .destroy) continue;
-            self.generation.requestTransientDestroy(request.handle) catch unreachable;
+            if (self.canceled_structural[request_index]) {
+                if (request.operation == .spawn) self.admission.release(request.behavior_count);
+                continue;
+            }
+            std.debug.assert(self.target_structural.appendRequest(request));
         }
         self.candidate_structural.count = 0;
     }
@@ -773,17 +862,26 @@ fn directSpawnObject(
     output.* = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
     if (prototype_id == null or prototype_id_length == 0 or prototype_id_length > scene_api.max_object_id_bytes or
         !validPosition(x, y) or !context.structural.canAppend(context.structural_generation)) return 0;
+    const prototype_index = context.generation.scene.prototypes.indexOfId(prototype_id[0..prototype_id_length]) orelse return 0;
+    const behavior_count = context.generation.scene.prototypes.entries[prototype_index].behaviors.count;
+    context.admission.reserve(behavior_count) catch return 0;
     const reserved = context.generation.reserveTransient(
         prototype_id[0..prototype_id_length],
         .{ @floatCast(x), @floatCast(y) },
-    ) catch return 0;
-    if (!context.structural.append(.spawn, reserved.handle, context.structural_generation)) {
-        context.generation.runtime_objects.discardTransient(reserved.handle) catch {};
+    ) catch {
+        context.admission.release(behavior_count);
+        return 0;
+    };
+    if (!context.structural.append(.spawn, reserved.handle, context.structural_generation, behavior_count)) {
+        context.generation.discardTransient(reserved.handle) catch {};
+        context.admission.release(behavior_count);
         return 0;
     }
     if (fillRuntimeObjectHandle(context.generation, reserved.handle, context.world_epoch, output) == 0) {
         context.structural.count -= 1;
-        context.generation.runtime_objects.discardTransient(reserved.handle) catch {};
+        context.structural.next_sequence -= 1;
+        context.generation.discardTransient(reserved.handle) catch {};
+        context.admission.release(behavior_count);
         return 0;
     }
     return 1;
@@ -799,12 +897,13 @@ fn directDestroyObject(
     const handle = context.generation.runtimeHandleAt(slot) orelse return 0;
     const record = context.generation.runtimeObject(handle) orelse return 0;
     if (record.source_index != null) return 0;
-    if (!context.structural.append(.destroy, handle, context.structural_generation)) return 0;
-    context.generation.requestTransientDestroy(handle) catch {
+    if (!context.structural.append(.destroy, handle, context.structural_generation, record.behavior_count)) return 0;
+    const disposition = context.generation.requestTransientDestroyDisposition(handle) catch {
         context.structural.count -= 1;
         context.structural.next_sequence -= 1;
         return 0;
     };
+    context.structural.requests[context.structural.count - 1].destroy_disposition = disposition;
     return 1;
 }
 
@@ -822,16 +921,30 @@ fn activationSpawnObject(
     if (prototype_id == null or prototype_id_length == 0 or prototype_id_length > scene_api.max_object_id_bytes or
         !validPosition(x, y) or !context.candidate_structural.canAppend(context.structural_generation) or
         context.target_structural.count + context.candidate_structural.count >= context.target_structural.requests.len) return 0;
+    const prototype_index = context.generation.scene.prototypes.indexOfId(prototype_id[0..prototype_id_length]) orelse return 0;
+    const behavior_count = context.generation.scene.prototypes.entries[prototype_index].behaviors.count;
+    context.admission.reserve(behavior_count) catch return 0;
     const reserved = context.generation.reserveTransient(
         prototype_id[0..prototype_id_length],
         .{ @floatCast(x), @floatCast(y) },
-    ) catch return 0;
-    if (!context.candidate_structural.append(.spawn, reserved.handle, context.structural_generation)) {
-        context.generation.runtime_objects.discardTransient(reserved.handle) catch {};
+    ) catch {
+        context.admission.release(behavior_count);
+        return 0;
+    };
+    if (!context.candidate_structural.append(.spawn, reserved.handle, context.structural_generation, behavior_count)) {
+        context.generation.discardTransient(reserved.handle) catch {};
+        context.admission.release(behavior_count);
         return 0;
     }
-    context.present[reserved.handle.slot] = true;
-    context.positions[reserved.handle.slot] = .{ @floatCast(x), @floatCast(y) };
+    const object_index = context.generation.objectIndexForRef(reserved.handle) orelse {
+        context.candidate_structural.count -= 1;
+        context.candidate_structural.next_sequence -= 1;
+        context.generation.discardTransient(reserved.handle) catch {};
+        context.admission.release(behavior_count);
+        return 0;
+    };
+    context.present[object_index] = true;
+    context.positions[object_index] = .{ @floatCast(x), @floatCast(y) };
     return fillRuntimeObjectHandle(context.generation, reserved.handle, context.world_epoch, output);
 }
 
@@ -846,7 +959,7 @@ fn activationDestroyObject(
     const handle = context.generation.runtimeHandleAt(slot) orelse return 0;
     const record = context.generation.runtimeObject(handle) orelse return 0;
     if (record.source_index != null) return 0;
-    if (!context.candidate_structural.append(.destroy, handle, context.structural_generation)) return 0;
+    if (!context.candidate_structural.append(.destroy, handle, context.structural_generation, record.behavior_count)) return 0;
     context.destroyed[slot] = true;
     return 1;
 }
@@ -860,7 +973,8 @@ fn activationResolveObject(
     const context: *ActivationHostContext = @ptrCast(@alignCast(userdata orelse return 0));
     if (object_id == null or object_id_length == 0 or object_id_length > behavior_runtime.max_object_id_bytes) return 0;
     const handle = context.generation.runtimeHandle(object_id[0..object_id_length]) orelse return 0;
-    if (context.destroyed[handle.slot]) return 0;
+    const object_index = context.generation.objectIndexForRef(handle) orelse return 0;
+    if (context.destroyed[object_index]) return 0;
     return fillRuntimeObjectHandle(context.generation, handle, context.world_epoch, out_object);
 }
 
@@ -896,7 +1010,8 @@ fn activationPostEvent(userdata: ?*anyopaque, event: ?*const behavior_runtime.Na
     if (context.target_events.count + context.candidate_events.count >= context.target_events.events.len) return 0;
     const posted = event orelse return 0;
     const target_slot = validateActivationObjectHandle(context, &posted.target) orelse return 0;
-    if (context.generation.runtime_objects.records[target_slot].state != .active or
+    const target_handle = context.generation.runtimeHandleAt(target_slot) orelse return 0;
+    if (context.generation.runtimeObject(target_handle).?.state != .active or
         validateActivationObjectHandle(context, &posted.sender) == null) return 0;
     if (posted.field_count > 0) {
         const fields = posted.fields orelse return 0;
@@ -925,7 +1040,8 @@ fn overlayResolveObject(
     const context: *OverlayHostContext = @ptrCast(@alignCast(userdata orelse return 0));
     if (object_id == null or object_id_length == 0 or object_id_length > behavior_runtime.max_object_id_bytes) return 0;
     const handle = context.generation.runtimeHandle(object_id[0..object_id_length]) orelse return 0;
-    if (!context.present[handle.slot]) return 0;
+    const object_index = context.generation.objectIndexForRef(handle) orelse return 0;
+    if (!context.present[object_index]) return 0;
     return fillRuntimeObjectHandle(context.generation, handle, context.world_epoch, out_object);
 }
 
@@ -1052,14 +1168,15 @@ fn fillObjectHandle(
 
 fn fillRuntimeObjectHandle(
     generation: *scene_generation_api.SceneGeneration,
-    handle: runtime_object_registry.Handle,
+    handle: scene_generation_api.RuntimeHandle,
     world_epoch: u64,
     out_object: ?*behavior_runtime.NativeObjectHandle,
 ) c_int {
     const output = out_object orelse return 0;
     const record = generation.runtimeObject(handle) orelse return 0;
     output.* = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-    output.world_epoch = world_epoch;
+    if (handle.world_epoch != world_epoch) return 0;
+    output.world_epoch = handle.world_epoch;
     output.logical_generation = handle.logical_generation;
     output.kind = switch (record.kind) {
         .sprite => 1,
@@ -1091,7 +1208,7 @@ fn validateRuntimeObjectHandle(
         .patrol_hazard => 4,
     };
     if (value.kind != expected_kind) return null;
-    return handle.slot;
+    return generation.objectIndexForRef(handle);
 }
 
 fn validateObjectHandle(
@@ -1148,7 +1265,8 @@ fn validRuntimePostedEventObjects(
     event: *const behavior_runtime.NativePostedEvent,
 ) bool {
     const target_index = validateRuntimeObjectHandle(generation, world_epoch, &event.target) orelse return false;
-    if (generation.runtime_objects.records[target_index].state != .active or
+    const target_handle = generation.runtimeHandleAt(target_index) orelse return false;
+    if (generation.runtimeObject(target_handle).?.state != .active or
         validateRuntimeObjectHandle(generation, world_epoch, &event.sender) == null or
         event.field_count > 8 or (event.field_count > 0 and event.fields == null)) return false;
     if (event.field_count > 0) {
@@ -1163,6 +1281,7 @@ fn validRuntimePostedEventObjects(
 test "Behavior event drain rejects a ninth-generation successor before enqueue" {
     var queue = EventQueue{};
     var structural = StructuralQueue{};
+    var admission = BehaviorAdmission{};
     var unused_generation: scene_generation_api.SceneGeneration = undefined;
     const unused_event = std.mem.zeroes(behavior_runtime.NativePostedEvent);
     var context = DirectHostContext{
@@ -1170,6 +1289,7 @@ test "Behavior event drain rejects a ninth-generation successor before enqueue" 
         .world_epoch = 1,
         .events = &queue,
         .structural = &structural,
+        .admission = &admission,
         .post_generation = max_event_drain_generation + 1,
     };
     try std.testing.expectEqual(@as(c_int, 0), directPostEvent(&context, &unused_event));
@@ -1181,11 +1301,13 @@ test "Direct Host resolves replacement entities and rejects stale object handles
     defer generation.deinit();
     var queue = EventQueue{};
     var structural = StructuralQueue{};
+    var admission = try BehaviorAdmission.init(&generation.scene);
     var context = DirectHostContext{
         .generation = &generation,
-        .world_epoch = 7,
+        .world_epoch = 1,
         .events = &queue,
         .structural = &structural,
+        .admission = &admission,
     };
     const host = directNativeHost(&context);
     const player_id = "player";
@@ -1211,6 +1333,46 @@ test "Direct Host resolves replacement entities and rejects stale object handles
     try std.testing.expectEqual(@as(c_int, 0), host.resolve_object.?(null, player_id.ptr, player_id.len, &object));
 }
 
+test "Behavior admission rejects before Core reservation without consuming transient serial" {
+    const source =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[]}],"prototypes":[
+        \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]}]}
+    ;
+    const scene = try scene_api.parse(std.testing.allocator, source);
+    var generation = try scene_generation_api.SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
+    defer generation.deinit();
+    var events = EventQueue{};
+    var structural = StructuralQueue{};
+    var admission = try BehaviorAdmission.init(&scene);
+    admission.admitted_count = behavior_runtime.max_binding_count;
+    var context = DirectHostContext{
+        .generation = &generation,
+        .world_epoch = 1,
+        .events = &events,
+        .structural = &structural,
+        .admission = &admission,
+    };
+    const prototype_id = "runtime-orb";
+    var object = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        directSpawnObject(&context, prototype_id.ptr, prototype_id.len, 1, 2, &object),
+    );
+    try std.testing.expect(generation.runtimeHandle("runtime-0000000000000001") == null);
+    try std.testing.expectEqual(@as(usize, 0), structural.count);
+
+    admission.admitted_count -= 1;
+    try std.testing.expectEqual(
+        @as(c_int, 1),
+        directSpawnObject(&context, prototype_id.ptr, prototype_id.len, 1, 2, &object),
+    );
+    try std.testing.expectEqualStrings("runtime-0000000000000001", object.object_id[0..object.object_id_length]);
+    try std.testing.expectEqual(behavior_runtime.max_binding_count, admission.admitted_count);
+}
+
 test "Direct Host enforces exact structural request and successor budgets" {
     const source =
         \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
@@ -1224,11 +1386,13 @@ test "Direct Host enforces exact structural request and successor budgets" {
     defer generation.deinit();
     var events = EventQueue{};
     var structural = StructuralQueue{};
+    var admission = try BehaviorAdmission.init(&scene);
     var context = DirectHostContext{
         .generation = &generation,
-        .world_epoch = 7,
+        .world_epoch = 1,
         .events = &events,
         .structural = &structural,
+        .admission = &admission,
     };
     const prototype_id = "runtime-orb";
     for (0..max_structural_requests_per_domain) |index| {
@@ -1245,7 +1409,7 @@ test "Direct Host enforces exact structural request and successor budgets" {
     try std.testing.expectEqual(max_structural_requests_per_domain, structural.count);
     var rejected = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
     try std.testing.expectEqual(@as(c_int, 0), directSpawnObject(&context, prototype_id.ptr, prototype_id.len, 0, 0, &rejected));
-    try std.testing.expectEqual(scene.objects.count + max_structural_requests_per_domain, generation.runtime_objects.liveCount());
+    try std.testing.expectEqual(scene.objects.count + max_structural_requests_per_domain, generation.liveCount());
 
     var source_object = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
     const player_id = "player";
@@ -1271,11 +1435,13 @@ test "Direct Host destroy failure leaves active transient object usable" {
     defer generation.deinit();
     var events = EventQueue{};
     var structural = StructuralQueue{ .next_sequence = std.math.maxInt(u64) };
+    var admission = try BehaviorAdmission.init(&scene);
     var context = DirectHostContext{
         .generation = &generation,
-        .world_epoch = 7,
+        .world_epoch = 1,
         .events = &events,
         .structural = &structural,
+        .admission = &admission,
     };
     const prototype_id = "runtime-orb";
     var rejected = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
@@ -1287,7 +1453,7 @@ test "Direct Host destroy failure leaves active transient object usable" {
         34,
         &rejected,
     ));
-    try std.testing.expectEqual(scene.objects.count, generation.runtime_objects.liveCount());
+    try std.testing.expectEqual(scene.objects.count, generation.liveCount());
 
     structural.next_sequence = 1;
     var pending = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
@@ -1390,6 +1556,7 @@ pub fn initArtifactAtEpoch(
         .package = package,
         .active = active,
         .world_epoch = world_epoch,
+        .admission = try BehaviorAdmission.init(scene),
         .fixed_events = fixed_events,
         .frame_events = frame_events,
         .fixed_structural = fixed_structural,

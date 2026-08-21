@@ -85,14 +85,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "kadath_scheduler"
+name = "kadath_runtime_core"
 version = "0.1.0"
 dependencies = [
  "bindgen",
 ]
 
 [[package]]
-name = "kadath_world"
+name = "kadath_scheduler"
 version = "0.1.0"
 dependencies = [
  "bindgen",

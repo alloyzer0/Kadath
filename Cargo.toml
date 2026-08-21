@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["modules/world", "modules/scheduler"]
+members = ["modules/runtime_core", "modules/scheduler"]
 
 [workspace.package]
 version = "0.1.0"

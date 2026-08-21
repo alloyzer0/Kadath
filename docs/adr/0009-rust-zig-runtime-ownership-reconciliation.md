@@ -276,6 +276,16 @@ Runtime Core 的外部 Interface 必须：
 - 输出只读 render/event snapshot；
 - 使 render extraction 不承担 gameplay mutation。
 
+### 5.3A 2026-08-21 Object Authority 分段澄清
+
+`P1-Rust-Runtime-Core-Object-Authority-01` 的独立 contract discovery 已冻结以下分段；本节是 dated clarification，不改写上述长期 TARGET：
+
+- 128 Runtime Object 是 Rust Object Authority 的物理 record storage hard limit，本增量随 ObjectId/Entity/generation/lifecycle 一并迁入 Rust；
+- 256 Behavior Instance、fixed/frame 各 64 structural request、fixed/frame 各 64 event 与跨资源 admission 继续由 Zig `BehaviorHost` 持有，直到 `P1-Rust-Runtime-Core-Phase-Commit-01`；
+- Object Authority 的 `ACTIVE_OBJECTS` 是供当前 Zig Adapter 消费的 coherent read view，不是 Gameplay 增量最终的 Rust render snapshot；
+- 本增量仍由 Zig `SceneGeneration` 将 active Object View 投影为现有 `RenderSprite` POD，只有 `P1-Rust-Runtime-Core-Gameplay-01` 建立专用 Rust render snapshot 后才删除该投影；
+- 上述临时分段不得形成 Zig/Rust 双写：Zig 不保存 object count、slot、logical generation、serial high-water、Entity 映射或 lifecycle writer，Rust 不接管 Behavior/queue/event/phase admission。
+
 ### 5.4 Scheduler
 
 Scheduler 只有在出现第二个真实异步消费者，或 Runtime Core 需要统一 completion ingestion 时才扩张。禁止为了提高 Rust 占比提前引入线程池、`rayon`、`tokio`、async runtime 或通用 task graph。

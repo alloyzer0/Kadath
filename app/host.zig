@@ -10,7 +10,7 @@ const audio_api = @import("audio");
 const game = @import("game.zig");
 const player_movement_ownership = @import("player_movement_ownership.zig");
 const runtime_texture_registry = @import("runtime_texture_registry.zig");
-const runtime_object_registry = @import("runtime_object_registry.zig");
+const runtime_core = @import("runtime_core");
 const scene_api = @import("scene.zig");
 const scene_generation_api = @import("scene_generation.zig");
 const script_api = @import("script.zig");
@@ -21,7 +21,6 @@ const PlatformExtent = @import("platform").WindowExtent;
 const InputSnapshot = @import("platform").InputSnapshot;
 const rhi = @import("rhi");
 const Rhi = rhi.Rhi;
-const world_api = @import("world");
 const Renderer2D = @import("renderer2d").Renderer2D;
 const SpriteInstance = @import("renderer2d").SpriteInstance;
 
@@ -83,7 +82,7 @@ pub const Host = struct {
     generation: scene_generation_api.SceneGeneration,
     world_extent: PlatformExtent,
     session: game.GameSession = .{},
-    render_sprites: [runtime_object_registry.max_runtime_object_count]world_api.RenderSprite = undefined,
+    render_sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined,
     render_count: usize = 0,
     quit_requested: bool = false,
     last_time_seconds: f64 = 0.0,
@@ -304,7 +303,7 @@ pub const Host = struct {
     fn submitRender(self: *Host) !void {
         if (self.render_count == 0) return error.WorldProducedNoRenderSprite;
         const extent: PlatformExtent = self.platform.clientExtent();
-        var instances: [runtime_object_registry.max_runtime_object_count]SpriteInstance = undefined;
+        var instances: [runtime_core.max_object_count]SpriteInstance = undefined;
         const player_entity = self.generation.playerEntity();
         for (self.render_sprites[0..self.render_count], 0..) |sprite, index| {
             instances[index] = .{
@@ -354,7 +353,7 @@ pub const Host = struct {
             if (!self.behavior_runtime.isLoaded()) return;
             const batch = try self.behavior_runtime.onStart(&self.generation);
             try self.generation.applyTranslationDeltas(batch.slice());
-            var sprites: [runtime_object_registry.max_runtime_object_count]world_api.RenderSprite = undefined;
+            var sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
             const ordered = try self.generation.extractSprites(&sprites);
             const player_entity = self.generation.playerEntity();
             const player = for (ordered) |sprite| {
@@ -499,7 +498,7 @@ pub const Host = struct {
         );
         errdefer candidate_registry.deinit(&self.rhi);
         try validateSceneTextureBindings(&candidate_registry, &candidate);
-        var replacement = try scene_generation_api.SceneGeneration.prepare(candidate, self.world_extent);
+        var replacement = try scene_generation_api.SceneGeneration.prepareSceneReload(candidate, self.world_extent, &self.generation);
         errdefer replacement.deinit();
         var candidate_behavior = behavior_host.Runtime{};
         errdefer candidate_behavior.deinit();
@@ -531,6 +530,7 @@ pub const Host = struct {
                 try applyScriptCommandsToGeneration(&replacement, commands);
             }
         }
+        try replacement.commitPrepared(&self.generation);
         var previous_generation = self.generation;
         var previous_registry = self.texture_registry;
         var previous_behavior = self.behavior_runtime;
@@ -576,6 +576,7 @@ pub const Host = struct {
             errdefer candidate.deinit();
             const batch = try candidate.onStart(&replacement);
             try replacement.applyTranslationDeltas(batch.slice());
+            try replacement.commitPrepared(&self.generation);
             var previous_generation = self.generation;
             var previous_behavior = self.behavior_runtime;
             self.generation = replacement;
@@ -677,7 +678,7 @@ pub const Host = struct {
         }
     }
 
-    fn renderSprite(self: *const Host, entity: world_api.EntityId) ?world_api.RenderSprite {
+    fn renderSprite(self: *const Host, entity: runtime_core.EntityId) ?runtime_core.RenderSprite {
         for (self.render_sprites[0..self.render_count]) |sprite| {
             if (sprite.entity_id == entity) return sprite;
         }

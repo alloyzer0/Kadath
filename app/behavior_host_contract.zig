@@ -167,10 +167,10 @@ test "Runtime object lifecycle activates prototype Behavior and destroys before 
     const pending_index = fixture.generation.objectIndex("runtime-0000000000000001") orelse return error.MissingPendingRuntimeObject;
     try std.testing.expectApproxEqAbs(@as(f32, 12), (try fixture.generation.objectPosition(pending_index))[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 23), (try fixture.generation.objectPosition(pending_index))[1], 0.0001);
-    try std.testing.expectEqual(@as(usize, 3), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expectEqual(@as(usize, 3), fixture.generation.activeCount());
 
     try fixture.runtime.finishFrame(&fixture.generation, .{});
-    try std.testing.expectEqual(@as(usize, 4), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expectEqual(@as(usize, 4), fixture.generation.activeCount());
     try std.testing.expectApproxEqAbs(@as(f32, 17), (try fixture.generation.objectPosition(pending_index))[0], 0.0001);
 
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
@@ -180,7 +180,7 @@ test "Runtime object lifecycle activates prototype Behavior and destroys before 
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
     try fixture.runtime.finishFrame(&fixture.generation, .{});
     try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") == null);
-    try std.testing.expectEqual(@as(usize, 3), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expectEqual(@as(usize, 3), fixture.generation.activeCount());
     try std.testing.expect(fixture.runtime.active.?.bindingEnabled(1));
 }
 
@@ -229,7 +229,7 @@ test "failed dynamic on_start rolls back object writes events and structural suc
     try fixture.runtime.finishFrame(&fixture.generation, .{});
     try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") == null);
     try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000002") == null);
-    try std.testing.expectEqual(@as(usize, 3), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expectEqual(@as(usize, 3), fixture.generation.activeCount());
     try std.testing.expectEqual(goal_before, try fixture.generation.objectPosition(0));
 }
 
@@ -281,7 +281,7 @@ test "dynamic on_start spawn then destroy cancels child before activation" {
     try fixture.runtime.finishFrame(&fixture.generation, .{});
     try std.testing.expectEqual(goal_before, try fixture.generation.objectPosition(0));
     try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000002") == null);
-    try std.testing.expectEqual(@as(usize, 4), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expectEqual(@as(usize, 4), fixture.generation.activeCount());
 }
 
 test "dynamic on_start self destroy skips later bindings and never renders" {
@@ -328,7 +328,7 @@ test "dynamic on_start self destroy skips later bindings and never renders" {
     try fixture.runtime.finishFrame(&fixture.generation, .{});
     try std.testing.expectEqual(goal_before, try fixture.generation.objectPosition(0));
     try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") == null);
-    try std.testing.expectEqual(@as(usize, 3), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expectEqual(@as(usize, 3), fixture.generation.activeCount());
 }
 
 test "dynamic on_start destroy hides an existing transient from later activations in the same flush" {
@@ -941,6 +941,18 @@ test "stale queued target is dropped without disabling its producer" {
     defer fixture.deinit();
 
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    var replacement = try scene_generation_api.SceneGeneration.prepareSceneReload(
+        fixture.generation.scene,
+        fixture.generation.extent,
+        &fixture.generation,
+    );
+    replacement.commitPrepared(&fixture.generation) catch |err| {
+        replacement.deinit();
+        return err;
+    };
+    var previous_generation = fixture.generation;
+    fixture.generation = replacement;
+    previous_generation.deinit();
     fixture.runtime.world_epoch += 1;
     try fixture.runtime.finishFrame(&fixture.generation, .{});
     try std.testing.expect(fixture.runtime.active.?.bindingEnabled(1));
@@ -989,8 +1001,20 @@ test "saved ObjectRef follows restart replacement and rejects a new world epoch"
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 3), (try fixture.generation.objectPosition(2))[0], 0.0001);
 
+    var replacement = try scene_generation_api.SceneGeneration.prepareSceneReload(
+        fixture.generation.scene,
+        fixture.generation.extent,
+        &fixture.generation,
+    );
+    replacement.commitPrepared(&fixture.generation) catch |err| {
+        replacement.deinit();
+        return err;
+    };
+    var previous_generation = fixture.generation;
+    fixture.generation = replacement;
+    previous_generation.deinit();
     fixture.runtime.world_epoch += 1;
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
-    try std.testing.expectApproxEqAbs(@as(f32, 3), (try fixture.generation.objectPosition(2))[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), (try fixture.generation.objectPosition(2))[0], 0.0001);
     try std.testing.expect(!fixture.runtime.active.?.bindingEnabled(1));
 }

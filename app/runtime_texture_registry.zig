@@ -3,7 +3,7 @@ const renderer2d = @import("renderer2d");
 const resource = @import("resource");
 const rhi = @import("rhi");
 const scene = @import("scene.zig");
-const world = @import("world");
+const runtime_core = @import("runtime_core");
 
 pub const resource_async_integration = true;
 const max_texture_count = scene.max_texture_count;
@@ -13,7 +13,7 @@ pub const TextureRefreshFailureReason = union(enum) { resource: resource.AsyncTe
 pub const TextureRefreshOutcome = union(enum) {
     applied,
     failed: struct {
-        texture_id: world.TextureId,
+        texture_id: runtime_core.TextureId,
         artifact_key: []const u8,
         stage: TextureRefreshFailureStage,
         reason: TextureRefreshFailureReason,
@@ -95,7 +95,7 @@ pub const RuntimeTextureRegistry = struct {
         return registry;
     }
 
-    pub fn resolve(self: *const RuntimeTextureRegistry, texture_id: world.TextureId) error{UnknownWorldTexture}!rhi.TextureHandle {
+    pub fn resolve(self: *const RuntimeTextureRegistry, texture_id: runtime_core.TextureId) error{UnknownWorldTexture}!rhi.TextureHandle {
         std.debug.assert(!self.deinitialized);
         for (self.specs[0..self.count], self.handles[0..self.count]) |spec, handle| {
             if (spec.textureId == texture_id) return handle;
@@ -282,7 +282,7 @@ test "refresh resource failure preserves the active set" {
     const outcome = registry.pollRefresh(&renderer, &backend).?;
     switch (outcome) {
         .applied => return error.ExpectedRefreshFailure,
-        .failed => |failure| try std.testing.expectEqual(@as(world.TextureId, 2), failure.texture_id),
+        .failed => |failure| try std.testing.expectEqual(@as(runtime_core.TextureId, 2), failure.texture_id),
     }
     try std.testing.expectEqualSlices(rhi.TextureHandle, old[0..3], registry.handles[0..3]);
     try std.testing.expectEqual(@as(u32, 3), backend.stats().textures_live);

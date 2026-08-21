@@ -251,12 +251,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const world_mod = b.createModule(.{
-        .root_source_file = b.path("modules/world/src/main.zig"),
+    const runtime_core_mod = b.createModule(.{
+        .root_source_file = b.path("modules/runtime_core/src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    world_mod.addIncludePath(b.path("abi"));
+    runtime_core_mod.addIncludePath(b.path("abi"));
 
     const renderer2d_mod = b.createModule(.{
         .root_source_file = b.path("modules/renderer2d/src/main.zig"),
@@ -275,7 +275,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("resource", resource_mod);
     exe_mod.addImport("audio", audio_mod);
     exe_mod.addImport("renderer2d", renderer2d_mod);
-    exe_mod.addImport("world", world_mod);
+    exe_mod.addImport("runtime_core", runtime_core_mod);
     exe_mod.addImport("preview_status", preview_status_mod);
 
     var glslc_path = configured_glslc orelse "glslc";
@@ -344,8 +344,8 @@ pub fn build(b: *std.Build) void {
     runtime_build_step.dependOn(&exe.step);
 
     var async_texture_test_step: ?*std.Build.Step = null;
-    var world_cargo_step: ?*std.Build.Step = null;
-    var world_library_path: ?[]const u8 = null;
+    var runtime_core_cargo_step: ?*std.Build.Step = null;
+    var runtime_core_library_path: ?[]const u8 = null;
     var behavior_native_step: ?*std.Build.Step = null;
     var behavior_artifact_mod: ?*std.Build.Module = null;
     var behavior_manifest_mod: ?*std.Build.Module = null;
@@ -394,12 +394,12 @@ pub fn build(b: *std.Build) void {
         exe.step.dependOn(&cargo_build.step);
         const rust_profile = if (optimize == .Debug) "debug" else "release";
         const rust_library_path = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile });
-        world_cargo_step = &cargo_build.step;
-        world_library_path = rust_library_path;
+        runtime_core_cargo_step = &cargo_build.step;
+        runtime_core_library_path = rust_library_path;
         exe.root_module.addLibraryPath(.{ .cwd_relative = rust_library_path });
         const gcc_runtime_dir = mingw_gcc_runtime_dir.?;
         exe.root_module.addLibraryPath(.{ .cwd_relative = gcc_runtime_dir });
-        exe.root_module.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+        exe.root_module.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("kernel32", .{});
@@ -459,10 +459,10 @@ pub fn build(b: *std.Build) void {
         exe.step.dependOn(&cargo_build.step);
         const rust_profile = if (optimize == .Debug) "debug" else "release";
         const rust_library_path = b.pathJoin(&.{ cargo_target_dir, rust_target, rust_profile });
-        world_cargo_step = &cargo_build.step;
-        world_library_path = rust_library_path;
+        runtime_core_cargo_step = &cargo_build.step;
+        runtime_core_library_path = rust_library_path;
         exe.root_module.addLibraryPath(.{ .cwd_relative = rust_library_path });
-        exe.root_module.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+        exe.root_module.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("kadath_scheduler", .{ .preferred_link_mode = .static });
         exe.root_module.linkSystemLibrary("gcc_s", .{});
         exe.root_module.linkSystemLibrary("util", .{});
@@ -598,13 +598,13 @@ pub fn build(b: *std.Build) void {
         behavior_host_test_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
         behavior_host_test_mod.addImport("behavior_scene_binding", behavior_scene_binding_mod.?);
         behavior_host_test_mod.addImport("platform", platform_mod);
-        behavior_host_test_mod.addImport("world", world_mod);
+        behavior_host_test_mod.addImport("runtime_core", runtime_core_mod);
         const behavior_host_tests = b.addTest(.{ .root_module = behavior_host_test_mod });
         behavior_host_tests.step.dependOn(native_step);
-        if (world_library_path) |library_path| {
-            behavior_host_tests.step.dependOn(world_cargo_step.?);
+        if (runtime_core_library_path) |library_path| {
+            behavior_host_tests.step.dependOn(runtime_core_cargo_step.?);
             behavior_host_test_mod.addLibraryPath(.{ .cwd_relative = library_path });
-            behavior_host_test_mod.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+            behavior_host_test_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
             if (target.result.os.tag == .windows) {
                 behavior_host_test_mod.addLibraryPath(.{ .cwd_relative = mingw_gcc_runtime_dir.? });
                 behavior_host_test_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
@@ -659,7 +659,105 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&behavior_host_test_run.step);
     }
 
-    if (world_library_path) |library_path| {
+    if (runtime_core_library_path) |library_path| {
+        const runtime_core_contract_mod = b.createModule(.{
+            .root_source_file = b.path("modules/runtime_core/tests/runtime_core_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        runtime_core_contract_mod.addImport("runtime_core", runtime_core_mod);
+        runtime_core_contract_mod.addLibraryPath(.{ .cwd_relative = library_path });
+        runtime_core_contract_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
+        if (target.result.os.tag == .windows) {
+            runtime_core_contract_mod.addLibraryPath(.{ .cwd_relative = mingw_gcc_runtime_dir.? });
+            runtime_core_contract_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
+            runtime_core_contract_mod.linkSystemLibrary("kernel32", .{});
+            runtime_core_contract_mod.linkSystemLibrary("dbghelp", .{});
+            runtime_core_contract_mod.linkSystemLibrary("advapi32", .{});
+            runtime_core_contract_mod.linkSystemLibrary("bcrypt", .{});
+            runtime_core_contract_mod.linkSystemLibrary("ntdll", .{});
+            runtime_core_contract_mod.linkSystemLibrary("userenv", .{});
+            runtime_core_contract_mod.linkSystemLibrary("ws2_32", .{});
+        } else if (target.result.os.tag == .linux) {
+            runtime_core_contract_mod.linkSystemLibrary("gcc_s", .{});
+            runtime_core_contract_mod.linkSystemLibrary("util", .{});
+            runtime_core_contract_mod.linkSystemLibrary("rt", .{});
+            runtime_core_contract_mod.linkSystemLibrary("pthread", .{});
+            runtime_core_contract_mod.linkSystemLibrary("m", .{});
+            runtime_core_contract_mod.linkSystemLibrary("dl", .{});
+        }
+        const runtime_core_contract_tests = b.addTest(.{ .root_module = runtime_core_contract_mod });
+        runtime_core_contract_tests.step.dependOn(runtime_core_cargo_step.?);
+        const runtime_core_contract_run = b.addRunArtifact(runtime_core_contract_tests);
+        const runtime_core_contract_step = b.step("test-runtime-core", "Run Runtime Core public Zig Adapter contracts");
+        runtime_core_contract_step.dependOn(&runtime_core_contract_run.step);
+        test_step.dependOn(runtime_core_contract_step);
+
+        const contract_rust_target = if (target.result.os.tag == .windows)
+            "x86_64-pc-windows-gnu"
+        else
+            "x86_64-unknown-linux-gnu";
+        const contract_cargo_target_dir = b.pathFromRoot(".zig-cache/cargo-runtime-core-contract");
+        const contract_cargo_build = b.addSystemCommand(&.{
+            "cargo",
+            "build",
+            "--locked",
+            "--manifest-path",
+            b.pathFromRoot("Cargo.toml"),
+            "--package",
+            "kadath_runtime_core",
+            "--features",
+            "contract-test-hooks",
+            "--target",
+            contract_rust_target,
+            "--target-dir",
+            contract_cargo_target_dir,
+        });
+        if (optimize != .Debug) contract_cargo_build.addArg("--release");
+        const contract_profile = if (optimize == .Debug) "debug" else "release";
+        const contract_library_path = b.pathJoin(&.{ contract_cargo_target_dir, contract_rust_target, contract_profile });
+        const runtime_core_public_c_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        runtime_core_public_c_mod.addIncludePath(b.path("abi"));
+        runtime_core_public_c_mod.addIncludePath(b.path("modules/runtime_core/tests"));
+        runtime_core_public_c_mod.addCSourceFile(.{
+            .file = b.path("modules/runtime_core/tests/public_contract.c"),
+            .flags = &.{ "-std=c17", "-Wall", "-Wextra", "-Werror", "-pedantic" },
+        });
+        runtime_core_public_c_mod.addLibraryPath(.{ .cwd_relative = contract_library_path });
+        runtime_core_public_c_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
+        if (target.result.os.tag == .windows) {
+            runtime_core_public_c_mod.addLibraryPath(.{ .cwd_relative = mingw_gcc_runtime_dir.? });
+            runtime_core_public_c_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
+            runtime_core_public_c_mod.linkSystemLibrary("kernel32", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("dbghelp", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("advapi32", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("bcrypt", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("ntdll", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("userenv", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("ws2_32", .{});
+        } else {
+            runtime_core_public_c_mod.linkSystemLibrary("gcc_s", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("util", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("rt", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("pthread", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("m", .{});
+            runtime_core_public_c_mod.linkSystemLibrary("dl", .{});
+        }
+        const runtime_core_public_c = b.addExecutable(.{
+            .name = "runtime-core-public-contract",
+            .root_module = runtime_core_public_c_mod,
+        });
+        runtime_core_public_c.step.dependOn(&contract_cargo_build.step);
+        const runtime_core_public_c_run = b.addRunArtifact(runtime_core_public_c);
+        const runtime_core_public_c_step = b.step("test-runtime-core-public-c", "Run Runtime Core public C17 contracts and fault hooks");
+        runtime_core_public_c_step.dependOn(&runtime_core_public_c_run.step);
+        test_step.dependOn(runtime_core_public_c_step);
+
         const scene_generation_test_mod = b.createModule(.{
             .root_source_file = b.path("app/scene_generation.zig"),
             .target = target,
@@ -667,9 +765,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         scene_generation_test_mod.addImport("platform", platform_mod);
-        scene_generation_test_mod.addImport("world", world_mod);
+        scene_generation_test_mod.addImport("runtime_core", runtime_core_mod);
         scene_generation_test_mod.addLibraryPath(.{ .cwd_relative = library_path });
-        scene_generation_test_mod.linkSystemLibrary("kadath_world", .{ .preferred_link_mode = .static });
+        scene_generation_test_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
         if (target.result.os.tag == .windows) {
             scene_generation_test_mod.addLibraryPath(.{ .cwd_relative = mingw_gcc_runtime_dir.? });
             scene_generation_test_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
@@ -689,22 +787,11 @@ pub fn build(b: *std.Build) void {
             scene_generation_test_mod.linkSystemLibrary("dl", .{});
         }
         const scene_generation_tests = b.addTest(.{ .root_module = scene_generation_test_mod });
-        scene_generation_tests.step.dependOn(world_cargo_step.?);
+        scene_generation_tests.step.dependOn(runtime_core_cargo_step.?);
         const scene_generation_test_run = b.addRunArtifact(scene_generation_tests);
-        const scene_generation_test_step = b.step("test-scene-generation", "Run Scene object generation contracts against World");
+        const scene_generation_test_step = b.step("test-scene-generation", "Run Scene object generation contracts against Runtime Core");
         scene_generation_test_step.dependOn(&scene_generation_test_run.step);
         test_step.dependOn(scene_generation_test_step);
-
-        const runtime_object_registry_test_mod = b.createModule(.{
-            .root_source_file = b.path("app/runtime_object_registry.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const runtime_object_registry_tests = b.addTest(.{ .root_module = runtime_object_registry_test_mod });
-        const runtime_object_registry_test_run = b.addRunArtifact(runtime_object_registry_tests);
-        const runtime_object_registry_test_step = b.step("test-runtime-object-registry", "Run Runtime Object Registry lifecycle contracts");
-        runtime_object_registry_test_step.dependOn(&runtime_object_registry_test_run.step);
-        test_step.dependOn(runtime_object_registry_test_step);
     }
 
     const null_rhi_mod = b.createModule(.{
@@ -777,7 +864,7 @@ pub fn build(b: *std.Build) void {
     runtime_texture_registry_test_mod.addImport("resource", resource_mod);
     runtime_texture_registry_test_mod.addImport("renderer2d", null_renderer2d_mod);
     runtime_texture_registry_test_mod.addImport("rhi", null_rhi_mod);
-    runtime_texture_registry_test_mod.addImport("world", world_mod);
+    runtime_texture_registry_test_mod.addImport("runtime_core", runtime_core_mod);
     const runtime_texture_registry_tests = b.addTest(.{ .root_module = runtime_texture_registry_test_mod });
     const registry_cargo_target_dir = b.pathFromRoot(".zig-cache/cargo-registry-tests");
     const registry_cargo_build = b.addSystemCommand(&.{

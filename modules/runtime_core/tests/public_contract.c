@@ -1,0 +1,921 @@
+#include <stddef.h>
+#include <stdint.h>
+#include <math.h>
+#include <string.h>
+#include <threads.h>
+
+#include "kadath_runtime_core.h"
+#include "test_hooks.h"
+
+_Static_assert(KADATH_RUNTIME_OBJECT_AUTHORITY_INTERFACE_V1 == 1U, "interface version");
+_Static_assert(KADATH_RUNTIME_MAX_OBJECTS == 128U, "object limit");
+_Static_assert(KADATH_RUNTIME_TARGET_LIVE == 1U, "live target");
+_Static_assert(KADATH_RUNTIME_TARGET_CANDIDATE == 2U, "candidate target");
+_Static_assert(KADATH_RUNTIME_QUERY_FIND_BY_ENTITY == 6U, "query tags");
+_Static_assert(KADATH_RUNTIME_MUTATION_FINALIZE_TRANSIENT_DESTROY == 8U, "mutation tags");
+_Static_assert(KADATH_ERR_RUNTIME_WRONG_THREAD == 0x4101, "runtime error start");
+_Static_assert(KADATH_ERR_RUNTIME_DUPLICATE_OBJECT_ID == 0x410B, "runtime error end");
+
+_Static_assert(sizeof(kadath_runtime_object_ref_v1_t) == 128U, "ObjectRef ABI");
+_Static_assert(offsetof(kadath_runtime_object_ref_v1_t, object_id) == 32U, "ObjectRef ID offset");
+_Static_assert(sizeof(kadath_runtime_object_view_v1_t) == 224U, "ObjectView ABI");
+_Static_assert(offsetof(kadath_runtime_object_view_v1_t, entity_value) == 144U, "Entity offset");
+_Static_assert(sizeof(kadath_runtime_query_item_v1_t) == 168U, "query item ABI");
+_Static_assert(sizeof(kadath_runtime_query_batch_t) == 80U, "query batch ABI");
+_Static_assert(sizeof(kadath_runtime_query_result_t) == 272U, "query result ABI");
+_Static_assert(sizeof(kadath_runtime_sprite_desc_v1_t) == 72U, "sprite descriptor ABI");
+_Static_assert(sizeof(kadath_runtime_mutation_item_v1_t) == 168U, "mutation item ABI");
+_Static_assert(sizeof(kadath_runtime_mutation_batch_t) == 80U, "mutation batch ABI");
+_Static_assert(sizeof(kadath_runtime_mutation_result_t) == 272U, "mutation result ABI");
+_Static_assert(sizeof(kadath_runtime_source_object_desc_v1_t) == 184U, "source descriptor ABI");
+_Static_assert(sizeof(kadath_runtime_scene_prepare_desc_t) == 96U, "prepare descriptor ABI");
+_Static_assert(sizeof(kadath_runtime_object_authority_interface_t) == 128U, "function table ABI");
+
+static kadath_runtime_object_authority_interface_t query_interface(void) {
+    kadath_runtime_object_authority_interface_t interface_value;
+    memset(&interface_value, 0, sizeof(interface_value));
+    interface_value.struct_size = (uint32_t)sizeof(interface_value);
+    interface_value.interface_version = KADATH_RUNTIME_OBJECT_AUTHORITY_INTERFACE_V1;
+
+    if (kadath_runtime_core_query_object_authority_interface(&interface_value) != KADATH_OK) {
+        memset(&interface_value, 0, sizeof(interface_value));
+        return interface_value;
+    }
+    return interface_value;
+}
+
+static void fill_source(
+    kadath_runtime_source_object_desc_v1_t* source,
+    const char* object_id,
+    uint32_t kind,
+    float x,
+    float move_speed) {
+    size_t object_id_length = strlen(object_id);
+    memset(source, 0, sizeof(*source));
+    source->struct_size = (uint32_t)sizeof(*source);
+    source->kind = kind;
+    source->object_id_length = (uint32_t)object_id_length;
+    memcpy(source->object_id, object_id, object_id_length);
+    source->sprite.struct_size = (uint32_t)sizeof(source->sprite);
+    source->sprite.position[0] = x;
+    source->sprite.position[1] = 20.0F;
+    source->sprite.size[0] = 8.0F;
+    source->sprite.size[1] = 8.0F;
+    source->sprite.color[0] = 1.0F;
+    source->sprite.color[1] = 1.0F;
+    source->sprite.color[2] = 1.0F;
+    source->sprite.color[3] = 1.0F;
+    source->sprite.texture_id = 1U;
+    source->sprite.move_speed = move_speed;
+}
+
+static int normal_path(kadath_runtime_object_authority_interface_t* interface_value) {
+    kadath_runtime_core_create_desc_t create_desc;
+    kadath_runtime_core_t* core = NULL;
+    memset(&create_desc, 0, sizeof(create_desc));
+    create_desc.struct_size = (uint32_t)sizeof(create_desc);
+    if (interface_value->create(&create_desc, &core) != KADATH_OK || core == NULL) {
+        return 10;
+    }
+
+    kadath_runtime_source_object_desc_v1_t sources[2];
+    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
+    fill_source(&sources[1], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+
+    kadath_runtime_scene_prepare_desc_t prepare_desc;
+    kadath_runtime_scene_candidate_info_t candidate_info;
+    memset(&prepare_desc, 0, sizeof(prepare_desc));
+    memset(&candidate_info, 0, sizeof(candidate_info));
+    prepare_desc.struct_size = (uint32_t)sizeof(prepare_desc);
+    prepare_desc.mode = KADATH_RUNTIME_PREPARE_INITIAL;
+    prepare_desc.bounds_max[0] = 100.0F;
+    prepare_desc.bounds_max[1] = 100.0F;
+    prepare_desc.source_objects = sources;
+    prepare_desc.source_object_count = 2U;
+    prepare_desc.source_object_stride = sizeof(sources[0]);
+    candidate_info.struct_size = (uint32_t)sizeof(candidate_info);
+    if (interface_value->prepare_scene(core, &prepare_desc, &candidate_info) != KADATH_OK ||
+        candidate_info.world_epoch != 1U || candidate_info.source_object_count != 2U) {
+        return 11;
+    }
+
+    kadath_runtime_query_item_v1_t item;
+    kadath_runtime_query_batch_t batch;
+    kadath_runtime_query_result_t result;
+    memset(&item, 0, sizeof(item));
+    memset(&batch, 0, sizeof(batch));
+    memset(&result, 0, sizeof(result));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_QUERY_STATE_INFO;
+    batch.struct_size = (uint32_t)sizeof(batch);
+    batch.target = KADATH_RUNTIME_TARGET_CANDIDATE;
+    batch.items = &item;
+    batch.item_count = 1U;
+    batch.item_stride = sizeof(item);
+    result.struct_size = (uint32_t)sizeof(result);
+    if (interface_value->query(core, &batch, &result, 1U) != KADATH_OK ||
+        result.found != KADATH_RUNTIME_FOUND || result.payload.state_info.world_epoch != 1U ||
+        result.payload.state_info.object_count != 2U) {
+        return 12;
+    }
+
+    if (interface_value->commit_scene(core) != KADATH_OK) {
+        return 13;
+    }
+
+    kadath_runtime_object_view_v1_t objects[2];
+    memset(objects, 0xA5, sizeof(objects));
+    memset(&item, 0, sizeof(item));
+    memset(&batch, 0, sizeof(batch));
+    memset(&result, 0, sizeof(result));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_QUERY_VISIBLE_OBJECTS;
+    item.payload.object_buffer.objects = objects;
+    item.payload.object_buffer.object_capacity = 2U;
+    item.payload.object_buffer.object_stride = sizeof(objects[0]);
+    batch.struct_size = (uint32_t)sizeof(batch);
+    batch.target = KADATH_RUNTIME_TARGET_LIVE;
+    batch.items = &item;
+    batch.item_count = 1U;
+    batch.item_stride = sizeof(item);
+    result.struct_size = (uint32_t)sizeof(result);
+    if (interface_value->query(core, &batch, &result, 1U) != KADATH_OK ||
+        result.payload.snapshot.object_count != 2U ||
+        objects[0].object_ref.object_id_length != 6U ||
+        memcmp(objects[0].object_ref.object_id, "player", 6U) != 0 ||
+        objects[1].object_ref.object_id_length != 4U ||
+        memcmp(objects[1].object_ref.object_id, "goal", 4U) != 0) {
+        return 14;
+    }
+
+    if (interface_value->destroy(&core) != KADATH_OK || core != NULL) {
+        return 15;
+    }
+    return 0;
+}
+
+static int create_live_core(
+    kadath_runtime_object_authority_interface_t* interface_value,
+    kadath_runtime_core_t** out_core) {
+    kadath_runtime_core_create_desc_t create_desc;
+    kadath_runtime_source_object_desc_v1_t sources[2];
+    kadath_runtime_scene_prepare_desc_t prepare_desc;
+    kadath_runtime_scene_candidate_info_t candidate_info;
+
+    memset(&create_desc, 0, sizeof(create_desc));
+    create_desc.struct_size = (uint32_t)sizeof(create_desc);
+    if (interface_value->create(&create_desc, out_core) != KADATH_OK || *out_core == NULL) {
+        return 20;
+    }
+    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
+    fill_source(&sources[1], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+    memset(&prepare_desc, 0, sizeof(prepare_desc));
+    memset(&candidate_info, 0, sizeof(candidate_info));
+    prepare_desc.struct_size = (uint32_t)sizeof(prepare_desc);
+    prepare_desc.mode = KADATH_RUNTIME_PREPARE_INITIAL;
+    prepare_desc.bounds_max[0] = 100.0F;
+    prepare_desc.bounds_max[1] = 100.0F;
+    prepare_desc.source_objects = sources;
+    prepare_desc.source_object_count = 2U;
+    prepare_desc.source_object_stride = sizeof(sources[0]);
+    candidate_info.struct_size = (uint32_t)sizeof(candidate_info);
+    if (interface_value->prepare_scene(*out_core, &prepare_desc, &candidate_info) != KADATH_OK ||
+        interface_value->commit_scene(*out_core) != KADATH_OK) {
+        return 21;
+    }
+    return 0;
+}
+
+static int mutate_one(
+    kadath_runtime_object_authority_interface_t* interface_value,
+    kadath_runtime_core_t* core,
+    kadath_runtime_mutation_item_v1_t* item,
+    kadath_runtime_mutation_result_t* result) {
+    kadath_runtime_mutation_batch_t batch;
+    memset(&batch, 0, sizeof(batch));
+    memset(result, 0, sizeof(*result));
+    batch.struct_size = (uint32_t)sizeof(batch);
+    batch.target = KADATH_RUNTIME_TARGET_LIVE;
+    batch.items = item;
+    batch.item_count = 1U;
+    batch.item_stride = sizeof(*item);
+    result->struct_size = (uint32_t)sizeof(*result);
+    return interface_value->mutate(core, &batch, result, 1U);
+}
+
+static int mutate_many(
+    kadath_runtime_object_authority_interface_t* interface_value,
+    kadath_runtime_core_t* core,
+    kadath_runtime_mutation_item_v1_t* items,
+    size_t item_count,
+    kadath_runtime_mutation_result_t* results) {
+    kadath_runtime_mutation_batch_t batch;
+    memset(&batch, 0, sizeof(batch));
+    memset(results, 0, item_count * sizeof(*results));
+    batch.struct_size = (uint32_t)sizeof(batch);
+    batch.target = KADATH_RUNTIME_TARGET_LIVE;
+    batch.items = items;
+    batch.item_count = item_count;
+    batch.item_stride = sizeof(*items);
+    for (size_t index = 0; index < item_count; ++index) {
+        results[index].struct_size = (uint32_t)sizeof(results[index]);
+    }
+    return interface_value->mutate(core, &batch, results, item_count);
+}
+
+static int query_exact(
+    kadath_runtime_object_authority_interface_t* interface_value,
+    kadath_runtime_core_t* core,
+    const kadath_runtime_object_ref_v1_t* object_ref,
+    kadath_runtime_query_result_t* result) {
+    kadath_runtime_query_item_v1_t item;
+    kadath_runtime_query_batch_t batch;
+    memset(&item, 0, sizeof(item));
+    memset(&batch, 0, sizeof(batch));
+    memset(result, 0, sizeof(*result));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_QUERY_RESOLVE_EXACT_REF;
+    item.payload.object_ref = *object_ref;
+    batch.struct_size = (uint32_t)sizeof(batch);
+    batch.target = KADATH_RUNTIME_TARGET_LIVE;
+    batch.items = &item;
+    batch.item_count = 1U;
+    batch.item_stride = sizeof(item);
+    result->struct_size = (uint32_t)sizeof(*result);
+    return interface_value->query(core, &batch, result, 1U);
+}
+
+static int query_id(
+    kadath_runtime_object_authority_interface_t* interface_value,
+    kadath_runtime_core_t* core,
+    const char* object_id,
+    kadath_runtime_query_result_t* result) {
+    kadath_runtime_query_item_v1_t item;
+    kadath_runtime_query_batch_t batch;
+    memset(&item, 0, sizeof(item));
+    memset(&batch, 0, sizeof(batch));
+    memset(result, 0, sizeof(*result));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_QUERY_FIND_BY_ID;
+    item.payload.object_id.data = (const uint8_t*)object_id;
+    item.payload.object_id.length = strlen(object_id);
+    batch.struct_size = (uint32_t)sizeof(batch);
+    batch.target = KADATH_RUNTIME_TARGET_LIVE;
+    batch.items = &item;
+    batch.item_count = 1U;
+    batch.item_stride = sizeof(item);
+    result->struct_size = (uint32_t)sizeof(*result);
+    return interface_value->query(core, &batch, result, 1U);
+}
+
+static int prepare_again(
+    kadath_runtime_object_authority_interface_t* interface_value,
+    kadath_runtime_core_t* core,
+    uint32_t mode) {
+    kadath_runtime_source_object_desc_v1_t sources[2];
+    kadath_runtime_scene_prepare_desc_t prepare_desc;
+    kadath_runtime_scene_candidate_info_t candidate_info;
+    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
+    fill_source(&sources[1], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+    memset(&prepare_desc, 0, sizeof(prepare_desc));
+    memset(&candidate_info, 0, sizeof(candidate_info));
+    prepare_desc.struct_size = (uint32_t)sizeof(prepare_desc);
+    prepare_desc.mode = mode;
+    prepare_desc.bounds_max[0] = 100.0F;
+    prepare_desc.bounds_max[1] = 100.0F;
+    prepare_desc.source_objects = sources;
+    prepare_desc.source_object_count = 2U;
+    prepare_desc.source_object_stride = sizeof(sources[0]);
+    candidate_info.struct_size = (uint32_t)sizeof(candidate_info);
+    int32_t prepare_result =
+        interface_value->prepare_scene(core, &prepare_desc, &candidate_info);
+    if (prepare_result != KADATH_OK || candidate_info.mode != mode) {
+        return 30;
+    }
+    return interface_value->commit_scene(core) == KADATH_OK ? 0 : 31;
+}
+
+static int transient_lifecycle(kadath_runtime_object_authority_interface_t* interface_value) {
+    kadath_runtime_core_t* core = NULL;
+    int create_result = create_live_core(interface_value, &core);
+    if (create_result != 0) {
+        return create_result;
+    }
+
+    kadath_runtime_mutation_item_v1_t item;
+    kadath_runtime_mutation_result_t mutation_result;
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_RESERVE_TRANSIENT;
+    item.payload.transient.struct_size = (uint32_t)sizeof(item.payload.transient);
+    item.payload.transient.prototype_key = 7U;
+    item.payload.transient.kind = KADATH_RUNTIME_OBJECT_KIND_SPRITE;
+    item.payload.transient.sprite.struct_size =
+        (uint32_t)sizeof(item.payload.transient.sprite);
+    item.payload.transient.sprite.position[0] = 30.0F;
+    item.payload.transient.sprite.position[1] = 40.0F;
+    item.payload.transient.sprite.size[0] = 4.0F;
+    item.payload.transient.sprite.size[1] = 4.0F;
+    item.payload.transient.sprite.color[0] = 1.0F;
+    item.payload.transient.sprite.color[1] = 1.0F;
+    item.payload.transient.sprite.color[2] = 1.0F;
+    item.payload.transient.sprite.color[3] = 1.0F;
+    item.payload.transient.sprite.texture_id = 1U;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK ||
+        mutation_result.object.lifecycle != KADATH_RUNTIME_LIFECYCLE_PENDING_SPAWN ||
+        mutation_result.object.entity_value != KADATH_RUNTIME_ENTITY_INVALID ||
+        mutation_result.object.object_ref.object_id_length != 24U ||
+        memcmp(mutation_result.object.object_ref.object_id, "runtime-0000000000000001", 24U) != 0) {
+        return 22;
+    }
+    kadath_runtime_object_ref_v1_t first_ref = mutation_result.object.object_ref;
+
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_ACTIVATE_TRANSIENT;
+    item.payload.object_ref = first_ref;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK) {
+        return 23;
+    }
+
+    kadath_runtime_query_result_t query_result;
+    if (query_exact(interface_value, core, &first_ref, &query_result) != KADATH_OK ||
+        query_result.found != KADATH_RUNTIME_FOUND ||
+        query_result.payload.object.lifecycle != KADATH_RUNTIME_LIFECYCLE_ACTIVE ||
+        query_result.payload.object.entity_value == KADATH_RUNTIME_ENTITY_INVALID) {
+        return 24;
+    }
+
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_REQUEST_TRANSIENT_DESTROY;
+    item.payload.object_ref = first_ref;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK ||
+        mutation_result.destroy_disposition !=
+            KADATH_RUNTIME_DESTROY_AWAITING_FINALIZE) {
+        return 25;
+    }
+    if (query_exact(interface_value, core, &first_ref, &query_result) != KADATH_OK ||
+        query_result.found != KADATH_RUNTIME_NOT_FOUND) {
+        return 26;
+    }
+
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_FINALIZE_TRANSIENT_DESTROY;
+    item.payload.object_ref = first_ref;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK) {
+        return 27;
+    }
+
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_RESERVE_TRANSIENT;
+    item.payload.transient.struct_size = (uint32_t)sizeof(item.payload.transient);
+    item.payload.transient.prototype_key = 7U;
+    item.payload.transient.kind = KADATH_RUNTIME_OBJECT_KIND_SPRITE;
+    item.payload.transient.sprite.struct_size =
+        (uint32_t)sizeof(item.payload.transient.sprite);
+    item.payload.transient.sprite.position[0] = 1.0F;
+    item.payload.transient.sprite.position[1] = 2.0F;
+    item.payload.transient.sprite.size[0] = 4.0F;
+    item.payload.transient.sprite.size[1] = 4.0F;
+    item.payload.transient.sprite.color[3] = 1.0F;
+    item.payload.transient.sprite.texture_id = 1U;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK ||
+        memcmp(mutation_result.object.object_ref.object_id, "runtime-0000000000000002", 24U) != 0 ||
+        mutation_result.object.object_ref.logical_generation == first_ref.logical_generation) {
+        return 28;
+    }
+
+    if (interface_value->destroy(&core) != KADATH_OK || core != NULL) {
+        return 29;
+    }
+    return 0;
+}
+
+static int restart_and_reload(kadath_runtime_object_authority_interface_t* interface_value) {
+    kadath_runtime_core_t* core = NULL;
+    int create_result = create_live_core(interface_value, &core);
+    if (create_result != 0) {
+        return create_result;
+    }
+
+    kadath_runtime_query_result_t player_result;
+    if (query_id(interface_value, core, "player", &player_result) != KADATH_OK ||
+        player_result.found != KADATH_RUNTIME_FOUND) {
+        return 32;
+    }
+    kadath_runtime_object_ref_v1_t original_player = player_result.payload.object.object_ref;
+    uint64_t original_entity = player_result.payload.object.entity_value;
+
+    kadath_runtime_mutation_item_v1_t item;
+    kadath_runtime_mutation_result_t mutation_result;
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_RESERVE_TRANSIENT;
+    item.payload.transient.struct_size = (uint32_t)sizeof(item.payload.transient);
+    item.payload.transient.prototype_key = 1U;
+    item.payload.transient.kind = KADATH_RUNTIME_OBJECT_KIND_SPRITE;
+    item.payload.transient.sprite.struct_size =
+        (uint32_t)sizeof(item.payload.transient.sprite);
+    item.payload.transient.sprite.size[0] = 2.0F;
+    item.payload.transient.sprite.size[1] = 2.0F;
+    item.payload.transient.sprite.color[3] = 1.0F;
+    item.payload.transient.sprite.texture_id = 1U;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK) {
+        return 33;
+    }
+    kadath_runtime_object_ref_v1_t original_transient = mutation_result.object.object_ref;
+
+    if (prepare_again(interface_value, core, KADATH_RUNTIME_PREPARE_RESTART) != 0) {
+        return 34;
+    }
+    if (query_exact(interface_value, core, &original_player, &player_result) != KADATH_OK ||
+        player_result.found != KADATH_RUNTIME_FOUND ||
+        player_result.payload.object.entity_value == original_entity) {
+        return 35;
+    }
+    kadath_runtime_object_ref_v1_t restart_player = player_result.payload.object.object_ref;
+    if (query_exact(interface_value, core, &original_transient, &player_result) != KADATH_OK ||
+        player_result.found != KADATH_RUNTIME_NOT_FOUND) {
+        return 36;
+    }
+
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_RESERVE_TRANSIENT;
+    item.payload.transient.struct_size = (uint32_t)sizeof(item.payload.transient);
+    item.payload.transient.prototype_key = 1U;
+    item.payload.transient.kind = KADATH_RUNTIME_OBJECT_KIND_SPRITE;
+    item.payload.transient.sprite.struct_size =
+        (uint32_t)sizeof(item.payload.transient.sprite);
+    item.payload.transient.sprite.size[0] = 2.0F;
+    item.payload.transient.sprite.size[1] = 2.0F;
+    item.payload.transient.sprite.color[3] = 1.0F;
+    item.payload.transient.sprite.texture_id = 1U;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK ||
+        memcmp(mutation_result.object.object_ref.object_id, "runtime-0000000000000002", 24U) != 0) {
+        return 37;
+    }
+
+    if (prepare_again(interface_value, core, KADATH_RUNTIME_PREPARE_SCENE_RELOAD) != 0) {
+        return 38;
+    }
+    if (query_exact(interface_value, core, &restart_player, &player_result) != KADATH_OK ||
+        player_result.found != KADATH_RUNTIME_NOT_FOUND) {
+        return 39;
+    }
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_RESERVE_TRANSIENT;
+    item.payload.transient.struct_size = (uint32_t)sizeof(item.payload.transient);
+    item.payload.transient.prototype_key = 1U;
+    item.payload.transient.kind = KADATH_RUNTIME_OBJECT_KIND_SPRITE;
+    item.payload.transient.sprite.struct_size =
+        (uint32_t)sizeof(item.payload.transient.sprite);
+    item.payload.transient.sprite.size[0] = 2.0F;
+    item.payload.transient.sprite.size[1] = 2.0F;
+    item.payload.transient.sprite.color[3] = 1.0F;
+    item.payload.transient.sprite.texture_id = 1U;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK ||
+        memcmp(mutation_result.object.object_ref.object_id, "runtime-0000000000000001", 24U) != 0) {
+        return 40;
+    }
+    return interface_value->destroy(&core) == KADATH_OK ? 0 : 41;
+}
+
+static int world_and_position_batch(kadath_runtime_object_authority_interface_t* interface_value) {
+    kadath_runtime_core_t* core = NULL;
+    int create_result = create_live_core(interface_value, &core);
+    if (create_result != 0) {
+        return create_result;
+    }
+    kadath_runtime_query_result_t player;
+    kadath_runtime_query_result_t goal;
+    if (query_id(interface_value, core, "player", &player) != KADATH_OK ||
+        query_id(interface_value, core, "goal", &goal) != KADATH_OK) {
+        return 42;
+    }
+    kadath_runtime_object_ref_v1_t player_ref = player.payload.object.object_ref;
+    kadath_runtime_object_ref_v1_t goal_ref = goal.payload.object.object_ref;
+
+    kadath_runtime_mutation_item_v1_t item;
+    kadath_runtime_mutation_result_t mutation_result;
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_STEP_FIXED;
+    item.payload.fixed_step.struct_size = (uint32_t)sizeof(item.payload.fixed_step);
+    item.payload.fixed_step.dt_seconds = 0.5F;
+    item.payload.fixed_step.move_x = 1;
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK ||
+        query_exact(interface_value, core, &player_ref, &player) != KADATH_OK ||
+        player.payload.object.position[0] != 20.0F) {
+        return 43;
+    }
+
+    kadath_runtime_position_patch_v1_t patches[2];
+    memset(patches, 0, sizeof(patches));
+    patches[0].struct_size = (uint32_t)sizeof(patches[0]);
+    patches[0].object_ref = player_ref;
+    patches[0].position[0] = 95.0F;
+    patches[0].position[1] = 95.0F;
+    patches[1].struct_size = (uint32_t)sizeof(patches[1]);
+    patches[1].object_ref = goal_ref;
+    patches[1].position[0] = 50.0F;
+    patches[1].position[1] = 60.0F;
+    memset(&item, 0, sizeof(item));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_MUTATION_APPLY_POSITIONS;
+    item.payload.positions.patches = patches;
+    item.payload.positions.patch_count = 2U;
+    item.payload.positions.patch_stride = sizeof(patches[0]);
+    if (mutate_one(interface_value, core, &item, &mutation_result) != KADATH_OK ||
+        query_exact(interface_value, core, &player_ref, &player) != KADATH_OK ||
+        player.payload.object.position[0] != 92.0F || player.payload.object.position[1] != 92.0F ||
+        query_exact(interface_value, core, &goal_ref, &goal) != KADATH_OK ||
+        goal.payload.object.position[0] != 50.0F || goal.payload.object.position[1] != 60.0F) {
+        return 44;
+    }
+
+    patches[0].position[0] = 1.0F;
+    patches[1].position[0] = NAN;
+    if (mutate_one(interface_value, core, &item, &mutation_result) !=
+            KADATH_ERR_INVALID_ARGUMENT ||
+        query_exact(interface_value, core, &player_ref, &player) != KADATH_OK ||
+        player.payload.object.position[0] != 92.0F) {
+        return 45;
+    }
+    return interface_value->destroy(&core) == KADATH_OK ? 0 : 46;
+}
+
+static int activation_batch_atomic(kadath_runtime_object_authority_interface_t* interface_value) {
+    kadath_runtime_core_t* core = NULL;
+    int create_result = create_live_core(interface_value, &core);
+    if (create_result != 0) return create_result;
+
+    kadath_runtime_query_result_t player;
+    if (query_id(interface_value, core, "player", &player) != KADATH_OK) return 50;
+
+    kadath_runtime_mutation_item_v1_t reserve;
+    kadath_runtime_mutation_result_t reserve_result;
+    memset(&reserve, 0, sizeof(reserve));
+    reserve.struct_size = (uint32_t)sizeof(reserve);
+    reserve.tag = KADATH_RUNTIME_MUTATION_RESERVE_TRANSIENT;
+    reserve.payload.transient.struct_size = (uint32_t)sizeof(reserve.payload.transient);
+    reserve.payload.transient.prototype_key = 3U;
+    reserve.payload.transient.kind = KADATH_RUNTIME_OBJECT_KIND_SPRITE;
+    reserve.payload.transient.sprite.struct_size = (uint32_t)sizeof(reserve.payload.transient.sprite);
+    reserve.payload.transient.sprite.size[0] = 2.0F;
+    reserve.payload.transient.sprite.size[1] = 2.0F;
+    reserve.payload.transient.sprite.color[3] = 1.0F;
+    reserve.payload.transient.sprite.texture_id = 1U;
+    if (mutate_one(interface_value, core, &reserve, &reserve_result) != KADATH_OK) return 51;
+    kadath_runtime_object_ref_v1_t root_ref = reserve_result.object.object_ref;
+
+    kadath_runtime_position_patch_v1_t patches[2];
+    memset(patches, 0, sizeof(patches));
+    patches[0].struct_size = (uint32_t)sizeof(patches[0]);
+    patches[0].object_ref = player.payload.object.object_ref;
+    patches[0].position[0] = 25.0F;
+    patches[0].position[1] = 20.0F;
+    patches[1].struct_size = (uint32_t)sizeof(patches[1]);
+    patches[1].object_ref = root_ref;
+    patches[1].position[0] = 35.0F;
+    patches[1].position[1] = 45.0F;
+
+    kadath_runtime_mutation_item_v1_t items[3];
+    kadath_runtime_mutation_result_t results[3];
+    memset(items, 0, sizeof(items));
+    for (size_t index = 0; index < 3U; ++index) items[index].struct_size = (uint32_t)sizeof(items[index]);
+    items[0].tag = KADATH_RUNTIME_MUTATION_APPLY_POSITIONS;
+    items[0].payload.positions.patches = patches;
+    items[0].payload.positions.patch_count = 2U;
+    items[0].payload.positions.patch_stride = sizeof(patches[0]);
+    items[1].tag = KADATH_RUNTIME_MUTATION_ACTIVATE_TRANSIENT;
+    items[1].payload.object_ref = root_ref;
+    items[2].tag = KADATH_RUNTIME_MUTATION_REQUEST_TRANSIENT_DESTROY;
+    items[2].payload.object_ref = root_ref;
+    if (mutate_many(interface_value, core, items, 3U, results) != KADATH_OK ||
+        results[2].destroy_disposition != KADATH_RUNTIME_DESTROY_AWAITING_FINALIZE ||
+        query_exact(interface_value, core, &root_ref, &player) != KADATH_OK ||
+        player.found != KADATH_RUNTIME_NOT_FOUND) {
+        return 52;
+    }
+
+    memset(&reserve, 0, sizeof(reserve));
+    reserve.struct_size = (uint32_t)sizeof(reserve);
+    reserve.tag = KADATH_RUNTIME_MUTATION_FINALIZE_TRANSIENT_DESTROY;
+    reserve.payload.object_ref = root_ref;
+    if (mutate_one(interface_value, core, &reserve, &reserve_result) != KADATH_OK) return 53;
+
+    /* The only permitted duplicate ObjectRef lifecycle pair is ACTIVATE -> REQUEST.
+     * Repeating REQUEST must reject atomically instead of replaying the first step. */
+    memset(&reserve, 0, sizeof(reserve));
+    reserve.struct_size = (uint32_t)sizeof(reserve);
+    reserve.tag = KADATH_RUNTIME_MUTATION_RESERVE_TRANSIENT;
+    reserve.payload.transient.struct_size = (uint32_t)sizeof(reserve.payload.transient);
+    reserve.payload.transient.prototype_key = 3U;
+    reserve.payload.transient.kind = KADATH_RUNTIME_OBJECT_KIND_SPRITE;
+    reserve.payload.transient.sprite.struct_size = (uint32_t)sizeof(reserve.payload.transient.sprite);
+    reserve.payload.transient.sprite.size[0] = 2.0F;
+    reserve.payload.transient.sprite.size[1] = 2.0F;
+    reserve.payload.transient.sprite.color[3] = 1.0F;
+    reserve.payload.transient.sprite.texture_id = 1U;
+    if (mutate_one(interface_value, core, &reserve, &reserve_result) != KADATH_OK) return 57;
+    kadath_runtime_object_ref_v1_t repeated_destroy_ref = reserve_result.object.object_ref;
+    memset(items, 0, sizeof(items));
+    for (size_t index = 0; index < 2U; ++index) items[index].struct_size = (uint32_t)sizeof(items[index]);
+    items[0].tag = KADATH_RUNTIME_MUTATION_REQUEST_TRANSIENT_DESTROY;
+    items[0].payload.object_ref = repeated_destroy_ref;
+    items[1].tag = KADATH_RUNTIME_MUTATION_REQUEST_TRANSIENT_DESTROY;
+    items[1].payload.object_ref = repeated_destroy_ref;
+    if (mutate_many(interface_value, core, items, 2U, results) != KADATH_ERR_INVALID_ARGUMENT ||
+        query_exact(interface_value, core, &repeated_destroy_ref, &player) != KADATH_OK ||
+        player.found != KADATH_RUNTIME_FOUND) {
+        return 58;
+    }
+
+    if (query_id(interface_value, core, "player", &player) != KADATH_OK ||
+        player.payload.object.position[0] != 25.0F) return 54;
+
+    memset(items, 0, sizeof(items));
+    for (size_t index = 0; index < 2U; ++index) items[index].struct_size = (uint32_t)sizeof(items[index]);
+    patches[0].position[0] = 40.0F;
+    items[0].tag = KADATH_RUNTIME_MUTATION_APPLY_POSITIONS;
+    items[0].payload.positions.patches = patches;
+    items[0].payload.positions.patch_count = 1U;
+    items[0].payload.positions.patch_stride = sizeof(patches[0]);
+    items[1].tag = KADATH_RUNTIME_MUTATION_ACTIVATE_TRANSIENT;
+    items[1].payload.object_ref = root_ref;
+    if (mutate_many(interface_value, core, items, 2U, results) != KADATH_ERR_RUNTIME_STALE_OBJECT ||
+        query_id(interface_value, core, "player", &player) != KADATH_OK ||
+        player.payload.object.position[0] != 25.0F) {
+        return 55;
+    }
+    return interface_value->destroy(&core) == KADATH_OK ? 0 : 56;
+}
+
+static int query_batch_atomic(kadath_runtime_object_authority_interface_t* interface_value) {
+    kadath_runtime_core_t* core = NULL;
+    int create_result = create_live_core(interface_value, &core);
+    if (create_result != 0) return create_result;
+
+    kadath_runtime_query_item_v1_t items[3];
+    kadath_runtime_query_result_t results[3];
+    kadath_runtime_query_batch_t batch;
+    memset(items, 0, sizeof(items));
+    memset(results, 0xA5, sizeof(results));
+    memset(&batch, 0, sizeof(batch));
+    for (size_t index = 0; index < 3U; ++index) {
+        items[index].struct_size = (uint32_t)sizeof(items[index]);
+        results[index].struct_size = (uint32_t)sizeof(results[index]);
+    }
+    items[0].tag = KADATH_RUNTIME_QUERY_STATE_INFO;
+    items[1].tag = KADATH_RUNTIME_QUERY_FIND_BY_ID;
+    items[1].payload.object_id.data = (const uint8_t*)"player";
+    items[1].payload.object_id.length = 6U;
+    items[2].tag = KADATH_RUNTIME_QUERY_FIND_BY_ID;
+    items[2].payload.object_id.data = (const uint8_t*)"missing";
+    items[2].payload.object_id.length = 7U;
+    batch.struct_size = (uint32_t)sizeof(batch);
+    batch.target = KADATH_RUNTIME_TARGET_LIVE;
+    batch.items = items;
+    batch.item_count = 3U;
+    batch.item_stride = sizeof(items[0]);
+    if (interface_value->query(core, &batch, results, 3U) != KADATH_OK ||
+        results[0].payload.state_info.object_count != 2U ||
+        results[1].found != KADATH_RUNTIME_FOUND ||
+        results[2].found != KADATH_RUNTIME_NOT_FOUND) {
+        return 60;
+    }
+
+    memset(results, 0xA5, sizeof(results));
+    for (size_t index = 0; index < 3U; ++index) results[index].struct_size = (uint32_t)sizeof(results[index]);
+    kadath_runtime_query_result_t sentinels[3];
+    memcpy(sentinels, results, sizeof(results));
+    items[2].tag = 0xFFFFFFFFU;
+    if (interface_value->query(core, &batch, results, 3U) != KADATH_ERR_NOT_SUPPORTED ||
+        memcmp(results, sentinels, sizeof(results)) != 0) {
+        return 61;
+    }
+
+    /* Known tags must zero inactive union bytes, and borrowed ranges may not alias. */
+    memset(results, 0xA5, sizeof(results));
+    for (size_t index = 0; index < 3U; ++index) results[index].struct_size = (uint32_t)sizeof(results[index]);
+    memcpy(sentinels, results, sizeof(results));
+    items[0].tag = KADATH_RUNTIME_QUERY_STATE_INFO;
+    items[0].payload.entity_value = 1U;
+    if (interface_value->query(core, &batch, results, 3U) != KADATH_ERR_INVALID_ARGUMENT ||
+        memcmp(results, sentinels, sizeof(results)) != 0) {
+        return 63;
+    }
+    memset(results, 0xA5, sizeof(results));
+    for (size_t index = 0; index < 3U; ++index) results[index].struct_size = (uint32_t)sizeof(results[index]);
+    memcpy(sentinels, results, sizeof(results));
+    memset(&items[0], 0, sizeof(items[0]));
+    items[0].struct_size = (uint32_t)sizeof(items[0]);
+    items[0].tag = KADATH_RUNTIME_QUERY_FIND_BY_ID;
+    items[0].payload.object_id.data = (const uint8_t*)items;
+    items[0].payload.object_id.length = 1U;
+    memset(&items[1], 0, sizeof(items[1]));
+    items[1].struct_size = (uint32_t)sizeof(items[1]);
+    items[1].tag = KADATH_RUNTIME_QUERY_STATE_INFO;
+    memset(&items[2], 0, sizeof(items[2]));
+    items[2].struct_size = (uint32_t)sizeof(items[2]);
+    items[2].tag = KADATH_RUNTIME_QUERY_STATE_INFO;
+    if (interface_value->query(core, &batch, results, 3U) != KADATH_ERR_INVALID_ARGUMENT ||
+        memcmp(results, sentinels, sizeof(results)) != 0) {
+        return 64;
+    }
+    return interface_value->destroy(&core) == KADATH_OK ? 0 : 62;
+}
+
+static int arm_fault(kadath_runtime_core_t* core, uint32_t entry, uint32_t fault) {
+    kadath_runtime_test_fault_desc_t desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.struct_size = (uint32_t)sizeof(desc);
+    desc.entry = entry;
+    desc.fault = fault;
+    return kadath_runtime_core_test_arm_next_fault(core, &desc);
+}
+
+static int fault_containment(kadath_runtime_object_authority_interface_t* interface_value) {
+    kadath_runtime_core_create_desc_t create_desc;
+    kadath_runtime_core_t* prepare_core = NULL;
+    memset(&create_desc, 0, sizeof(create_desc));
+    create_desc.struct_size = (uint32_t)sizeof(create_desc);
+    if (interface_value->create(&create_desc, &prepare_core) != KADATH_OK) return 69;
+    kadath_runtime_source_object_desc_v1_t source;
+    kadath_runtime_scene_prepare_desc_t prepare_desc;
+    kadath_runtime_scene_candidate_info_t candidate_info;
+    kadath_runtime_scene_candidate_info_t candidate_sentinel;
+    fill_source(&source, "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
+    memset(&prepare_desc, 0, sizeof(prepare_desc));
+    memset(&candidate_info, 0xA5, sizeof(candidate_info));
+    prepare_desc.struct_size = (uint32_t)sizeof(prepare_desc);
+    prepare_desc.mode = KADATH_RUNTIME_PREPARE_INITIAL;
+    prepare_desc.bounds_max[0] = 100.0F;
+    prepare_desc.bounds_max[1] = 100.0F;
+    prepare_desc.source_objects = &source;
+    prepare_desc.source_object_count = 1U;
+    prepare_desc.source_object_stride = sizeof(source);
+    candidate_info.struct_size = (uint32_t)sizeof(candidate_info);
+    memcpy(&candidate_sentinel, &candidate_info, sizeof(candidate_info));
+    if (arm_fault(prepare_core, KADATH_RUNTIME_TEST_ENTRY_PREPARE, KADATH_RUNTIME_TEST_FAULT_ALLOCATION_FAILURE) != KADATH_OK ||
+        interface_value->prepare_scene(prepare_core, &prepare_desc, &candidate_info) != KADATH_ERR_OUT_OF_MEMORY ||
+        memcmp(&candidate_info, &candidate_sentinel, sizeof(candidate_info)) != 0 ||
+        interface_value->prepare_scene(prepare_core, &prepare_desc, &candidate_info) != KADATH_OK ||
+        interface_value->abort_scene(prepare_core) != KADATH_OK ||
+        interface_value->destroy(&prepare_core) != KADATH_OK) {
+        return 73;
+    }
+
+    kadath_runtime_core_t* core = NULL;
+    int create_result = create_live_core(interface_value, &core);
+    if (create_result != 0) return create_result;
+
+    kadath_runtime_query_item_v1_t query_item;
+    kadath_runtime_query_batch_t query_batch;
+    kadath_runtime_query_result_t query_result;
+    kadath_runtime_query_result_t query_sentinel;
+    memset(&query_item, 0, sizeof(query_item));
+    memset(&query_batch, 0, sizeof(query_batch));
+    memset(&query_result, 0xA5, sizeof(query_result));
+    query_item.struct_size = (uint32_t)sizeof(query_item);
+    query_item.tag = KADATH_RUNTIME_QUERY_FIND_BY_ID;
+    query_item.payload.object_id.data = (const uint8_t*)"player";
+    query_item.payload.object_id.length = 6U;
+    query_batch.struct_size = (uint32_t)sizeof(query_batch);
+    query_batch.target = KADATH_RUNTIME_TARGET_LIVE;
+    query_batch.items = &query_item;
+    query_batch.item_count = 1U;
+    query_batch.item_stride = sizeof(query_item);
+    query_result.struct_size = (uint32_t)sizeof(query_result);
+    memcpy(&query_sentinel, &query_result, sizeof(query_result));
+    if (arm_fault(core, KADATH_RUNTIME_TEST_ENTRY_QUERY, KADATH_RUNTIME_TEST_FAULT_PANIC_BEFORE_PUBLICATION) != KADATH_OK ||
+        interface_value->query(core, &query_batch, &query_result, 1U) != KADATH_ERR_INTERNAL ||
+        memcmp(&query_result, &query_sentinel, sizeof(query_result)) != 0) {
+        return 70;
+    }
+
+    kadath_runtime_mutation_item_v1_t mutation_item;
+    kadath_runtime_mutation_batch_t mutation_batch;
+    kadath_runtime_mutation_result_t mutation_result;
+    kadath_runtime_mutation_result_t mutation_sentinel;
+    memset(&mutation_item, 0, sizeof(mutation_item));
+    memset(&mutation_batch, 0, sizeof(mutation_batch));
+    memset(&mutation_result, 0xA5, sizeof(mutation_result));
+    mutation_item.struct_size = (uint32_t)sizeof(mutation_item);
+    mutation_item.tag = KADATH_RUNTIME_MUTATION_SET_BOUNDS;
+    mutation_item.payload.bounds.struct_size = (uint32_t)sizeof(mutation_item.payload.bounds);
+    mutation_item.payload.bounds.max[0] = 50.0F;
+    mutation_item.payload.bounds.max[1] = 50.0F;
+    mutation_batch.struct_size = (uint32_t)sizeof(mutation_batch);
+    mutation_batch.target = KADATH_RUNTIME_TARGET_LIVE;
+    mutation_batch.items = &mutation_item;
+    mutation_batch.item_count = 1U;
+    mutation_batch.item_stride = sizeof(mutation_item);
+    mutation_result.struct_size = (uint32_t)sizeof(mutation_result);
+    memcpy(&mutation_sentinel, &mutation_result, sizeof(mutation_result));
+    if (arm_fault(core, KADATH_RUNTIME_TEST_ENTRY_MUTATE, KADATH_RUNTIME_TEST_FAULT_ALLOCATION_FAILURE) != KADATH_OK ||
+        interface_value->mutate(core, &mutation_batch, &mutation_result, 1U) != KADATH_ERR_OUT_OF_MEMORY ||
+        memcmp(&mutation_result, &mutation_sentinel, sizeof(mutation_result)) != 0 ||
+        query_id(interface_value, core, "goal", &query_result) != KADATH_OK ||
+        query_result.payload.object.position[0] != 80.0F) {
+        return 71;
+    }
+    return interface_value->destroy(&core) == KADATH_OK ? 0 : 72;
+}
+
+typedef struct wrong_thread_context_t {
+    kadath_runtime_object_authority_interface_t* interface_value;
+    kadath_runtime_core_t* core;
+    int32_t result;
+} wrong_thread_context_t;
+
+static int call_core_on_wrong_thread(void* userdata) {
+    wrong_thread_context_t* context = (wrong_thread_context_t*)userdata;
+    context->result = context->interface_value->abort_scene(context->core);
+    return 0;
+}
+
+static int misuse_contract(kadath_runtime_object_authority_interface_t* interface_value) {
+    kadath_runtime_object_authority_interface_t probe;
+    kadath_runtime_object_authority_interface_t sentinel;
+    memset(&probe, 0xA5, sizeof(probe));
+    probe.struct_size = 4U;
+    probe.interface_version = KADATH_RUNTIME_OBJECT_AUTHORITY_INTERFACE_V1;
+    memcpy(&sentinel, &probe, sizeof(probe));
+    if (kadath_runtime_core_query_object_authority_interface(NULL) != KADATH_ERR_INVALID_ARGUMENT ||
+        kadath_runtime_core_query_object_authority_interface(&probe) != KADATH_ERR_INVALID_ARGUMENT ||
+        memcmp(&probe, &sentinel, sizeof(probe)) != 0) {
+        return 80;
+    }
+    memset(&probe, 0, sizeof(probe));
+    probe.struct_size = (uint32_t)sizeof(probe);
+    probe.interface_version = 0xFFFFFFFFU;
+    memcpy(&sentinel, &probe, sizeof(probe));
+    if (kadath_runtime_core_query_object_authority_interface(&probe) != KADATH_ERR_NOT_SUPPORTED ||
+        memcmp(&probe, &sentinel, sizeof(probe)) != 0) {
+        return 81;
+    }
+
+    kadath_runtime_core_create_desc_t create_desc;
+    kadath_runtime_core_t* core = (kadath_runtime_core_t*)(uintptr_t)0x1U;
+    memset(&create_desc, 0, sizeof(create_desc));
+    create_desc.struct_size = 4U;
+    if (interface_value->create(&create_desc, &core) != KADATH_ERR_INVALID_ARGUMENT ||
+        core != (kadath_runtime_core_t*)(uintptr_t)0x1U ||
+        interface_value->destroy(NULL) != KADATH_ERR_INVALID_ARGUMENT) {
+        return 82;
+    }
+    core = NULL;
+    if (interface_value->destroy(&core) != KADATH_OK) return 83;
+    int create_result = create_live_core(interface_value, &core);
+    if (create_result != 0) return create_result;
+    if (interface_value->abort_scene(core) != KADATH_OK ||
+        interface_value->commit_scene(core) != KADATH_ERR_RUNTIME_INVALID_STATE) {
+        return 84;
+    }
+    wrong_thread_context_t context = { interface_value, core, KADATH_OK };
+    thrd_t thread;
+    int thread_result = 0;
+    if (thrd_create(&thread, call_core_on_wrong_thread, &context) != thrd_success ||
+        thrd_join(thread, &thread_result) != thrd_success || thread_result != 0 ||
+        context.result != KADATH_ERR_RUNTIME_WRONG_THREAD) {
+        return 85;
+    }
+    return interface_value->destroy(&core) == KADATH_OK ? 0 : 86;
+}
+
+int main(void) {
+    kadath_runtime_object_authority_interface_t interface_value = query_interface();
+    if (interface_value.create == NULL || interface_value.destroy == NULL ||
+        interface_value.prepare_scene == NULL || interface_value.commit_scene == NULL ||
+        interface_value.abort_scene == NULL || interface_value.query == NULL ||
+        interface_value.mutate == NULL) {
+        return 1;
+    }
+    int normal_result = normal_path(&interface_value);
+    if (normal_result != 0) {
+        return normal_result;
+    }
+    int transient_result = transient_lifecycle(&interface_value);
+    if (transient_result != 0) {
+        return transient_result;
+    }
+    int restart_result = restart_and_reload(&interface_value);
+    if (restart_result != 0) {
+        return restart_result;
+    }
+    int world_result = world_and_position_batch(&interface_value);
+    if (world_result != 0) return world_result;
+    int activation_result = activation_batch_atomic(&interface_value);
+    if (activation_result != 0) return activation_result;
+    int query_result = query_batch_atomic(&interface_value);
+    if (query_result != 0) return query_result;
+    int fault_result = fault_containment(&interface_value);
+    if (fault_result != 0) return fault_result;
+    return misuse_contract(&interface_value);
+}
