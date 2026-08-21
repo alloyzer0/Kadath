@@ -1,10 +1,11 @@
-# Kadath C4 容器与核心组件图
+# Kadath C4 Runtime 容器与核心 Module
 
 ## 元信息
 
-- **状态**: 已确认
-- **日期**: 2026-06-04
-- **主题**: Kadath 的轻量容器 / 组件合并图
+- **状态**: 已确认；2026-08-21 ownership 对账更新
+- **初始日期**: 2026-06-04
+- **更新日期**: 2026-08-21
+- **主题**: Kadath Runtime 当前态、目标态与迁移 seam
 - **依据**:
   - `ADR-0002`: 构建系统与项目结构
   - `ADR-0004`: RHI 抽象粒度
@@ -12,164 +13,244 @@
   - `ADR-0006`: 编辑器与 Runtime 边界
   - `ADR-0007`: 资源加载与资产边界
   - `ADR-0008`: 调度 / 执行模型
+  - `ADR-0009`: Rust / Zig Runtime Ownership 对账
 
 ---
 
-## 1. 目标
+## 1. 目标与读图规则
 
-这张图采用比标准 C4 更轻的表达方式，把：
+本文同时记录：
 
-- 物理容器边界
-- Runtime 内部核心组件关系
+- **CURRENT**：截至 `P2-Runtime-Object-Lifecycle-01` candidate `bfc5504` 的实现事实；
+- **TARGET**：完成 `ADR-0009` 分阶段迁移后的目标 ownership；
+- **MIGRATION**：从 CURRENT 到 TARGET 的固定点顺序。
 
-合并在一张图里，服务于当前 `M0-M3` 阶段的工程讨论。
-
-它的重点不是穷举未来所有模块，而是固定：
-
-- Runtime 作为单一可执行入口时，内部的主要职责如何分层
-- Future Editor 与 Future Asset Tool 在物理上与 Runtime 如何相邻
-- 哪些组件处在主路径上，哪些组件是后续增强位点
+目标态在对应代码候选合并前不得改写成当前态。图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。
 
 ---
 
-## 2. 容器与核心组件图
+## 2. CURRENT：`bfc5504` 当前实现
 
 ```mermaid
 graph TD
-    subgraph Runtime["Kadath Runtime（当前主路径容器）"]
-        Host["Default Host / App<br/>主循环与生命周期驱动"]
-        Platform["Platform<br/>窗口、输入、时钟、文件 I/O"]
-        Scheduler["Scheduler<br/>后台任务与异步工作协作"]
-        Resource["Resource System<br/>逻辑资源标识、资源源、运行时加载"]
-        World["World<br/>实体、组件、系统、运行态"]
-        Collision["Collision<br/>2D 碰撞与触发器"]
-        Audio["Audio<br/>播放、混合、运行时音频对象"]
-        Renderer2D["Renderer2D<br/>精灵、瓦片、批处理、调试绘制"]
-        RHI["RHI<br/>GPU 资源、命令、同步"]
-        Memory["Memory<br/>分配策略与生命周期基础设施"]
+    subgraph Editor["Editor Container"]
+        CSharpEditor["C# Editor / Workspace / Service / Avalonia"]
     end
 
-    subgraph Editor["Editor Container（Runtime 外部容器）"]
-        EditorUI["Thin Authoring Shell<br/>未来 Scene / Inspector / Preview UI"]
-    end
-
-    subgraph AssetTool["Future Asset Tool（未来容器）"]
+    subgraph AssetTool["Asset Tool Container"]
         ImportBake["Importer / Baker / Packager"]
     end
 
-    RuntimeAssets["Runtime Assets<br/>目录 / Archive / 未来 .kpack"]
+    subgraph Runtime["Kadath Runtime 当前容器"]
+        ZigHost["Zig Host<br/>进程、主循环、阶段调用、产品生命周期"]
+        ZigPlatform["Zig Platform / Input / Clock"]
+        ZigMemory["Zig Memory / Allocator Policy"]
+        ZigResource["Zig Resource / Package Adapter"]
+        ZigScene["Zig SceneGeneration<br/>Scene 对象映射与 reload 编排"]
+        ZigBehavior["Zig BehaviorHost<br/>fixed/update/event 与结构提交"]
+        ZigRegistry["Zig RuntimeObjectRegistry<br/>transient ObjectId / generation / stale"]
+        LuauBridge["C++ / Zig Luau Bridge"]
+        RustWorld["Rust World<br/>Sprite Entity 存储与 fixed-step"]
+        RustScheduler["Rust Scheduler<br/>bounded read worker"]
+        ZigRenderer["Zig Renderer2D / RHI"]
+        ZigAudio["Zig Audio"]
+    end
 
-    Host --> Platform
-    Host --> Scheduler
-    Host --> Resource
-    Host --> World
-    Host --> Renderer2D
-    Host --> Audio
+    RuntimeAssets["Runtime Assets / KDAT / KSCN / KSCP"]
 
-    Platform --> RHI
-    Platform --> Resource
-    Memory --> Platform
-    Memory --> Resource
-    Memory --> World
-    Memory --> RHI
-
-    Resource -.submit async load.-> Scheduler
-    World -.M3+ async prep / jobs.-> Scheduler
-
-    Resource --> RuntimeAssets
-    Resource --> Renderer2D
-    Resource --> Audio
-    Resource -.future scene/prefab loading.-> World
-
-    World --> Collision
-    World --> Renderer2D
-
-    Renderer2D --> RHI
-
-    EditorUI -.future coarse control / preview.-> Host
-    EditorUI -.future scene & resource refs.-> Resource
-    EditorUI -.future debug draw / overlay.-> Renderer2D
-
+    CSharpEditor -->|"Scene / Publication / Preview"| ZigHost
+    CSharpEditor -->|"Import / Bake / Package"| ImportBake
     ImportBake --> RuntimeAssets
-    EditorUI -.future trigger import/build.-> ImportBake
+    RuntimeAssets --> ZigResource
+    ZigHost --> ZigPlatform
+    ZigMemory --> ZigHost
+    ZigMemory --> ZigResource
+    ZigMemory --> ZigRenderer
+    ZigHost --> ZigResource
+    ZigHost --> ZigScene
+    ZigHost --> ZigBehavior
+    ZigHost --> ZigAudio
+    ZigScene --> ZigRegistry
+    ZigBehavior --> ZigRegistry
+    ZigBehavior --> LuauBridge
+    ZigScene -->|"Zig C ABI Adapter"| RustWorld
+    ZigResource --> RustScheduler
+    RustWorld -->|"Render Sprite extraction"| ZigRenderer
+    ZigResource --> ZigRenderer
 ```
 
----
+### 2.1 当前职责
 
-## 3. 读图说明
+- `Zig Host` 已经是实际组合根，拥有 Platform pump、Clock、fixed accumulator、reload/restart 外层事务和产品生命周期；
+- `Zig SceneGeneration` 拥有 Scene Object 到 Rust Entity 的映射，并编排 source/artifact generation；
+- `Zig BehaviorHost` 拥有双时钟 callback、ObjectRef Adapter、event FIFO、Activation Overlay 和 Structural Flush；
+- `Zig RuntimeObjectRegistry` 拥有动态 ObjectId、generation、stale、spawn/despawn reservation 与预算；
+- `Rust World` 拥有 Sprite Entity 存储、位置、bounds、fixed-step、spawn/despawn 与 render extraction；
+- `Rust Scheduler` 是隔离的异步读取 Module，不拥有主线程 Runtime 推进；
+- `Zig Memory / Allocator Policy` 保留原 C4 的底层内存职责；当前实现可以分散使用显式 allocator，不宣称已经存在一个成熟的独立 Memory Module；
+- `C# Editor`、Asset Tool pipeline 与 `Luau Behavior` 已是实际产品入口，不再是 Future 组件。
 
-### 3.1 Runtime 是当前唯一主路径容器
+### 2.2 当前架构债务
 
-当前真正先落地的物理容器是 `Kadath Runtime`。
-
-它内部最重要的驱动关系是：
-
-- `Host` 负责生命周期和帧推进
-- `World` 负责运行态语义
-- `Renderer2D` 与 `Audio` 负责主要输出
-- `Resource` 负责把逻辑资源引用解析成可消费运行时对象
-- `Platform` 是 Runtime 内部对外部目标平台的适配层，对接 `C4-Context` 中的窗口、输入、时钟、文件 I/O、GPU 与音频设备等平台能力
-- `RHI` 只提供图形底层抽象，不吸收高层渲染和编辑器职责
-
-### 3.2 `Host` 是默认宿主，而不是业务核心
-
-`Host` 对应 `ADR-0006` 与 `ADR-0008` 中的“默认宿主”概念：
-
-- 它驱动主循环、阶段切分和外层生命周期
-- 它不是世界逻辑、资源导入或渲染策略本身
-- Future Editor 若要接管 Runtime，本质上是替换或包裹这一层宿主职责
-
-### 3.3 `Scheduler` 与执行模型不是一回事
-
-图中单列 `Scheduler`，是为了强调：
-
-- 它承担后台任务执行与异步工作协作基础设施
-- `Resource` 是最先、最自然会向它提交后台加载工作的组件
-- `World` 若未来出现后台准备或批处理任务，也应通过受控任务提交接近它
-- 但它不等于主线程上的 Runtime 权威推进顺序
-
-换句话说：
-
-- `ADR-0008` 锁的是 `Host` 如何推进 Runtime
-- `Scheduler` 只是在 `M3+` 之后开始帮助处理异步工作
-
-### 3.4 `Resource` 是 Runtime 与工具链的汇合边界
-
-`Resource System` 当前既面向 Runtime，也面向未来 `Asset Tool` 的产物。
-
-它承担的核心职责是：
-
-- 管理逻辑资源身份
-- 对接资源源 / 运行时资源包
-- 实例化纹理、音频、场景相关运行时对象
-
-它不承担：
-
-- 完整 importer / baker 语义
-- 编辑器资产管理 UI
-- 底层 GPU 提交
-
-### 3.5 Editor（当前薄 authoring shell）与 Future Asset Tool 是外部容器
-
-它们都在图上出现，但被明确放在 Runtime 外部：
-
-- 当前薄 authoring shell 已通过 Authoring CLI 和 Preview Protocol 以粗粒度方式接近 Runtime；未来完整 Editor 可继续扩展场景 / 资源引用与调试绘制协作
-- `Future Asset Tool` 未来负责导入、烘焙、打包，再把运行时产物交给 `Resource System`
-
-这样既保留了扩展路径，也不会污染当前主路径。
+World 对象语义横跨 `SceneGeneration`、`BehaviorHost`、`RuntimeObjectRegistry` 与 Rust `World`。它们没有直接共享私有容器，但调用方必须理解多个 Module 的顺序、identity 和 failure domain，导致 Object Authority 与 Phase Commit 缺少单一深 Interface。
 
 ---
 
-## 4. 当前锁定的结构结论
+## 3. TARGET：Zig Host + Rust Runtime Core
 
-- `Host -> World / Resource / Renderer2D / Audio` 是当前最重要的主路径骨架。
-- `Platform -> RHI` 是图形和窗口的底层桥接路径。
-- `Resource` 是 Runtime 与未来工具链之间最关键的稳定边界之一。
-- `World` 与 `Renderer2D` 协作，但 `Renderer2D` 不反向支配世界更新语义。
-- 当前薄 authoring shell、未来完整 Editor 和 `Future Asset Tool` 都有清晰接入位点，但 GUI 不改变 Runtime 核心职责。
+```mermaid
+graph TD
+    subgraph Editor["Editor Container"]
+        CSharpEditor["C# Editor / Workspace / Service / Avalonia"]
+    end
+
+    subgraph AssetTool["Asset Tool Container"]
+        ImportBake["Importer / Baker / Packager"]
+    end
+
+    subgraph Runtime["Kadath Runtime 目标容器"]
+        ZigHost["Zig Host<br/>进程、平台节奏、设备与产品生命周期"]
+        ZigPlatform["Zig Platform / Input / Clock"]
+        ZigMemory["Zig Memory / Allocator Policy"]
+        ZigResource["Zig Resource / Artifact Adapter"]
+        ZigLuauAdapter["Zig / C++ Luau Adapter"]
+        ZigCoreAdapter["Zig Runtime Core Adapter<br/>稳定 C ABI + 版本化接口描述符"]
+        RustCore["Rust Runtime Core<br/>Object Authority / Phase Commit / Gameplay"]
+        Snapshot["Caller-owned Render / Event Snapshot"]
+
+        RustScheduler["Rust Scheduler<br/>受控后台工作"]
+        ZigRenderer["Zig Renderer2D / RHI"]
+        ZigAudio["Zig Audio"]
+    end
+
+    RuntimeAssets["Runtime Assets / KDAT / KSCN / KSCP"]
+
+    CSharpEditor -->|"Scene / Publication / Preview"| ZigHost
+    CSharpEditor -->|"Import / Bake / Package"| ImportBake
+    ImportBake --> RuntimeAssets
+    RuntimeAssets --> ZigResource
+    ZigHost --> ZigPlatform
+    ZigMemory --> ZigHost
+    ZigMemory --> ZigResource
+    ZigMemory --> ZigCoreAdapter
+    ZigMemory --> ZigRenderer
+    ZigHost --> ZigResource
+    ZigHost --> ZigLuauAdapter
+    ZigHost --> ZigCoreAdapter
+    ZigHost --> ZigAudio
+    ZigLuauAdapter -->|"phase-bound ObjectRef"| ZigCoreAdapter
+    ZigCoreAdapter --> RustCore
+    RustCore --> Snapshot
+    ZigResource -->|"completion at controlled sync point"| ZigCoreAdapter
+    RustScheduler -->|"bounded completion"| ZigCoreAdapter
+    Snapshot -->|"caller-owned snapshot"| ZigRenderer
+    ZigResource --> ZigRenderer
+```
+
+### 3.1 目标职责
+
+- `Zig Host` 决定 **何时** pump、fixed、update、event、extract 和 render；
+- `Rust Runtime Core` 决定阶段内 World 状态 **如何** 变化；
+- `Rust Runtime Core` 在自己的单一外部 Interface 后隐藏 Object Authority、Phase Commit、World、Collision 与 Gameplay，图中不暴露这些内部实现之间的调用链；
+- Runtime Core 内部的 `Object Authority` 唯一拥有 ObjectId、Entity、generation、source/transient 与 stale；
+- Runtime Core 内部的 `Phase Commit` 唯一拥有 mutation、结构请求、事件、预算和 failure domain；
+- `World / Collision / Gameplay` 不依赖 Window、RHI、Editor 或 Luau VM layout；
+- `Snapshot` 是 Renderer 与事件消费者的只读输出，不允许反向修改 Runtime Core；
+- `Zig Runtime Core Adapter` 只做 preflight、类型转换、调用编排和错误映射，不复制 state machine。
 
 ---
 
-## 5. 一句话结论
+## 4. Ownership 对照
 
-Kadath 当前的轻量容器 / 组件结构是：**以 `Host` 驱动 Runtime 主循环，以 `World + Resource + Renderer2D + Audio` 组成主路径，以 `Platform + RHI + Memory` 提供底层支撑，并为当前薄 authoring shell、未来完整 Editor 与 Asset Tool 预留外部接入边界。**
+| 运行时事实 | CURRENT | TARGET | 迁移增量 |
+|---|---|---|---|
+| 进程、窗口、时钟、fixed accumulator | Zig Host | Zig Host | 不迁移 |
+| Memory / allocator policy | Zig 显式 allocator | Zig 显式 allocator | 不迁移 |
+| RHI、Renderer、Audio、Resource I/O | Zig | Zig | 不迁移 |
+| Scene/KSCN/KSCP 解码 | Zig | Zig Adapter | 不迁移 authority |
+| Sprite Entity 存储 | Rust World | Rust Runtime Core | Object Authority |
+| ObjectId→Entity 映射 | Zig SceneGeneration | Rust Runtime Core | Object Authority |
+| transient ObjectId / generation / stale | Zig Registry | Rust Runtime Core | Object Authority |
+| spawn/despawn 生命周期 | Zig Registry + Rust World | Rust Runtime Core | Object Authority |
+| Scene candidate Runtime state prepare/commit/abort | Zig Host/SceneGeneration | Rust Runtime Core；Zig Host 保留跨 Module 外层编排 | Object Authority |
+| restart Runtime object replacement | Zig Host/SceneGeneration | Rust Runtime Core | Object Authority |
+| fixed/frame structure queue | Zig BehaviorHost | Rust Runtime Core | Phase Commit |
+| 对象、实例、结构、事件预算 | Zig BehaviorHost/Registry | Rust Runtime Core | Phase Commit |
+| collision/contact | Zig SceneGeneration/Contact | Rust Runtime Core | Gameplay |
+| GameSession / demo gameplay | Zig Host/SceneGeneration | Rust Runtime Core | Gameplay |
+| Render extraction | Rust World + Zig ordering | Rust snapshot → Zig Renderer | Gameplay |
+| Runtime 调用时机 | Zig Host | Zig Host | 不迁移 |
+| Editor authoring/read-model | C# | C# | 不迁移 |
+| Behavior source | Luau | Luau | 不迁移 |
+| Luau native bridge | C++/Zig | C++/Zig Adapter | 不扩张 |
+| Importer / Baker / Packager | Editor/Asset Tool pipeline | Runtime 外部 Asset Tool | 不迁入 Runtime Core |
+
+---
+
+## 5. 外部 seam
+
+Rust Runtime Core 通过稳定 C ABI + 版本化接口描述符提供一个深 Interface。具体函数表由 `P1-Rust-Runtime-Core-Object-Authority-01` 冻结，但必须满足：
+
+- opaque handle；
+- 不设置构建产物级全局 ABI version；descriptor、callback table 和 snapshot 使用 `struct_size`，只有语义不兼容时才使用各自 `interface_version`；
+- size/reserved preflight；
+- caller-owned descriptor、batch 与 snapshot buffer；
+- count/length/alignment/enum 全量校验；
+- Rust panic 不穿越 ABI；
+- 错误无未声明部分提交；
+- 不暴露 Rust collection、reference、trait object 或 allocator layout；
+- 不为每个内部字段建立长期 getter/setter 扇出。
+
+Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调用 Runtime Core；合法性、stale 和 mutation 规则只能由 Runtime Core 裁决。
+
+---
+
+## 6. MIGRATION 固定点
+
+### 6.1 当前固定点
+
+- `e1a9313`：Behavior 双阶段对象与事件 API 已进入 Inner main；
+- `bfc5504`：Runtime Object Lifecycle candidate，作为对象生命周期行为 oracle；
+- 当前 C4 的 CURRENT 图以 `bfc5504` 为准，不能将 TARGET 图解释为已经实现。
+
+### 6.2 迁移顺序
+
+1. `P1-Rust-Runtime-Core-Object-Authority-01`：迁移 ObjectId/Entity/generation/lifecycle、Runtime state candidate prepare/commit/abort 与 restart replacement，并删除 Zig Registry authority；
+2. `P1-Rust-Runtime-Core-Phase-Commit-01`：迁移 phase queue、结构提交、事件与预算；
+3. `P1-Rust-Runtime-Core-Gameplay-01`：迁移 collision/contact、GameSession 与 snapshot authority。
+
+每个增量必须：
+
+- 独立 contract discovery 与 `GO_IMPLEMENT`；
+- 使用前一固定点行为作为 oracle；
+- 在同一 candidate 删除被替换 authority；
+- 通过 Rust/public C/Zig focused 与 Linux 产品矩阵；
+- 不以 Linux 证据宣告 Windows 产品验收；
+- 不修改 `.scratch/` 或新增 PowerShell 脚本。
+
+---
+
+## 7. Scheduler 与后台工作
+
+`Scheduler` 与 Runtime phase authority 仍是不同 Module：
+
+- Host 选择 completion ingestion 同步点；
+- Runtime Core 决定 completion 如何影响 World state；
+- Scheduler worker 不直接持有 World、Renderer、RHI 或 Editor state；
+- 没有第二个真实消费者前，不扩张为线程池、task graph 或 async runtime。
+
+---
+
+## 8. 结构结论
+
+1. CURRENT 是 Zig 高层 orchestration + Rust Sprite World 的分裂 ownership；它是迁移起点，不是目标架构；
+2. TARGET 是 Zig Host + Rust Runtime Core，Host 拥有 timing，Core 拥有 state transition；
+3. Editor、Luau 和 Renderer 只通过 Adapter/snapshot 接近 Runtime Core；
+4. 迁移采用替换而不是叠层，同一事实禁止双 authority；
+5. 架构验收基于 ownership、Interface Depth、旧状态删除和产品等价，不基于语言行数。
+
+---
+
+## 9. 一句话结论
+
+Kadath 当前以 Zig Host/Scene/Behavior 编排 Rust Sprite World；目标是在保留 Zig 平台与产品优势的同时，用版本化 coarse C ABI 将 Object Authority、Phase Commit 和 Gameplay 逐步收敛到 Rust Runtime Core，并在每个固定点删除对应 Zig authority。

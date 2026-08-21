@@ -484,8 +484,43 @@ Kadath 的执行模型采用 **“外层变频驱动 + 内层固定步长模拟 
 
 ---
 
-## 10. 审阅记录
+## 10. 2026-08-21 补充：Phase timing 与 state transition ownership
+
+本节由 `ADR-0009` 触发，补充当前 Zig Host、Behavior phase 与目标 Rust Runtime Core 的职责。原有双时钟、固定步长、受控同步点和 render 只读消费原则继续有效。
+
+### 10.1 Zig Host 长期负责
+
+- Platform event pump 与 Input Snapshot；
+- 单调时钟、variable frame `dt` 与 fixed accumulator；
+- 每帧执行 0..N 个 fixed step 的选择；
+- fixed/update/event/render 的外层调用顺序；
+- Window、RHI、Audio、Resource completion 与进程生命周期；
+- Runtime Core C ABI Adapter 的调用与产品级错误映射。
+
+### 10.2 Rust Runtime Core 长期负责
+
+- fixed/frame phase 内 ObjectRef 的合法性和对象 state transition；
+- structural/event queue、预算、代际和 failure domain；
+- World fixed-step、collision/contact 与 gameplay state；
+- restart/reload candidate Runtime state 的 prepare/commit/abort；
+- phase 完成后供 Renderer 消费的只读 snapshot。
+
+### 10.3 当前态与迁移态
+
+截至 `bfc5504`，Behavior phase、结构队列和 Runtime Object Registry 仍在 Zig。文档不得把目标 Rust ownership 写成已经完成。迁移按 Object Authority → Phase Commit → Gameplay/Collision 执行，每个增量必须保持：
+
+- Host 仍决定“何时推进”；
+- Runtime Core 逐步接管“状态如何推进”；
+- 同一 phase state 只有一个 writer；
+- Renderer 不触发 gameplay mutation；
+- Scheduler completion 只在 Host 选择的同步点回流；
+- 不借迁移引入 Parallel Luau、多线程 World 或新的 async runtime。
+
+---
+
+## 11. 审阅记录
 
 - 2026-06-04: 初稿，待主导者审阅
 - 2026-06-04: 主导者确认当前方向可采纳，状态调整为“已采纳”
 - 2026-06-04: 补充补偿步次数上限、插值边界具体化与后台结果回流伪代码示意，不改变已采纳方向
+- 2026-08-21: 根据 `ADR-0009` 明确 Zig Host 拥有 phase timing、Rust Runtime Core 逐步接管 phase state transition，并要求 CURRENT/TARGET 分离记录。

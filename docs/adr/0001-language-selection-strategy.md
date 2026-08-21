@@ -239,7 +239,25 @@
 
 ---
 
+## 2026-08-21 补充：Runtime ownership 对账
+
+本节是带日期的补充，不追溯修改 2026-05-27 至 2026-06-04 的原始判断。当前语言与产品事实已由 `ADR-0009` 重新对账：
+
+1. Zig + Rust 仍是 Runtime 核心的双语言策略，但不设置代码行数、文件数或提交数配额；
+2. Zig 长期拥有 Host、Platform、RHI、Audio/Resource 设备与 I/O、产品装配和外部 Adapter；
+3. Rust 长期拥有内部 Runtime Core，包括 World Object Authority、生命周期、阶段事务、collision/gameplay 与只读 snapshot；
+4. 当前开发者入口已经是 C# Editor/Scene Authoring + Luau Behavior，不再要求项目开发者直接编写 Rust API；Rust 仍是高层 Runtime 语义的内部权威实现；
+5. C# Editor 位于 Runtime 外部容器；C++ 仅作为 vendored Luau/native bridge Adapter，不扩张为第三套 Runtime 核心；
+6. “两种语言都可实现时优先 Zig”不得再越过 ownership 门禁：World/Object/Gameplay/复杂阶段状态默认进入 Rust Runtime Core，OS/设备/I/O/产品装配默认进入 Zig；
+7. 高频跨语言协作应通过 coarse descriptor、batch 和 snapshot 深化 Interface，而不是把 authority 留在调用侧；
+8. `P2-Runtime-Object-Lifecycle-01` 候选 `bfc5504` 保留为行为固定点，后续按 `ADR-0009` 增量迁移，不进行一次性重写。
+
+此后新增 Runtime 模块或扩张既有模块时，语言选择必须同时满足本 ADR 与 `ADR-0009`；若冲突，以日期更新且更具体的 `ADR-0009` 为准。
+
+---
+
 ## 审阅记录
 
 - 2026-05-27: 初稿，待主导者审阅
 - 2026-06-04: 主导者确认采用，状态调整为“已采纳”
+- 2026-08-21: 增加 Runtime ownership 对账补充；保留双语言方向，禁止 LOC 配额，并由 `ADR-0009` 明确 Zig Host / Rust Runtime Core 的长期职责。

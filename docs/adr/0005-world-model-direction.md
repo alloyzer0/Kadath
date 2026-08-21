@@ -439,8 +439,33 @@ Kadath 的世界模型采用 **“对外 OOP 语义为主，内部热点路径�
 
 ---
 
-## 11. 审阅记录
+## 11. 2026-08-21 补充：World 外部语义与内部 authority
+
+本节由 `ADR-0009` 触发，补充当前 Scene、Editor 与 Luau 已经落地后的 World 使用方式；原有“对象/实体导向外部语义 + 内部热点数据导向”的决策继续有效。
+
+### 11.1 当前事实
+
+- 项目开发者主要通过 Scene Authoring、C# Editor 与 Luau `ObjectRef` 使用 World 语义，而不是直接链接 Rust crate；
+- Rust `world` 当前拥有 Sprite Entity 存储和基本 fixed-step；
+- Zig `SceneGeneration`、`BehaviorHost` 与 `RuntimeObjectRegistry` 当前拥有 ObjectId 映射、phase mutation、动态对象生命周期和 stale 语义；
+- 该分布是迁移起点，不是长期双 authority 目标。
+
+### 11.2 目标裁决
+
+- Rust Runtime Core 是 ObjectId、Runtime Entity、generation、source/transient 生命周期和 gameplay state 的唯一内部 authority；
+- Scene、Editor 与 Luau 继续消费对象/实体导向语义，但只通过版本化外部 Interface 和 Adapter，不依赖 Rust layout；
+- Zig Host 决定 phase 调用时机，Rust Runtime Core 决定 phase 内 World state transition；
+- Renderer 只消费 caller-owned snapshot，不反向读取 World 容器；
+- 迁移必须在每个增量中删除对应 Zig authority，禁止长期保留 Zig Registry + Rust Registry 双写；
+- 是否采用 ECS、稠密组件池或其它数据布局仍是 Rust Runtime Core 的私有 Implementation 决策，不进入 Scene/Luau/Editor Interface。
+
+因此，本文早期“开发者主要通过 Rust API”应按今天的产品形态理解为：**开发者使用的稳定对象语义由 Rust Runtime Core 统一实现和约束，但实际入口可以是 Scene、Luau 或 Editor Adapter。**
+
+---
+
+## 12. 审阅记录
 
 - 2026-05-27: 初稿，待主导者审阅
 - 2026-06-02: 按 Phase 1 定稿前评审计划补充 `P4` 回答、周边子系统边界、首个实现前冻结项与定稿评审结果，状态调整为“已完成一致性评审，待主导者审阅”
 - 2026-06-03: 主导者确认 `ADR-0005` 方向基本可以确定，状态调整为“已采纳”
+- 2026-08-21: 根据 `ADR-0009` 补充 Scene/Luau/Editor 外部入口与 Rust Runtime Core 内部 authority，明确当前分裂状态只是迁移起点。
