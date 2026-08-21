@@ -41,7 +41,7 @@ struct KadathLuauInstance
     int32_t move_x = 0;
     int32_t move_y = 0;
     bool input_context_active = false;
-    const KadathLuauHostV3* active_host_v3 = nullptr;
+    const KadathLuauHostV4* active_host_v4 = nullptr;
     KadathLuauTranslateCommand pending_commands[KADATH_LUAU_MAX_COMMAND_COUNT] = {};
     size_t pending_command_count = 0;
 };
@@ -131,16 +131,18 @@ static KadathLuauInstance* instance_from_upvalue(lua_State* state)
     return static_cast<KadathLuauInstance*>(lua_touserdata(state, lua_upvalueindex(1)));
 }
 
-static bool host_v3_valid(const KadathLuauHostV3* host)
+static bool host_v4_valid(const KadathLuauHostV4* host)
 {
     return host != nullptr &&
         host->version == KADATH_LUAU_HOST_INTERFACE_VERSION &&
-        host->struct_size >= sizeof(KadathLuauHostV3) &&
+        host->struct_size >= sizeof(KadathLuauHostV4) &&
         host->world_epoch > 0 && host->world_epoch <= 9007199254740991ULL &&
         host->resolve_object != nullptr &&
         host->get_object_position != nullptr &&
         host->set_object_position != nullptr &&
-        host->post_event != nullptr;
+        host->post_event != nullptr &&
+        host->spawn_object != nullptr &&
+        host->destroy_object != nullptr;
 }
 
 static bool valid_object_handle(const KadathLuauObjectHandle& object, uint64_t expected_world_epoch)
@@ -181,17 +183,17 @@ static bool object_id_from_table(lua_State* state, int index, const char*& objec
 
 static bool resolve_object_ref(lua_State* state, KadathLuauInstance* instance, int index, KadathLuauObjectHandle& object)
 {
-    if (instance == nullptr || instance->active_host_v3 == nullptr)
+    if (instance == nullptr || instance->active_host_v4 == nullptr)
         return false;
     const char* object_id = nullptr;
     size_t object_id_length = 0;
     uint64_t world_epoch = 0;
     uint64_t logical_generation = 0;
     if (!object_id_from_table(state, index, object_id, object_id_length, world_epoch, logical_generation) ||
-        world_epoch != instance->active_host_v3->world_epoch)
+        world_epoch != instance->active_host_v4->world_epoch)
         return false;
-    if (!instance->active_host_v3->resolve_object(instance->active_host_v3->userdata, object_id, object_id_length, &object) ||
-        !valid_object_handle(object, instance->active_host_v3->world_epoch))
+    if (!instance->active_host_v4->resolve_object(instance->active_host_v4->userdata, object_id, object_id_length, &object) ||
+        !valid_object_handle(object, instance->active_host_v4->world_epoch))
         return false;
     return valid_object_handle(object, world_epoch) && object.logical_generation == logical_generation;
 }
@@ -248,14 +250,6 @@ static int self_id(lua_State* state)
     uint64_t logical_generation = 0;
     if (!object_id_from_table(state, 1, object_id, object_id_length, world_epoch, logical_generation))
         return raise_host_error(state, "invalid behavior object reference");
-    if (instance->active_host_v3 != nullptr)
-    {
-        KadathLuauObjectHandle object{};
-        if (!resolve_object_ref(state, instance, 1, object))
-            return raise_host_error(state, "behavior object reference is stale or unknown");
-        object_id = object.object_id;
-        object_id_length = object.object_id_length;
-    }
     lua_pushlstring(state, object_id, object_id_length);
     return 1;
 }
@@ -263,8 +257,8 @@ static int self_id(lua_State* state)
 static int self_is_valid(lua_State* state)
 {
     auto* instance = instance_from_upvalue(state);
-    if (instance == nullptr || instance->active_host_v3 == nullptr)
-        return raise_host_error(state, "behavior object access is unavailable outside a Host v3 hook");
+    if (instance == nullptr || instance->active_host_v4 == nullptr)
+        return raise_host_error(state, "behavior object access is unavailable outside a Host v4 hook");
     KadathLuauObjectHandle object{};
     lua_pushboolean(state, resolve_object_ref(state, instance, 1, object));
     return 1;
@@ -298,11 +292,11 @@ static int self_position(lua_State* state)
     }
     double position_x = instance->position_x;
     double position_y = instance->position_y;
-    if (instance->active_host_v3 != nullptr)
+    if (instance->active_host_v4 != nullptr)
     {
         KadathLuauObjectHandle object{};
         if (!resolve_object_ref(state, instance, 1, object) ||
-            !instance->active_host_v3->get_object_position(instance->active_host_v3->userdata, &object, &position_x, &position_y) ||
+            !instance->active_host_v4->get_object_position(instance->active_host_v4->userdata, &object, &position_x, &position_y) ||
             !std::isfinite(position_x) || !std::isfinite(position_y))
             return raise_host_error(state, "behavior object position is unavailable");
     }
@@ -317,8 +311,8 @@ static int self_position(lua_State* state)
 static int self_set_position(lua_State* state)
 {
     auto* instance = instance_from_upvalue(state);
-    if (instance == nullptr || instance->active_host_v3 == nullptr)
-        return raise_host_error(state, "behavior object mutation is unavailable outside a Host v3 hook");
+    if (instance == nullptr || instance->active_host_v4 == nullptr)
+        return raise_host_error(state, "behavior object mutation is unavailable outside a Host v4 hook");
     const double x = luaL_checknumber(state, 2);
     const double y = luaL_checknumber(state, 3);
     if (!std::isfinite(x) || !std::isfinite(y))
@@ -326,7 +320,7 @@ static int self_set_position(lua_State* state)
     KadathLuauObjectHandle object{};
     if (!resolve_object_ref(state, instance, 1, object))
         return raise_host_error(state, "behavior object reference is stale or unknown");
-    if (!instance->active_host_v3->set_object_position(instance->active_host_v3->userdata, &object, x, y))
+    if (!instance->active_host_v4->set_object_position(instance->active_host_v4->userdata, &object, x, y))
         return raise_host_error(state, "behavior object position mutation failed");
     return 0;
 }
@@ -344,15 +338,15 @@ static int self_translate(lua_State* state)
         luaL_error(state, "translate arguments must be finite");
         return 0;
     }
-    if (instance->active_host_v3 != nullptr)
+    if (instance->active_host_v4 != nullptr)
     {
         KadathLuauObjectHandle object{};
         double position_x = 0.0;
         double position_y = 0.0;
         if (!resolve_object_ref(state, instance, 1, object) ||
-            !instance->active_host_v3->get_object_position(instance->active_host_v3->userdata, &object, &position_x, &position_y) ||
+            !instance->active_host_v4->get_object_position(instance->active_host_v4->userdata, &object, &position_x, &position_y) ||
             !std::isfinite(position_x + dx) || !std::isfinite(position_y + dy) ||
-            !instance->active_host_v3->set_object_position(instance->active_host_v3->userdata, &object, position_x + dx, position_y + dy))
+            !instance->active_host_v4->set_object_position(instance->active_host_v4->userdata, &object, position_x + dx, position_y + dy))
             return raise_host_error(state, "behavior object translation failed");
         return 0;
     }
@@ -364,17 +358,30 @@ static int self_translate(lua_State* state)
     return 0;
 }
 
+static int self_destroy(lua_State* state)
+{
+    auto* instance = instance_from_upvalue(state);
+    if (instance == nullptr || instance->active_host_v4 == nullptr)
+        return raise_host_error(state, "behavior object destroy is unavailable outside a Host v4 hook");
+    KadathLuauObjectHandle object{};
+    if (!resolve_object_ref(state, instance, 1, object))
+        return raise_host_error(state, "behavior object reference is stale or unknown");
+    if (!instance->active_host_v4->destroy_object(instance->active_host_v4->userdata, &object))
+        return raise_host_error(state, "behavior object destroy request failed");
+    return 0;
+}
+
 static int scene_find(lua_State* state)
 {
     auto* instance = instance_from_upvalue(state);
-    if (instance == nullptr || instance->active_host_v3 == nullptr)
-        return raise_host_error(state, "behavior scene access is unavailable outside a Host v3 hook");
+    if (instance == nullptr || instance->active_host_v4 == nullptr)
+        return raise_host_error(state, "behavior scene access is unavailable outside a Host v4 hook");
     size_t object_id_length = 0;
     const char* object_id = luaL_checklstring(state, 1, &object_id_length);
     if (object_id_length == 0 || object_id_length > KADATH_LUAU_MAX_OBJECT_ID_BYTES)
         return raise_host_error(state, "behavior object id is invalid");
     KadathLuauObjectHandle object{};
-    if (!instance->active_host_v3->resolve_object(instance->active_host_v3->userdata, object_id, object_id_length, &object))
+    if (!instance->active_host_v4->resolve_object(instance->active_host_v4->userdata, object_id, object_id_length, &object))
     {
         lua_pushnil(state);
         return 1;
@@ -383,11 +390,35 @@ static int scene_find(lua_State* state)
     return 1;
 }
 
+static int scene_spawn(lua_State* state)
+{
+    auto* instance = instance_from_upvalue(state);
+    if (instance == nullptr || instance->active_host_v4 == nullptr)
+        return raise_host_error(state, "behavior scene spawn is unavailable outside a Host v4 hook");
+    size_t prototype_id_length = 0;
+    const char* prototype_id = luaL_checklstring(state, 1, &prototype_id_length);
+    const double x = luaL_checknumber(state, 2);
+    const double y = luaL_checknumber(state, 3);
+    if (prototype_id_length == 0 || prototype_id_length > KADATH_LUAU_MAX_OBJECT_ID_BYTES || !std::isfinite(x) || !std::isfinite(y))
+        return raise_host_error(state, "behavior spawn arguments are invalid");
+    KadathLuauObjectHandle object{};
+    if (!instance->active_host_v4->spawn_object(
+            instance->active_host_v4->userdata,
+            prototype_id,
+            prototype_id_length,
+            x,
+            y,
+            &object) || !valid_object_handle(object, instance->active_host_v4->world_epoch))
+        return raise_host_error(state, "behavior object spawn request failed");
+    push_object_ref(state, instance, object);
+    return 1;
+}
+
 static int event_post(lua_State* state)
 {
     auto* instance = instance_from_upvalue(state);
-    if (instance == nullptr || instance->active_host_v3 == nullptr)
-        return raise_host_error(state, "behavior event access is unavailable outside a Host v3 hook");
+    if (instance == nullptr || instance->active_host_v4 == nullptr)
+        return raise_host_error(state, "behavior event access is unavailable outside a Host v4 hook");
     KadathLuauPostedEvent event{};
     if (!resolve_object_ref(state, instance, 1, event.target))
         return raise_host_error(state, "behavior event target is stale or unknown");
@@ -397,11 +428,11 @@ static int event_post(lua_State* state)
         return raise_host_error(state, "behavior event name is invalid");
     event.name = name;
     event.name_length = name_length;
-    if (!instance->active_host_v3->resolve_object(
-            instance->active_host_v3->userdata,
+    if (!instance->active_host_v4->resolve_object(
+            instance->active_host_v4->userdata,
             instance->object_id,
             instance->object_id_length,
-            &event.sender) || !valid_object_handle(event.sender, instance->active_host_v3->world_epoch))
+            &event.sender) || !valid_object_handle(event.sender, instance->active_host_v4->world_epoch))
         return raise_host_error(state, "behavior event sender is unavailable");
 
     KadathLuauEventField fields[KADATH_LUAU_MAX_EVENT_FIELD_COUNT]{};
@@ -470,7 +501,7 @@ static int event_post(lua_State* state)
         }
     }
     event.fields = event.field_count == 0 ? nullptr : fields;
-    if (!instance->active_host_v3->post_event(instance->active_host_v3->userdata, &event))
+    if (!instance->active_host_v4->post_event(instance->active_host_v4->userdata, &event))
         return raise_host_error(state, "behavior event queue rejected the event");
     return 0;
 }
@@ -502,6 +533,9 @@ static void push_object_ref(lua_State* state, KadathLuauInstance* instance, cons
     lua_pushlightuserdata(state, instance);
     lua_pushcclosure(state, self_translate, "translate", 1);
     lua_setfield(state, -2, "translate");
+    lua_pushlightuserdata(state, instance);
+    lua_pushcclosure(state, self_destroy, "destroy", 1);
+    lua_setfield(state, -2, "destroy");
     lua_setreadonly(state, -1, true);
 }
 
@@ -563,7 +597,7 @@ static int install_environment(KadathLuauInstance* instance, char* error_buffer,
 {
     lua_State* state = instance->thread;
     lua_createtable(state, 0, 4);
-    lua_createtable(state, 0, 1);
+    lua_createtable(state, 0, 2);
     lua_pushlightuserdata(state, instance);
     lua_pushcclosure(state, parameter_number, "number", 1);
     lua_setfield(state, -2, "number");
@@ -578,6 +612,9 @@ static int install_environment(KadathLuauInstance* instance, char* error_buffer,
     lua_pushlightuserdata(state, instance);
     lua_pushcclosure(state, scene_find, "find", 1);
     lua_setfield(state, -2, "find");
+    lua_pushlightuserdata(state, instance);
+    lua_pushcclosure(state, scene_spawn, "spawn", 1);
+    lua_setfield(state, -2, "spawn");
     lua_setreadonly(state, -1, true);
     lua_setfield(state, -2, "scene");
     lua_createtable(state, 0, 1);
@@ -601,17 +638,17 @@ static int install_environment(KadathLuauInstance* instance, char* error_buffer,
     return 1;
 }
 
-static int run_hook_v3(
+static int run_hook_v4(
     KadathLuauInstance* instance,
     const char* hook_name,
     bool with_delta,
     double dt_seconds,
     const KadathLuauInputSnapshot& input_snapshot,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size)
 {
-    if (instance == nullptr || !host_v3_valid(host))
+    if (instance == nullptr || !host_v4_valid(host))
     {
         write_error(error_buffer, error_buffer_size, "UnsupportedBehaviorHostInterface");
         return 0;
@@ -624,7 +661,7 @@ static int run_hook_v3(
     instance->move_x = input_snapshot.move_x;
     instance->move_y = input_snapshot.move_y;
     instance->input_context_active = true;
-    instance->active_host_v3 = host;
+    instance->active_host_v4 = host;
     struct HostContextGuard
     {
         KadathLuauInstance* instance;
@@ -633,7 +670,7 @@ static int run_hook_v3(
             instance->move_x = 0;
             instance->move_y = 0;
             instance->input_context_active = false;
-            instance->active_host_v3 = nullptr;
+            instance->active_host_v4 = nullptr;
         }
     } host_context_guard{instance};
 
@@ -762,15 +799,15 @@ static void push_event(lua_State* state, KadathLuauInstance* instance, const Kad
     lua_setreadonly(state, -1, true);
 }
 
-static int run_event_hook_v3(
+static int run_event_hook_v4(
     KadathLuauInstance* instance,
     const KadathLuauEvent* event,
     const KadathLuauInputSnapshot& input_snapshot,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size)
 {
-    if (instance == nullptr || !host_v3_valid(host))
+    if (instance == nullptr || !host_v4_valid(host))
     {
         write_error(error_buffer, error_buffer_size, "UnsupportedBehaviorHostInterface");
         return 0;
@@ -788,7 +825,7 @@ static int run_event_hook_v3(
     instance->move_x = input_snapshot.move_x;
     instance->move_y = input_snapshot.move_y;
     instance->input_context_active = true;
-    instance->active_host_v3 = host;
+    instance->active_host_v4 = host;
     struct HostContextGuard
     {
         KadathLuauInstance* instance;
@@ -797,7 +834,7 @@ static int run_event_hook_v3(
             instance->move_x = 0;
             instance->move_y = 0;
             instance->input_context_active = false;
-            instance->active_host_v3 = nullptr;
+            instance->active_host_v4 = nullptr;
         }
     } host_context_guard{instance};
 
@@ -1126,21 +1163,21 @@ extern "C" int kadath_luau_instance_fixed_update(
     return run_hook(instance, "fixed_update", true, dt_seconds, position_x, position_y, *input_snapshot, commands, command_capacity, command_count, error_buffer, error_buffer_size);
 }
 
-extern "C" int kadath_luau_instance_on_start_v3(
+extern "C" int kadath_luau_instance_on_start_v4(
     KadathLuauInstance* instance,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size)
 {
     const KadathLuauInputSnapshot input_snapshot{};
-    return run_hook_v3(instance, "on_start", false, 0.0, input_snapshot, host, error_buffer, error_buffer_size);
+    return run_hook_v4(instance, "on_start", false, 0.0, input_snapshot, host, error_buffer, error_buffer_size);
 }
 
-extern "C" int kadath_luau_instance_fixed_update_v3(
+extern "C" int kadath_luau_instance_fixed_update_v4(
     KadathLuauInstance* instance,
     double dt_seconds,
     const KadathLuauInputSnapshot* input_snapshot,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size)
 {
@@ -1149,14 +1186,14 @@ extern "C" int kadath_luau_instance_fixed_update_v3(
         write_error(error_buffer, error_buffer_size, "behavior input snapshot is required");
         return 0;
     }
-    return run_hook_v3(instance, "fixed_update", true, dt_seconds, *input_snapshot, host, error_buffer, error_buffer_size);
+    return run_hook_v4(instance, "fixed_update", true, dt_seconds, *input_snapshot, host, error_buffer, error_buffer_size);
 }
 
-extern "C" int kadath_luau_instance_update_v3(
+extern "C" int kadath_luau_instance_update_v4(
     KadathLuauInstance* instance,
     double dt_seconds,
     const KadathLuauInputSnapshot* input_snapshot,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size)
 {
@@ -1165,14 +1202,14 @@ extern "C" int kadath_luau_instance_update_v3(
         write_error(error_buffer, error_buffer_size, "behavior input snapshot is required");
         return 0;
     }
-    return run_hook_v3(instance, "update", true, dt_seconds, *input_snapshot, host, error_buffer, error_buffer_size);
+    return run_hook_v4(instance, "update", true, dt_seconds, *input_snapshot, host, error_buffer, error_buffer_size);
 }
 
-extern "C" int kadath_luau_instance_on_event_v3(
+extern "C" int kadath_luau_instance_on_event_v4(
     KadathLuauInstance* instance,
     const KadathLuauEvent* event,
     const KadathLuauInputSnapshot* input_snapshot,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size)
 {
@@ -1181,5 +1218,5 @@ extern "C" int kadath_luau_instance_on_event_v3(
         write_error(error_buffer, error_buffer_size, "behavior input snapshot is required");
         return 0;
     }
-    return run_event_hook_v3(instance, event, *input_snapshot, host, error_buffer, error_buffer_size);
+    return run_event_hook_v4(instance, event, *input_snapshot, host, error_buffer, error_buffer_size);
 }

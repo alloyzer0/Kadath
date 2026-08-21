@@ -1,9 +1,11 @@
 const std = @import("std");
 const content_identity = @import("content_identity.zig");
 
-pub const current_schema_version: u32 = 5;
+pub const current_schema_version: u32 = 6;
+pub const behavior_schema_version: u32 = 5;
 pub const legacy_object_schema_version: u32 = 4;
-pub const scene_artifact_version: u32 = 5;
+pub const scene_artifact_version: u32 = 6;
+pub const behavior_artifact_version: u32 = 5;
 pub const legacy_object_artifact_version: u32 = 4;
 pub const max_texture_count: usize = 4;
 pub const max_texture_artifact_bytes: usize = 255;
@@ -14,6 +16,8 @@ pub const max_behavior_bindings_per_object: usize = 4;
 pub const max_behavior_binding_count: usize = 256;
 pub const max_behavior_parameter_count: usize = 16;
 pub const max_behavior_parameter_name_bytes: usize = 63;
+pub const max_spawn_prototype_count: usize = 32;
+pub const max_prototype_behavior_binding_count: usize = 128;
 
 const scene_artifact_header_bytes: usize = 16;
 const scene_artifact_v1_payload_bytes: usize = 28 * @sizeOf(f32);
@@ -64,6 +68,22 @@ pub const ObjectId = struct {
 
     pub fn eql(self: *const ObjectId, other: *const ObjectId) bool {
         return std.mem.eql(u8, self.slice(), other.slice());
+    }
+};
+
+pub const PrototypeId = struct {
+    byte_count: u8 = 0,
+    storage: [max_object_id_bytes]u8 = [_]u8{0} ** max_object_id_bytes,
+
+    pub fn init(bytes: []const u8) !PrototypeId {
+        try validateObjectIdBytes(bytes);
+        var value = PrototypeId{ .byte_count = @intCast(bytes.len) };
+        @memcpy(value.storage[0..bytes.len], bytes);
+        return value;
+    }
+
+    pub fn slice(self: *const PrototypeId) []const u8 {
+        return self.storage[0..self.byte_count];
     }
 };
 
@@ -132,6 +152,29 @@ pub const SceneObjectSet = struct {
     }
 };
 
+pub const SpawnPrototype = struct {
+    prototypeId: PrototypeId = .{},
+    kind: ObjectKind = .sprite,
+    sprite: Sprite = .{},
+    behaviors: BehaviorBindingSet = .{},
+};
+
+pub const SpawnPrototypeSet = struct {
+    count: u8 = 0,
+    entries: [max_spawn_prototype_count]SpawnPrototype = [_]SpawnPrototype{.{}} ** max_spawn_prototype_count,
+
+    pub fn slice(self: *const SpawnPrototypeSet) []const SpawnPrototype {
+        return self.entries[0..self.count];
+    }
+
+    pub fn indexOfId(self: *const SpawnPrototypeSet, prototype_id: []const u8) ?usize {
+        for (self.slice(), 0..) |prototype, index| {
+            if (std.mem.eql(u8, prototype.prototypeId.slice(), prototype_id)) return index;
+        }
+        return null;
+    }
+};
+
 pub const TextureSpec = struct {
     textureId: u32 = 0,
     artifactBytes: u16 = 0,
@@ -162,6 +205,7 @@ pub const Scene = struct {
     schemaVersion: u32 = current_schema_version,
     textures: TextureSet,
     objects: SceneObjectSet,
+    prototypes: SpawnPrototypeSet = .{},
 
     pub fn player(self: *const Scene) *const SceneObject {
         return &self.objects.entries[self.objects.indexOfKind(.player) orelse unreachable];
@@ -261,6 +305,20 @@ const WireSceneV5 = struct {
     schemaVersion: u32,
     textures: []const WireTextureSpec,
     objects: []const WireSceneObjectV5,
+};
+
+const WireSpawnPrototype = struct {
+    prototypeId: []const u8,
+    kind: ObjectKind,
+    sprite: WireSprite,
+    behaviors: []const WireBehaviorBinding,
+};
+
+const WireSceneV6 = struct {
+    schemaVersion: u32,
+    textures: []const WireTextureSpec,
+    objects: []const WireSceneObjectV5,
+    prototypes: []const WireSpawnPrototype,
 };
 
 const SchemaProbe = struct {
@@ -370,7 +428,8 @@ pub fn loadArtifactWithIdentity(io: std.Io, allocator: std.mem.Allocator, path: 
 }
 
 fn parseWithIdentity(allocator: std.mem.Allocator, contents: []const u8, kind: content_identity.ContentKind) !LoadedScene {
-    const value = try parse(allocator, contents);
+    var value: Scene = undefined;
+    try parseInto(allocator, contents, &value);
     return .{
         .value = value,
         .identity = try content_identity.ContentIdentity.fromBytes(kind, contents),
@@ -379,7 +438,8 @@ fn parseWithIdentity(allocator: std.mem.Allocator, contents: []const u8, kind: c
 }
 
 fn parseArtifactWithIdentity(contents: []const u8) !LoadedScene {
-    const value = try parseArtifact(contents);
+    var value: Scene = undefined;
+    try parseArtifactInto(contents, &value);
     return .{
         .value = value,
         .identity = try content_identity.ContentIdentity.fromBytes(.artifact, contents),
@@ -388,14 +448,21 @@ fn parseArtifactWithIdentity(contents: []const u8) !LoadedScene {
 }
 
 pub fn parse(allocator: std.mem.Allocator, contents: []const u8) !Scene {
+    var value: Scene = undefined;
+    try parseInto(allocator, contents, &value);
+    return value;
+}
+
+fn parseInto(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
     const probe = try std.json.parseFromSlice(SchemaProbe, allocator, contents, .{ .ignore_unknown_fields = true });
     defer probe.deinit();
-    return switch (probe.value.schemaVersion) {
-        3 => parseSourceV3(allocator, contents),
-        legacy_object_schema_version => parseSourceV4(allocator, contents),
-        current_schema_version => parseSourceV5(allocator, contents),
-        else => error.UnsupportedSceneSchema,
-    };
+    switch (probe.value.schemaVersion) {
+        3 => output.* = try parseSourceV3(allocator, contents),
+        legacy_object_schema_version => output.* = try parseSourceV4(allocator, contents),
+        behavior_schema_version => try parseSourceV5Into(allocator, contents, output),
+        current_schema_version => try parseSourceV6Into(allocator, contents, output),
+        else => return error.UnsupportedSceneSchema,
+    }
 }
 
 fn parseSourceV3(allocator: std.mem.Allocator, contents: []const u8) !Scene {
@@ -459,16 +526,52 @@ fn parseSourceV4(allocator: std.mem.Allocator, contents: []const u8) !Scene {
     return value;
 }
 
-fn parseSourceV5(allocator: std.mem.Allocator, contents: []const u8) !Scene {
+fn parseSourceV5Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
     const parsed = try std.json.parseFromSlice(WireSceneV5, allocator, contents, .{});
     defer parsed.deinit();
+    if (parsed.value.schemaVersion != behavior_schema_version) return error.UnsupportedSceneSchema;
+    output.* = .{
+        .schemaVersion = behavior_schema_version,
+        .textures = try normalizeTextures(parsed.value.textures),
+        .objects = undefined,
+    };
+    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, &output.objects);
+    try validate(output);
+}
+
+fn parseSourceV6Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
+    const parsed = try std.json.parseFromSlice(WireSceneV6, allocator, contents, .{});
+    defer parsed.deinit();
     if (parsed.value.schemaVersion != current_schema_version) return error.UnsupportedSceneSchema;
-    const textures = try normalizeTextures(parsed.value.textures);
-    if (parsed.value.objects.len < min_scene_object_count or parsed.value.objects.len > max_scene_object_count) {
+    output.* = .{
+        .schemaVersion = current_schema_version,
+        .textures = try normalizeTextures(parsed.value.textures),
+        .objects = undefined,
+    };
+    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, &output.objects);
+    if (parsed.value.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
+    output.prototypes.count = @intCast(parsed.value.prototypes.len);
+    for (parsed.value.prototypes, 0..) |wire, index| {
+        output.prototypes.entries[index] = .{
+            .prototypeId = try PrototypeId.init(wire.prototypeId),
+            .kind = wire.kind,
+            .sprite = .{
+                .size = wire.sprite.size,
+                .color = wire.sprite.color,
+                .textureId = wire.sprite.textureId,
+            },
+            .behaviors = try normalizeBehaviorBindings(wire.behaviors),
+        };
+    }
+    try validate(output);
+}
+
+fn normalizeBehaviorSceneObjectsInto(wire_objects: []const WireSceneObjectV5, output: *SceneObjectSet) !void {
+    if (wire_objects.len < min_scene_object_count or wire_objects.len > max_scene_object_count) {
         return error.InvalidSceneObjectCount;
     }
-    var objects = SceneObjectSet{ .count = @intCast(parsed.value.objects.len) };
-    for (parsed.value.objects, 0..) |wire, index| {
+    output.* = .{ .count = @intCast(wire_objects.len) };
+    for (wire_objects, 0..) |wire, index| {
         const object_id = try ObjectId.init(wire.objectId);
         const sprite = Sprite{
             .position = wire.transform.position,
@@ -478,7 +581,7 @@ fn parseSourceV5(allocator: std.mem.Allocator, contents: []const u8) !Scene {
         };
         const wire_behaviors = wire.behaviors orelse return error.MissingSceneBehaviors;
         const behaviors = try normalizeBehaviorBindings(wire_behaviors);
-        objects.entries[index] = switch (wire.kind) {
+        output.entries[index] = switch (wire.kind) {
             .sprite, .goal => blk: {
                 if (wire.player != null or wire.patrol != null) return error.InvalidSceneObjectPayload;
                 break :blk .{ .objectId = object_id, .kind = wire.kind, .sprite = sprite, .behaviors = behaviors };
@@ -504,9 +607,6 @@ fn parseSourceV5(allocator: std.mem.Allocator, contents: []const u8) !Scene {
             },
         };
     }
-    const value = Scene{ .schemaVersion = current_schema_version, .textures = textures, .objects = objects };
-    try validate(&value);
-    return value;
 }
 
 fn normalizeBehaviorBindings(wire_bindings: []const WireBehaviorBinding) !BehaviorBindingSet {
@@ -609,6 +709,13 @@ pub fn artifactByteCount(value: *const Scene) !usize {
         payload_bytes = try std.math.add(usize, payload_bytes, 4);
         payload_bytes = try std.math.add(usize, payload_bytes, try objectEntryBytes(value.schemaVersion, &object));
     }
+    if (value.schemaVersion == current_schema_version) {
+        payload_bytes = try std.math.add(usize, payload_bytes, 4);
+        for (value.prototypes.slice()) |prototype| {
+            payload_bytes = try std.math.add(usize, payload_bytes, 4);
+            payload_bytes = try std.math.add(usize, payload_bytes, try prototypeEntryBytes(&prototype));
+        }
+    }
     return try std.math.add(usize, scene_artifact_header_bytes, payload_bytes);
 }
 
@@ -663,22 +770,29 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
                 }
             },
         }
-        if (value.schemaVersion == current_schema_version) {
-            writeLittleU32(output[cursor..][0..4], object.behaviors.count);
+        if (schemaHasBehaviorBindings(value.schemaVersion)) {
+            cursor = writeBehaviorBindingSet(output, cursor, &object.behaviors);
+        }
+    }
+    if (value.schemaVersion == current_schema_version) {
+        writeLittleU32(output[cursor..][0..4], value.prototypes.count);
+        cursor += 4;
+        for (value.prototypes.slice()) |prototype| {
+            const entry_bytes = try prototypeEntryBytes(&prototype);
+            writeLittleU32(output[cursor..][0..4], @intCast(entry_bytes));
             cursor += 4;
-            for (object.behaviors.slice()) |binding| {
-                writeLittleU32(output[cursor..][0..4], binding.scriptId);
-                writeLittleU32(output[cursor + 4 ..][0..4], binding.parameterCount);
-                cursor += 8;
-                for (binding.parameterSlice()) |parameter| {
-                    writeLittleU32(output[cursor..][0..4], parameter.nameBytes);
-                    cursor += 4;
-                    @memcpy(output[cursor .. cursor + parameter.nameBytes], parameter.name());
-                    cursor += parameter.nameBytes;
-                    writeLittleF64(output[cursor..][0..8], parameter.value);
-                    cursor += 8;
-                }
+            writeLittleU32(output[cursor..][0..4], @intFromEnum(prototype.kind));
+            writeLittleU32(output[cursor + 4 ..][0..4], prototype.prototypeId.byte_count);
+            cursor += 8;
+            @memcpy(output[cursor .. cursor + prototype.prototypeId.byte_count], prototype.prototypeId.slice());
+            cursor += prototype.prototypeId.byte_count;
+            for (prototype.sprite.size ++ prototype.sprite.color) |number| {
+                writeLittleF32(output[cursor..][0..4], number);
+                cursor += 4;
             }
+            writeLittleU32(output[cursor..][0..4], prototype.sprite.textureId);
+            cursor += 4;
+            cursor = writeBehaviorBindingSet(output, cursor, &prototype.behaviors);
         }
     }
     std.debug.assert(cursor == output.len);
@@ -688,6 +802,7 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
 fn artifactVersionForSchema(schema_version: u32) !u32 {
     return switch (schema_version) {
         legacy_object_schema_version => legacy_object_artifact_version,
+        behavior_schema_version => behavior_artifact_version,
         current_schema_version => scene_artifact_version,
         else => error.UnsupportedSceneSchema,
     };
@@ -699,7 +814,7 @@ fn objectEntryBytes(schema_version: u32, object: *const SceneObject) !usize {
         .player => 4,
         .patrol_hazard => if (schema_version == legacy_object_schema_version) 12 else 0,
     };
-    if (schema_version == current_schema_version) {
+    if (schemaHasBehaviorBindings(schema_version)) {
         payload_bytes = try std.math.add(usize, payload_bytes, 4);
         for (object.behaviors.slice()) |binding| {
             payload_bytes = try std.math.add(usize, payload_bytes, 8);
@@ -713,19 +828,67 @@ fn objectEntryBytes(schema_version: u32, object: *const SceneObject) !usize {
     return try std.math.add(usize, 4 + 4 + object.objectId.byte_count + 8 * 4 + 4, payload_bytes);
 }
 
+fn prototypeEntryBytes(prototype: *const SpawnPrototype) !usize {
+    var payload_bytes: usize = 4 + 4 + prototype.prototypeId.byte_count + 6 * 4 + 4 + 4;
+    for (prototype.behaviors.slice()) |binding| {
+        payload_bytes = try std.math.add(usize, payload_bytes, 8);
+        for (binding.parameterSlice()) |parameter| {
+            payload_bytes = try std.math.add(usize, payload_bytes, 4 + parameter.name().len + 8);
+        }
+    }
+    return payload_bytes;
+}
+
+fn writeBehaviorBindingSet(output: []u8, start: usize, bindings: *const BehaviorBindingSet) usize {
+    var cursor = start;
+    writeLittleU32(output[cursor..][0..4], bindings.count);
+    cursor += 4;
+    for (bindings.slice()) |binding| {
+        writeLittleU32(output[cursor..][0..4], binding.scriptId);
+        writeLittleU32(output[cursor + 4 ..][0..4], binding.parameterCount);
+        cursor += 8;
+        for (binding.parameterSlice()) |parameter| {
+            writeLittleU32(output[cursor..][0..4], parameter.nameBytes);
+            cursor += 4;
+            @memcpy(output[cursor .. cursor + parameter.nameBytes], parameter.name());
+            cursor += parameter.nameBytes;
+            writeLittleF64(output[cursor..][0..8], parameter.value);
+            cursor += 8;
+        }
+    }
+    return cursor;
+}
+
+fn schemaHasBehaviorBindings(schema_version: u32) bool {
+    return schema_version == behavior_schema_version or schema_version == current_schema_version;
+}
+
 fn parseArtifact(source: []const u8) !Scene {
+    var value: Scene = undefined;
+    try parseArtifactInto(source, &value);
+    return value;
+}
+
+fn parseArtifactInto(source: []const u8, output: *Scene) !void {
     if (source.len < scene_artifact_header_bytes) return error.InvalidSceneArtifact;
     if (!std.mem.eql(u8, source[0..4], "KSCN")) return error.InvalidSceneArtifact;
     const artifact_version = readLittleU32(source[4..8]);
     const schema_version = readLittleU32(source[8..12]);
     const payload_bytes = readLittleU32(source[12..16]);
     if (source.len != scene_artifact_header_bytes + @as(usize, payload_bytes)) return error.InvalidSceneArtifact;
-    return switch (artifact_version) {
-        1, 2, 3 => parseLegacyArtifact(source, artifact_version, schema_version, payload_bytes),
-        legacy_object_artifact_version => parseArtifactV4(source, schema_version),
-        scene_artifact_version => parseArtifactV5(source, schema_version),
-        else => error.UnsupportedSceneArtifactVersion,
-    };
+    switch (artifact_version) {
+        1, 2, 3 => output.* = try parseLegacyArtifact(source, artifact_version, schema_version, payload_bytes),
+        legacy_object_artifact_version => output.* = try parseArtifactV4(source, schema_version),
+        behavior_artifact_version => {
+            if (schema_version != behavior_schema_version) return error.UnsupportedSceneSchema;
+            try parseArtifactBehaviorSceneInto(source, behavior_schema_version, false, output);
+        },
+        scene_artifact_version => {
+            if (schema_version != current_schema_version) return error.UnsupportedSceneSchema;
+            try parseArtifactBehaviorSceneInto(source, current_schema_version, true, output);
+        },
+        else => return error.UnsupportedSceneArtifactVersion,
+    }
 }
 
 fn parseLegacyArtifact(source: []const u8, artifact_version: u32, schema_version: u32, payload_bytes: u32) !Scene {
@@ -831,14 +994,17 @@ fn parseArtifactV4(source: []const u8, schema_version: u32) !Scene {
     return value;
 }
 
-fn parseArtifactV5(source: []const u8, schema_version: u32) !Scene {
-    if (schema_version != current_schema_version) return error.UnsupportedSceneSchema;
+fn parseArtifactBehaviorSceneInto(source: []const u8, schema_version: u32, read_prototypes: bool, output: *Scene) !void {
     var reader = ByteReader{ .source = source, .cursor = scene_artifact_header_bytes };
-    const textures = try readTextureSet(&reader);
+    output.* = .{
+        .schemaVersion = schema_version,
+        .textures = try readTextureSet(&reader),
+        .objects = undefined,
+    };
     const object_count = try reader.readU32();
     if (object_count < min_scene_object_count or object_count > max_scene_object_count) return error.InvalidSceneObjectCount;
-    var objects = SceneObjectSet{ .count = @intCast(object_count) };
-    for (objects.mutableSlice()) |*object| {
+    output.objects = .{ .count = @intCast(object_count) };
+    for (output.objects.mutableSlice()) |*object| {
         const entry_bytes = try reader.readU32();
         const entry_source = try reader.readBytes(entry_bytes);
         var entry = ByteReader{ .source = entry_source };
@@ -863,10 +1029,29 @@ fn parseArtifactV5(source: []const u8, schema_version: u32) !Scene {
         object.behaviors = try readBehaviorBindingSet(&entry);
         if (!entry.atEnd()) return error.InvalidSceneObjectPayload;
     }
+    if (read_prototypes) {
+        const prototype_count = try reader.readU32();
+        if (prototype_count > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
+        output.prototypes.count = @intCast(prototype_count);
+        for (output.prototypes.entries[0..output.prototypes.count]) |*prototype| {
+            const entry_bytes = try reader.readU32();
+            var entry = ByteReader{ .source = try reader.readBytes(entry_bytes) };
+            const kind_value = try entry.readU32();
+            if (kind_value != @intFromEnum(ObjectKind.sprite)) return error.InvalidSpawnPrototypeKind;
+            const prototype_id_bytes = try entry.readU32();
+            prototype.prototypeId = try PrototypeId.init(try entry.readBytes(prototype_id_bytes));
+            prototype.kind = .sprite;
+            prototype.sprite = .{
+                .size = .{ try entry.readF32(), try entry.readF32() },
+                .color = .{ try entry.readF32(), try entry.readF32(), try entry.readF32(), try entry.readF32() },
+                .textureId = try entry.readU32(),
+            };
+            prototype.behaviors = try readBehaviorBindingSet(&entry);
+            if (!entry.atEnd()) return error.InvalidSpawnPrototypePayload;
+        }
+    }
     if (!reader.atEnd()) return error.InvalidSceneArtifact;
-    const value = Scene{ .schemaVersion = current_schema_version, .textures = textures, .objects = objects };
-    try validate(&value);
-    return value;
+    try validate(output);
 }
 
 const ByteReader = struct {
@@ -939,7 +1124,10 @@ fn readTextureSet(reader: *ByteReader) !TextureSet {
 }
 
 pub fn validate(value: *const Scene) !void {
-    if (value.schemaVersion != legacy_object_schema_version and value.schemaVersion != current_schema_version) {
+    if (value.schemaVersion != legacy_object_schema_version and
+        value.schemaVersion != behavior_schema_version and
+        value.schemaVersion != current_schema_version)
+    {
         return error.UnsupportedSceneSchema;
     }
     if (value.textures.count == 0 or value.textures.count > max_texture_count) return error.InvalidTextureSetCount;
@@ -1003,6 +1191,31 @@ pub fn validate(value: *const Scene) !void {
         }
     }
     if (player_count != 1 or goal_count != 1 or hazard_count == 0) return error.InvalidSceneRoleCount;
+    if (value.schemaVersion != current_schema_version) {
+        if (value.prototypes.count != 0) return error.LegacySceneSpawnPrototype;
+        return;
+    }
+    if (value.prototypes.count > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
+    var prototype_binding_count: usize = 0;
+    for (value.prototypes.slice(), 0..) |prototype, index| {
+        try validateObjectIdBytes(prototype.prototypeId.slice());
+        for (value.prototypes.slice()[0..index]) |previous| {
+            if (std.mem.eql(u8, prototype.prototypeId.slice(), previous.prototypeId.slice())) {
+                return error.DuplicateSpawnPrototypeId;
+            }
+        }
+        if (prototype.kind != .sprite) return error.InvalidSpawnPrototypeKind;
+        try validateSprite(.{ 0, 0 }, prototype.sprite.size, prototype.sprite.color);
+        if (prototype.sprite.textureId == 0) return error.InvalidTextureId;
+        if (!value.textures.contains(prototype.sprite.textureId)) return error.UnknownSceneTexture;
+        try validateBehaviorBindings(&prototype.behaviors);
+        prototype_binding_count = std.math.add(usize, prototype_binding_count, prototype.behaviors.count) catch {
+            return error.PrototypeBehaviorBindingCountExceeded;
+        };
+        if (prototype_binding_count > max_prototype_behavior_binding_count) {
+            return error.PrototypeBehaviorBindingCountExceeded;
+        }
+    }
 }
 
 fn validateBehaviorBindings(bindings: *const BehaviorBindingSet) !void {
@@ -1168,6 +1381,14 @@ const scene_v5_source =
     \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[]}]}
 ;
 
+const scene_v6_source =
+    \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+    \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+    \\{"objectId":"hazard-1","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[5,6],"color":[1,0,0,1],"textureId":1},"behaviors":[{"scriptId":7,"parameters":{"speed":7,"minY":20,"maxY":60}}]},
+    \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[]}],"prototypes":[
+    \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,3],"color":[0.25,0.5,0.75,1],"textureId":1},"behaviors":[{"scriptId":9,"parameters":{"speed":12}}]}]}
+;
+
 test "scene v4 parses ordered objects" {
     const contents =
         \\{"schemaVersion":4,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
@@ -1198,7 +1419,7 @@ test "scene v3 normalizes fixed roles to objects" {
 
 test "scene v5 parses ordered behavior bindings and canonical parameters" {
     const value = try parse(std.testing.allocator, scene_v5_source);
-    try std.testing.expectEqual(current_schema_version, value.schemaVersion);
+    try std.testing.expectEqual(behavior_schema_version, value.schemaVersion);
     try std.testing.expectEqual(@as(u8, 1), value.objects.entries[1].behaviors.count);
     const binding = &value.objects.entries[1].behaviors.entries[0];
     try std.testing.expectEqual(@as(u32, 7), binding.scriptId);
@@ -1207,6 +1428,42 @@ test "scene v5 parses ordered behavior bindings and canonical parameters" {
     try std.testing.expectEqual(@as(f64, 60), binding.parameters[0].value);
     try std.testing.expectEqualStrings("minY", binding.parameters[1].name());
     try std.testing.expectEqualStrings("speed", binding.parameters[2].name());
+}
+
+test "scene v6 parses bounded sprite spawn prototypes" {
+    const value = try parse(std.testing.allocator, scene_v6_source);
+    try std.testing.expectEqual(@as(u32, 6), value.schemaVersion);
+    try std.testing.expectEqual(@as(u8, 1), value.prototypes.count);
+    const prototype = &value.prototypes.entries[0];
+    try std.testing.expectEqualStrings("runtime-orb", prototype.prototypeId.slice());
+    try std.testing.expectEqual(.sprite, prototype.kind);
+    try std.testing.expectEqual(@as(f32, 2), prototype.sprite.size[0]);
+    try std.testing.expectEqual(@as(u32, 9), prototype.behaviors.entries[0].scriptId);
+    try std.testing.expectEqualStrings("speed", prototype.behaviors.entries[0].parameters[0].name());
+}
+
+test "scene v6 rejects invalid prototype identity kind texture and count" {
+    var value = try parse(std.testing.allocator, scene_v6_source);
+    value.prototypes.entries[0].kind = .goal;
+    try std.testing.expectError(error.InvalidSpawnPrototypeKind, validate(&value));
+
+    value = try parse(std.testing.allocator, scene_v6_source);
+    value.prototypes.count = 2;
+    value.prototypes.entries[1] = value.prototypes.entries[0];
+    try std.testing.expectError(error.DuplicateSpawnPrototypeId, validate(&value));
+
+    value = try parse(std.testing.allocator, scene_v6_source);
+    value.prototypes.entries[0].sprite.textureId = 99;
+    try std.testing.expectError(error.UnknownSceneTexture, validate(&value));
+
+    value = try parse(std.testing.allocator, scene_v6_source);
+    value.prototypes.count = max_spawn_prototype_count + 1;
+    try std.testing.expectError(error.SpawnPrototypeCountExceeded, validate(&value));
+
+    var legacy = try parse(std.testing.allocator, scene_v5_source);
+    legacy.prototypes.count = 1;
+    legacy.prototypes.entries[0] = value.prototypes.entries[0];
+    try std.testing.expectError(error.LegacySceneSpawnPrototype, validate(&legacy));
 }
 
 test "scene v5 requires explicit behaviors and behavior-driven hazards" {
@@ -1273,16 +1530,31 @@ test "KSCN v5 round trips behavior order and f64 parameters" {
     const source = try parse(std.testing.allocator, scene_v5_source);
     const artifact = try encodeArtifact(std.testing.allocator, &source);
     defer std.testing.allocator.free(artifact);
-    try std.testing.expectEqual(scene_artifact_version, readLittleU32(artifact[4..8]));
-    try std.testing.expectEqual(current_schema_version, readLittleU32(artifact[8..12]));
+    try std.testing.expectEqual(behavior_artifact_version, readLittleU32(artifact[4..8]));
+    try std.testing.expectEqual(behavior_schema_version, readLittleU32(artifact[8..12]));
     const value = try parseArtifact(artifact);
-    try std.testing.expectEqual(current_schema_version, value.schemaVersion);
+    try std.testing.expectEqual(behavior_schema_version, value.schemaVersion);
     const binding = &value.objects.entries[1].behaviors.entries[0];
     try std.testing.expectEqual(@as(u32, 7), binding.scriptId);
     try std.testing.expectEqualStrings("maxY", binding.parameters[0].name());
     try std.testing.expectEqual(@as(f64, 60), binding.parameters[0].value);
     try std.testing.expectEqualStrings("speed", binding.parameters[2].name());
     try std.testing.expectEqual(@as(f64, 7), binding.parameters[2].value);
+}
+
+test "KSCN v6 round trips spawn prototypes while v5 normalizes empty" {
+    const source = try parse(std.testing.allocator, scene_v6_source);
+    const artifact = try encodeArtifact(std.testing.allocator, &source);
+    defer std.testing.allocator.free(artifact);
+    try std.testing.expectEqual(@as(u32, 6), readLittleU32(artifact[4..8]));
+    try std.testing.expectEqual(@as(u32, 6), readLittleU32(artifact[8..12]));
+    const value = try parseArtifact(artifact);
+    try std.testing.expectEqual(@as(u8, 1), value.prototypes.count);
+    try std.testing.expectEqualStrings("runtime-orb", value.prototypes.entries[0].prototypeId.slice());
+    try std.testing.expectEqual(@as(f64, 12), value.prototypes.entries[0].behaviors.entries[0].parameters[0].value);
+
+    const legacy = try parse(std.testing.allocator, scene_v5_source);
+    try std.testing.expectEqual(@as(u8, 0), legacy.prototypes.count);
 }
 
 test "KSCN v4 rejects truncated entry and trailing bytes" {

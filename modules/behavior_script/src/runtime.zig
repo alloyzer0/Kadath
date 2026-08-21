@@ -14,7 +14,7 @@ pub const InputSnapshot = struct {
     move_x: i32 = 0,
     move_y: i32 = 0,
 };
-pub const NativeHostV3 = c.KadathLuauHostV3;
+pub const NativeHostV4 = c.KadathLuauHostV4;
 pub const NativeObjectHandle = c.KadathLuauObjectHandle;
 pub const NativePostedEvent = c.KadathLuauPostedEvent;
 pub const NativeEvent = c.KadathLuauEvent;
@@ -204,6 +204,49 @@ pub const ActiveSet = struct {
         self.* = undefined;
     }
 
+    pub fn appendPrepared(self: *ActiveSet, prepared: *PreparedSet) !void {
+        if (self.binding_count + prepared.binding_count > self.bindings.len) {
+            return error.BehaviorBindingCountExceeded;
+        }
+        for (prepared.bindings[0..prepared.binding_count]) |*optional_binding| {
+            self.bindings[self.binding_count] = optional_binding.*;
+            optional_binding.* = null;
+            self.binding_count += 1;
+        }
+        prepared.binding_count = 0;
+    }
+
+    pub fn appendActive(self: *ActiveSet, source: *ActiveSet) !void {
+        if (self.binding_count + source.binding_count > self.bindings.len) {
+            return error.BehaviorBindingCountExceeded;
+        }
+        for (source.bindings[0..source.binding_count]) |*optional_binding| {
+            self.bindings[self.binding_count] = optional_binding.*;
+            optional_binding.* = null;
+            self.binding_count += 1;
+        }
+        source.binding_count = 0;
+    }
+
+    pub fn removeObject(self: *ActiveSet, object_id: []const u8) void {
+        var write_index: usize = 0;
+        for (self.bindings[0..self.binding_count], 0..) |*optional_binding, read_index| {
+            var binding = optional_binding.* orelse continue;
+            if (std.mem.eql(u8, binding.objectId(), object_id)) {
+                binding.instance.deinit();
+                optional_binding.* = null;
+                continue;
+            }
+            if (write_index != read_index) {
+                self.bindings[write_index] = binding;
+                optional_binding.* = null;
+            }
+            write_index += 1;
+        }
+        for (self.bindings[write_index..self.binding_count]) |*binding| binding.* = null;
+        self.binding_count = write_index;
+    }
+
     pub fn onStartCommands(self: *ActiveSet) []const CommandIntent {
         self.command_intent_count = 0;
         self.failure_count = 0;
@@ -239,25 +282,47 @@ pub const ActiveSet = struct {
         }
     }
 
-    pub fn runStartV3(self: *ActiveSet, host: *const NativeHostV3) !void {
+    pub const BindingObserver = struct {
+        userdata: ?*anyopaque,
+        begin: *const fn (?*anyopaque, usize, []const u8, u32) void,
+        end: *const fn (?*anyopaque) void,
+    };
+
+    pub fn runStartV4(self: *ActiveSet, host: *const NativeHostV4) !void {
+        return self.runStartV4Observed(host, null);
+    }
+
+    pub fn runStartV4Observed(self: *ActiveSet, host: *const NativeHostV4, observer: ?BindingObserver) !void {
         self.failure_count = 0;
-        for (self.bindings[0..self.binding_count]) |*optional_binding| {
+        for (self.bindings[0..self.binding_count], 0..) |*optional_binding, binding_index| {
             const binding = &optional_binding.*.?;
             if (!binding.enabled) continue;
+            if (!hostResolves(host, binding.objectId())) continue;
             var diagnostic = Diagnostic{};
-            try binding.instance.onStartV3(host, &diagnostic);
+            if (observer) |value| value.begin(value.userdata, binding_index, binding.objectId(), binding.script_id);
+            const result = binding.instance.onStartV4(host, &diagnostic);
+            if (observer) |value| value.end(value.userdata);
+            try result;
         }
     }
 
-    pub fn runFixedV3(self: *ActiveSet, dt_seconds: f32, input: InputSnapshot, host: *const NativeHostV3) !void {
+    pub fn runFixedV4(self: *ActiveSet, dt_seconds: f32, input: InputSnapshot, host: *const NativeHostV4) !void {
+        return self.runFixedV4Observed(dt_seconds, input, host, null);
+    }
+
+    pub fn runFixedV4Observed(self: *ActiveSet, dt_seconds: f32, input: InputSnapshot, host: *const NativeHostV4, observer: ?BindingObserver) !void {
         if (!std.math.isFinite(dt_seconds) or dt_seconds <= 0) return error.InvalidFixedDelta;
         try validateInputSnapshot(input);
         self.failure_count = 0;
         for (self.bindings[0..self.binding_count], 0..) |*optional_binding, binding_index| {
             const binding = &optional_binding.*.?;
             if (!binding.enabled) continue;
+            if (!hostResolves(host, binding.objectId())) continue;
             var diagnostic = Diagnostic{};
-            binding.instance.fixedUpdateV3(dt_seconds, input, host, &diagnostic) catch |err| {
+            if (observer) |value| value.begin(value.userdata, binding_index, binding.objectId(), binding.script_id);
+            const result = binding.instance.fixedUpdateV4(dt_seconds, input, host, &diagnostic);
+            if (observer) |value| value.end(value.userdata);
+            result catch |err| {
                 binding.enabled = false;
                 self.recordFailure(binding_index, err, diagnostic.slice());
                 continue;
@@ -265,15 +330,23 @@ pub const ActiveSet = struct {
         }
     }
 
-    pub fn runUpdateV3(self: *ActiveSet, dt_seconds: f32, input: InputSnapshot, host: *const NativeHostV3) !void {
+    pub fn runUpdateV4(self: *ActiveSet, dt_seconds: f32, input: InputSnapshot, host: *const NativeHostV4) !void {
+        return self.runUpdateV4Observed(dt_seconds, input, host, null);
+    }
+
+    pub fn runUpdateV4Observed(self: *ActiveSet, dt_seconds: f32, input: InputSnapshot, host: *const NativeHostV4, observer: ?BindingObserver) !void {
         if (!std.math.isFinite(dt_seconds) or dt_seconds < 0) return error.InvalidFrameDelta;
         try validateInputSnapshot(input);
         self.failure_count = 0;
         for (self.bindings[0..self.binding_count], 0..) |*optional_binding, binding_index| {
             const binding = &optional_binding.*.?;
             if (!binding.enabled) continue;
+            if (!hostResolves(host, binding.objectId())) continue;
             var diagnostic = Diagnostic{};
-            binding.instance.updateV3(dt_seconds, input, host, &diagnostic) catch |err| {
+            if (observer) |value| value.begin(value.userdata, binding_index, binding.objectId(), binding.script_id);
+            const result = binding.instance.updateV4(dt_seconds, input, host, &diagnostic);
+            if (observer) |value| value.end(value.userdata);
+            result catch |err| {
                 binding.enabled = false;
                 self.recordFailure(binding_index, err, diagnostic.slice());
                 continue;
@@ -281,19 +354,34 @@ pub const ActiveSet = struct {
         }
     }
 
-    pub fn dispatchEventV3(
+    pub fn dispatchEventV4(
         self: *ActiveSet,
         target_object_id: []const u8,
         event: *const NativeEvent,
         input: InputSnapshot,
-        host: *const NativeHostV3,
+        host: *const NativeHostV4,
+    ) !void {
+        return self.dispatchEventV4Observed(target_object_id, event, input, host, null);
+    }
+
+    pub fn dispatchEventV4Observed(
+        self: *ActiveSet,
+        target_object_id: []const u8,
+        event: *const NativeEvent,
+        input: InputSnapshot,
+        host: *const NativeHostV4,
+        observer: ?BindingObserver,
     ) !void {
         try validateInputSnapshot(input);
         for (self.bindings[0..self.binding_count], 0..) |*optional_binding, binding_index| {
             const binding = &optional_binding.*.?;
             if (!binding.enabled or !std.mem.eql(u8, binding.objectId(), target_object_id)) continue;
+            if (!hostResolves(host, binding.objectId())) continue;
             var diagnostic = Diagnostic{};
-            binding.instance.onEventV3(event, input, host, &diagnostic) catch |err| {
+            if (observer) |value| value.begin(value.userdata, binding_index, binding.objectId(), binding.script_id);
+            const result = binding.instance.onEventV4(event, input, host, &diagnostic);
+            if (observer) |value| value.end(value.userdata);
+            result catch |err| {
                 binding.enabled = false;
                 self.recordFailure(binding_index, err, diagnostic.slice());
                 continue;
@@ -330,12 +418,29 @@ pub const ActiveSet = struct {
         return self.bindings[binding_index].?.enabled;
     }
 
+    pub fn containsObject(self: *const ActiveSet, object_id: []const u8) bool {
+        for (self.bindings[0..self.binding_count]) |optional_binding| {
+            const binding = optional_binding orelse continue;
+            if (std.mem.eql(u8, binding.objectId(), object_id)) return true;
+        }
+        return false;
+    }
+
     pub fn disableBinding(self: *ActiveSet, binding_index: usize, err: anyerror, diagnostic: []const u8) void {
         if (binding_index >= self.binding_count) return;
         const binding = &self.bindings[binding_index].?;
         if (!binding.enabled) return;
         binding.enabled = false;
         self.recordFailure(binding_index, err, diagnostic);
+    }
+
+    pub fn disableBindingByIdentity(self: *ActiveSet, object_id: []const u8, script_id: u32, err: anyerror, diagnostic: []const u8) void {
+        for (self.bindings[0..self.binding_count], 0..) |*optional_binding, binding_index| {
+            const binding = &optional_binding.*.?;
+            if (binding.script_id != script_id or !std.mem.eql(u8, binding.objectId(), object_id)) continue;
+            self.disableBinding(binding_index, err, diagnostic);
+            return;
+        }
     }
 
     fn appendCommands(self: *ActiveSet, binding_index: usize, commands: []const TranslateCommand) void {
@@ -362,6 +467,12 @@ pub const ActiveSet = struct {
         self.failure_count += 1;
     }
 };
+
+fn hostResolves(host: *const NativeHostV4, object_id: []const u8) bool {
+    const resolve = host.resolve_object orelse return false;
+    var object = std.mem.zeroes(NativeObjectHandle);
+    return resolve(host.userdata, object_id.ptr, object_id.len, &object) != 0;
+}
 
 fn findSnapshot(snapshots: []const ObjectSnapshot, object_id: []const u8) ?ObjectSnapshot {
     for (snapshots) |snapshot| {
@@ -517,9 +628,9 @@ pub const Instance = struct {
         return self.run(true, dt_seconds, position, input, output, diagnostic);
     }
 
-    pub fn onStartV3(self: *Instance, host: *const NativeHostV3, diagnostic: *Diagnostic) !void {
+    pub fn onStartV4(self: *Instance, host: *const NativeHostV4, diagnostic: *Diagnostic) !void {
         diagnostic.clear();
-        const succeeded = c.kadath_luau_instance_on_start_v3(
+        const succeeded = c.kadath_luau_instance_on_start_v4(
             self.handle,
             host,
             &diagnostic.storage,
@@ -529,36 +640,36 @@ pub const Instance = struct {
         if (succeeded == 0) return error.BehaviorHookFailed;
     }
 
-    pub fn fixedUpdateV3(
+    pub fn fixedUpdateV4(
         self: *Instance,
         dt_seconds: f32,
         input: InputSnapshot,
-        host: *const NativeHostV3,
+        host: *const NativeHostV4,
         diagnostic: *Diagnostic,
     ) !void {
-        return self.runV3(.fixed, dt_seconds, input, host, diagnostic);
+        return self.runV4(.fixed, dt_seconds, input, host, diagnostic);
     }
 
-    pub fn updateV3(
+    pub fn updateV4(
         self: *Instance,
         dt_seconds: f32,
         input: InputSnapshot,
-        host: *const NativeHostV3,
+        host: *const NativeHostV4,
         diagnostic: *Diagnostic,
     ) !void {
-        return self.runV3(.frame, dt_seconds, input, host, diagnostic);
+        return self.runV4(.frame, dt_seconds, input, host, diagnostic);
     }
 
-    pub fn onEventV3(
+    pub fn onEventV4(
         self: *Instance,
         event: *const NativeEvent,
         input: InputSnapshot,
-        host: *const NativeHostV3,
+        host: *const NativeHostV4,
         diagnostic: *Diagnostic,
     ) !void {
         var native_input = c.KadathLuauInputSnapshot{ .move_x = input.move_x, .move_y = input.move_y };
         diagnostic.clear();
-        const succeeded = c.kadath_luau_instance_on_event_v3(
+        const succeeded = c.kadath_luau_instance_on_event_v4(
             self.handle,
             event,
             &native_input,
@@ -570,20 +681,20 @@ pub const Instance = struct {
         if (succeeded == 0) return error.BehaviorHookFailed;
     }
 
-    const V3Phase = enum { fixed, frame };
+    const V4Phase = enum { fixed, frame };
 
-    fn runV3(
+    fn runV4(
         self: *Instance,
-        phase: V3Phase,
+        phase: V4Phase,
         dt_seconds: f32,
         input: InputSnapshot,
-        host: *const NativeHostV3,
+        host: *const NativeHostV4,
         diagnostic: *Diagnostic,
     ) !void {
         var native_input = c.KadathLuauInputSnapshot{ .move_x = input.move_x, .move_y = input.move_y };
         diagnostic.clear();
         const succeeded = switch (phase) {
-            .fixed => c.kadath_luau_instance_fixed_update_v3(
+            .fixed => c.kadath_luau_instance_fixed_update_v4(
                 self.handle,
                 dt_seconds,
                 &native_input,
@@ -591,7 +702,7 @@ pub const Instance = struct {
                 &diagnostic.storage,
                 diagnostic.storage.len,
             ),
-            .frame => c.kadath_luau_instance_update_v3(
+            .frame => c.kadath_luau_instance_update_v4(
                 self.handle,
                 dt_seconds,
                 &native_input,

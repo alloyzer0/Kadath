@@ -852,13 +852,13 @@ internal static class Program
         var assetSnapshot = await client.GetAssetCatalogSnapshotAsync(new SnapshotQueryParameters(projectName)).ConfigureAwait(false);
         var publicationSnapshot = await client.GetPublicationSnapshotAsync(new PublicationSnapshotQueryParameters(projectName, "debug")).ConfigureAwait(false);
         Assert(projectSnapshot.ModelVersion == 1 && hierarchySnapshot.SnapshotVersion == 2, "real service snapshot version mismatch");
-        Assert(projectSnapshot.Scene.SchemaVersion == 5
+        Assert(projectSnapshot.Scene.SchemaVersion == 6
             && projectSnapshot.Scene.Textures is { Count: 3 }
             && projectSnapshot.Scene.Textures.Any(texture => texture.TextureId == 3)
             && projectSnapshot.Scene.HazardTextureId == 3
             && projectSnapshot.Scene.Objects is { Count: 5 }
             && projectSnapshot.Scene.Objects.Count(value => value.Behaviors is { Count: > 0 }) == 5,
-            "real service scene v5 snapshot mismatch");
+            "real service scene v6 snapshot mismatch");
         Assert(projectSnapshot.Script.SchemaVersion == 2
             && projectSnapshot.Script.GoalPosition.Length == 0
             && projectSnapshot.Script.GoalVelocity.Length == 0

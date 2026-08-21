@@ -135,6 +135,7 @@ export type Object = {
     position: (self: Object) -> { x: number, y: number },
     set_position: (self: Object, x: number, y: number) -> (),
     translate: (self: Object, dx: number, dy: number) -> (),
+    destroy: (self: Object) -> (),
 }
 
 export type EventValue = boolean | number | string | Object
@@ -156,6 +157,7 @@ declare kadath: {
     },
     scene: {
         find: (object_id: string) -> Object?,
+        spawn: (prototype_id: string, x: number, y: number) -> Object,
     },
     event: {
         post: (target: Object, name: string, payload: EventPayload?) -> (),

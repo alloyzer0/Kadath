@@ -31,8 +31,8 @@ Editor 诊断工具
 - `assets/renderer2d/test.texture`：TextureId 1；
 - `assets/renderer2d/goal.texture`：TextureId 2；
 - `assets/audio/won.audio.wav` 与 `lost.audio.wav`：规范 PCM WAV；
-- `assets/scenes/preview.scene`：KSCN v5，对全部五个 source object 声明 Behavior Binding，用于证明 Player fixed movement、decoration frame update 与 contact/custom event；
-- `assets/scripts/preview.script`：聚合 KSCP v2 / Host Interface v3，包含默认 `patrol.luau` 与 `player_controller.luau`；
+- `assets/scenes/preview.scene`：KSCN v6，对全部五个 source object 声明 Behavior Binding，并携带只读 `runtime-orb` Spawn Prototype，用于证明 Player fixed movement、decoration frame update、contact/custom event 与瞬态对象生命周期；
+- `assets/scripts/preview.script`：聚合 KSCP v2 / Host Interface v4，包含默认 `patrol.luau` 与 `player_controller.luau`；
 - `assets/scenes/preview.scene.json`、`assets/scripts/preview.script.json`、`assets/scripts/patrol.luau` 与 `assets/scripts/player_controller.luau`：Linux 默认行为项目的 source dependency set，不是 Runtime 启动输入。
 
 完整性
@@ -45,4 +45,4 @@ Editor 诊断工具
 
 仓库开发验证说明
 ----------------
-Linux Runtime 包的默认资产由 Zig + Luau tooling 生成 KSCN v5/KSCP v2，不依赖 PowerShell。Editor Service 的 legacy v4/v1 Publication 路径继续兼容旧项目；包内只携带受控 Behavior Tool，不包含完整 Linux Editor。
+Linux Runtime 包的默认资产由 Zig + Luau tooling 生成 KSCN v6/KSCP v2，不依赖 PowerShell。Runtime 与 Workspace 继续读取 KSCN v4/v5；Editor Service 的 legacy v4/v1 Publication 路径继续兼容旧项目。包内只携带受控 Behavior Tool，不包含完整 Linux Editor。

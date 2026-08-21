@@ -5,7 +5,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const artifact_version: u32 = 2;
 pub const source_schema_version: u32 = 2;
-pub const host_interface_version: u32 = 3;
+pub const host_interface_version: u32 = 4;
 pub const max_entry_count: usize = 16;
 pub const max_source_name_bytes: usize = common.max_source_name_bytes;
 pub const max_toolchain_identity_bytes: usize = 127;

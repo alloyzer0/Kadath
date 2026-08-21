@@ -11,7 +11,8 @@ pub const RoutedInput = struct {
 };
 
 pub fn route(scene: *const scene_api.Scene, input: AxisInput) RoutedInput {
-    const behavior_owned = scene.schemaVersion == scene_api.current_schema_version and
+    const behavior_owned = (scene.schemaVersion == scene_api.behavior_schema_version or
+        scene.schemaVersion == scene_api.current_schema_version) and
         scene.player().behaviors.count != 0;
     return .{
         .world = if (behavior_owned) .{} else input,
@@ -25,7 +26,7 @@ test "Scene v4 keeps Player movement in Native World" {
     try @import("std").testing.expectEqual(input, routed.world);
 }
 
-test "Scene v5 without Player bindings keeps Player movement in Native World" {
+test "Behavior Scene without Player bindings keeps Player movement in Native World" {
     var scene = scene_api.default_scene;
     scene.schemaVersion = scene_api.current_schema_version;
     const input = AxisInput{ .move_x = -1, .move_y = 1 };
@@ -34,7 +35,7 @@ test "Scene v5 without Player bindings keeps Player movement in Native World" {
     try @import("std").testing.expectEqual(input, routed.behaviors);
 }
 
-test "Scene v5 with any Player binding moves ownership to Behavior Bindings" {
+test "Behavior Scene with any Player binding moves ownership to Behavior Bindings" {
     var scene = scene_api.default_scene;
     scene.schemaVersion = scene_api.current_schema_version;
     const player = &scene.objects.entries[scene.objects.indexOfKind(.player).?];

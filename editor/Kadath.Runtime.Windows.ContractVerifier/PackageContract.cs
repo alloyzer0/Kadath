@@ -71,7 +71,7 @@ internal sealed class PackageContract
             ValidateScriptContract(
                 paths["bin/assets/scripts/preview.script.json"],
                 paths["bin/assets/scripts/player_controller.luau"]);
-            ValidateArtifactHeader(paths["bin/assets/scenes/preview.scene"], "KSCN", 5, 5, "Scene artifact");
+            ValidateArtifactHeader(paths["bin/assets/scenes/preview.scene"], "KSCN", 6, 6, "Scene artifact");
             ValidateBehaviorArtifactHeader(paths["bin/assets/scripts/preview.script"]);
             ValidateFrozenTextures(paths);
             ValidateCanonicalAudio(paths, "won", "Won audio");
@@ -161,11 +161,11 @@ internal sealed class PackageContract
         var root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object
             || !root.TryGetProperty("schemaVersion", out var schema)
-            || schema.GetInt32() != 5
+            || schema.GetInt32() != 6
             || !root.TryGetProperty("objects", out var objects)
             || objects.ValueKind != JsonValueKind.Array)
         {
-            throw Product("Scene source must be schema v5 with an objects array.");
+            throw Product("Scene source must be schema v6 with an objects array.");
         }
 
         JsonElement? player = null;
@@ -182,8 +182,13 @@ internal sealed class PackageContract
             || !behaviors.EnumerateArray().Any(value =>
                 value.TryGetProperty("scriptId", out var scriptId) && scriptId.TryGetUInt32(out var id) && id == 2))
         {
-            throw Product("Scene v5 must bind Player movement to behavior scriptId 2 and contain one Goal.");
+            throw Product("Scene v6 must bind Player movement to behavior scriptId 2 and contain one Goal.");
         }
+        if (!root.TryGetProperty("prototypes", out var prototypes)
+            || prototypes.ValueKind != JsonValueKind.Array
+            || !prototypes.EnumerateArray().Any(value =>
+                value.TryGetProperty("prototypeId", out var prototypeId) && prototypeId.GetString() == "runtime-orb"))
+            throw Product("Scene v6 must contain the runtime-orb spawn prototype.");
     }
 
     private static void ValidateScriptContract(string manifestPath, string playerSourcePath)
@@ -239,9 +244,9 @@ internal sealed class PackageContract
         if (stream.Read(header) != header.Length
             || !header[..4].SequenceEqual("KSCP"u8)
             || BinaryPrimitives.ReadUInt32LittleEndian(header[4..8]) != 2
-            || BinaryPrimitives.ReadUInt32LittleEndian(header[12..16]) != 3)
+            || BinaryPrimitives.ReadUInt32LittleEndian(header[12..16]) != 4)
         {
-            throw Product("Behavior Script artifact must use KSCP v2 with Host Interface v3.");
+            throw Product("Behavior Script artifact must use KSCP v2 with Host Interface v4.");
         }
     }
 

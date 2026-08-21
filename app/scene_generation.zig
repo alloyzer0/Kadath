@@ -1,4 +1,6 @@
+const std = @import("std");
 const collision = @import("collision.zig");
+const runtime_object_registry = @import("runtime_object_registry.zig");
 const scene_api = @import("scene.zig");
 const PlatformExtent = @import("platform").WindowExtent;
 const world_api = @import("world");
@@ -17,6 +19,11 @@ pub const SceneContacts = struct {
     touching: [scene_api.max_scene_object_count]bool = [_]bool{false} ** scene_api.max_scene_object_count,
 };
 
+pub const ObjectPositionUpdate = struct {
+    object_index: u8,
+    position: [2]f32,
+};
+
 const HazardState = struct {
     object_index: u8 = 0,
     entity: world_api.EntityId = world_api.invalid_entity,
@@ -27,6 +34,7 @@ const HazardState = struct {
 pub const SceneGeneration = struct {
     scene: scene_api.Scene,
     world: World,
+    runtime_objects: runtime_object_registry.Registry,
     extent: PlatformExtent,
     entity_by_object: [scene_api.max_scene_object_count]world_api.EntityId = [_]world_api.EntityId{world_api.invalid_entity} ** scene_api.max_scene_object_count,
     player_index: u8,
@@ -40,6 +48,7 @@ pub const SceneGeneration = struct {
         var runtime_world = try World.init();
         errdefer runtime_world.deinit();
         try runtime_world.setBounds(worldBounds(extent));
+        var runtime_objects = try runtime_object_registry.Registry.init(&value);
 
         var entities = [_]world_api.EntityId{world_api.invalid_entity} ** scene_api.max_scene_object_count;
         var player_index: ?u8 = null;
@@ -49,6 +58,7 @@ pub const SceneGeneration = struct {
         for (value.objects.slice(), 0..) |object, index| {
             const entity = try runtime_world.spawnSprite(spawnDesc(&object));
             entities[index] = entity;
+            try runtime_objects.bindSourceEntity(index, entity);
             switch (object.kind) {
                 .sprite => {},
                 .player => player_index = @intCast(index),
@@ -67,6 +77,7 @@ pub const SceneGeneration = struct {
         var generation = SceneGeneration{
             .scene = value,
             .world = runtime_world,
+            .runtime_objects = runtime_objects,
             .extent = extent,
             .entity_by_object = entities,
             .player_index = player_index orelse return error.SceneGenerationMissingPlayer,
@@ -79,16 +90,29 @@ pub const SceneGeneration = struct {
         return generation;
     }
 
+    pub fn prepareRestart(
+        value: scene_api.Scene,
+        extent: PlatformExtent,
+        previous: *const SceneGeneration,
+    ) !SceneGeneration {
+        var generation = try prepare(value, extent);
+        generation.runtime_objects.next_spawn_serial = previous.runtime_objects.next_spawn_serial;
+        return generation;
+    }
+
     pub fn deinit(self: *SceneGeneration) void {
         self.world.deinit();
+        self.runtime_objects = .{};
         self.entity_by_object = [_]world_api.EntityId{world_api.invalid_entity} ** scene_api.max_scene_object_count;
         self.hazard_count = 0;
     }
 
     pub fn reset(self: *SceneGeneration) !void {
+        try self.clearTransients();
         const player_object = &self.scene.objects.entries[self.player_index];
         const replacement = try self.world.replaceSprite(self.playerEntity(), spawnDesc(player_object));
         self.entity_by_object[self.player_index] = replacement;
+        try self.runtime_objects.bindSourceEntity(self.player_index, replacement);
 
         for (self.scene.objects.slice(), 0..) |object, index| {
             if (index == self.player_index) continue;
@@ -118,10 +142,10 @@ pub const SceneGeneration = struct {
     }
 
     pub fn applyTranslationDeltas(self: *SceneGeneration, deltas: []const [2]f64) !void {
-        if (deltas.len != self.scene.objects.count) return error.InvalidBehaviorTranslationBatch;
-        var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+        if (deltas.len != self.runtime_objects.activeCount()) return error.InvalidBehaviorTranslationBatch;
+        var sprites: [runtime_object_registry.max_runtime_object_count]world_api.RenderSprite = undefined;
         const ordered = try self.extractOrdered(&sprites);
-        var targets: [scene_api.max_scene_object_count][2]f32 = undefined;
+        var targets: [runtime_object_registry.max_runtime_object_count][2]f32 = undefined;
         for (ordered, 0..) |sprite, index| {
             const target_x = @as(f64, sprite.position[0]) + deltas[index][0];
             const target_y = @as(f64, sprite.position[1]) + deltas[index][1];
@@ -134,12 +158,15 @@ pub const SceneGeneration = struct {
             }
             targets[index] = .{ @floatCast(target_x), @floatCast(target_y) };
         }
-        for (targets[0..self.scene.objects.count], deltas, 0..) |target, delta, index| {
+        var handles: [runtime_object_registry.max_runtime_object_count]runtime_object_registry.Handle = undefined;
+        const active = self.runtime_objects.activeHandles(&handles);
+        for (targets[0..active.len], deltas, active) |target, delta, handle| {
             if (delta[0] == 0 and delta[1] == 0) continue;
-            try self.world.setSpritePosition(self.entity_by_object[index], target);
-            if (index == self.goal_index) self.goal_position = target;
+            const record = self.runtime_objects.resolve(handle) orelse return error.UnknownSceneObject;
+            try self.world.setSpritePosition(record.entity, target);
+            if (record.source_index == @as(?u8, self.goal_index)) self.goal_position = target;
             for (self.hazards[0..self.hazard_count]) |*hazard| {
-                if (hazard.object_index == index) {
+                if (record.source_index == @as(?u8, hazard.object_index)) {
                     hazard.y = target[1];
                     break;
                 }
@@ -194,8 +221,66 @@ pub const SceneGeneration = struct {
     }
 
     pub fn extractSprites(self: *const SceneGeneration, output: []world_api.RenderSprite) ![]world_api.RenderSprite {
-        if (output.len < self.scene.objects.count) return error.WorldRenderBufferTooSmall;
+        if (output.len < self.runtime_objects.activeCount()) return error.WorldRenderBufferTooSmall;
         return self.extractOrdered(output);
+    }
+
+    pub fn reserveTransient(
+        self: *SceneGeneration,
+        prototype_id: []const u8,
+        position: [2]f32,
+    ) !runtime_object_registry.ReservedSpawn {
+        const prototype_index = self.scene.prototypes.indexOfId(prototype_id) orelse return error.UnknownSpawnPrototype;
+        const prototype = &self.scene.prototypes.entries[prototype_index];
+        const reserved = try self.runtime_objects.reserveSpawn(@intCast(prototype_index), position, prototype.behaviors.count);
+        errdefer self.runtime_objects.requestDestroy(reserved.handle) catch {};
+        try self.runtime_objects.configurePending(reserved.handle, prototype);
+        return reserved;
+    }
+
+    pub fn activateTransient(self: *SceneGeneration, handle: runtime_object_registry.Handle) !void {
+        const record = self.runtime_objects.resolveForCommit(handle) orelse return error.StaleRuntimeObject;
+        if (record.state != .pending_spawn) return error.InvalidRuntimeObjectActivation;
+        const entity = try self.world.spawnSprite(spawnDescForSprite(record.sprite));
+        errdefer self.world.despawn(entity) catch {};
+        try self.runtime_objects.activate(handle, entity);
+    }
+
+    pub fn requestTransientDestroy(self: *SceneGeneration, handle: runtime_object_registry.Handle) !void {
+        try self.runtime_objects.requestDestroy(handle);
+    }
+
+    pub fn commitTransientDestroy(self: *SceneGeneration, handle: runtime_object_registry.Handle) !void {
+        const record = self.runtime_objects.resolveForCommit(handle) orelse return error.StaleRuntimeObject;
+        if (record.state != .pending_destroy or record.entity == world_api.invalid_entity) return error.InvalidRuntimeObjectDestroy;
+        try self.world.despawn(record.entity);
+        try self.runtime_objects.completeDestroy(handle);
+    }
+
+    pub fn runtimeObject(self: *SceneGeneration, handle: runtime_object_registry.Handle) ?*runtime_object_registry.Record {
+        return self.runtime_objects.resolve(handle);
+    }
+
+    pub fn runtimeHandle(self: *SceneGeneration, object_id: []const u8) ?runtime_object_registry.Handle {
+        return self.runtime_objects.findHandle(object_id);
+    }
+
+    pub fn runtimeHandleAt(self: *SceneGeneration, object_index: usize) ?runtime_object_registry.Handle {
+        if (object_index >= runtime_object_registry.max_runtime_object_count) return null;
+        const record = &self.runtime_objects.records[object_index];
+        if (record.state == .stale or record.state == .pending_destroy) return null;
+        return record.handle(object_index);
+    }
+
+    pub fn clearTransients(self: *SceneGeneration) !void {
+        for (&self.runtime_objects.records, 0..) |*record, index| {
+            if (record.source_index != null or record.state == .stale) continue;
+            const handle = record.handle(index);
+            if ((record.state == .active or record.state == .pending_destroy) and record.entity != world_api.invalid_entity) {
+                try self.world.despawn(record.entity);
+            }
+            try self.runtime_objects.discardTransient(handle);
+        }
     }
 
     pub fn playerEntity(self: *const SceneGeneration) world_api.EntityId {
@@ -216,34 +301,46 @@ pub const SceneGeneration = struct {
     }
 
     pub fn objectIndex(self: *const SceneGeneration, object_id: []const u8) ?usize {
-        for (self.scene.objects.slice(), 0..) |object, index| {
-            if (@import("std").mem.eql(u8, object.objectId.slice(), object_id)) return index;
-        }
-        return null;
+        const mutable: *SceneGeneration = @constCast(self);
+        const handle = mutable.runtime_objects.findHandle(object_id) orelse return null;
+        return handle.slot;
     }
 
     pub fn objectKind(self: *const SceneGeneration, object_index: usize) ?scene_api.ObjectKind {
-        if (object_index >= self.scene.objects.count) return null;
-        return self.scene.objects.entries[object_index].kind;
+        if (object_index >= runtime_object_registry.max_runtime_object_count) return null;
+        const mutable: *SceneGeneration = @constCast(self);
+        const record = &mutable.runtime_objects.records[object_index];
+        if (record.state == .stale or record.state == .pending_destroy) return null;
+        return record.kind;
     }
 
     pub fn objectPosition(self: *const SceneGeneration, object_index: usize) ![2]f32 {
-        if (object_index >= self.scene.objects.count) return error.UnknownSceneObject;
-        var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
-        const ordered = try self.extractOrdered(&sprites);
-        return ordered[object_index].position;
+        if (object_index >= runtime_object_registry.max_runtime_object_count) return error.UnknownSceneObject;
+        const mutable: *SceneGeneration = @constCast(self);
+        const record = &mutable.runtime_objects.records[object_index];
+        if (record.state == .pending_spawn) return record.sprite.position;
+        if (record.state != .active) return error.UnknownSceneObject;
+        var sprites: [runtime_object_registry.max_runtime_object_count]world_api.RenderSprite = undefined;
+        const unordered = try self.world.extractSprites(&sprites);
+        return (findSprite(unordered, record.entity) orelse return error.WorldProducedIncompleteScene).position;
     }
 
     pub fn setObjectPosition(self: *SceneGeneration, object_index: usize, position: [2]f32) !void {
-        if (object_index >= self.scene.objects.count) return error.UnknownSceneObject;
+        if (object_index >= runtime_object_registry.max_runtime_object_count) return error.UnknownSceneObject;
         if (!@import("std").math.isFinite(position[0]) or !@import("std").math.isFinite(position[1])) {
             return error.InvalidBehaviorPosition;
         }
-        if (object_index == self.goal_index) {
+        const record = &self.runtime_objects.records[object_index];
+        if (record.state == .pending_spawn) {
+            record.sprite.position = position;
+            return;
+        }
+        if (record.state != .active) return error.UnknownSceneObject;
+        if (record.source_index != null and object_index == self.goal_index) {
             try self.setGoalPosition(position);
             return;
         }
-        try self.world.setSpritePosition(self.entity_by_object[object_index], position);
+        try self.world.setSpritePosition(record.entity, position);
         const actual = try self.objectPosition(object_index);
         for (self.hazards[0..self.hazard_count]) |*hazard| {
             if (hazard.object_index == object_index) {
@@ -253,9 +350,39 @@ pub const SceneGeneration = struct {
         }
     }
 
+    pub fn applyObjectPositionsAtomically(self: *SceneGeneration, updates: []const ObjectPositionUpdate) !void {
+        if (updates.len > runtime_object_registry.max_runtime_object_count) return error.InvalidBehaviorPositionBatch;
+        var previous: [runtime_object_registry.max_runtime_object_count][2]f32 = undefined;
+        var seen = [_]bool{false} ** runtime_object_registry.max_runtime_object_count;
+        for (updates, 0..) |update, index| {
+            if (update.object_index >= runtime_object_registry.max_runtime_object_count or seen[update.object_index]) {
+                return error.InvalidBehaviorPositionBatch;
+            }
+            if (!std.math.isFinite(update.position[0]) or !std.math.isFinite(update.position[1])) {
+                return error.InvalidBehaviorPosition;
+            }
+            seen[update.object_index] = true;
+            previous[index] = try self.objectPosition(update.object_index);
+        }
+
+        var applied: usize = 0;
+        errdefer {
+            while (applied > 0) {
+                applied -= 1;
+                self.setObjectPosition(updates[applied].object_index, previous[applied]) catch {
+                    @panic("Runtime object position rollback failed");
+                };
+            }
+        }
+        for (updates) |update| {
+            try self.setObjectPosition(update.object_index, update.position);
+            applied += 1;
+        }
+    }
+
     pub fn objectIdForEntity(self: *const SceneGeneration, entity: world_api.EntityId) ?scene_api.ObjectId {
-        for (self.entity_by_object[0..self.scene.objects.count], 0..) |candidate, index| {
-            if (candidate == entity) return self.scene.objects.entries[index].objectId;
+        for (self.runtime_objects.records) |record| {
+            if (record.state == .active and record.entity == entity) return record.object_id;
         }
         return null;
     }
@@ -269,13 +396,17 @@ pub const SceneGeneration = struct {
     }
 
     fn extractOrdered(self: *const SceneGeneration, output: []world_api.RenderSprite) ![]world_api.RenderSprite {
-        var unordered_storage: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+        var unordered_storage: [runtime_object_registry.max_runtime_object_count]world_api.RenderSprite = undefined;
         const unordered = try self.world.extractSprites(&unordered_storage);
-        if (unordered.len != self.scene.objects.count) return error.WorldProducedIncompleteScene;
-        for (self.entity_by_object[0..self.scene.objects.count], 0..) |entity, index| {
-            output[index] = findSprite(unordered, entity) orelse return error.WorldProducedIncompleteScene;
+        const mutable: *SceneGeneration = @constCast(self);
+        var handles: [runtime_object_registry.max_runtime_object_count]runtime_object_registry.Handle = undefined;
+        const active = mutable.runtime_objects.activeHandles(&handles);
+        if (unordered.len != active.len) return error.WorldProducedIncompleteScene;
+        for (active, 0..) |handle, index| {
+            const record = mutable.runtime_objects.resolve(handle) orelse return error.WorldProducedIncompleteScene;
+            output[index] = findSprite(unordered, record.entity) orelse return error.WorldProducedIncompleteScene;
         }
-        return output[0..self.scene.objects.count];
+        return output[0..active.len];
     }
 };
 
@@ -286,6 +417,16 @@ fn spawnDesc(object: *const scene_api.SceneObject) world_api.SpriteSpawnDesc {
         .color = object.sprite.color,
         .texture_id = object.sprite.textureId,
         .move_speed = if (object.kind == .player) object.player.moveSpeed else 0.0,
+    };
+}
+
+fn spawnDescForSprite(sprite: scene_api.Sprite) world_api.SpriteSpawnDesc {
+    return .{
+        .position = sprite.position,
+        .size = sprite.size,
+        .color = sprite.color,
+        .texture_id = sprite.textureId,
+        .move_speed = 0,
     };
 }
 
@@ -350,6 +491,50 @@ test "SceneGeneration preserves source order and updates independent hazards" {
     try @import("std").testing.expect(stepped[2].position[1] != first_y);
     try @import("std").testing.expect(stepped[3].position[1] != second_y);
     try @import("std").testing.expect(stepped[2].position[1] - first_y != stepped[3].position[1] - second_y);
+}
+
+test "SceneGeneration activates and despawns transient prototype objects without exposing pending state" {
+    var scene = scene_api.default_scene;
+    scene.schemaVersion = scene_api.current_schema_version;
+    for (scene.objects.mutableSlice()) |*object| {
+        if (object.kind == .patrol_hazard) {
+            object.behaviors.count = 1;
+            object.behaviors.entries[0].scriptId = 7;
+        }
+    }
+    scene.prototypes.count = 1;
+    scene.prototypes.entries[0] = .{
+        .prototypeId = try scene_api.PrototypeId.init("runtime-orb"),
+        .sprite = .{ .size = .{ 12, 8 }, .color = .{ 1, 1, 1, 1 }, .textureId = 1 },
+    };
+    var generation = try SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
+    defer generation.deinit();
+
+    const pending = try generation.reserveTransient("runtime-orb", .{ 20, 30 });
+    var before: [runtime_object_registry.max_runtime_object_count]world_api.RenderSprite = undefined;
+    try std.testing.expectEqual(scene.objects.count, (try generation.extractSprites(&before)).len);
+
+    try generation.activateTransient(pending.handle);
+    const active = try generation.extractSprites(&before);
+    try std.testing.expectEqual(scene.objects.count + 1, active.len);
+    try std.testing.expectEqual(@as(f32, 20), active[active.len - 1].position[0]);
+
+    try generation.requestTransientDestroy(pending.handle);
+    try generation.commitTransientDestroy(pending.handle);
+    try std.testing.expectEqual(scene.objects.count, (try generation.extractSprites(&before)).len);
+    try std.testing.expect(generation.runtimeObject(pending.handle) == null);
+
+    const restart_transient = try generation.reserveTransient("runtime-orb", .{ 40, 50 });
+    try generation.activateTransient(restart_transient.handle);
+    try generation.reset();
+    try std.testing.expect(generation.runtimeObject(restart_transient.handle) == null);
+    const after_restart = try generation.reserveTransient("runtime-orb", .{ 60, 70 });
+    try std.testing.expectEqualStrings("runtime-0000000000000003", after_restart.object_id.slice());
+
+    var replacement = try SceneGeneration.prepareRestart(scene, .{ .width = 1024, .height = 720 }, &generation);
+    defer replacement.deinit();
+    const replacement_transient = try replacement.reserveTransient("runtime-orb", .{ 80, 90 });
+    try std.testing.expectEqualStrings("runtime-0000000000000004", replacement_transient.object_id.slice());
 }
 
 test "SceneGeneration contacts ignore decorative sprites" {

@@ -32,8 +32,8 @@ internal static class BehaviorPublicationVerifier
             var artifactPath = Path.Combine(initial.DerivedDirectory, "script.script");
             var artifact = File.ReadAllBytes(artifactPath);
             Require(BinaryPrimitives.ReadUInt32LittleEndian(artifact.AsSpan(4, 4)) == 2
-                && BinaryPrimitives.ReadUInt32LittleEndian(artifact.AsSpan(12, 4)) == 3,
-                "Publication did not produce KSCP v2 with Host Interface v3.");
+                && BinaryPrimitives.ReadUInt32LittleEndian(artifact.AsSpan(12, 4)) == 4,
+                "Publication did not produce KSCP v2 with Host Interface v4.");
             var hostV2Artifact = artifact.ToArray();
             BinaryPrimitives.WriteUInt32LittleEndian(hostV2Artifact.AsSpan(12, 4), 2);
             try

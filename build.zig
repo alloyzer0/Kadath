@@ -694,6 +694,17 @@ pub fn build(b: *std.Build) void {
         const scene_generation_test_step = b.step("test-scene-generation", "Run Scene object generation contracts against World");
         scene_generation_test_step.dependOn(&scene_generation_test_run.step);
         test_step.dependOn(scene_generation_test_step);
+
+        const runtime_object_registry_test_mod = b.createModule(.{
+            .root_source_file = b.path("app/runtime_object_registry.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const runtime_object_registry_tests = b.addTest(.{ .root_module = runtime_object_registry_test_mod });
+        const runtime_object_registry_test_run = b.addRunArtifact(runtime_object_registry_tests);
+        const runtime_object_registry_test_step = b.step("test-runtime-object-registry", "Run Runtime Object Registry lifecycle contracts");
+        runtime_object_registry_test_step.dependOn(&runtime_object_registry_test_run.step);
+        test_step.dependOn(runtime_object_registry_test_step);
     }
 
     const null_rhi_mod = b.createModule(.{

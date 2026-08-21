@@ -108,7 +108,7 @@ test "Behavior Host keeps runtime ownership stack bounded" {
     try std.testing.expect(@sizeOf(behavior_host.Runtime) < 1024);
 }
 
-test "unsupported Behavior Host stub mirrors the Host v3 scheduling surface" {
+test "unsupported Behavior Host stub mirrors the Host v4 scheduling surface" {
     var runtime = behavior_host_stub.Runtime{};
     var generation: scene_generation_api.SceneGeneration = undefined;
     try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.onStart(&generation));
@@ -116,6 +116,425 @@ test "unsupported Behavior Host stub mirrors the Host v3 scheduling surface" {
     try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.runUpdate(&generation, 0.25, .{}));
     try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.finishFixedStep(&generation, &.{}, .{}));
     try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.finishFrame(&generation, .{}));
+}
+
+test "Runtime object lifecycle activates prototype Behavior and destroys before later callbacks" {
+    const lifecycle_manifest =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/spawner.luau"},
+        \\{"scriptId":2,"source":"scripts/orb.luau"}]}
+    ;
+    const spawner_source =
+        \\--!strict
+        \\local frame = 0
+        \\local orb: Kadath.Object? = nil
+        \\return {
+        \\    update = function(self: Kadath.Object, dt: number)
+        \\        frame += 1
+        \\        if frame == 1 then
+        \\            local created = kadath.scene.spawn("runtime-orb", 10, 20)
+        \\            created:translate(2, 3)
+        \\            orb = created
+        \\        elseif frame == 3 and orb then
+        \\            local current = orb
+        \\            current:destroy()
+        \\            if current:id() ~= "runtime-0000000000000001" then error("stale id changed") end
+        \\        end
+        \\    end,
+        \\}
+    ;
+    const orb_source =
+        \\--!strict
+        \\return {
+        \\    on_start = function(self: Kadath.Object) self:translate(5, 0) end,
+        \\    update = function(self: Kadath.Object, dt: number) self:translate(1, 0) end,
+        \\}
+    ;
+    const lifecycle_scene =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]}],"prototypes":[
+        \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(lifecycle_manifest, &.{
+        .{ .path = "scripts/spawner.luau", .source = spawner_source },
+        .{ .path = "scripts/orb.luau", .source = orb_source },
+    }, lifecycle_scene);
+    defer fixture.deinit();
+
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    const pending_index = fixture.generation.objectIndex("runtime-0000000000000001") orelse return error.MissingPendingRuntimeObject;
+    try std.testing.expectApproxEqAbs(@as(f32, 12), (try fixture.generation.objectPosition(pending_index))[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 23), (try fixture.generation.objectPosition(pending_index))[1], 0.0001);
+    try std.testing.expectEqual(@as(usize, 3), fixture.generation.runtime_objects.activeCount());
+
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expectEqual(@as(usize, 4), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expectApproxEqAbs(@as(f32, 17), (try fixture.generation.objectPosition(pending_index))[0], 0.0001);
+
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expectApproxEqAbs(@as(f32, 18), (try fixture.generation.objectPosition(pending_index))[0], 0.0001);
+
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") == null);
+    try std.testing.expectEqual(@as(usize, 3), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expect(fixture.runtime.active.?.bindingEnabled(1));
+}
+
+test "failed dynamic on_start rolls back object writes events and structural successors" {
+    const manifest_source =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/spawner.luau"},
+        \\{"scriptId":2,"source":"scripts/dirty.luau"},
+        \\{"scriptId":3,"source":"scripts/fail.luau"}]}
+    ;
+    const spawner =
+        \\--!strict
+        \\local spawned = false
+        \\return { update = function(self: Kadath.Object, dt: number)
+        \\    if not spawned then kadath.scene.spawn("runtime-orb", 10, 20); spawned = true end
+        \\end }
+    ;
+    const dirty =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object)
+        \\    local goal = kadath.scene.find("goal")
+        \\    if goal then goal:translate(100, 0); kadath.event.post(goal, "candidate") end
+        \\    kadath.scene.spawn("runtime-orb", 30, 40)
+        \\end }
+    ;
+    const failing =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object) error("activation failure") end }
+    ;
+    const rollback_scene_source =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]}],"prototypes":[
+        \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}},{"scriptId":3,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(manifest_source, &.{
+        .{ .path = "scripts/spawner.luau", .source = spawner },
+        .{ .path = "scripts/dirty.luau", .source = dirty },
+        .{ .path = "scripts/fail.luau", .source = failing },
+    }, rollback_scene_source);
+    defer fixture.deinit();
+
+    const goal_before = try fixture.generation.objectPosition(0);
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") == null);
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000002") == null);
+    try std.testing.expectEqual(@as(usize, 3), fixture.generation.runtime_objects.activeCount());
+    try std.testing.expectEqual(goal_before, try fixture.generation.objectPosition(0));
+}
+
+test "dynamic on_start spawn then destroy cancels child before activation" {
+    const manifest_source =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/spawner.luau"},
+        \\{"scriptId":2,"source":"scripts/parent.luau"},
+        \\{"scriptId":3,"source":"scripts/child.luau"}]}
+    ;
+    const spawner =
+        \\--!strict
+        \\local spawned = false
+        \\return { update = function(self: Kadath.Object, dt: number)
+        \\    if not spawned then kadath.scene.spawn("runtime-parent", 10, 20); spawned = true end
+        \\end }
+    ;
+    const parent =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object)
+        \\    local child = kadath.scene.spawn("runtime-child", 30, 40)
+        \\    child:destroy()
+        \\end }
+    ;
+    const child =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object)
+        \\    local goal = kadath.scene.find("goal")
+        \\    if goal then goal:translate(100, 0) end
+        \\end }
+    ;
+    const lifecycle_scene =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":3,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]}],"prototypes":[
+        \\{"prototypeId":"runtime-parent","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]},
+        \\{"prototypeId":"runtime-child","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":3,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(manifest_source, &.{
+        .{ .path = "scripts/spawner.luau", .source = spawner },
+        .{ .path = "scripts/parent.luau", .source = parent },
+        .{ .path = "scripts/child.luau", .source = child },
+    }, lifecycle_scene);
+    defer fixture.deinit();
+
+    const goal_before = try fixture.generation.objectPosition(0);
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expectEqual(goal_before, try fixture.generation.objectPosition(0));
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000002") == null);
+    try std.testing.expectEqual(@as(usize, 4), fixture.generation.runtime_objects.activeCount());
+}
+
+test "dynamic on_start self destroy skips later bindings and never renders" {
+    const manifest_source =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/spawner.luau"},
+        \\{"scriptId":2,"source":"scripts/destroy-self.luau"},
+        \\{"scriptId":3,"source":"scripts/after-destroy.luau"}]}
+    ;
+    const spawner =
+        \\--!strict
+        \\local spawned = false
+        \\return { update = function(self: Kadath.Object, dt: number)
+        \\    if not spawned then kadath.scene.spawn("runtime-orb", 10, 20); spawned = true end
+        \\end }
+    ;
+    const destroy_self =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object) self:destroy() end }
+    ;
+    const after_destroy =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object)
+        \\    local goal = kadath.scene.find("goal")
+        \\    if goal then goal:translate(1000, 0) end
+        \\end }
+    ;
+    const lifecycle_scene =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":3,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]}],"prototypes":[
+        \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}},{"scriptId":3,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(manifest_source, &.{
+        .{ .path = "scripts/spawner.luau", .source = spawner },
+        .{ .path = "scripts/destroy-self.luau", .source = destroy_self },
+        .{ .path = "scripts/after-destroy.luau", .source = after_destroy },
+    }, lifecycle_scene);
+    defer fixture.deinit();
+
+    const goal_before = try fixture.generation.objectPosition(0);
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expectEqual(goal_before, try fixture.generation.objectPosition(0));
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") == null);
+    try std.testing.expectEqual(@as(usize, 3), fixture.generation.runtime_objects.activeCount());
+}
+
+test "dynamic on_start destroy hides an existing transient from later activations in the same flush" {
+    const manifest_source =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/spawner.luau"},
+        \\{"scriptId":2,"source":"scripts/killer.luau"},
+        \\{"scriptId":3,"source":"scripts/observer.luau"}]}
+    ;
+    const spawner =
+        \\--!strict
+        \\local frame = 0
+        \\return { update = function(self: Kadath.Object, dt: number)
+        \\    frame += 1
+        \\    if frame == 1 then
+        \\        kadath.scene.spawn("runtime-victim", 10, 20)
+        \\    elseif frame == 2 then
+        \\        kadath.scene.spawn("runtime-killer", 30, 40)
+        \\        kadath.scene.spawn("runtime-observer", 50, 60)
+        \\    end
+        \\end }
+    ;
+    const killer =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object)
+        \\    local victim = kadath.scene.find("runtime-0000000000000001")
+        \\    if victim then victim:destroy() end
+        \\end }
+    ;
+    const observer =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object)
+        \\    if kadath.scene.find("runtime-0000000000000001") then
+        \\        local goal = kadath.scene.find("goal")
+        \\        if goal then goal:translate(100, 0) end
+        \\    end
+        \\end }
+    ;
+    const lifecycle_scene =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":3,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]}],"prototypes":[
+        \\{"prototypeId":"runtime-victim","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"prototypeId":"runtime-killer","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]},
+        \\{"prototypeId":"runtime-observer","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":3,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(manifest_source, &.{
+        .{ .path = "scripts/spawner.luau", .source = spawner },
+        .{ .path = "scripts/killer.luau", .source = killer },
+        .{ .path = "scripts/observer.luau", .source = observer },
+    }, lifecycle_scene);
+    defer fixture.deinit();
+
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") != null);
+
+    const goal_before = try fixture.generation.objectPosition(0);
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expectEqual(goal_before, try fixture.generation.objectPosition(0));
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") == null);
+}
+
+test "event destroy skips later bindings for the same transient target" {
+    const manifest_source =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/driver.luau"},
+        \\{"scriptId":2,"source":"scripts/destroy-on-event.luau"},
+        \\{"scriptId":3,"source":"scripts/after-destroy.luau"}]}
+    ;
+    const driver =
+        \\--!strict
+        \\local frame = 0
+        \\local target: Kadath.Object? = nil
+        \\return { update = function(self: Kadath.Object, dt: number)
+        \\    frame += 1
+        \\    if frame == 1 then
+        \\        target = kadath.scene.spawn("runtime-target", 10, 20)
+        \\    elseif frame == 2 and target then
+        \\        kadath.event.post(target, "destroy")
+        \\    end
+        \\end }
+    ;
+    const destroy_on_event =
+        \\--!strict
+        \\return { on_event = function(self: Kadath.Object, event: Kadath.Event)
+        \\    if event.name == "destroy" then self:destroy() end
+        \\end }
+    ;
+    const after_destroy =
+        \\--!strict
+        \\return { on_event = function(self: Kadath.Object, event: Kadath.Event)
+        \\    if event.name == "destroy" then
+        \\        local goal = kadath.scene.find("goal")
+        \\        if goal then goal:translate(100, 0) end
+        \\    end
+        \\end }
+    ;
+    const lifecycle_scene =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":3,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]}],"prototypes":[
+        \\{"prototypeId":"runtime-target","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}},{"scriptId":3,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(manifest_source, &.{
+        .{ .path = "scripts/driver.luau", .source = driver },
+        .{ .path = "scripts/destroy-on-event.luau", .source = destroy_on_event },
+        .{ .path = "scripts/after-destroy.luau", .source = after_destroy },
+    }, lifecycle_scene);
+    defer fixture.deinit();
+
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    const goal_before = try fixture.generation.objectPosition(0);
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expectEqual(goal_before, try fixture.generation.objectPosition(0));
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") == null);
+}
+
+test "eighth generation event can enqueue a first generation structural request" {
+    const manifest_source =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/event-chain.luau"},
+        \\{"scriptId":99,"source":"scripts/no-op.luau"}]}
+    ;
+    const event_chain =
+        \\--!strict
+        \\local started = false
+        \\local count = 0
+        \\return {
+        \\    update = function(self: Kadath.Object, dt: number)
+        \\        if not started then started = true; kadath.event.post(self, "chain") end
+        \\    end,
+        \\    on_event = function(self: Kadath.Object, event: Kadath.Event)
+        \\        if event.name ~= "chain" then return end
+        \\        count += 1
+        \\        if count < 9 then
+        \\            kadath.event.post(self, "chain")
+        \\        else
+        \\            kadath.scene.spawn("runtime-target", 10, 20)
+        \\        end
+        \\    end,
+        \\}
+    ;
+    const lifecycle_scene =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":99,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]}],"prototypes":[
+        \\{"prototypeId":"runtime-target","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[]}]}
+    ;
+    var fixture = try makeRuntimeFixture(manifest_source, &.{
+        .{ .path = "scripts/event-chain.luau", .source = event_chain },
+        .{ .path = "scripts/no-op.luau", .source = no_op_source },
+    }, lifecycle_scene);
+    defer fixture.deinit();
+
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expect(fixture.generation.objectIndex("runtime-0000000000000001") != null);
+}
+
+test "candidate on_start rebuilds and updates live transient Behavior state" {
+    const manifest_source =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/spawner.luau"},
+        \\{"scriptId":2,"source":"scripts/orb.luau"}]}
+    ;
+    const spawner =
+        \\--!strict
+        \\local spawned = false
+        \\return { update = function(self: Kadath.Object, dt: number)
+        \\    if not spawned then kadath.scene.spawn("runtime-orb", 10, 20); spawned = true end
+        \\end }
+    ;
+    const orb =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object) self:translate(5, 0) end }
+    ;
+    const reload_scene =
+        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]}],"prototypes":[
+        \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(manifest_source, &.{
+        .{ .path = "scripts/spawner.luau", .source = spawner },
+        .{ .path = "scripts/orb.luau", .source = orb },
+    }, reload_scene);
+    defer fixture.deinit();
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    const transient_index = fixture.generation.objectIndex("runtime-0000000000000001") orelse return error.MissingTransientRuntimeObject;
+    try std.testing.expectApproxEqAbs(@as(f32, 15), (try fixture.generation.objectPosition(transient_index))[0], 0.0001);
+
+    var candidate = try fixture.runtime.cloneForRestart(std.testing.allocator, &fixture.generation.scene);
+    defer candidate.deinit();
+    const batch = try candidate.onStart(&fixture.generation);
+    try fixture.generation.applyTranslationDeltas(batch.slice());
+    try std.testing.expectApproxEqAbs(@as(f32, 20), (try fixture.generation.objectPosition(transient_index))[0], 0.0001);
+    try std.testing.expect(candidate.active.?.containsObject("runtime-0000000000000001"));
 }
 
 test "Behavior Host applies on_start and fixed commands in Scene order" {

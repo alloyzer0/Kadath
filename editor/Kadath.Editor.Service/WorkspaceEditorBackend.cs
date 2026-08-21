@@ -571,7 +571,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion is not (3 or 4 or 5)
+                    || model.Scene.SchemaVersion is not (3 or 4 or 5 or 6)
                     || !textureSetValid
                     || !ValidateSceneObjects(objects, textures!, sceneModel!, behaviorDependencySetValid ? scriptDependencies!.Select(dependency => dependency.ScriptId).ToHashSet() : null)
                     || model.Script.SchemaVersion is not (1 or 2)
@@ -706,7 +706,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 if (value.MoveSpeed is null || value.MoveSpeed < 0 || !double.IsFinite(value.MoveSpeed.Value)
                     || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null) return false;
             }
-            if (scene.SchemaVersion == 5)
+            if (scene.SchemaVersion is 5 or 6)
             {
                 if (behaviorScriptIds is null
                     || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null

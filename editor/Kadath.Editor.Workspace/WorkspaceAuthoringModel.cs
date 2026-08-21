@@ -394,14 +394,17 @@ public sealed class WorkspaceAuthoringModel
             ? current.Textures
             : normalized.ResolvedSceneTextures.Select(value => new WorkspaceSceneTexture(value.TextureId, value.Artifact)).ToArray();
         var objects = normalized.ResolvedSceneObjects ?? ApplyFixedObjectPatch(current.Objects, normalized.Patch);
-        if (current.SourceSchemaVersion is WorkspaceSceneDocumentCodec.CurrentSchemaVersion or WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
+        if (current.SourceSchemaVersion is WorkspaceSceneDocumentCodec.LegacySchemaVersion or WorkspaceSceneDocumentCodec.BehaviorSchemaVersion or WorkspaceSceneDocumentCodec.CurrentSchemaVersion
             || normalized.ResolvedSceneObjects is not null)
         {
             try
             {
-                return current.SourceSchemaVersion == WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
-                    ? WorkspaceSceneDocumentCodec.SerializeV5(textures, objects)
-                    : WorkspaceSceneDocumentCodec.SerializeV4(textures, objects);
+                return current.SourceSchemaVersion switch
+                {
+                    WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV6(textures, objects, current.Prototypes),
+                    WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV5(textures, objects),
+                    _ => WorkspaceSceneDocumentCodec.SerializeV4(textures, objects)
+                };
             }
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
         }
@@ -488,7 +491,7 @@ public sealed class WorkspaceAuthoringModel
         if (normalized.ResolvedSceneObjects is not { } requested) return;
         var currentObjects = current.Scene.Objects
             ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene object set is missing from the snapshot.");
-        if (current.Scene.SchemaVersion != WorkspaceSceneDocumentCodec.BehaviorSchemaVersion) return;
+        if (current.Scene.SchemaVersion is not (WorkspaceSceneDocumentCodec.BehaviorSchemaVersion or WorkspaceSceneDocumentCodec.CurrentSchemaVersion)) return;
         if (!BehaviorCollectionsChanged(currentObjects, requested)) return;
 
         WorkspaceBehaviorContractObservation observation;
@@ -559,9 +562,12 @@ public sealed class WorkspaceAuthoringModel
             binding.Parameters?.ToDictionary(parameter => parameter.Name, parameter => parameter.Value, StringComparer.Ordinal))).ToArray());
 
     private static int TargetSceneSchema(int sourceSchemaVersion) =>
-        sourceSchemaVersion == WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
-            ? WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
-            : WorkspaceSceneDocumentCodec.CurrentSchemaVersion;
+        sourceSchemaVersion switch
+        {
+            WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.CurrentSchemaVersion,
+            WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => WorkspaceSceneDocumentCodec.BehaviorSchemaVersion,
+            _ => WorkspaceSceneDocumentCodec.LegacySchemaVersion
+        };
 
     private static JsonObject ParseObject(byte[] bytes, string name)
     {

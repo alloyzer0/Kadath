@@ -16,7 +16,7 @@ extern "C" {
 #define KADATH_LUAU_MAX_OBJECT_ID_BYTES 63
 #define KADATH_LUAU_MAX_ANALYSIS_DIAGNOSTIC_COUNT 32
 #define KADATH_LUAU_MAX_ANALYSIS_MESSAGE_BYTES 1024
-#define KADATH_LUAU_HOST_INTERFACE_VERSION 3
+#define KADATH_LUAU_HOST_INTERFACE_VERSION 4
 #define KADATH_LUAU_MAX_EVENT_NAME_BYTES 63
 #define KADATH_LUAU_MAX_EVENT_FIELD_COUNT 8
 #define KADATH_LUAU_MAX_EVENT_KEY_BYTES 31
@@ -127,8 +127,16 @@ typedef int (*KadathLuauSetObjectPositionFn)(
     double x,
     double y);
 typedef int (*KadathLuauPostEventFn)(void* userdata, const KadathLuauPostedEvent* event);
+typedef int (*KadathLuauSpawnObjectFn)(
+    void* userdata,
+    const char* prototype_id,
+    size_t prototype_id_length,
+    double x,
+    double y,
+    KadathLuauObjectHandle* out_object);
+typedef int (*KadathLuauDestroyObjectFn)(void* userdata, const KadathLuauObjectHandle* object);
 
-typedef struct KadathLuauHostV3 {
+typedef struct KadathLuauHostV4 {
     uint32_t version;
     uint32_t struct_size;
     void* userdata;
@@ -137,7 +145,9 @@ typedef struct KadathLuauHostV3 {
     KadathLuauGetObjectPositionFn get_object_position;
     KadathLuauSetObjectPositionFn set_object_position;
     KadathLuauPostEventFn post_event;
-} KadathLuauHostV3;
+    KadathLuauSpawnObjectFn spawn_object;
+    KadathLuauDestroyObjectFn destroy_object;
+} KadathLuauHostV4;
 
 typedef struct KadathLuauCompileResult {
     uint8_t* bytecode;
@@ -271,33 +281,33 @@ int kadath_luau_instance_fixed_update(
     char* error_buffer,
     size_t error_buffer_size);
 
-int kadath_luau_instance_on_start_v3(
+int kadath_luau_instance_on_start_v4(
     KadathLuauInstance* instance,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size);
 
-int kadath_luau_instance_fixed_update_v3(
-    KadathLuauInstance* instance,
-    double dt_seconds,
-    const KadathLuauInputSnapshot* input_snapshot,
-    const KadathLuauHostV3* host,
-    char* error_buffer,
-    size_t error_buffer_size);
-
-int kadath_luau_instance_update_v3(
+int kadath_luau_instance_fixed_update_v4(
     KadathLuauInstance* instance,
     double dt_seconds,
     const KadathLuauInputSnapshot* input_snapshot,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size);
 
-int kadath_luau_instance_on_event_v3(
+int kadath_luau_instance_update_v4(
+    KadathLuauInstance* instance,
+    double dt_seconds,
+    const KadathLuauInputSnapshot* input_snapshot,
+    const KadathLuauHostV4* host,
+    char* error_buffer,
+    size_t error_buffer_size);
+
+int kadath_luau_instance_on_event_v4(
     KadathLuauInstance* instance,
     const KadathLuauEvent* event,
     const KadathLuauInputSnapshot* input_snapshot,
-    const KadathLuauHostV3* host,
+    const KadathLuauHostV4* host,
     char* error_buffer,
     size_t error_buffer_size);
 

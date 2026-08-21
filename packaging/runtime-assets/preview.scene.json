@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "textures": [
     { "textureId": 1, "artifact": "assets/renderer2d/test.texture" },
     { "textureId": 2, "artifact": "assets/renderer2d/goal.texture" },
@@ -88,6 +88,23 @@
         "textureId": 1
       },
       "player": { "moveSpeed": 180.0 },
+      "behaviors": [
+        {
+          "scriptId": 2,
+          "parameters": { "speed": 180.0 }
+        }
+      ]
+    }
+  ],
+  "prototypes": [
+    {
+      "prototypeId": "runtime-orb",
+      "kind": "sprite",
+      "sprite": {
+        "size": [48.0, 48.0],
+        "color": [0.35, 0.85, 1.0, 1.0],
+        "textureId": 2
+      },
       "behaviors": [
         {
           "scriptId": 2,

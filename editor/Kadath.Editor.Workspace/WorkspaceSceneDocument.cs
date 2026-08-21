@@ -14,6 +14,14 @@ internal sealed record WorkspaceSceneBehaviorBinding(
     uint ScriptId,
     WorkspaceSceneBehaviorParameter[] Parameters);
 
+internal sealed record WorkspaceScenePrototype(
+    string PrototypeId,
+    string Kind,
+    double[] Size,
+    double[] Color,
+    uint TextureId,
+    WorkspaceSceneBehaviorBinding[] Behaviors);
+
 internal sealed record WorkspaceSceneObject(
     string ObjectId,
     string Kind,
@@ -45,7 +53,8 @@ internal sealed record WorkspaceSceneObject(
 internal sealed record WorkspaceSceneDocument(
     int SourceSchemaVersion,
     WorkspaceSceneTexture[] Textures,
-    WorkspaceSceneObject[] Objects)
+    WorkspaceSceneObject[] Objects,
+    WorkspaceScenePrototype[] Prototypes)
 {
     internal WorkspaceSceneObject Player => Objects.Single(value => value.Kind == WorkspaceSceneDocumentCodec.PlayerKind);
     internal WorkspaceSceneObject Goal => Objects.Single(value => value.Kind == WorkspaceSceneDocumentCodec.GoalKind);
@@ -54,14 +63,17 @@ internal sealed record WorkspaceSceneDocument(
 
 internal static partial class WorkspaceSceneDocumentCodec
 {
-    internal const int CurrentSchemaVersion = 4;
+    internal const int LegacySchemaVersion = 4;
     internal const int BehaviorSchemaVersion = 5;
+    internal const int CurrentSchemaVersion = 6;
     internal const int MinObjectCount = 3;
     internal const int MaxObjectCount = 64;
     internal const int MaxBehaviorBindingsPerObject = 4;
     internal const int MaxBehaviorBindingCount = 256;
     internal const int MaxBehaviorParameterCount = 16;
     internal const int MaxBehaviorParameterNameBytes = 63;
+    internal const int MaxPrototypeCount = 32;
+    internal const int MaxPrototypeBehaviorBindingCount = 128;
     internal const string SpriteKind = "sprite";
     internal const string PlayerKind = "player";
     internal const string GoalKind = "goal";
@@ -90,14 +102,16 @@ internal static partial class WorkspaceSceneDocumentCodec
             var properties = schemaVersion switch
             {
                 3 => ReadProperties(root, ["schemaVersion", "textures", "player", "goal", "hazard"], [], "Scene"),
-                CurrentSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects"], [], "Scene"),
+                LegacySchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects"], [], "Scene"),
                 BehaviorSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects"], [], "Scene"),
+                CurrentSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], [], "Scene"),
                 _ => throw Failure("Unsupported Scene schemaVersion.")
             };
             var textures = ReadTextures(properties["textures"]);
             var objects = schemaVersion == 3 ? ReadLegacyObjects(properties) : ReadObjects(properties["objects"], schemaVersion);
-            Validate(textures, objects, schemaVersion == 3 ? CurrentSchemaVersion : schemaVersion);
-            return new WorkspaceSceneDocument(schemaVersion, textures, objects);
+            var prototypes = schemaVersion == CurrentSchemaVersion ? ReadPrototypes(properties["prototypes"]) : Array.Empty<WorkspaceScenePrototype>();
+            Validate(textures, objects, prototypes, schemaVersion == 3 ? LegacySchemaVersion : schemaVersion);
+            return new WorkspaceSceneDocument(schemaVersion, textures, objects, prototypes);
         }
         catch (JsonException exception)
         {
@@ -110,7 +124,7 @@ internal static partial class WorkspaceSceneDocumentCodec
     }
 
     internal static WorkspaceSceneObject[] NormalizeDefinitions(IReadOnlyList<SceneObjectDefinition> definitions, IReadOnlyList<WorkspaceSceneTexture> textures) =>
-        NormalizeDefinitions(definitions, textures, CurrentSchemaVersion);
+        NormalizeDefinitions(definitions, textures, LegacySchemaVersion);
 
     internal static WorkspaceSceneObject[] NormalizeDefinitions(
         IReadOnlyList<SceneObjectDefinition> definitions,
@@ -133,31 +147,45 @@ internal static partial class WorkspaceSceneDocumentCodec
                 binding.ScriptId,
                 binding.Parameters?.Select(parameter => new WorkspaceSceneBehaviorParameter(parameter.Key, parameter.Value)).ToArray()
                     ?? Array.Empty<WorkspaceSceneBehaviorParameter>())).ToArray())).ToArray();
-        Validate(textures, objects, schemaVersion);
+        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), schemaVersion);
         return objects;
     }
 
     internal static void ValidateNormalized(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects) =>
-        Validate(textures, objects, CurrentSchemaVersion);
+        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacySchemaVersion);
 
     internal static void ValidateNormalized(
         IReadOnlyList<WorkspaceSceneTexture> textures,
         IReadOnlyList<WorkspaceSceneObject> objects,
         int schemaVersion) =>
-        Validate(textures, objects, schemaVersion);
+        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), schemaVersion);
+
+    internal static void ValidateNormalized(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        int schemaVersion) =>
+        Validate(textures, objects, prototypes, schemaVersion);
 
     internal static byte[] SerializeV4(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects)
-        => Serialize(CurrentSchemaVersion, textures, objects);
+        => Serialize(LegacySchemaVersion, textures, objects, Array.Empty<WorkspaceScenePrototype>());
 
     internal static byte[] SerializeV5(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects)
-        => Serialize(BehaviorSchemaVersion, textures, objects);
+        => Serialize(BehaviorSchemaVersion, textures, objects, Array.Empty<WorkspaceScenePrototype>());
+
+    internal static byte[] SerializeV6(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes)
+        => Serialize(CurrentSchemaVersion, textures, objects, prototypes);
 
     private static byte[] Serialize(
         int schemaVersion,
         IReadOnlyList<WorkspaceSceneTexture> textures,
-        IReadOnlyList<WorkspaceSceneObject> objects)
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes)
     {
-        Validate(textures, objects, schemaVersion);
+        Validate(textures, objects, prototypes, schemaVersion);
         var buffer = new ArrayBufferWriter<byte>();
         using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
         {
@@ -197,7 +225,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                     writer.WriteNumber("moveSpeed", sceneObject.MoveSpeed!.Value);
                     writer.WriteEndObject();
                 }
-                else if (schemaVersion == CurrentSchemaVersion && sceneObject.Kind == PatrolHazardKind)
+                else if (schemaVersion == LegacySchemaVersion && sceneObject.Kind == PatrolHazardKind)
                 {
                     writer.WritePropertyName("patrol");
                     writer.WriteStartObject();
@@ -206,7 +234,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                     writer.WriteNumber("speed", sceneObject.PatrolSpeed!.Value);
                     writer.WriteEndObject();
                 }
-                if (schemaVersion == BehaviorSchemaVersion)
+                if (schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion)
                 {
                     writer.WritePropertyName("behaviors");
                     writer.WriteStartArray();
@@ -228,6 +256,26 @@ internal static partial class WorkspaceSceneDocumentCodec
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
+            if (schemaVersion == CurrentSchemaVersion)
+            {
+                writer.WritePropertyName("prototypes");
+                writer.WriteStartArray();
+                foreach (var prototype in prototypes)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("prototypeId", prototype.PrototypeId);
+                    writer.WriteString("kind", prototype.Kind);
+                    writer.WritePropertyName("sprite");
+                    writer.WriteStartObject();
+                    WriteVector(writer, "size", prototype.Size);
+                    WriteVector(writer, "color", prototype.Color);
+                    writer.WriteNumber("textureId", prototype.TextureId);
+                    writer.WriteEndObject();
+                    WriteBehaviorBindings(writer, prototype.Behaviors);
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndArray();
+            }
             writer.WriteEndObject();
         }
         var bytes = new byte[buffer.WrittenCount + 1];
@@ -261,7 +309,7 @@ internal static partial class WorkspaceSceneDocumentCodec
         foreach (var element in value.EnumerateArray())
         {
             var owner = $"Scene.objects[{index}]";
-            var properties = schemaVersion == BehaviorSchemaVersion
+            var properties = schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion
                 ? ReadProperties(element, ["objectId", "kind", "transform", "sprite", "behaviors"], ["player"], owner)
                 : ReadProperties(element, ["objectId", "kind", "transform", "sprite"], ["player", "patrol"], owner);
             var objectId = RequireString(properties["objectId"], $"{owner}.objectId");
@@ -272,7 +320,7 @@ internal static partial class WorkspaceSceneDocumentCodec
             double? patrolMinY = null;
             double? patrolMaxY = null;
             double? patrolSpeed = null;
-            var behaviors = schemaVersion == BehaviorSchemaVersion
+            var behaviors = schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion
                 ? ReadBehaviorBindings(properties["behaviors"], owner)
                 : Array.Empty<WorkspaceSceneBehaviorBinding>();
             switch (kind)
@@ -288,7 +336,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                     break;
                 case PatrolHazardKind:
                     if (properties.ContainsKey("player")) throw Failure($"{owner} has an invalid player payload.");
-                    if (schemaVersion == BehaviorSchemaVersion)
+                    if (schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion)
                     {
                         if (behaviors.Length == 0) throw Failure($"{owner} must contain at least one behavior binding.");
                     }
@@ -319,6 +367,29 @@ internal static partial class WorkspaceSceneDocumentCodec
             index++;
         }
         return objects.ToArray();
+    }
+
+    private static WorkspaceScenePrototype[] ReadPrototypes(JsonElement value)
+    {
+        RequireArray(value, "Scene.prototypes");
+        if (value.GetArrayLength() > MaxPrototypeCount) throw Failure($"Scene.prototypes exceeds the {MaxPrototypeCount} prototype limit.");
+        var prototypes = new List<WorkspaceScenePrototype>();
+        var index = 0;
+        foreach (var element in value.EnumerateArray())
+        {
+            var owner = $"Scene.prototypes[{index}]";
+            var properties = ReadProperties(element, ["prototypeId", "kind", "sprite", "behaviors"], [], owner);
+            var sprite = ReadProperties(properties["sprite"], ["size", "color", "textureId"], [], $"{owner}.sprite");
+            prototypes.Add(new WorkspaceScenePrototype(
+                RequireString(properties["prototypeId"], $"{owner}.prototypeId"),
+                RequireString(properties["kind"], $"{owner}.kind"),
+                RequireVector(sprite["size"], 2, $"{owner}.sprite.size"),
+                RequireVector(sprite["color"], 4, $"{owner}.sprite.color"),
+                RequireUInt32(sprite["textureId"], $"{owner}.sprite.textureId"),
+                ReadBehaviorBindings(properties["behaviors"], owner)));
+            index++;
+        }
+        return prototypes.ToArray();
     }
 
     private static WorkspaceSceneBehaviorBinding[] ReadBehaviorBindings(JsonElement value, string owner)
@@ -386,9 +457,10 @@ internal static partial class WorkspaceSceneDocumentCodec
     private static void Validate(
         IReadOnlyList<WorkspaceSceneTexture> textures,
         IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
         int schemaVersion)
     {
-        if (schemaVersion is not (CurrentSchemaVersion or BehaviorSchemaVersion)) throw Failure("Unsupported Scene schemaVersion.");
+        if (schemaVersion is not (LegacySchemaVersion or BehaviorSchemaVersion or CurrentSchemaVersion)) throw Failure("Unsupported Scene schemaVersion.");
         if (textures.Count is < 1 or > 4) throw Failure("Scene.textures must contain 1 to 4 entries.");
         var textureIds = new HashSet<uint>();
         foreach (var texture in textures)
@@ -410,9 +482,9 @@ internal static partial class WorkspaceSceneDocumentCodec
             ValidateVector(sceneObject.Color, 4, $"Scene.objects[{sceneObject.ObjectId}].color", positive: false, color: true);
             if (sceneObject.TextureId == 0 || !textureIds.Contains(sceneObject.TextureId)) throw Failure($"Scene.objects[{sceneObject.ObjectId}].textureId is not declared by Scene.textures.");
             var behaviors = sceneObject.Behaviors ?? Array.Empty<WorkspaceSceneBehaviorBinding>();
-            if (schemaVersion == CurrentSchemaVersion && behaviors.Length != 0)
+            if (schemaVersion == LegacySchemaVersion && behaviors.Length != 0)
                 throw Failure($"Scene.objects[{sceneObject.ObjectId}] cannot contain behavior bindings in schema v4.");
-            if (schemaVersion == BehaviorSchemaVersion)
+            if (schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion)
             {
                 ValidateBehaviorBindings(behaviors, sceneObject.ObjectId);
                 behaviorBindingCount = checked(behaviorBindingCount + behaviors.Length);
@@ -435,7 +507,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                 case PatrolHazardKind:
                     hazardCount++;
                     if (sceneObject.MoveSpeed is not null) throw Failure($"Scene.objects[{sceneObject.ObjectId}] has an invalid player payload.");
-                    if (schemaVersion == CurrentSchemaVersion)
+                    if (schemaVersion == LegacySchemaVersion)
                     {
                         if (sceneObject.PatrolMinY is null || sceneObject.PatrolMaxY is null || sceneObject.PatrolSpeed is null
                             || !IsFiniteF32(sceneObject.PatrolMinY.Value) || !IsFiniteF32(sceneObject.PatrolMaxY.Value) || !IsFiniteF32(sceneObject.PatrolSpeed.Value)
@@ -453,6 +525,38 @@ internal static partial class WorkspaceSceneDocumentCodec
             }
         }
         if (playerCount != 1 || goalCount != 1 || hazardCount < 1) throw Failure("Scene must contain exactly one player, exactly one goal, and at least one patrol_hazard.");
+        if (schemaVersion != CurrentSchemaVersion && prototypes.Count != 0) throw Failure("Scene prototypes require schema v6.");
+        if (prototypes.Count > MaxPrototypeCount) throw Failure("Scene prototype budget exceeded.");
+        var prototypeIds = new HashSet<string>(StringComparer.Ordinal);
+        var prototypeBehaviorCount = 0;
+        foreach (var prototype in prototypes)
+        {
+            if (!IsObjectId(prototype.PrototypeId) || !prototypeIds.Add(prototype.PrototypeId)) throw Failure("Scene PrototypeId must be unique and valid.");
+            if (prototype.Kind != SpriteKind) throw Failure($"Scene.prototypes[{prototype.PrototypeId}].kind must be sprite.");
+            ValidateVector(prototype.Size, 2, $"Scene.prototypes[{prototype.PrototypeId}].size", positive: true, color: false);
+            ValidateVector(prototype.Color, 4, $"Scene.prototypes[{prototype.PrototypeId}].color", positive: false, color: true);
+            if (prototype.TextureId == 0 || !textureIds.Contains(prototype.TextureId)) throw Failure($"Scene.prototypes[{prototype.PrototypeId}].textureId is not declared by Scene.textures.");
+            ValidateBehaviorBindings(prototype.Behaviors, prototype.PrototypeId);
+            prototypeBehaviorCount = checked(prototypeBehaviorCount + prototype.Behaviors.Length);
+            if (prototypeBehaviorCount > MaxPrototypeBehaviorBindingCount) throw Failure("Scene prototype behavior binding budget exceeded.");
+        }
+    }
+
+    private static void WriteBehaviorBindings(Utf8JsonWriter writer, IReadOnlyList<WorkspaceSceneBehaviorBinding> behaviors)
+    {
+        writer.WritePropertyName("behaviors");
+        writer.WriteStartArray();
+        foreach (var behavior in behaviors)
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("scriptId", behavior.ScriptId);
+            writer.WritePropertyName("parameters");
+            writer.WriteStartObject();
+            foreach (var parameter in behavior.Parameters) writer.WriteNumber(parameter.Name, parameter.Value);
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+        writer.WriteEndArray();
     }
 
     private static void ValidateBehaviorBindings(IReadOnlyList<WorkspaceSceneBehaviorBinding> behaviors, string objectId)

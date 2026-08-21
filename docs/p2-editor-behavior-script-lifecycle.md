@@ -3,15 +3,15 @@
 ## 目标
 
 本阶段把行为脚本项目从“可以验证和发布”推进到“可以创建、打开、读取、编辑，并在 Editor 内管理脚本资产生命周期”。
-行为脚本使用 Luau 源文件，项目清单使用 Script v2，场景使用 Scene v5。
+行为脚本使用 Luau 源文件，项目清单使用 Script v2；Scene v5 提供对象 Behavior Binding，Scene v6 在此基础上增加只读 Spawn Prototype。
 
 ## 固定契约
 
 - `script.json` 的 `schemaVersion=2` 是行为脚本清单，清单中的每个条目包含唯一的 `scriptId` 和 `scripts/*.luau` 源路径。
-- `scene.json` 的 `schemaVersion=5` 在对象上声明 `behaviors`，每个绑定引用 `scriptId`，参数由稳定名称和值组成。
+- `scene.json` 的 `schemaVersion=5/6` 在对象上声明 `behaviors`，每个绑定引用 `scriptId`，参数由稳定名称和值组成；v6 还允许在 `prototypes[]` 中声明 sprite-only 生成原型。
 - `Create` 在模板校验通过后复制清单声明的全部 Luau 依赖；缺失依赖不得创建部分项目。
 - `Open` 和 `Validate` 使用同一套项目边界与重解析点检查，且不修改项目树。
-- `ReadModel` 的行为脚本快照保留 Scene v5、Script v2 版本，并公开脚本依赖和场景行为绑定。
+- `ReadModel` 的行为脚本快照保留 Scene v5/v6、Script v2 版本，并公开脚本依赖和场景行为绑定；Prototype 在 Workspace/Publication 内部无损保留，但不投影为 Hierarchy 节点。
 - `Authoring` 接受完整 `SceneObjectDefinition` 行为绑定集合，可修改绑定参数；v5 场景始终以 v5 序列化，撤销恢复原始绑定。
 - Avalonia 对象草稿必须无损保留 `ProjectModelSceneObject.Behaviors`；修改位置、尺寸、颜色、纹理或对象顺序时，必须按原顺序和参数重新提交绑定，不得把已有绑定误序列化为空集合。
 - Avalonia 必须区分 v4 原生 `patrol` 字段与 v5 `behaviors` 字段；v5 不显示或提交已废弃的原生 Patrol 参数，v4 继续保持原有编辑语义。
@@ -32,18 +32,18 @@
 - v1 Hook 脚本仍保留原有 `GoalPosition` / `GoalVelocity` 投影；v2 行为脚本不伪造 Hook 指令，相关数组为空。
 - v2 项目的 `AuthoringRevision` 使用场景字节哈希和完整脚本依赖集合修订，而不是只哈希 `script.json`。
 - Behavior Tool 在提取参数和校验返回表时会执行 Luau 顶层代码；tooling VM 必须同时施加 2 MiB 内存上限和 100000 次中断预算，失控脚本只能使本次发布失败，不得无限占用 Editor Service。
-- Behavior Host Interface v3 保留 `kadath.input.move_axis() -> (number, number)`，并增加双阶段 ObjectRef/Event 能力；它只在 Hook 期间读取当前 Host Frame 的不可变规范化输入，`on_start` 固定观察 `0,0`，顶层 Tooling 执行调用必须失败。
-- Native `KadathLuauInputSnapshot` 与 Host v3 callback table 由调用方拥有、仅在单次 `fixed_update`、`update` 或 `on_event` 调用期间借用；null 或超出 `-1 / 0 / 1` 的轴值必须在 Luau 与 World 产生副作用前失败，Hook 退出和失败路径均清除活动输入与 Host 上下文。
+- Behavior Host Interface v4 保留 `kadath.input.move_axis()`、双阶段 ObjectRef/Event，并增加 `kadath.scene.spawn(...)` 与 `object:destroy()`；Host 在 fixed/frame Structural Flush 才提交危险结构变化，普通位置修改仍在当前 callback 直接生效。
+- Native `KadathLuauInputSnapshot` 与 Host v4 callback table 由调用方拥有、仅在单次 `on_start`、`fixed_update`、`update` 或 `on_event` 调用期间借用；null 或超出 `-1 / 0 / 1` 的轴值必须在 Luau 与 World 产生副作用前失败，Hook 退出和失败路径均清除活动输入与 Host 上下文。
 - Scene v5 Player 存在任意 Behavior Binding 时，Host 把 World 的移动输入清零并把原始 gated input 交给全部 Behavior Binding；无 Binding 或 Scene v4 时继续由 Native World 移动，脚本失败不得隐式恢复 Native fallback。
 - 默认 Linux 产品固定包含 `scriptId=1 / patrol.luau` 与 `scriptId=2 / player_controller.luau`，Player 绑定后者且保留 `moveSpeed=180`；因此默认项目中新建 Script Asset 的最小可用 ID 为 `3`。
-- KSCP 物理格式保持 v2，但 `host_interface_version` 推进到 `3`；Runtime 与 Editor 必须拒绝 Host v2 artifact 并要求重新 Bake，不能降级运行或推进 Preview loaded identity。
+- KSCP 物理格式保持 v2，但 `host_interface_version` 推进到 `4`；Runtime 与 Editor 必须拒绝旧 Host artifact 并要求重新 Bake，不能降级运行或推进 Preview loaded identity。
 
 ## 实现位置
 
 - 项目创建、依赖复制与有界清理：`editor/Kadath.Editor.Workspace/WorkspaceProjectLifecycleModel.cs`
 - Script v2 清单、依赖读取与修订：`editor/Kadath.Editor.Workspace/WorkspaceScriptSourceModel.cs`
-- Scene v5 行为绑定解析与模型转换：`editor/Kadath.Editor.Workspace/WorkspaceSceneDocument.cs`
-- Scene v5 行为绑定 Authoring 与事务：`editor/Kadath.Editor.Workspace/WorkspaceAuthoringModel.cs`
+- Scene v5/v6 行为绑定、Spawn Prototype 解析与模型转换：`editor/Kadath.Editor.Workspace/WorkspaceSceneDocument.cs`
+- Scene v5/v6 行为绑定 Authoring、Prototype 无损保留与事务：`editor/Kadath.Editor.Workspace/WorkspaceAuthoringModel.cs`
 - Avalonia Scene 对象草稿、v4/v5 边界与行为绑定无损回传：`editor/Kadath.Editor.Avalonia/ViewModels/SceneObjectDraftViewModel.cs`、`editor/Kadath.Editor.Avalonia/ViewModels/AvaloniaEditorViewModel.cs`
 - Avalonia 行为脚本源码状态、命令与界面：`editor/Kadath.Editor.ViewModels/EditorScriptSourceViewModel.cs`、`editor/Kadath.Editor.ViewModels/EditorWorkspaceViewModel.cs`、`editor/Kadath.Editor.Avalonia/ViewModels/AvaloniaEditorViewModel.cs`、`editor/Kadath.Editor.Avalonia/Views/MainWindow.axaml`
 - Native 结构化诊断 ABI 与 Luau 共享管线：`modules/behavior_script/native/kadath_luau.h`、`modules/behavior_script/native/tooling_bridge.cpp`、`modules/behavior_script/src/tooling.zig`
@@ -69,7 +69,7 @@
 - Service Contract Verifier：`verification=ok`
 - Native/Behavior Runtime contract 已覆盖 Tooling 类型可见、顶层调用失败、`on_start=0,0`、null/越界输入零输出、同一步多 Binding 共享输入、失败 Hook 上下文清理、Host v2 artifact 拒绝，以及 Scene reload/restart 的 World epoch 边界。
 - Player movement ownership contract 已覆盖 Scene v4、Scene v5 无 Player Binding、Scene v5 任意 Player Binding 三条路由；多 Binding 继续按 Scene 顺序产生 additive translation，脚本失败保持 fail-closed。
-- 默认产品已迁移到两个 Script v2 dependency 和 Host Interface v3；`player_controller.luau` 绑定全部五个 source object，但只在 Player 的 `fixed_update` 消费移动输入、只在 decoration 的 `update` 执行逐帧视觉移动，并用 contact/custom event 证明跨对象修改；Won、Audio Cue 与 Patrol Hazard 行为继续保持。
+- 默认产品使用两个 Script v2 dependency、Scene/KSCN v6 和 Host Interface v4；`player_controller.luau` 除既有 Player fixed movement、decoration frame update 与 contact/custom event 外，还通过 `runtime-orb` Prototype 证明 transient spawn、动态 `on_start`、后续 callback 与 destroy/stale 生命周期。
 - Workspace、真实 stdio Service、Client、Avalonia headless 与 Xvfb 工作流均按 `scriptId/sourcePath` 选择两个 Behavior Contract；Player Controller 源码读取、in-use 删除保护、下一资产 ID `3` 和绑定保留均已验证。
 - 行为项目创建后可被 `ReadProjectAsync` 和 `ReadHierarchyAsync` 读取。
 - Hierarchy 会展示 `ScriptDependency`、`SceneBehavior` 和 `BehaviorParameter` 节点。
@@ -101,4 +101,4 @@
 
 本阶段已提供 Avalonia 基础 Luau 源码编辑器、未保存缓冲区结构化诊断和单资产 Create/Rename/Delete/Undo，但不包含语法高亮、自动补全、LSP、调试器、多标签页、文件夹树、批量操作或诊断 range 波浪线；这些能力仍是后续独立切片。
 诊断通过不授权保存、Bake 或 Runtime reload；保存后热发布继续由既有 opt-in Live Bake/Preview Watch 链路负责。
-当前候选的验收边界是 Linux 上的 Host Interface v3、Player movement ownership、双阶段 ObjectRef/Event、共享 ViewModel、Avalonia 编译资源、真实 stdio RPC/Xvfb 源码工作流与现有产品矩阵；不包含完整 Input Action、键位配置、鼠标、手柄或多玩家输入。跨平台窗口验收不属于本候选边界。
+当前候选的验收边界是 Linux 上的 Scene/KSCN v6、Host Interface v4、Runtime Object Registry、fixed/frame Structural Flush、动态 Behavior 实例、stale ObjectRef、共享 ViewModel、真实 stdio RPC/Xvfb 工作流与现有产品矩阵；不包含 Prototype UI、通用 ECS 反射、动态碰撞体、持久化瞬态对象或 Windows 产品验收。

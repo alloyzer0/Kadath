@@ -1329,7 +1329,7 @@ fn validateRuntimeLogs(
             "Runtime host initialized with Vulkan RHI scene objects=3",
         },
         .package_root => .{
-            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=5",
+            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=6",
             "Runtime host initialized with Vulkan RHI scene objects=5",
         },
     };

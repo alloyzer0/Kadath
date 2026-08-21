@@ -7,6 +7,8 @@ local speed = kadath.parameter.number("speed", {
 })
 
 local decorationSpeed = 6
+local spawnedOrb = false
+local runtimeAge = 0
 
 return {
     fixed_update = function(self: Kadath.Object, dt: number)
@@ -17,7 +19,18 @@ return {
         self:translate(moveX * speed * dt, moveY * speed * dt)
     end,
     update = function(self: Kadath.Object, dt: number)
-        if self:kind() == "sprite" then
+        if self:kind() == "player" and not spawnedOrb then
+            local position = self:position()
+            local orb = kadath.scene.spawn("runtime-orb", position.x + 180, position.y)
+            orb:translate(8, 0)
+            spawnedOrb = true
+        elseif self:kind() == "sprite" and string.sub(self:id(), 1, 8) == "runtime-" then
+            runtimeAge += dt
+            self:translate(48 * dt, 0)
+            if runtimeAge >= 1 then
+                self:destroy()
+            end
+        elseif self:kind() == "sprite" then
             self:translate(decorationSpeed * dt, 0)
         end
     end,

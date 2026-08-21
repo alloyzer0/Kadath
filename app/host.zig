@@ -10,6 +10,7 @@ const audio_api = @import("audio");
 const game = @import("game.zig");
 const player_movement_ownership = @import("player_movement_ownership.zig");
 const runtime_texture_registry = @import("runtime_texture_registry.zig");
+const runtime_object_registry = @import("runtime_object_registry.zig");
 const scene_api = @import("scene.zig");
 const scene_generation_api = @import("scene_generation.zig");
 const script_api = @import("script.zig");
@@ -26,16 +27,26 @@ const SpriteInstance = @import("renderer2d").SpriteInstance;
 
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
+const max_exact_luau_world_epoch: u64 = 9_007_199_254_740_991;
 
 fn validateSceneTextureBindings(registry: *const runtime_texture_registry.RuntimeTextureRegistry, scene: *const scene_api.Scene) !void {
     for (scene.objects.slice()) |object| _ = try registry.resolve(object.sprite.textureId);
+    for (scene.prototypes.slice()) |prototype| _ = try registry.resolve(prototype.sprite.textureId);
 }
 
 fn sceneHasBehaviors(scene: *const scene_api.Scene) bool {
     for (scene.objects.slice()) |object| {
         if (object.behaviors.count != 0) return true;
     }
+    for (scene.prototypes.slice()) |prototype| {
+        if (prototype.behaviors.count != 0) return true;
+    }
     return false;
+}
+
+fn usesBehaviorRuntime(scene: *const scene_api.Scene) bool {
+    return scene.schemaVersion == scene_api.behavior_schema_version or
+        scene.schemaVersion == scene_api.current_schema_version;
 }
 
 fn initialLoadedTarget(identity: ?content_identity.ContentIdentity) preview_status_api.InitialLoadedTarget {
@@ -63,6 +74,7 @@ pub const Host = struct {
     script_enabled: bool,
     script_tick: u64,
     behavior_runtime: behavior_host.Runtime,
+    world_epoch: u64,
     platform: Platform,
     rhi: Rhi,
     renderer2d: Renderer2D,
@@ -71,7 +83,7 @@ pub const Host = struct {
     generation: scene_generation_api.SceneGeneration,
     world_extent: PlatformExtent,
     session: game.GameSession = .{},
-    render_sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined,
+    render_sprites: [runtime_object_registry.max_runtime_object_count]world_api.RenderSprite = undefined,
     render_count: usize = 0,
     quit_requested: bool = false,
     last_time_seconds: f64 = 0.0,
@@ -100,7 +112,7 @@ pub const Host = struct {
         var script_program = script_api.Program{};
         var behavior_candidate: ?behavior_host.Runtime = null;
         errdefer if (behavior_candidate) |*runtime| runtime.deinit();
-        if (scene.schemaVersion == scene_api.current_schema_version) {
+        if (usesBehaviorRuntime(&scene)) {
             if (script_path) |path| {
                 const loaded = try behavior_host.loadWithIdentity(io, std.heap.page_allocator, path, &scene);
                 script_identity = loaded.identity;
@@ -164,6 +176,7 @@ pub const Host = struct {
             .script_enabled = script_program.hasInstructions(),
             .script_tick = 0,
             .behavior_runtime = behavior_candidate orelse .{},
+            .world_epoch = if (behavior_candidate) |runtime| runtime.worldEpoch() else 1,
             .platform = platform,
             .rhi = backend,
             .renderer2d = renderer2d,
@@ -291,7 +304,7 @@ pub const Host = struct {
     fn submitRender(self: *Host) !void {
         if (self.render_count == 0) return error.WorldProducedNoRenderSprite;
         const extent: PlatformExtent = self.platform.clientExtent();
-        var instances: [scene_api.max_scene_object_count]SpriteInstance = undefined;
+        var instances: [runtime_object_registry.max_runtime_object_count]SpriteInstance = undefined;
         const player_entity = self.generation.playerEntity();
         for (self.render_sprites[0..self.render_count], 0..) |sprite, index| {
             instances[index] = .{
@@ -337,11 +350,11 @@ pub const Host = struct {
     }
 
     fn resetScript(self: *Host) !void {
-        if (self.scene.schemaVersion == scene_api.current_schema_version) {
+        if (usesBehaviorRuntime(&self.scene)) {
             if (!self.behavior_runtime.isLoaded()) return;
             const batch = try self.behavior_runtime.onStart(&self.generation);
             try self.generation.applyTranslationDeltas(batch.slice());
-            var sprites: [scene_api.max_scene_object_count]world_api.RenderSprite = undefined;
+            var sprites: [runtime_object_registry.max_runtime_object_count]world_api.RenderSprite = undefined;
             const ordered = try self.generation.extractSprites(&sprites);
             const player_entity = self.generation.playerEntity();
             const player = for (ordered) |sprite| {
@@ -388,7 +401,7 @@ pub const Host = struct {
     }
 
     fn runBehaviorUpdate(self: *Host, dt_seconds: f32, input: InputSnapshot) !void {
-        if (self.scene.schemaVersion != scene_api.current_schema_version or !self.behavior_runtime.isLoaded()) return;
+        if (!usesBehaviorRuntime(&self.scene) or !self.behavior_runtime.isLoaded()) return;
         const frame_input = if (self.session.acceptsInput()) input else InputSnapshot{};
         try self.behavior_runtime.runUpdate(
             &self.generation,
@@ -427,13 +440,13 @@ pub const Host = struct {
             std.log.warn("Script reload requested but no --script path was supplied", .{});
             return error.MissingScriptPath;
         };
-        if (self.scene.schemaVersion == scene_api.current_schema_version) {
+        if (usesBehaviorRuntime(&self.scene)) {
             var candidate = (try behavior_host.loadWithIdentityAtEpoch(
                 self.io,
                 std.heap.page_allocator,
                 path,
                 &self.scene,
-                self.behavior_runtime.worldEpoch(),
+                self.world_epoch,
             )).value;
             errdefer candidate.deinit();
             const batch = try candidate.onStart(&self.generation);
@@ -472,7 +485,10 @@ pub const Host = struct {
             return error.MissingScenePath;
         };
         const candidate = try scene_api.load(self.io, std.heap.page_allocator, path);
-        if (candidate.schemaVersion != self.scene.schemaVersion) return error.SceneScriptModelTransitionUnsupported;
+        const candidate_world_epoch = if (self.world_epoch >= max_exact_luau_world_epoch)
+            return error.BehaviorWorldEpochExhausted
+        else
+            self.world_epoch + 1;
         var prepared_textures = try runtime_texture_registry.prepareScene(self.io, std.heap.page_allocator, &candidate);
         defer prepared_textures.deinit();
         var candidate_registry = try runtime_texture_registry.RuntimeTextureRegistry.initPrepared(
@@ -487,13 +503,32 @@ pub const Host = struct {
         errdefer replacement.deinit();
         var candidate_behavior = behavior_host.Runtime{};
         errdefer candidate_behavior.deinit();
-        if (candidate.schemaVersion == scene_api.current_schema_version) {
+        var candidate_program = script_api.Program{};
+        var candidate_script_enabled = false;
+        if (usesBehaviorRuntime(&candidate)) {
             if (self.behavior_runtime.isLoaded()) {
                 candidate_behavior = try self.behavior_runtime.cloneForSceneReload(std.heap.page_allocator, &candidate);
+            } else if (sceneHasBehaviors(&candidate)) {
+                const script_path = self.script_path orelse return error.MissingScriptPath;
+                candidate_behavior = (try behavior_host.loadWithIdentityAtEpoch(
+                    self.io,
+                    std.heap.page_allocator,
+                    script_path,
+                    &candidate,
+                    candidate_world_epoch,
+                )).value;
+            }
+            if (candidate_behavior.isLoaded()) {
                 const batch = try candidate_behavior.onStart(&replacement);
                 try replacement.applyTranslationDeltas(batch.slice());
-            } else if (sceneHasBehaviors(&candidate)) {
-                return error.MissingScriptPath;
+            }
+        } else if (self.script_path) |script_path| {
+            candidate_program = try script_api.load(self.io, std.heap.page_allocator, script_path);
+            candidate_script_enabled = candidate_program.hasInstructions();
+            if (candidate_script_enabled) {
+                var command_buffer: script_api.CommandBuffer = undefined;
+                const commands = try candidate_program.emit(.on_start, 0.0, &command_buffer);
+                try applyScriptCommandsToGeneration(&replacement, commands);
             }
         }
         var previous_generation = self.generation;
@@ -502,6 +537,10 @@ pub const Host = struct {
         self.generation = replacement;
         self.texture_registry = candidate_registry.take();
         self.behavior_runtime = candidate_behavior;
+        self.script_program = candidate_program;
+        self.script_enabled = candidate_script_enabled;
+        self.script_tick = 0;
+        self.world_epoch = candidate_world_epoch;
         self.scene = candidate;
         self.session = .{};
         self.accumulator_seconds = 0.0;
@@ -509,9 +548,6 @@ pub const Host = struct {
         previous_generation.deinit();
         previous_registry.deinit(&self.rhi);
         previous_behavior.deinit();
-        if (candidate.schemaVersion != scene_api.current_schema_version) {
-            self.resetScript() catch |err| self.disableScript(err);
-        }
         std.log.info("Scene reloaded explicitly: objects={d}, player={d}, goal={d}", .{
             candidate.objects.count,
             self.generation.playerEntity(),
@@ -521,7 +557,7 @@ pub const Host = struct {
 
     fn restartGame(self: *Host) !void {
         if (self.session.phase == .playing) return;
-        if (self.scene.schemaVersion == scene_api.current_schema_version) {
+        if (usesBehaviorRuntime(&self.scene)) {
             if (!self.behavior_runtime.isLoaded()) {
                 try self.generation.reset();
                 std.debug.assert(self.session.restart());
@@ -530,7 +566,11 @@ pub const Host = struct {
                 std.log.info("Game session restarted without behavior package", .{});
                 return;
             }
-            var replacement = try scene_generation_api.SceneGeneration.prepare(self.scene, self.world_extent);
+            var replacement = try scene_generation_api.SceneGeneration.prepareRestart(
+                self.scene,
+                self.world_extent,
+                &self.generation,
+            );
             errdefer replacement.deinit();
             var candidate = try self.behavior_runtime.cloneForRestart(std.heap.page_allocator, &self.scene);
             errdefer candidate.deinit();
@@ -582,7 +622,7 @@ pub const Host = struct {
                 .move_x = step_input.move_x,
                 .move_y = step_input.move_y,
             });
-            if (self.scene.schemaVersion == scene_api.current_schema_version) {
+            if (usesBehaviorRuntime(&self.scene)) {
                 try self.runBehaviorFixed(@floatCast(fixed_dt_seconds), .{
                     .move_x = @intCast(routed_input.behaviors.move_x),
                     .move_y = @intCast(routed_input.behaviors.move_y),
@@ -596,7 +636,7 @@ pub const Host = struct {
             });
             const contacts = try self.generation.observeContacts();
             self.observeFixedContacts(contacts);
-            if (self.scene.schemaVersion == scene_api.current_schema_version and self.behavior_runtime.isLoaded()) {
+            if (usesBehaviorRuntime(&self.scene) and self.behavior_runtime.isLoaded()) {
                 try self.behavior_runtime.finishFixedStep(
                     &self.generation,
                     contacts.touching[0..self.scene.objects.count],
@@ -678,4 +718,26 @@ test "scene texture bindings must resolve before world replacement" {
     try validateSceneTextureBindings(&registry, &scene);
     scene.objects.entries[0].sprite.textureId = 4;
     try std.testing.expectError(error.UnknownWorldTexture, validateSceneTextureBindings(&registry, &scene));
+}
+
+test "Scene v5 and v6 share Behavior Runtime while v4 keeps legacy scripts" {
+    var scene = scene_api.default_scene;
+    scene.schemaVersion = scene_api.legacy_object_schema_version;
+    try std.testing.expect(!usesBehaviorRuntime(&scene));
+    scene.schemaVersion = scene_api.behavior_schema_version;
+    try std.testing.expect(usesBehaviorRuntime(&scene));
+    scene.schemaVersion = scene_api.current_schema_version;
+    try std.testing.expect(usesBehaviorRuntime(&scene));
+}
+
+fn applyScriptCommandsToGeneration(generation: *scene_generation_api.SceneGeneration, commands: []const script_api.Command) !void {
+    for (commands) |command| {
+        switch (command) {
+            .set_goal_position => |position| try generation.setGoalPosition(position),
+            .translate_goal => |delta| {
+                const current = generation.goalPosition();
+                try generation.setGoalPosition(.{ current[0] + delta[0], current[1] + delta[1] });
+            },
+        }
+    }
 }

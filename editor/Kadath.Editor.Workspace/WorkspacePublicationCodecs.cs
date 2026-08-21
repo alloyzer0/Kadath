@@ -12,23 +12,30 @@ internal static class WorkspaceSceneCodec
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     internal const string LegacyFormat = "KSCN-SCENE-V4";
     internal const string BehaviorFormat = "KSCN-SCENE-V5";
+    internal const string PrototypeFormat = "KSCN-SCENE-V6";
     private const int LegacyVersion = 4;
     private const int BehaviorVersion = 5;
+    private const int PrototypeVersion = 6;
     private const int HeaderBytes = 16;
     private const int MaxArtifactBytes = 1024 * 1024;
 
     internal static byte[] EncodeSource(byte[] source)
     {
         var scene = WorkspaceSceneDocumentCodec.Parse(source);
-        var artifactVersion = scene.SourceSchemaVersion == WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
-            ? BehaviorVersion
-            : LegacyVersion;
+        var artifactVersion = scene.SourceSchemaVersion switch
+        {
+            WorkspaceSceneDocumentCodec.CurrentSchemaVersion => PrototypeVersion,
+            WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => BehaviorVersion,
+            _ => LegacyVersion
+        };
         var textures = scene.Textures.Select(value => new TextureEntry(value.TextureId, StrictUtf8.GetBytes(value.Artifact))).ToArray();
         var objects = scene.Objects.Select(value => new ObjectEntry(value, StrictUtf8.GetBytes(value.ObjectId))).ToArray();
+        var prototypes = scene.Prototypes.Select(value => new PrototypeEntry(value, StrictUtf8.GetBytes(value.PrototypeId))).ToArray();
         var payloadBytes = sizeof(uint)
             + textures.Sum(value => 2 * sizeof(uint) + value.Artifact.Length)
             + sizeof(uint)
-            + objects.Sum(value => sizeof(uint) + value.EntryBytes(artifactVersion));
+            + objects.Sum(value => sizeof(uint) + value.EntryBytes(artifactVersion))
+            + (artifactVersion == PrototypeVersion ? sizeof(uint) + prototypes.Sum(value => sizeof(uint) + value.EntryBytes()) : 0);
         var artifact = new byte[HeaderBytes + payloadBytes];
         Encoding.ASCII.GetBytes("KSCN").CopyTo(artifact, 0);
         WriteUInt32(artifact, 4, checked((uint)artifactVersion));
@@ -74,27 +81,31 @@ internal static class WorkspaceSceneCodec
                 WriteSingle(artifact, offset + 8, (float)entry.Value.PatrolSpeed!.Value);
                 offset += 12;
             }
-            if (artifactVersion == BehaviorVersion)
+            if (artifactVersion >= BehaviorVersion)
             {
-                var behaviors = entry.Value.Behaviors ?? Array.Empty<WorkspaceSceneBehaviorBinding>();
-                WriteUInt32(artifact, offset, checked((uint)behaviors.Length));
-                offset += sizeof(uint);
-                foreach (var binding in behaviors)
+                WriteBindings(artifact, ref offset, entry.Value.Behaviors ?? Array.Empty<WorkspaceSceneBehaviorBinding>());
+            }
+        }
+        if (artifactVersion == PrototypeVersion)
+        {
+            WriteUInt32(artifact, offset, checked((uint)prototypes.Length));
+            offset += sizeof(uint);
+            foreach (var entry in prototypes)
+            {
+                WriteUInt32(artifact, offset, checked((uint)entry.EntryBytes()));
+                WriteUInt32(artifact, offset + 4, KindValue(entry.Value.Kind));
+                WriteUInt32(artifact, offset + 8, checked((uint)entry.PrototypeId.Length));
+                offset += 12;
+                entry.PrototypeId.CopyTo(artifact, offset);
+                offset += entry.PrototypeId.Length;
+                foreach (var value in entry.Value.Size.Concat(entry.Value.Color))
                 {
-                    WriteUInt32(artifact, offset, binding.ScriptId);
-                    WriteUInt32(artifact, offset + sizeof(uint), checked((uint)binding.Parameters.Length));
-                    offset += 2 * sizeof(uint);
-                    foreach (var parameter in binding.Parameters)
-                    {
-                        var name = StrictUtf8.GetBytes(parameter.Name);
-                        WriteUInt32(artifact, offset, checked((uint)name.Length));
-                        offset += sizeof(uint);
-                        name.CopyTo(artifact, offset);
-                        offset += name.Length;
-                        WriteDouble(artifact, offset, parameter.Value);
-                        offset += sizeof(double);
-                    }
+                    WriteSingle(artifact, offset, (float)value);
+                    offset += sizeof(float);
                 }
+                WriteUInt32(artifact, offset, entry.Value.TextureId);
+                offset += sizeof(uint);
+                WriteBindings(artifact, ref offset, entry.Value.Behaviors);
             }
         }
         if (offset != artifact.Length) throw new InvalidOperationException("Internal KSCN length mismatch.");
@@ -109,7 +120,7 @@ internal static class WorkspaceSceneCodec
         var artifactVersion = ReadUInt32(artifact, 4);
         var schemaVersion = ReadUInt32(artifact, 8);
         if (artifactVersion != schemaVersion
-            || artifactVersion is not (LegacyVersion or BehaviorVersion)
+            || artifactVersion is not (LegacyVersion or BehaviorVersion or PrototypeVersion)
             || ReadUInt32(artifact, 12) != artifact.Length - HeaderBytes)
             throw new InvalidDataException("Scene artifact header mismatch.");
         var offset = HeaderBytes;
@@ -155,7 +166,7 @@ internal static class WorkspaceSceneCodec
                 patrolMaxY = ReadRequiredSingle(artifact, ref offset);
                 patrolSpeed = ReadRequiredSingle(artifact, ref offset);
             }
-            if (artifactVersion == BehaviorVersion)
+            if (artifactVersion >= BehaviorVersion)
             {
                 var behaviorCount = ReadRequiredUInt32(artifact, ref offset);
                 if (behaviorCount > WorkspaceSceneDocumentCodec.MaxBehaviorBindingsPerObject)
@@ -182,10 +193,31 @@ internal static class WorkspaceSceneCodec
             if (offset != entryEnd) throw new InvalidDataException("Scene artifact object entry length mismatch.");
             objects.Add(new WorkspaceSceneObject(objectId, kind, position, size, color, textureId, moveSpeed, patrolMinY, patrolMaxY, patrolSpeed, behaviors));
         }
+        var prototypes = new List<WorkspaceScenePrototype>();
+        if (artifactVersion == PrototypeVersion)
+        {
+            var prototypeCount = ReadRequiredUInt32(artifact, ref offset);
+            if (prototypeCount > WorkspaceSceneDocumentCodec.MaxPrototypeCount) throw new InvalidDataException("Scene artifact prototype count mismatch.");
+            for (var index = 0; index < prototypeCount; index++)
+            {
+                var entryBytes = ReadRequiredUInt32(artifact, ref offset);
+                if (entryBytes > int.MaxValue || entryBytes > artifact.Length - offset) throw new InvalidDataException("Scene artifact prototype entry is truncated.");
+                var entryEnd = offset + (int)entryBytes;
+                var kind = KindName(ReadRequiredUInt32(artifact, ref offset));
+                var prototypeIdBytes = ReadRequiredUInt32(artifact, ref offset);
+                var prototypeId = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, prototypeIdBytes));
+                var size = ReadVector(artifact, ref offset, 2);
+                var color = ReadVector(artifact, ref offset, 4);
+                var textureId = ReadRequiredUInt32(artifact, ref offset);
+                var behaviors = ReadBindings(artifact, ref offset);
+                if (offset != entryEnd) throw new InvalidDataException("Scene artifact prototype entry length mismatch.");
+                prototypes.Add(new WorkspaceScenePrototype(prototypeId, kind, size, color, textureId, behaviors));
+            }
+        }
         if (offset != artifact.Length) throw new InvalidDataException("Scene artifact contains trailing bytes.");
-        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects, checked((int)schemaVersion)); }
+        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects, prototypes, checked((int)schemaVersion)); }
         catch (WorkspaceProjectValidationException exception) { throw new InvalidDataException(exception.Message, exception); }
-        var format = artifactVersion == BehaviorVersion ? BehaviorFormat : LegacyFormat;
+        var format = artifactVersion switch { PrototypeVersion => PrototypeFormat, BehaviorVersion => BehaviorFormat, _ => LegacyFormat };
         return new WorkspaceArtifactInfo(Convert.ToHexString(SHA256.HashData(artifact)).ToLowerInvariant(), artifact.LongLength, format, checked((int)artifactVersion), checked((int)artifactVersion));
     }
 
@@ -256,6 +288,51 @@ internal static class WorkspaceSceneCodec
         catch (DecoderFallbackException exception) { throw new InvalidDataException("Scene artifact contains invalid UTF-8.", exception); }
     }
 
+    private static void WriteBindings(byte[] artifact, ref int offset, IReadOnlyList<WorkspaceSceneBehaviorBinding> behaviors)
+    {
+        WriteUInt32(artifact, offset, checked((uint)behaviors.Count));
+        offset += sizeof(uint);
+        foreach (var binding in behaviors)
+        {
+            WriteUInt32(artifact, offset, binding.ScriptId);
+            WriteUInt32(artifact, offset + sizeof(uint), checked((uint)binding.Parameters.Length));
+            offset += 2 * sizeof(uint);
+            foreach (var parameter in binding.Parameters)
+            {
+                var name = StrictUtf8.GetBytes(parameter.Name);
+                WriteUInt32(artifact, offset, checked((uint)name.Length));
+                offset += sizeof(uint);
+                name.CopyTo(artifact, offset);
+                offset += name.Length;
+                WriteDouble(artifact, offset, parameter.Value);
+                offset += sizeof(double);
+            }
+        }
+    }
+
+    private static WorkspaceSceneBehaviorBinding[] ReadBindings(byte[] artifact, ref int offset)
+    {
+        var behaviorCount = ReadRequiredUInt32(artifact, ref offset);
+        if (behaviorCount > WorkspaceSceneDocumentCodec.MaxBehaviorBindingsPerObject) throw new InvalidDataException("Scene artifact behavior binding count mismatch.");
+        var behaviors = new WorkspaceSceneBehaviorBinding[behaviorCount];
+        for (var behaviorIndex = 0; behaviorIndex < behaviorCount; behaviorIndex++)
+        {
+            var scriptId = ReadRequiredUInt32(artifact, ref offset);
+            var parameterCount = ReadRequiredUInt32(artifact, ref offset);
+            if (parameterCount > WorkspaceSceneDocumentCodec.MaxBehaviorParameterCount) throw new InvalidDataException("Scene artifact behavior parameter count mismatch.");
+            var parameters = new WorkspaceSceneBehaviorParameter[parameterCount];
+            for (var parameterIndex = 0; parameterIndex < parameterCount; parameterIndex++)
+            {
+                var nameBytes = ReadRequiredUInt32(artifact, ref offset);
+                if (nameBytes is < 1 or > WorkspaceSceneDocumentCodec.MaxBehaviorParameterNameBytes) throw new InvalidDataException("Scene artifact behavior parameter name mismatch.");
+                var name = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, nameBytes));
+                parameters[parameterIndex] = new WorkspaceSceneBehaviorParameter(name, ReadRequiredDouble(artifact, ref offset));
+            }
+            behaviors[behaviorIndex] = new WorkspaceSceneBehaviorBinding(scriptId, parameters);
+        }
+        return behaviors;
+    }
+
     private static uint ReadUInt32(byte[] bytes, int offset) => BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset, 4));
     private static float ReadSingle(byte[] bytes, int offset) => BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset, 4)));
     private static void WriteUInt32(byte[] bytes, int offset, uint value) => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), value);
@@ -272,7 +349,7 @@ internal static class WorkspaceSceneCodec
                 WorkspaceSceneDocumentCodec.PatrolHazardKind when artifactVersion == LegacyVersion => 12,
                 _ => 0
             });
-            if (artifactVersion != BehaviorVersion) return bytes;
+            if (artifactVersion < BehaviorVersion) return bytes;
             bytes = checked(bytes + sizeof(uint));
             foreach (var binding in Value.Behaviors ?? Array.Empty<WorkspaceSceneBehaviorBinding>())
             {
@@ -285,6 +362,20 @@ internal static class WorkspaceSceneCodec
             return bytes;
         }
     }
+    private sealed record PrototypeEntry(WorkspaceScenePrototype Value, byte[] PrototypeId)
+    {
+        internal int EntryBytes()
+        {
+            var bytes = 4 + 4 + PrototypeId.Length + 6 * sizeof(float) + sizeof(uint) + sizeof(uint);
+            foreach (var binding in Value.Behaviors)
+            {
+                bytes = checked(bytes + 2 * sizeof(uint));
+                foreach (var parameter in binding.Parameters)
+                    bytes = checked(bytes + sizeof(uint) + StrictUtf8.GetByteCount(parameter.Name) + sizeof(double));
+            }
+            return bytes;
+        }
+    }
 }
 
 internal static class WorkspaceScriptCodec
@@ -293,7 +384,7 @@ internal static class WorkspaceScriptCodec
     internal const string BehaviorFormat = "KSCP-SCRIPT-V2";
     private const int LegacyVersion = 1;
     private const int BehaviorVersion = 2;
-    private const int BehaviorHostInterfaceVersion = 3;
+    private const int BehaviorHostInterfaceVersion = 4;
     private const int BehaviorHeaderBytes = 60;
     private const int BehaviorEntryHeaderBytes = 84;
     private const int MaxBehaviorArtifactBytes = 16 * 1024 * 1024;

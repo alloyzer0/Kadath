@@ -13,7 +13,7 @@ fn parameter(name: []const u8, default_value: f64, minimum: f64, maximum: f64) a
 }
 
 test "KSCP v2 round trips aggregate entries and identities" {
-    try std.testing.expectEqual(@as(u32, 3), artifact.host_interface_version);
+    try std.testing.expectEqual(@as(u32, 4), artifact.host_interface_version);
     const patrol_parameters = [_]artifact.ParameterSchema{
         parameter("minY", 245, -100000, 100000),
         parameter("maxY", 330, -100000, 100000),

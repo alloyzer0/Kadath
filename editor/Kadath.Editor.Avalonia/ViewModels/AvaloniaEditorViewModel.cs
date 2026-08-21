@@ -549,7 +549,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         { ErrorCode: { } code } => $"行为契约不可用 · {code}",
         _ => "行为契约不可用。"
     };
-    public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion == 5;
+    public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6;
     public bool HasSelectedBehaviorBinding => SelectedBehaviorBinding is not null;
     public bool CanAddBehaviorBinding => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
@@ -1271,8 +1271,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                     || draft.Behaviors.Count > 4
                     || draft.Behaviors.Select(binding => binding.ScriptId).Distinct().Count() != draft.Behaviors.Count)
                     return false;
-                if (project.Scene.SchemaVersion == 5 && draft.IsPatrolHazard && draft.Behaviors.Count == 0) return false;
-                if (project.Scene.SchemaVersion == 5 && draft.IsPatrolHazard && draft.UsesNativePatrol) return false;
+                if (project.Scene.SchemaVersion is 5 or 6 && draft.IsPatrolHazard && draft.Behaviors.Count == 0) return false;
+                if (project.Scene.SchemaVersion is 5 or 6 && draft.IsPatrolHazard && draft.UsesNativePatrol) return false;
             }
             return true;
         }

@@ -90,7 +90,7 @@ internal static class Program
         var expectedAssetCount = Directory.EnumerateFiles(Path.Combine(packageRoot, "bin", "assets"), "*", SearchOption.AllDirectories).Count();
         var openedHierarchy = workspace.HierarchySnapshot.Value ?? throw new InvalidOperationException("Opened hierarchy snapshot is missing.");
         var expectedOpenedHierarchyCount = openedHierarchy.ProjectModelVersion == EditorSnapshotVersions.ProjectModel
-            && workspace.ProjectSnapshot.Value?.Scene.SchemaVersion == 5
+            && workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6
             ? openedHierarchy.Nodes.Length
             : 13;
         Require(avaloniaViewModel.HierarchyItems.Count == expectedOpenedHierarchyCount
@@ -109,7 +109,7 @@ internal static class Program
         Console.WriteLine("workflow_project_open=ok");
 
         var openedProject = workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Opened project snapshot is missing.");
-        if (openedProject.Scene.SchemaVersion == 5)
+        if (openedProject.Scene.SchemaVersion is 5 or 6)
         {
             var expectedBehaviors = CaptureBehaviorSignatures(openedProject);
             var hazardDraft = avaloniaViewModel.SceneObjectDrafts.First(draft => draft.Kind == "patrol_hazard");
@@ -117,7 +117,7 @@ internal static class Program
             hazardDraft.PositionX = (double.Parse(hazardDraft.PositionX, CultureInfo.InvariantCulture) + 7d).ToString("R", CultureInfo.InvariantCulture);
 
             var preserved = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
-            Require(preserved.ProjectSnapshot.Scene.SchemaVersion == 5
+            Require(preserved.ProjectSnapshot.Scene.SchemaVersion == openedProject.Scene.SchemaVersion
                 && preserved.ProjectSnapshot.Scene.Objects?.Single(item => item.ObjectId == hazardDraft.ObjectId).Position[0]
                     == double.Parse(hazardDraft.PositionX, CultureInfo.InvariantCulture),
                 "Avalonia did not commit the non-behavior Scene v5 object edit");
@@ -519,7 +519,7 @@ internal static class Program
             && created.ProjectName == createdProjectName
             && workspace.ProjectSnapshot.Value?.ProjectName == createdProjectName
             && workspace.HierarchySnapshot.Value?.ProjectName == createdProjectName
-            && avaloniaViewModel.HierarchyItems.Count == (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion == 5
+            && avaloniaViewModel.HierarchyItems.Count == (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6
                 ? workspace.HierarchySnapshot.Value?.Nodes.Length
                 : 13)
             && avaloniaViewModel.AssetItems.Count == expectedAssetCount
