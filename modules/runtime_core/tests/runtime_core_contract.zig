@@ -1,6 +1,15 @@
 const std = @import("std");
 const runtime_core = @import("runtime_core");
 
+const ReplayRng = struct {
+    state: u64,
+
+    fn next(self: *ReplayRng) u32 {
+        self.state = self.state *% 6_364_136_223_846_793_005 +% 1_442_695_040_888_963_407;
+        return @truncate(self.state >> 32);
+    }
+};
+
 fn seededPhaseEvent(target: runtime_core.ObjectRef, domain: u32, generation: u32, command: u32) runtime_core.PhaseEvent {
     var event = std.mem.zeroes(runtime_core.PhaseEvent);
     event.struct_size = @sizeOf(runtime_core.PhaseEvent);
@@ -157,4 +166,79 @@ test "Runtime Core Phase replay preserves FIFO, domain counters, and generation 
     try std.testing.expectEqual(@as(usize, 1), try core.drainPhaseEvents(.frame, seed + 2, drained[0..]));
     try std.testing.expectEqual(@as(u64, 1), drained[0].sequence);
     try core.endPhase(.frame, seed + 2);
+}
+
+test "Runtime Core Phase bounded command replay is reproducible across seeds" {
+    const seeds = [_]u64{
+        0x5048_4153_0000_0001,
+        0x5048_4153_0000_0002,
+        0x5048_4153_0000_0003,
+        0x5048_4153_0000_0004,
+    };
+
+    for (seeds) |seed| {
+        var core = try runtime_core.RuntimeCore.init();
+        defer core.deinit();
+        const sources = [_]runtime_core.SourceDesc{
+            .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
+        };
+        _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
+        try core.commitScene();
+        const player = (try core.findById(.live, "player")).?.object_ref;
+        const phase_sequence = if (seed == 0) 1 else seed;
+        try core.beginPhase(.fixed, phase_sequence);
+
+        var rng = ReplayRng{ .state = seed };
+        var drained: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
+        var expected_generation: u32 = 0;
+        var expected_sequence: u64 = 1;
+        var queued: usize = 0;
+        var command_index: u32 = 0;
+        while (command_index < 32) : (command_index += 1) {
+            const draw = rng.next();
+            if (queued > 0 and (draw & 3) == 0) {
+                const count = try core.drainPhaseEvents(.fixed, phase_sequence, drained[0..]);
+                try std.testing.expectEqual(queued, count);
+                const first_sequence = expected_sequence - @as(u64, @intCast(count));
+                for (drained[0..count], 0..) |event, index| {
+                    try std.testing.expectEqual(expected_generation, event.generation);
+                    try std.testing.expectEqual(first_sequence + @as(u64, @intCast(index)), event.sequence);
+                }
+                queued = 0;
+                expected_generation += 1;
+                if (expected_generation > runtime_core.max_phase_generation) break;
+                continue;
+            }
+            if (expected_generation > runtime_core.max_phase_generation) break;
+
+            const input_generation = switch ((draw >> 2) % 4) {
+                0 => 0,
+                1 => expected_generation,
+                2 => expected_generation + 1,
+                else => runtime_core.max_phase_generation + 1,
+            };
+            const event = seededPhaseEvent(player, 1, input_generation, command_index);
+            const result = core.submitPhaseEvents(&[_]runtime_core.PhaseEvent{event}) catch |err| {
+                const expected_error = if (input_generation > runtime_core.max_phase_generation)
+                    error.InvalidRuntimeCoreArgument
+                else
+                    error.InvalidRuntimePhaseRequest;
+                try std.testing.expectEqual(expected_error, err);
+                continue;
+            };
+            try std.testing.expectEqual(expected_sequence, result.first_sequence);
+            try std.testing.expectEqual(expected_sequence, result.last_sequence);
+            expected_sequence += 1;
+            queued += 1;
+        }
+
+        if (queued > 0) {
+            const count = try core.drainPhaseEvents(.fixed, phase_sequence, drained[0..]);
+            try std.testing.expectEqual(queued, count);
+            for (drained[0..count]) |event| {
+                try std.testing.expectEqual(expected_generation, event.generation);
+            }
+        }
+        try core.endPhase(.fixed, phase_sequence);
+    }
 }
