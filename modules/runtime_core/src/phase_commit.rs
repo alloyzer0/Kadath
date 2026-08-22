@@ -767,7 +767,6 @@ pub(crate) fn drain_events(
     if (output_ptr as usize) % mem::align_of::<abi::kadath_runtime_phase_event_v1_t>() != 0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    valid_output_array(output_ptr, output_capacity)?;
     let generation = core
         .phase
         .event_queue
@@ -787,6 +786,7 @@ pub(crate) fn drain_events(
     if output_capacity < count {
         return Err(abi::KADATH_ERR_BUFFER_TOO_SMALL);
     }
+    valid_output_array(output_ptr, count)?;
     let state = core
         .live
         .as_ref()
@@ -1041,7 +1041,6 @@ pub(crate) fn take_structural(
     if ranges_overlap(flush_range, output_range) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    valid_output_array(output_ptr, output_capacity)?;
     if core.phase.flush.is_some() || core.phase.activation.is_some() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
     }
@@ -1064,6 +1063,7 @@ pub(crate) fn take_structural(
     if output_capacity < count {
         return Err(abi::KADATH_ERR_BUFFER_TOO_SMALL);
     }
+    valid_output_array(output_ptr, count)?;
     let mut entries = Vec::new();
     let mut remaining = Vec::with_capacity(core.phase.structural_queue.len());
     for entry in core.phase.structural_queue.drain(..) {
