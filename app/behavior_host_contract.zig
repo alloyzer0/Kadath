@@ -574,8 +574,10 @@ test "Behavior Host applies on_start and fixed commands in Scene order" {
     try std.testing.expectApproxEqAbs(@as(f32, 44), (try generation.objectPosition(1))[1], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 5), (try generation.objectPosition(2))[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 10), (try generation.objectPosition(2))[1], 0.0001);
+    try runtime.finishFixedStep(&generation, &[_]bool{ false, false, false }, .{});
     try runtime.runFixed(&generation, 0.5, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 39), (try generation.objectPosition(1))[1], 0.0001);
+    try runtime.finishFixedStep(&generation, &[_]bool{ false, false, false }, .{});
     const before_frame_events = (try generation.objectPosition(2))[0];
     try runtime.runUpdate(&generation, 0.25, .{});
     try std.testing.expectApproxEqAbs(before_frame_events, (try generation.objectPosition(2))[0], 0.0001);
@@ -658,8 +660,12 @@ test "Behavior Host schedules zero one or many fixed hooks and exactly one updat
         );
         defer fixture.deinit();
 
-        for (0..fixed_count) |_| try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, .{});
+        for (0..fixed_count) |_| {
+            try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, .{});
+            try fixture.runtime.finishFixedStep(&fixture.generation, &[_]bool{ false, false, false }, .{});
+        }
         try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+        try fixture.runtime.finishFrame(&fixture.generation, .{});
 
         const position = try fixture.generation.objectPosition(2);
         try std.testing.expectApproxEqAbs(@as(f32, 1 + @as(f32, @floatFromInt(fixed_count))), position[0], 0.0001);
@@ -757,9 +763,11 @@ test "failed active Binding keeps prior writes and isolates later hooks" {
     try std.testing.expectApproxEqAbs(@as(f32, 9), (try fixture.generation.objectPosition(2))[0], 0.0001);
     try std.testing.expect(!fixture.runtime.active.?.bindingEnabled(1));
     try std.testing.expect(fixture.runtime.active.?.bindingEnabled(2));
+    try fixture.runtime.finishFixedStep(&fixture.generation, &[_]bool{ false, false, false }, .{});
 
     try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 14), (try fixture.generation.objectPosition(2))[0], 0.0001);
+    try fixture.runtime.finishFixedStep(&fixture.generation, &[_]bool{ false, false, false }, .{});
 }
 
 test "contact events are directed and deliver end before begin" {
@@ -941,6 +949,7 @@ test "stale queued target is dropped without disabling its producer" {
     defer fixture.deinit();
 
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
     var replacement = try scene_generation_api.SceneGeneration.prepareSceneReload(
         fixture.generation.scene,
         fixture.generation.extent,
@@ -954,7 +963,6 @@ test "stale queued target is dropped without disabling its producer" {
     fixture.generation = replacement;
     previous_generation.deinit();
     fixture.runtime.world_epoch += 1;
-    try fixture.runtime.finishFrame(&fixture.generation, .{});
     try std.testing.expect(fixture.runtime.active.?.bindingEnabled(1));
 }
 
@@ -1000,6 +1008,7 @@ test "saved ObjectRef follows restart replacement and rejects a new world epoch"
 
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 3), (try fixture.generation.objectPosition(2))[0], 0.0001);
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
 
     var replacement = try scene_generation_api.SceneGeneration.prepareSceneReload(
         fixture.generation.scene,

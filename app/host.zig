@@ -353,6 +353,7 @@ pub const Host = struct {
             if (!self.behavior_runtime.isLoaded()) return;
             const batch = try self.behavior_runtime.onStart(&self.generation);
             try self.generation.applyTranslationDeltas(batch.slice());
+            try self.behavior_runtime.publishStartupEvents(&self.generation, &batch);
             var sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
             const ordered = try self.generation.extractSprites(&sprites);
             const player_entity = self.generation.playerEntity();
@@ -450,9 +451,12 @@ pub const Host = struct {
             errdefer candidate.deinit();
             const batch = try candidate.onStart(&self.generation);
             try self.generation.applyTranslationDeltas(batch.slice());
+            try candidate.preparePhaseState(&self.generation);
+            try candidate.commitPhaseState(&self.generation);
             var previous = self.behavior_runtime;
             self.behavior_runtime = candidate;
             previous.deinit();
+            try self.behavior_runtime.publishStartupEvents(&self.generation, &batch);
             std.log.info("Behavior package reloaded explicitly", .{});
             return;
         }
@@ -502,6 +506,7 @@ pub const Host = struct {
         errdefer replacement.deinit();
         var candidate_behavior = behavior_host.Runtime{};
         errdefer candidate_behavior.deinit();
+        var candidate_startup: ?behavior_host.TranslationBatch = null;
         var candidate_program = script_api.Program{};
         var candidate_script_enabled = false;
         if (usesBehaviorRuntime(&candidate)) {
@@ -520,6 +525,7 @@ pub const Host = struct {
             if (candidate_behavior.isLoaded()) {
                 const batch = try candidate_behavior.onStart(&replacement);
                 try replacement.applyTranslationDeltas(batch.slice());
+                candidate_startup = batch;
             }
         } else if (self.script_path) |script_path| {
             candidate_program = try script_api.load(self.io, std.heap.page_allocator, script_path);
@@ -531,6 +537,10 @@ pub const Host = struct {
             }
         }
         try replacement.commitPrepared(&self.generation);
+        if (candidate_behavior.isLoaded()) {
+            try candidate_behavior.preparePhaseState(&replacement);
+            try candidate_behavior.commitPhaseState(&replacement);
+        }
         var previous_generation = self.generation;
         var previous_registry = self.texture_registry;
         var previous_behavior = self.behavior_runtime;
@@ -548,6 +558,7 @@ pub const Host = struct {
         previous_generation.deinit();
         previous_registry.deinit(&self.rhi);
         previous_behavior.deinit();
+        if (candidate_startup) |*startup| try self.behavior_runtime.publishStartupEvents(&self.generation, startup);
         std.log.info("Scene reloaded explicitly: objects={d}, player={d}, goal={d}", .{
             candidate.objects.count,
             self.generation.playerEntity(),
@@ -577,12 +588,15 @@ pub const Host = struct {
             const batch = try candidate.onStart(&replacement);
             try replacement.applyTranslationDeltas(batch.slice());
             try replacement.commitPrepared(&self.generation);
+            try candidate.preparePhaseState(&replacement);
+            try candidate.commitPhaseState(&replacement);
             var previous_generation = self.generation;
             var previous_behavior = self.behavior_runtime;
             self.generation = replacement;
             self.behavior_runtime = candidate;
             previous_generation.deinit();
             previous_behavior.deinit();
+            try self.behavior_runtime.publishStartupEvents(&self.generation, &batch);
         } else {
             try self.generation.reset();
             self.resetScript() catch |err| self.disableScript(err);

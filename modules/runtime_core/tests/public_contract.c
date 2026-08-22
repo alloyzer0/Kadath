@@ -1207,7 +1207,9 @@ static int phase_commit_path(
     destroy_request.struct_size = (uint32_t)sizeof(destroy_request);
     destroy_request.operation = KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY;
     destroy_request.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    destroy_request.script_id = 11U;
     destroy_request.object_ref = acceptance.object.object_ref;
+    destroy_request.origin = player;
     memset(&destroy_acceptance, 0, sizeof(destroy_acceptance));
     destroy_acceptance.struct_size = (uint32_t)sizeof(destroy_acceptance);
     memset(&structural_batch, 0, sizeof(structural_batch));
@@ -1277,7 +1279,9 @@ static int phase_commit_path(
     destroy_request.struct_size = (uint32_t)sizeof(destroy_request);
     destroy_request.operation = KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY;
     destroy_request.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    destroy_request.script_id = 11U;
     destroy_request.object_ref = taken.object_ref;
+    destroy_request.origin = player;
     memset(&nested_result, 0, sizeof(nested_result));
     nested_result.struct_size = (uint32_t)sizeof(nested_result);
     memset(&activation_batch, 0, sizeof(activation_batch));
@@ -1419,7 +1423,9 @@ static int activation_discard_path(
     discard_request.struct_size = (uint32_t)sizeof(discard_request);
     discard_request.operation = KADATH_RUNTIME_PHASE_OPERATION_DISCARD_RESERVATION;
     discard_request.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    discard_request.script_id = 11U;
     discard_request.object_ref = nested_result.object_ref;
+    discard_request.origin = player_result.payload.object.object_ref;
     discard_result.struct_size = (uint32_t)sizeof(discard_result);
     activation_batch.structural = &discard_request;
     activation_batch.structural_count = 1U;

@@ -480,9 +480,11 @@ fn validate_structural(
             if state.visible_exact(key).is_none() {
                 return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
             }
-            if !zero_object_ref(&item.origin)
+            let origin = read_object_key(&item.origin)
+                .map_err(|_| abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
+            if state.visible_exact(origin).is_none()
+                || item.script_id == 0
                 || item.prototype_key != 0
-                || item.script_id != 0
                 || item.behavior_count != 0
                 || item.transient_sprite.struct_size != 0
                 || item.transient_sprite.position != [0.0; 2]

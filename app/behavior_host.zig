@@ -9,112 +9,7 @@ const runtime_core = @import("runtime_core");
 
 pub const InputSnapshot = behavior_runtime.InputSnapshot;
 
-const max_events_per_domain: usize = 64;
-const max_event_drain_generation: u8 = 8;
-const max_structural_requests_per_domain: usize = 64;
-const max_structural_generation: u8 = 8;
 const max_exact_luau_world_epoch: u64 = 9_007_199_254_740_991;
-
-const BehaviorAdmission = struct {
-    admitted_count: usize = 0,
-
-    fn init(scene: *const scene_api.Scene) !BehaviorAdmission {
-        var count: usize = 0;
-        for (scene.objects.slice()) |object| {
-            count = std.math.add(usize, count, object.behaviors.count) catch return error.BehaviorInstanceCapacityExceeded;
-        }
-        if (count > behavior_runtime.max_binding_count) return error.BehaviorInstanceCapacityExceeded;
-        return .{ .admitted_count = count };
-    }
-
-    fn reserve(self: *BehaviorAdmission, count: usize) !void {
-        if (count > behavior_runtime.max_binding_count - self.admitted_count) {
-            return error.BehaviorInstanceCapacityExceeded;
-        }
-        self.admitted_count += count;
-    }
-
-    fn release(self: *BehaviorAdmission, count: usize) void {
-        std.debug.assert(count <= self.admitted_count);
-        self.admitted_count -= count;
-    }
-};
-
-const StoredEventValue = struct {
-    kind: u32 = 0,
-    boolean_value: i32 = 0,
-    number_value: f64 = 0,
-    string_storage: [128]u8 = [_]u8{0} ** 128,
-    string_bytes: u8 = 0,
-    object_value: behavior_runtime.NativeObjectHandle = std.mem.zeroes(behavior_runtime.NativeObjectHandle),
-};
-
-const StoredEventField = struct {
-    key_storage: [32]u8 = [_]u8{0} ** 32,
-    key_bytes: u8 = 0,
-    value: StoredEventValue = .{},
-};
-
-const QueuedEvent = struct {
-    target: behavior_runtime.NativeObjectHandle = std.mem.zeroes(behavior_runtime.NativeObjectHandle),
-    has_sender: bool = false,
-    sender: behavior_runtime.NativeObjectHandle = std.mem.zeroes(behavior_runtime.NativeObjectHandle),
-    has_other: bool = false,
-    other: behavior_runtime.NativeObjectHandle = std.mem.zeroes(behavior_runtime.NativeObjectHandle),
-    name_storage: [64]u8 = [_]u8{0} ** 64,
-    name_bytes: u8 = 0,
-    fields: [8]StoredEventField = [_]StoredEventField{.{}} ** 8,
-    field_count: u8 = 0,
-    generation: u8 = 0,
-};
-
-const EventQueue = struct {
-    events: [max_events_per_domain]QueuedEvent = [_]QueuedEvent{.{}} ** max_events_per_domain,
-    count: usize = 0,
-
-    fn clear(self: *EventQueue) void {
-        self.count = 0;
-    }
-
-    fn appendPosted(self: *EventQueue, source: *const behavior_runtime.NativePostedEvent, generation: u8) bool {
-        if (self.count >= self.events.len or source.name == null or source.name_length == 0 or source.name_length > 63 or
-            source.field_count > 8 or (source.field_count > 0 and source.fields == null)) return false;
-        var event = QueuedEvent{
-            .target = source.target,
-            .has_sender = true,
-            .sender = source.sender,
-            .name_bytes = @intCast(source.name_length),
-            .field_count = @intCast(source.field_count),
-            .generation = generation,
-        };
-        @memcpy(event.name_storage[0..source.name_length], source.name[0..source.name_length]);
-        if (source.field_count > 0) {
-            const source_fields = source.fields orelse return false;
-            for (source_fields[0..source.field_count], 0..) |field, index| {
-                if (field.key == null or field.key_length == 0 or field.key_length > 31) return false;
-                if (!validEventValue(&field.value)) return false;
-                event.fields[index].key_bytes = @intCast(field.key_length);
-                @memcpy(event.fields[index].key_storage[0..field.key_length], field.key[0..field.key_length]);
-                event.fields[index].value.kind = field.value.kind;
-                event.fields[index].value.boolean_value = field.value.boolean_value;
-                event.fields[index].value.number_value = field.value.number_value;
-                event.fields[index].value.object_value = field.value.object_value;
-                if (field.value.kind == 3) {
-                    event.fields[index].value.string_bytes = @intCast(field.value.string_value_length);
-                    @memcpy(
-                        event.fields[index].value.string_storage[0..field.value.string_value_length],
-                        field.value.string_value[0..field.value.string_value_length],
-                    );
-                }
-            }
-        }
-        self.events[self.count] = event;
-        self.count += 1;
-        return true;
-    }
-};
-
-const StructuralOperation = enum { spawn, destroy };
 
 const StructuralOrigin = struct {
     object_id: scene_api.ObjectId = .{},
@@ -125,90 +20,34 @@ const StructuralOrigin = struct {
     }
 };
 
-const StructuralRequest = struct {
-    operation: StructuralOperation = .spawn,
-    handle: scene_generation_api.RuntimeHandle = std.mem.zeroes(scene_generation_api.RuntimeHandle),
-    destroy_disposition: ?runtime_core.DestroyDisposition = null,
-    behavior_count: u8 = 0,
-    generation: u8 = 0,
-    sequence: u64 = 0,
-    origin: StructuralOrigin = .{},
-};
-
-const StructuralQueue = struct {
-    requests: [max_structural_requests_per_domain]StructuralRequest = [_]StructuralRequest{.{}} ** max_structural_requests_per_domain,
-    count: usize = 0,
-    next_sequence: u64 = 1,
-    current_origin: StructuralOrigin = .{},
-
-    fn canAppend(self: *const StructuralQueue, generation: u8) bool {
-        return self.canAppendCount(1) and
-            generation <= max_structural_generation and
-            self.next_sequence != std.math.maxInt(u64);
-    }
-
-    fn canAppendCount(self: *const StructuralQueue, additional_count: usize) bool {
-        return additional_count <= self.requests.len - self.count and
-            additional_count <= std.math.maxInt(u64) - self.next_sequence;
-    }
-
-    fn append(
-        self: *StructuralQueue,
-        operation: StructuralOperation,
-        handle: scene_generation_api.RuntimeHandle,
-        generation: u8,
-        behavior_count: u8,
-    ) bool {
-        if (!self.canAppend(generation)) return false;
-        self.requests[self.count] = .{
-            .operation = operation,
-            .handle = handle,
-            .behavior_count = behavior_count,
-            .generation = generation,
-            .sequence = self.next_sequence,
-            .origin = self.current_origin,
-        };
-        self.count += 1;
-        self.next_sequence += 1;
-        return true;
-    }
-
-    fn clear(self: *StructuralQueue) void {
-        self.count = 0;
-        self.current_origin = .{};
-    }
-
-    fn appendRequest(self: *StructuralQueue, request: StructuralRequest) bool {
-        const previous_origin = self.current_origin;
-        defer self.current_origin = previous_origin;
-        self.current_origin = request.origin;
-        if (!self.append(request.operation, request.handle, request.generation, request.behavior_count)) return false;
-        self.requests[self.count - 1].destroy_disposition = request.destroy_disposition;
-        return true;
-    }
-};
-
 fn beginStructuralOrigin(userdata: ?*anyopaque, binding_index: usize, object_id: []const u8, script_id: u32) void {
     _ = binding_index;
-    const queue: *StructuralQueue = @ptrCast(@alignCast(userdata orelse return));
-    queue.current_origin = .{
+    const origin: *StructuralOrigin = @ptrCast(@alignCast(userdata orelse return));
+    origin.* = .{
         .object_id = scene_api.ObjectId.init(object_id) catch return,
         .script_id = script_id,
     };
 }
 
 fn endStructuralOrigin(userdata: ?*anyopaque) void {
-    const queue: *StructuralQueue = @ptrCast(@alignCast(userdata orelse return));
-    queue.current_origin = .{};
+    const origin: *StructuralOrigin = @ptrCast(@alignCast(userdata orelse return));
+    origin.* = .{};
 }
 
-fn structuralObserver(queue: *StructuralQueue) behavior_runtime.ActiveSet.BindingObserver {
-    return .{ .userdata = queue, .begin = beginStructuralOrigin, .end = endStructuralOrigin };
+fn structuralObserver(origin: *StructuralOrigin) behavior_runtime.ActiveSet.BindingObserver {
+    return .{ .userdata = origin, .begin = beginStructuralOrigin, .end = endStructuralOrigin };
 }
+
+const PhaseSession = struct {
+    domain: runtime_core.PhaseDomain,
+    sequence: u64,
+};
 
 pub const TranslationBatch = struct {
     deltas: [runtime_core.max_object_count][2]f64 = [_][2]f64{.{ 0, 0 }} ** runtime_core.max_object_count,
     object_count: usize = 0,
+    events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined,
+    event_count: usize = 0,
 
     pub fn slice(self: *const TranslationBatch) []const [2]f64 {
         return self.deltas[0..self.object_count];
@@ -226,11 +65,10 @@ pub const Runtime = struct {
     package: ?*behavior_runtime.Package = null,
     active: ?*behavior_runtime.ActiveSet = null,
     world_epoch: u64 = 1,
-    admission: BehaviorAdmission = .{},
-    fixed_events: ?*EventQueue = null,
-    frame_events: ?*EventQueue = null,
-    fixed_structural: ?*StructuralQueue = null,
-    frame_structural: ?*StructuralQueue = null,
+    phase_serial: u64 = 1,
+    active_phase: ?PhaseSession = null,
+    fixed_structural_generation: u32 = 0,
+    frame_structural_generation: u32 = 0,
     contact_active: [scene_api.max_scene_object_count]bool = [_]bool{false} ** scene_api.max_scene_object_count,
 
     pub fn deinit(self: *Runtime) void {
@@ -242,10 +80,6 @@ pub const Runtime = struct {
             package.deinit();
             self.allocator.destroy(package);
         }
-        if (self.fixed_events) |events| self.allocator.destroy(events);
-        if (self.frame_events) |events| self.allocator.destroy(events);
-        if (self.fixed_structural) |queue| self.allocator.destroy(queue);
-        if (self.frame_structural) |queue| self.allocator.destroy(queue);
         self.* = .{};
     }
 
@@ -268,9 +102,74 @@ pub const Runtime = struct {
         return self.world_epoch;
     }
 
+    pub fn preparePhaseState(self: *Runtime, generation: *scene_generation_api.SceneGeneration) !void {
+        const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
+        var bindings: [runtime_core.max_phase_bindings]runtime_core.PhaseBinding = undefined;
+        var binding_count: usize = 0;
+        if (active.binding_count > runtime_core.max_phase_bindings) return error.BehaviorInstanceCapacityExceeded;
+        for (active.bindings[0..active.binding_count]) |optional_binding| {
+            const behavior = optional_binding orelse continue;
+            if (binding_count >= bindings.len) return error.BehaviorInstanceCapacityExceeded;
+            var binding = std.mem.zeroes(runtime_core.PhaseBinding);
+            binding.struct_size = @sizeOf(runtime_core.PhaseBinding);
+            binding.behavior_count = 1;
+            binding.script_id = behavior.script_id;
+            binding.object_ref = generation.runtimeHandle(behavior.objectId()) orelse return error.StaleRuntimeObject;
+            bindings[binding_count] = binding;
+            binding_count += 1;
+        }
+        _ = try generation.core.preparePhaseState(generation.target, bindings[0..binding_count]);
+    }
+
+    pub fn commitPhaseState(self: *Runtime, generation: *scene_generation_api.SceneGeneration) !void {
+        _ = self.active orelse return error.BehaviorRuntimeNotLoaded;
+        try generation.core.commitPhaseState();
+    }
+
+    pub fn abortPhaseState(self: *Runtime, generation: *scene_generation_api.SceneGeneration) void {
+        if (!self.isLoaded()) return;
+        generation.core.abortPhaseState() catch |err| {
+            std.log.err("Runtime Core phase candidate abort failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn beginPhase(self: *Runtime, generation: *scene_generation_api.SceneGeneration, domain: runtime_core.PhaseDomain) !PhaseSession {
+        if (self.active_phase != null or self.phase_serial == 0 or self.phase_serial == std.math.maxInt(u64)) {
+            return error.RuntimePhaseBusy;
+        }
+        try self.preparePhaseState(generation);
+        try self.commitPhaseState(generation);
+        switch (domain) {
+            .fixed => self.fixed_structural_generation = 0,
+            .frame => self.frame_structural_generation = 0,
+        }
+        const session = PhaseSession{ .domain = domain, .sequence = self.phase_serial };
+        try generation.core.beginPhase(domain, session.sequence);
+        self.phase_serial += 1;
+        self.active_phase = session;
+        return session;
+    }
+
+    fn requirePhase(self: *Runtime, domain: runtime_core.PhaseDomain) !PhaseSession {
+        const session = self.active_phase orelse return error.RuntimePhaseActiveRequired;
+        if (session.domain != domain) return error.InvalidRuntimePhaseDomain;
+        return session;
+    }
+
+    fn structuralGeneration(self: *const Runtime, domain: runtime_core.PhaseDomain) u32 {
+        return switch (domain) {
+            .fixed => self.fixed_structural_generation,
+            .frame => self.frame_structural_generation,
+        };
+    }
+
+    fn endPhase(self: *Runtime, generation: *scene_generation_api.SceneGeneration, session: PhaseSession) !void {
+        try generation.core.endPhase(session.domain, session.sequence);
+        self.active_phase = null;
+    }
+
     pub fn onStart(self: *Runtime, generation: *const scene_generation_api.SceneGeneration) !TranslationBatch {
         const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
-        const frame_events = self.frame_events orelse return error.BehaviorRuntimeNotLoaded;
         const mutable_generation: *scene_generation_api.SceneGeneration = @constCast(generation);
         try self.prepareTransientBindings(mutable_generation);
         var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
@@ -283,11 +182,6 @@ pub const Runtime = struct {
         }
         var host = overlayNativeHost(&context);
         try active.runStartV4(&host);
-        for (context.events.events[0..context.events.count]) |event| {
-            if (frame_events.count >= frame_events.events.len) return error.BehaviorEventQueueOverflow;
-            frame_events.events[frame_events.count] = event;
-            frame_events.count += 1;
-        }
         var batch = TranslationBatch{ .object_count = ordered.len };
         for (ordered, 0..) |handle, index| {
             const object_index = mutable_generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
@@ -297,27 +191,42 @@ pub const Runtime = struct {
                 context.positions[object_index][1] - position[1],
             };
         }
+        batch.event_count = context.event_count;
+        @memcpy(batch.events[0..context.event_count], context.events[0..context.event_count]);
         return batch;
     }
 
     fn prepareTransientBindings(self: *Runtime, generation: *scene_generation_api.SceneGeneration) !void {
         const package = self.package orelse return error.BehaviorRuntimeNotLoaded;
-        const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
         var diagnostic = behavior_runtime.Diagnostic{};
         var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
         for (try generation.activeHandles(&handles)) |handle| {
             const record = generation.runtimeObject(handle) orelse continue;
-            if (record.source_index != null or record.behavior_count == 0 or active.containsObject(record.object_id.slice())) continue;
-            try self.admission.reserve(record.behavior_count);
-            errdefer self.admission.release(record.behavior_count);
+            if (record.source_index != null or record.behavior_count == 0 or self.active.?.containsObject(record.object_id.slice())) continue;
             const prototype_index = record.prototype_index orelse return error.InvalidRuntimeObjectActivation;
             const prototype = &generation.scene.prototypes.entries[prototype_index];
-            const object_index = generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
-            const normalized = try scene_adapter.normalizePrototype(&package.parsed, prototype, record.object_id.slice(), try generation.objectPosition(object_index));
+            const normalized = try scene_adapter.normalizePrototype(
+                &package.parsed,
+                prototype,
+                record.object_id.slice(),
+                record.sprite.position,
+            );
             var prepared = try normalized.prepare(package, &diagnostic);
             errdefer prepared.deinit();
-            try active.appendPrepared(&prepared);
+            try self.active.?.appendPrepared(&prepared);
         }
+    }
+
+    pub fn publishStartupEvents(
+        self: *Runtime,
+        generation: *scene_generation_api.SceneGeneration,
+        batch: *const TranslationBatch,
+    ) !void {
+        if (batch.event_count == 0) return;
+        const session = try self.beginPhase(generation, .frame);
+        _ = try generation.core.submitPhaseEvents(batch.events[0..batch.event_count]);
+        try self.settlePhase(generation, session, .{});
+        try self.endPhase(generation, session);
     }
 
     pub fn runFixed(
@@ -327,17 +236,14 @@ pub const Runtime = struct {
         input: InputSnapshot,
     ) !void {
         const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
-        const fixed_events = self.fixed_events orelse return error.BehaviorRuntimeNotLoaded;
-        const fixed_structural = self.fixed_structural orelse return error.BehaviorRuntimeNotLoaded;
+        _ = try self.beginPhase(generation, .fixed);
         var context = DirectHostContext{
             .generation = generation,
             .world_epoch = self.world_epoch,
-            .events = fixed_events,
-            .structural = fixed_structural,
-            .admission = &self.admission,
+            .domain = .fixed,
         };
         var host = directNativeHost(&context);
-        try active.runFixedV4Observed(dt_seconds, input, &host, structuralObserver(fixed_structural));
+        try active.runFixedV4Observed(dt_seconds, input, &host, structuralObserver(&context.origin));
         logFailures(active);
     }
 
@@ -348,17 +254,14 @@ pub const Runtime = struct {
         input: InputSnapshot,
     ) !void {
         const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
-        const frame_events = self.frame_events orelse return error.BehaviorRuntimeNotLoaded;
-        const frame_structural = self.frame_structural orelse return error.BehaviorRuntimeNotLoaded;
+        _ = try self.beginPhase(generation, .frame);
         var context = DirectHostContext{
             .generation = generation,
             .world_epoch = self.world_epoch,
-            .events = frame_events,
-            .structural = frame_structural,
-            .admission = &self.admission,
+            .domain = .frame,
         };
         var host = directNativeHost(&context);
-        try active.runUpdateV4Observed(dt_seconds, input, &host, structuralObserver(frame_structural));
+        try active.runUpdateV4Observed(dt_seconds, input, &host, structuralObserver(&context.origin));
         logFailures(active);
     }
 
@@ -369,6 +272,10 @@ pub const Runtime = struct {
         input: InputSnapshot,
     ) !void {
         if (touching.len != generation.scene.objects.count) return error.InvalidBehaviorContactSnapshot;
+        const session = if (self.active_phase == null)
+            try self.beginPhase(generation, .fixed)
+        else
+            try self.requirePhase(.fixed);
         const player_index = generation.playerObjectIndex();
         for (touching, 0..) |is_touching, index| {
             if (index == player_index or is_touching or !self.contact_active[index]) continue;
@@ -379,9 +286,8 @@ pub const Runtime = struct {
             try self.appendContactEvent(generation, player_index, index, "contact_begin");
         }
         @memcpy(self.contact_active[0..touching.len], touching);
-        const structural = self.fixed_structural orelse return error.BehaviorRuntimeNotLoaded;
-        try self.drainEvents(generation, self.fixed_events orelse return error.BehaviorRuntimeNotLoaded, structural, 1, input);
-        try self.flushStructural(generation, self.fixed_events orelse return error.BehaviorRuntimeNotLoaded, structural);
+        try self.settlePhase(generation, session, input);
+        try self.endPhase(generation, session);
     }
 
     pub fn finishFrame(
@@ -389,9 +295,9 @@ pub const Runtime = struct {
         generation: *scene_generation_api.SceneGeneration,
         input: InputSnapshot,
     ) !void {
-        const structural = self.frame_structural orelse return error.BehaviorRuntimeNotLoaded;
-        try self.drainEvents(generation, self.frame_events orelse return error.BehaviorRuntimeNotLoaded, structural, 2, input);
-        try self.flushStructural(generation, self.frame_events orelse return error.BehaviorRuntimeNotLoaded, structural);
+        const session = try self.requirePhase(.frame);
+        try self.settlePhase(generation, session, input);
+        try self.endPhase(generation, session);
     }
 
     fn appendContactEvent(
@@ -412,204 +318,308 @@ pub const Runtime = struct {
         other_index: usize,
         name: []const u8,
     ) !void {
-        const fixed_events = self.fixed_events orelse return error.BehaviorRuntimeNotLoaded;
-        if (fixed_events.count >= fixed_events.events.len) return error.BehaviorEventQueueOverflow;
-        var event = QueuedEvent{ .has_other = true, .name_bytes = @intCast(name.len) };
-        _ = fillObjectHandle(&generation.scene, target_index, self.world_epoch, &event.target);
-        _ = fillObjectHandle(&generation.scene, other_index, self.world_epoch, &event.other);
-        @memcpy(event.name_storage[0..name.len], name);
-        fixed_events.events[fixed_events.count] = event;
-        fixed_events.count += 1;
+        _ = try self.requirePhase(.fixed);
+        var event = std.mem.zeroes(runtime_core.PhaseEvent);
+        event.struct_size = @sizeOf(runtime_core.PhaseEvent);
+        event.domain = @intFromEnum(runtime_core.PhaseDomain.fixed);
+        event.target = generation.runtimeHandleAt(target_index) orelse return error.StaleRuntimeObject;
+        event.has_other = 1;
+        event.other = generation.runtimeHandleAt(other_index) orelse return error.StaleRuntimeObject;
+        event.name_length = @intCast(name.len);
+        @memcpy(event.name[0..name.len], name);
+        _ = try @constCast(generation).core.submitPhaseEvents(&.{event});
+    }
+
+    fn settlePhase(
+        self: *Runtime,
+        generation: *scene_generation_api.SceneGeneration,
+        session: PhaseSession,
+        input: InputSnapshot,
+    ) !void {
+        const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
+        active.beginEventDrain();
+        while (true) {
+            const drained = try self.drainEvents(generation, session, input);
+            const flushed = try self.flushStructural(generation, session);
+            if (!drained and !flushed) return;
+        }
     }
 
     fn drainEvents(
         self: *Runtime,
         generation: *scene_generation_api.SceneGeneration,
-        queue: *EventQueue,
-        structural: *StructuralQueue,
-        domain: u32,
+        session: PhaseSession,
         input: InputSnapshot,
-    ) !void {
+    ) !bool {
         const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
-        active.beginEventDrain();
-        var index: usize = 0;
-        while (index < queue.count) : (index += 1) {
-            const event = &queue.events[index];
-            if (event.generation > max_event_drain_generation) continue;
-            const target_id = event.target.object_id[0..event.target.object_id_length];
-            if (validateRuntimeObjectHandle(generation, self.world_epoch, &event.target) == null) {
-                std.log.warn("Behavior event target became stale before delivery: name={s}, target={s}", .{
-                    event.name_storage[0..event.name_bytes],
-                    target_id,
-                });
-                continue;
+        var did_work = false;
+        while (true) {
+            var drained: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
+            for (&drained) |*event| {
+                event.* = std.mem.zeroes(runtime_core.PhaseEvent);
+                event.struct_size = @sizeOf(runtime_core.PhaseEvent);
             }
-            var context = DirectHostContext{
-                .generation = generation,
-                .world_epoch = self.world_epoch,
-                .events = queue,
-                .structural = structural,
-                .admission = &self.admission,
-                .post_generation = event.generation +| 1,
-                .structural_generation = 1,
-            };
-            var host = directNativeHost(&context);
-            var native_fields: [8]behavior_runtime.NativeEventField = undefined;
-            for (event.fields[0..event.field_count], 0..) |*field, field_index| {
-                native_fields[field_index] = std.mem.zeroes(behavior_runtime.NativeEventField);
-                native_fields[field_index].key = &field.key_storage;
-                native_fields[field_index].key_length = field.key_bytes;
-                native_fields[field_index].value.kind = field.value.kind;
-                native_fields[field_index].value.boolean_value = field.value.boolean_value;
-                native_fields[field_index].value.number_value = field.value.number_value;
-                native_fields[field_index].value.object_value = field.value.object_value;
-                if (field.value.kind == 3) {
-                    native_fields[field_index].value.string_value = &field.value.string_storage;
-                    native_fields[field_index].value.string_value_length = field.value.string_bytes;
+            const count = try generation.core.drainPhaseEvents(session.domain, session.sequence, &drained);
+            if (count == 0) break;
+            did_work = true;
+            for (drained[0..count]) |*event| {
+                const target_id = runtime_core.objectIdSlice(&event.target);
+                if (generation.runtimeObject(event.target) == null) {
+                    std.log.warn("Behavior event target became stale before delivery: name={s}, target={s}", .{
+                        event.name[0..event.name_length],
+                        target_id,
+                    });
+                    continue;
                 }
+                var context = DirectHostContext{
+                    .generation = generation,
+                    .world_epoch = self.world_epoch,
+                    .domain = session.domain,
+                    .post_generation = event.generation + 1,
+                    .structural_generation = self.structuralGeneration(session.domain),
+                };
+                var host = directNativeHost(&context);
+                var native_fields: [8]behavior_runtime.NativeEventField = undefined;
+                for (event.fields[0..event.field_count], 0..) |*field, field_index| {
+                    native_fields[field_index] = std.mem.zeroes(behavior_runtime.NativeEventField);
+                    native_fields[field_index].key = &field.key;
+                    native_fields[field_index].key_length = field.key_length;
+                    native_fields[field_index].value.kind = field.value_kind;
+                    switch (field.value_kind) {
+                        runtime_core.phase_event_boolean => native_fields[field_index].value.boolean_value = field.value.boolean_value,
+                        runtime_core.phase_event_number => native_fields[field_index].value.number_value = field.value.number_value,
+                        runtime_core.phase_event_string => {
+                            native_fields[field_index].value.string_value = &field.value.string_value.bytes;
+                            native_fields[field_index].value.string_value_length = field.value.string_value.length;
+                        },
+                        runtime_core.phase_event_object => {
+                            _ = fillNativeObjectHandle(field.value.object_value, &native_fields[field_index].value.object_value);
+                        },
+                        else => return error.InvalidRuntimePhaseRequest,
+                    }
+                }
+                var sender = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
+                var other = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
+                if (event.has_sender != 0) _ = fillNativeObjectHandle(event.sender, &sender);
+                if (event.has_other != 0) _ = fillNativeObjectHandle(event.other, &other);
+                var native_event = behavior_runtime.NativeEvent{
+                    .name = &event.name,
+                    .name_length = event.name_length,
+                    .domain = @intFromEnum(session.domain),
+                    .has_sender = event.has_sender,
+                    .sender = sender,
+                    .has_other = event.has_other,
+                    .other = other,
+                    .fields = if (event.field_count == 0) null else &native_fields,
+                    .field_count = event.field_count,
+                };
+                try active.dispatchEventV4Observed(
+                    target_id,
+                    &native_event,
+                    input,
+                    &host,
+                    structuralObserver(&context.origin),
+                );
             }
-            var native_event = behavior_runtime.NativeEvent{
-                .name = &event.name_storage,
-                .name_length = event.name_bytes,
-                .domain = domain,
-                .has_sender = @intFromBool(event.has_sender),
-                .sender = event.sender,
-                .has_other = @intFromBool(event.has_other),
-                .other = event.other,
-                .fields = if (event.field_count == 0) null else &native_fields,
-                .field_count = event.field_count,
-            };
-            try active.dispatchEventV4Observed(target_id, &native_event, input, &host, structuralObserver(structural));
         }
-        queue.clear();
         logFailures(active);
+        return did_work;
     }
 
     fn flushStructural(
         self: *Runtime,
         generation: *scene_generation_api.SceneGeneration,
-        events: *EventQueue,
-        queue: *StructuralQueue,
-    ) !void {
+        session: PhaseSession,
+    ) !bool {
         const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
-        var index: usize = 0;
-        while (index < queue.count) : (index += 1) {
-            const request = queue.requests[index];
-            switch (request.operation) {
-                .spawn => {
-                    const record = generation.runtimeObject(request.handle) orelse continue;
-                    if (record.state != .pending_spawn) continue;
-                    const package = self.package orelse return error.BehaviorRuntimeNotLoaded;
-                    const prototype_index = record.prototype_index orelse {
-                        self.discardAdmittedReservation(generation, request);
-                        reportStructuralFailure(active, request, error.InvalidRuntimeObjectActivation, null);
-                        continue;
-                    };
-                    const prototype = &generation.scene.prototypes.entries[prototype_index];
-                    const object_id = record.object_id;
-                    const position = record.sprite.position;
-                    const normalized = scene_adapter.normalizePrototype(&package.parsed, prototype, object_id.slice(), position) catch |err| {
-                        self.discardAdmittedReservation(generation, request);
-                        reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
-                        continue;
-                    };
-                    var diagnostic = behavior_runtime.Diagnostic{};
-                    var prepared = normalized.prepare(package, &diagnostic) catch |err| {
-                        self.discardAdmittedReservation(generation, request);
-                        logDiagnostic("Dynamic Behavior binding preparation failed", err, diagnostic.slice());
-                        reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
-                        continue;
-                    };
-                    var candidate = prepared.activate();
-                    const activation_context = self.allocator.create(ActivationHostContext) catch |err| {
-                        candidate.deinit();
-                        self.discardAdmittedReservation(generation, request);
-                        reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
-                        continue;
-                    };
-                    defer self.allocator.destroy(activation_context);
-                    activation_context.* = ActivationHostContext.init(
-                        generation,
-                        self.world_epoch,
-                        events,
-                        queue,
-                        &self.admission,
-                        request.generation +| 1,
-                    ) catch |err| {
-                        candidate.deinit();
-                        self.discardAdmittedReservation(generation, request);
-                        reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
-                        continue;
-                    };
-                    var activation_host = activationNativeHost(activation_context);
-                    candidate.runStartV4Observed(&activation_host, structuralObserver(&activation_context.candidate_structural)) catch |err| {
-                        candidate.deinit();
-                        activation_context.rollback();
-                        self.discardAdmittedReservation(generation, request);
-                        std.log.warn("Dynamic Behavior on_start failed: sequence={d}, error={s}", .{ request.sequence, @errorName(err) });
-                        continue;
-                    };
-                    if (candidate.binding_count > active.bindings.len - active.binding_count) {
-                        candidate.deinit();
-                        activation_context.rollback();
-                        self.discardAdmittedReservation(generation, request);
-                        reportStructuralFailure(active, request, error.BehaviorBindingCountExceeded, prototype.prototypeId.slice());
-                        continue;
-                    }
-                    activation_context.commitCore(request.handle) catch |err| {
-                        candidate.deinit();
-                        activation_context.rollback();
-                        self.discardAdmittedReservation(generation, request);
-                        reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
-                        continue;
-                    };
-                    active.appendActive(&candidate) catch unreachable;
-                    activation_context.publish();
-                },
-                .destroy => {
-                    const object_id = runtime_core.objectIdSlice(&request.handle);
-                    switch (request.destroy_disposition orelse continue) {
-                        .cancelled_pending_spawn => self.admission.release(request.behavior_count),
-                        .awaiting_finalize => {
-                            generation.commitTransientDestroy(request.handle) catch |err| {
-                                reportStructuralFailure(active, request, err, object_id);
-                                return err;
+        var did_work = false;
+        while (true) {
+            var requests: [runtime_core.max_phase_structural]runtime_core.PhaseStructural = undefined;
+            for (&requests) |*request| {
+                request.* = std.mem.zeroes(runtime_core.PhaseStructural);
+                request.struct_size = @sizeOf(runtime_core.PhaseStructural);
+            }
+            const taken = try generation.core.takePhaseStructural(session.domain, session.sequence, &requests);
+            if (taken.count == 0) break;
+            did_work = true;
+            const next_structural_generation = requests[0].generation + 1;
+            switch (session.domain) {
+                .fixed => self.fixed_structural_generation = next_structural_generation,
+                .frame => self.frame_structural_generation = next_structural_generation,
+            }
+
+            var completions: [runtime_core.max_phase_structural]runtime_core.PhaseCompletion = undefined;
+            var completion_count: usize = 0;
+            for (requests[0..taken.count]) |request| {
+                switch (request.operation) {
+                    runtime_core.phase_operation_reserve_transient => {
+                        const transaction = try generation.core.beginPhaseActivation(taken.info.flush_token, request.sequence);
+                        const maybe_record = generation.runtimeObject(request.object_ref);
+                        if (maybe_record == null) {
+                            var context = ActivationHostContext.init(
+                                generation,
+                                self.world_epoch,
+                                transaction.transaction_id,
+                                session.domain,
+                                runtime_core.max_phase_bindings,
+                                request.generation + 1,
+                            ) catch |err| {
+                                try generation.core.abortPhaseActivation(transaction.transaction_id);
+                                reportStructuralFailure(active, request, err, null);
+                                continue;
                             };
-                            active.removeObject(object_id);
-                            self.admission.release(request.behavior_count);
-                        },
+                            context.finish() catch |err| {
+                                try generation.core.abortPhaseActivation(transaction.transaction_id);
+                                reportStructuralFailure(active, request, err, null);
+                                continue;
+                            };
+                            _ = generation.core.commitPhaseActivation(transaction.transaction_id) catch |err| {
+                                generation.core.abortPhaseActivation(transaction.transaction_id) catch {};
+                                reportStructuralFailure(active, request, err, null);
+                                continue;
+                            };
+                            continue;
+                        }
+
+                        const record = maybe_record.?;
+                        const package = self.package orelse return error.BehaviorRuntimeNotLoaded;
+                        const prototype_index = record.prototype_index orelse {
+                            try generation.core.abortPhaseActivation(transaction.transaction_id);
+                            reportStructuralFailure(active, request, error.InvalidRuntimeObjectActivation, null);
+                            continue;
+                        };
+                        const prototype = &generation.scene.prototypes.entries[prototype_index];
+                        const normalized = scene_adapter.normalizePrototype(
+                            &package.parsed,
+                            prototype,
+                            record.object_id.slice(),
+                            record.sprite.position,
+                        ) catch |err| {
+                            try generation.core.abortPhaseActivation(transaction.transaction_id);
+                            reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
+                            continue;
+                        };
+                        var diagnostic = behavior_runtime.Diagnostic{};
+                        var prepared = normalized.prepare(package, &diagnostic) catch |err| {
+                            try generation.core.abortPhaseActivation(transaction.transaction_id);
+                            logDiagnostic("Dynamic Behavior binding preparation failed", err, diagnostic.slice());
+                            reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
+                            continue;
+                        };
+                        var candidate = prepared.activate();
+                        if (active.binding_count > runtime_core.max_phase_bindings or
+                            candidate.binding_count > runtime_core.max_phase_bindings - active.binding_count)
+                        {
+                            candidate.deinit();
+                            try generation.core.abortPhaseActivation(transaction.transaction_id);
+                            reportStructuralFailure(active, request, error.BehaviorBindingCountExceeded, prototype.prototypeId.slice());
+                            continue;
+                        }
+
+                        const activation_context = self.allocator.create(ActivationHostContext) catch |err| {
+                            candidate.deinit();
+                            try generation.core.abortPhaseActivation(transaction.transaction_id);
+                            reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
+                            continue;
+                        };
+                        defer self.allocator.destroy(activation_context);
+                        activation_context.* = ActivationHostContext.init(
+                            generation,
+                            self.world_epoch,
+                            transaction.transaction_id,
+                            session.domain,
+                            runtime_core.max_phase_bindings,
+                            request.generation + 1,
+                        ) catch |err| {
+                            candidate.deinit();
+                            try generation.core.abortPhaseActivation(transaction.transaction_id);
+                            reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
+                            continue;
+                        };
+                        var activation_host = activationNativeHost(activation_context);
+                        candidate.runStartV4Observed(
+                            &activation_host,
+                            structuralObserver(&activation_context.origin),
+                        ) catch |err| {
+                            candidate.deinit();
+                            try generation.core.abortPhaseActivation(transaction.transaction_id);
+                            std.log.warn("Dynamic Behavior on_start failed: sequence={d}, error={s}", .{
+                                request.sequence,
+                                @errorName(err),
+                            });
+                            continue;
+                        };
+                        activation_context.finish() catch |err| {
+                            candidate.deinit();
+                            try generation.core.abortPhaseActivation(transaction.transaction_id);
+                            reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
+                            continue;
+                        };
+                        const activation_result = generation.core.commitPhaseActivation(transaction.transaction_id) catch |err| {
+                            candidate.deinit();
+                            generation.core.abortPhaseActivation(transaction.transaction_id) catch {};
+                            reportStructuralFailure(active, request, err, prototype.prototypeId.slice());
+                            continue;
+                        };
+                        if (activation_result.root_object.struct_size == 0) {
+                            candidate.deinit();
+                        } else {
+                            active.appendActive(&candidate) catch unreachable;
+                        }
+                    },
+                    runtime_core.phase_operation_request_destroy,
+                    runtime_core.phase_operation_discard_reservation,
+                    => {
+                        completions[completion_count] = std.mem.zeroes(runtime_core.PhaseCompletion);
+                        completions[completion_count].struct_size = @sizeOf(runtime_core.PhaseCompletion);
+                        completions[completion_count].status = runtime_core.phase_completion_accepted;
+                        completions[completion_count].sequence = request.sequence;
+                        completion_count += 1;
+                    },
+                    else => return error.InvalidRuntimePhaseRequest,
+                }
+            }
+            if (completion_count != 0) {
+                try generation.core.completePhaseStructural(taken.info.flush_token, completions[0..completion_count]);
+                for (requests[0..taken.count]) |request| {
+                    if (request.operation == runtime_core.phase_operation_request_destroy or
+                        request.operation == runtime_core.phase_operation_discard_reservation)
+                    {
+                        active.removeObject(runtime_core.objectIdSlice(&request.object_ref));
                     }
-                },
+                }
             }
         }
-        queue.clear();
-    }
-
-    fn discardAdmittedReservation(
-        self: *Runtime,
-        generation: *scene_generation_api.SceneGeneration,
-        request: StructuralRequest,
-    ) void {
-        generation.discardTransient(request.handle) catch {};
-        self.admission.release(request.behavior_count);
+        if (did_work) try generation.refreshPhaseProjection();
+        return did_work;
     }
 };
 
 fn reportStructuralFailure(
     active: *behavior_runtime.ActiveSet,
-    request: StructuralRequest,
+    request: runtime_core.PhaseStructural,
     err: anyerror,
     target_id: ?[]const u8,
 ) void {
-    const origin_id = if (request.origin.isValid()) request.origin.object_id.slice() else "<unknown>";
+    const has_origin = request.origin.struct_size != 0 and request.script_id != 0;
+    const origin_id = if (has_origin) runtime_core.objectIdSlice(&request.origin) else "<unknown>";
     const target = target_id orelse "<unknown>";
-    if (request.origin.isValid()) {
-        active.disableBindingByIdentity(origin_id, request.origin.script_id, err, "structural commit failed");
+    if (has_origin) {
+        active.disableBindingByIdentity(origin_id, request.script_id, err, "structural commit failed");
     }
     std.log.warn(
         "Behavior structural commit failed: sequence={d}, operation={s}, origin_object={s}, origin_script={d}, target={s}, error={s}",
-        .{ request.sequence, @tagName(request.operation), origin_id, request.origin.script_id, target, @errorName(err) },
+        .{ request.sequence, phaseOperationName(request.operation), origin_id, request.script_id, target, @errorName(err) },
     );
+}
+
+fn phaseOperationName(operation: u32) []const u8 {
+    return switch (operation) {
+        runtime_core.phase_operation_reserve_transient => "spawn",
+        runtime_core.phase_operation_request_destroy => "destroy",
+        runtime_core.phase_operation_discard_reservation => "discard",
+        else => "unknown",
+    };
 }
 
 const OverlayHostContext = struct {
@@ -617,7 +627,8 @@ const OverlayHostContext = struct {
     world_epoch: u64,
     positions: [runtime_core.max_object_count][2]f32 = [_][2]f32{.{ 0, 0 }} ** runtime_core.max_object_count,
     present: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
-    events: EventQueue = .{},
+    events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined,
+    event_count: usize = 0,
 
     fn init(generation: *scene_generation_api.SceneGeneration, world_epoch: u64) !OverlayHostContext {
         var context = OverlayHostContext{ .generation = generation, .world_epoch = world_epoch };
@@ -634,147 +645,71 @@ const OverlayHostContext = struct {
 const DirectHostContext = struct {
     generation: *scene_generation_api.SceneGeneration,
     world_epoch: u64,
-    events: *EventQueue,
-    structural: *StructuralQueue,
-    admission: *BehaviorAdmission,
-    post_generation: u8 = 0,
-    structural_generation: u8 = 0,
+    domain: runtime_core.PhaseDomain,
+    post_generation: u32 = 0,
+    structural_generation: u32 = 0,
+    origin: StructuralOrigin = .{},
 };
 
 const ActivationHostContext = struct {
     generation: *scene_generation_api.SceneGeneration,
     world_epoch: u64,
-    target_events: *EventQueue,
-    target_structural: *StructuralQueue,
-    admission: *BehaviorAdmission,
+    transaction_id: u64,
+    domain: runtime_core.PhaseDomain,
+    active_binding_capacity: usize,
+    handles: [runtime_core.max_object_count]runtime_core.ObjectRef = undefined,
     positions: [runtime_core.max_object_count][2]f32 = [_][2]f32{.{ 0, 0 }} ** runtime_core.max_object_count,
     present: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
     destroyed: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
-    candidate_events: EventQueue = .{},
-    candidate_structural: StructuralQueue = .{},
-    canceled_structural: [max_structural_requests_per_domain]bool = [_]bool{false} ** max_structural_requests_per_domain,
-    accepted_structural_count: usize = 0,
-    core_committed: bool = false,
-    structural_generation: u8,
+    handle_count: usize = 0,
+    successor_generation: u32,
+    origin: StructuralOrigin = .{},
 
     fn init(
         generation: *scene_generation_api.SceneGeneration,
         world_epoch: u64,
-        target_events: *EventQueue,
-        target_structural: *StructuralQueue,
-        admission: *BehaviorAdmission,
-        structural_generation: u8,
+        transaction_id: u64,
+        domain: runtime_core.PhaseDomain,
+        active_binding_capacity: usize,
+        successor_generation: u32,
     ) !ActivationHostContext {
         var context = ActivationHostContext{
             .generation = generation,
             .world_epoch = world_epoch,
-            .target_events = target_events,
-            .target_structural = target_structural,
-            .admission = admission,
-            .structural_generation = structural_generation,
+            .transaction_id = transaction_id,
+            .domain = domain,
+            .active_binding_capacity = active_binding_capacity,
+            .successor_generation = successor_generation,
         };
         var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
         for (try generation.visibleHandles(&handles)) |handle| {
-            const index = generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
+            const index = context.handle_count;
+            context.handles[index] = handle;
             context.present[index] = true;
-            context.positions[index] = try generation.objectPosition(index);
+            const object_index = generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
+            context.positions[index] = try generation.objectPosition(object_index);
+            context.handle_count += 1;
         }
         return context;
     }
 
-    fn rollback(self: *ActivationHostContext) void {
-        for (self.candidate_structural.requests[0..self.candidate_structural.count]) |request| {
-            if (request.operation != .spawn) continue;
-            self.generation.discardTransient(request.handle) catch {};
-            self.admission.release(request.behavior_count);
+    fn indexOf(self: *const ActivationHostContext, object: *const behavior_runtime.NativeObjectHandle) ?usize {
+        for (self.handles[0..self.handle_count], 0..) |handle, index| {
+            if (nativeMatchesObjectRef(object, handle) and self.present[index] and !self.destroyed[index]) return index;
         }
+        return null;
     }
 
-    fn commitCore(self: *ActivationHostContext, root_handle: scene_generation_api.RuntimeHandle) !void {
-        if (self.target_events.count + self.candidate_events.count > self.target_events.events.len) return error.BehaviorEventQueueOverflow;
-        for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, destroy_index| {
-            if (request.operation != .destroy) continue;
-            for (self.candidate_structural.requests[0..destroy_index], 0..) |candidate, spawn_index| {
-                if (candidate.operation != .spawn or
-                    !runtime_core.sameObjectRef(candidate.handle, request.handle)) continue;
-                self.canceled_structural[spawn_index] = true;
-                self.canceled_structural[destroy_index] = true;
-                break;
-            }
-        }
-        self.accepted_structural_count = 0;
-        for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, request_index| {
-            if (self.canceled_structural[request_index]) continue;
-            self.accepted_structural_count += 1;
-            if (request.generation > max_structural_generation) {
-                return error.BehaviorStructuralQueueOverflow;
-            }
-            if (request.operation == .destroy) {
-                const record = self.generation.runtimeObject(request.handle) orelse return error.InvalidRuntimeObjectDestroy;
-                if (record.source_index != null or (record.state != .pending_spawn and record.state != .active)) {
-                    return error.InvalidRuntimeObjectDestroy;
-                }
-            }
-        }
-        if (!self.target_structural.canAppendCount(self.accepted_structural_count)) return error.BehaviorStructuralQueueOverflow;
-        var position_updates: [runtime_core.max_object_count]scene_generation_api.ObjectPositionUpdate = undefined;
-        var position_update_count: usize = 0;
-        for (self.present, 0..) |is_present, index| {
-            if (!is_present) continue;
-            position_updates[position_update_count] = .{
-                .object_index = @intCast(index),
-                .position = self.positions[index],
-            };
-            position_update_count += 1;
-        }
-        var commands: [max_structural_requests_per_domain + 1]scene_generation_api.ActivationCommand = undefined;
-        var command_request_index: [max_structural_requests_per_domain + 1]?usize = [_]?usize{null} ** (max_structural_requests_per_domain + 1);
-        var dispositions: [max_structural_requests_per_domain + 1]?runtime_core.DestroyDisposition = [_]?runtime_core.DestroyDisposition{null} ** (max_structural_requests_per_domain + 1);
-        var command_count: usize = 1;
-        commands[0] = .{ .activate = root_handle };
-        for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, request_index| {
-            if (self.canceled_structural[request_index]) {
-                if (request.operation == .spawn) {
-                    commands[command_count] = .{ .discard_reservation = request.handle };
-                    command_request_index[command_count] = request_index;
-                    command_count += 1;
-                }
-                continue;
-            }
-            if (request.operation == .destroy) {
-                commands[command_count] = .{ .request_destroy = request.handle };
-                command_request_index[command_count] = request_index;
-                command_count += 1;
-            }
-        }
-        try self.generation.commitActivation(
-            position_updates[0..position_update_count],
-            commands[0..command_count],
-            dispositions[0..command_count],
-        );
-        for (command_request_index[0..command_count], 0..) |maybe_request_index, command_index| {
-            const request_index = maybe_request_index orelse continue;
-            if (self.candidate_structural.requests[request_index].operation == .destroy) {
-                self.candidate_structural.requests[request_index].destroy_disposition = dispositions[command_index];
-            }
-        }
-        self.core_committed = true;
+    fn submit(self: *ActivationHostContext, batch: *runtime_core.PhaseActivationBatch, results: []runtime_core.PhaseActivationStructuralResult) !void {
+        batch.struct_size = @sizeOf(runtime_core.PhaseActivationBatch);
+        batch.transaction_id = self.transaction_id;
+        batch.active_binding_capacity = self.active_binding_capacity;
+        try self.generation.core.submitPhaseActivation(self.transaction_id, batch, results);
     }
 
-    fn publish(self: *ActivationHostContext) void {
-        std.debug.assert(self.core_committed);
-        for (self.candidate_events.events[0..self.candidate_events.count]) |event| {
-            self.target_events.events[self.target_events.count] = event;
-            self.target_events.count += 1;
-        }
-        for (self.candidate_structural.requests[0..self.candidate_structural.count], 0..) |request, request_index| {
-            if (self.canceled_structural[request_index]) {
-                if (request.operation == .spawn) self.admission.release(request.behavior_count);
-                continue;
-            }
-            std.debug.assert(self.target_structural.appendRequest(request));
-        }
-        self.candidate_structural.count = 0;
+    fn finish(self: *ActivationHostContext) !void {
+        var batch = std.mem.zeroes(runtime_core.PhaseActivationBatch);
+        try self.submit(&batch, &[_]runtime_core.PhaseActivationStructuralResult{});
     }
 };
 
@@ -861,30 +796,23 @@ fn directSpawnObject(
     const output = out_object orelse return 0;
     output.* = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
     if (prototype_id == null or prototype_id_length == 0 or prototype_id_length > scene_api.max_object_id_bytes or
-        !validPosition(x, y) or !context.structural.canAppend(context.structural_generation)) return 0;
+        !validPosition(x, y)) return 0;
     const prototype_index = context.generation.scene.prototypes.indexOfId(prototype_id[0..prototype_id_length]) orelse return 0;
-    const behavior_count = context.generation.scene.prototypes.entries[prototype_index].behaviors.count;
-    context.admission.reserve(behavior_count) catch return 0;
-    const reserved = context.generation.reserveTransient(
-        prototype_id[0..prototype_id_length],
+    const prototype = &context.generation.scene.prototypes.entries[prototype_index];
+    const request = phaseSpawnRequest(
+        context.generation,
+        context.domain,
+        context.structural_generation,
+        context.origin,
+        prototype_index,
+        prototype,
         .{ @floatCast(x), @floatCast(y) },
-    ) catch {
-        context.admission.release(behavior_count);
-        return 0;
-    };
-    if (!context.structural.append(.spawn, reserved.handle, context.structural_generation, behavior_count)) {
-        context.generation.discardTransient(reserved.handle) catch {};
-        context.admission.release(behavior_count);
-        return 0;
-    }
-    if (fillRuntimeObjectHandle(context.generation, reserved.handle, context.world_epoch, output) == 0) {
-        context.structural.count -= 1;
-        context.structural.next_sequence -= 1;
-        context.generation.discardTransient(reserved.handle) catch {};
-        context.admission.release(behavior_count);
-        return 0;
-    }
-    return 1;
+    ) orelse return 0;
+    var acceptance = std.mem.zeroes(runtime_core.PhaseCompletion);
+    acceptance.struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    var acceptances = [_]runtime_core.PhaseCompletion{acceptance};
+    _ = context.generation.core.submitPhaseStructural(&.{request}, &acceptances) catch return 0;
+    return fillNativeObjectHandle(acceptances[0].object.object_ref, output);
 }
 
 fn directDestroyObject(
@@ -892,18 +820,13 @@ fn directDestroyObject(
     object: ?*const behavior_runtime.NativeObjectHandle,
 ) callconv(.c) c_int {
     const context: *DirectHostContext = @ptrCast(@alignCast(userdata orelse return 0));
-    if (!context.structural.canAppend(context.structural_generation)) return 0;
     const slot = validateRuntimeObjectHandle(context.generation, context.world_epoch, object) orelse return 0;
     const handle = context.generation.runtimeHandleAt(slot) orelse return 0;
-    const record = context.generation.runtimeObject(handle) orelse return 0;
-    if (record.source_index != null) return 0;
-    if (!context.structural.append(.destroy, handle, context.structural_generation, record.behavior_count)) return 0;
-    const disposition = context.generation.requestTransientDestroyDisposition(handle) catch {
-        context.structural.count -= 1;
-        context.structural.next_sequence -= 1;
-        return 0;
-    };
-    context.structural.requests[context.structural.count - 1].destroy_disposition = disposition;
+    const request = phaseDestroyRequest(context.generation, context.domain, context.structural_generation, context.origin, handle) orelse return 0;
+    var acceptance = std.mem.zeroes(runtime_core.PhaseCompletion);
+    acceptance.struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    var acceptances = [_]runtime_core.PhaseCompletion{acceptance};
+    _ = context.generation.core.submitPhaseStructural(&.{request}, &acceptances) catch return 0;
     return 1;
 }
 
@@ -919,33 +842,32 @@ fn activationSpawnObject(
     const output = out_object orelse return 0;
     output.* = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
     if (prototype_id == null or prototype_id_length == 0 or prototype_id_length > scene_api.max_object_id_bytes or
-        !validPosition(x, y) or !context.candidate_structural.canAppend(context.structural_generation) or
-        context.target_structural.count + context.candidate_structural.count >= context.target_structural.requests.len) return 0;
+        !validPosition(x, y) or context.handle_count >= context.handles.len) return 0;
     const prototype_index = context.generation.scene.prototypes.indexOfId(prototype_id[0..prototype_id_length]) orelse return 0;
-    const behavior_count = context.generation.scene.prototypes.entries[prototype_index].behaviors.count;
-    context.admission.reserve(behavior_count) catch return 0;
-    const reserved = context.generation.reserveTransient(
-        prototype_id[0..prototype_id_length],
+    const prototype = &context.generation.scene.prototypes.entries[prototype_index];
+    const request = phaseSpawnRequest(
+        context.generation,
+        context.domain,
+        context.successor_generation,
+        context.origin,
+        prototype_index,
+        prototype,
         .{ @floatCast(x), @floatCast(y) },
-    ) catch {
-        context.admission.release(behavior_count);
-        return 0;
-    };
-    if (!context.candidate_structural.append(.spawn, reserved.handle, context.structural_generation, behavior_count)) {
-        context.generation.discardTransient(reserved.handle) catch {};
-        context.admission.release(behavior_count);
-        return 0;
-    }
-    const object_index = context.generation.objectIndexForRef(reserved.handle) orelse {
-        context.candidate_structural.count -= 1;
-        context.candidate_structural.next_sequence -= 1;
-        context.generation.discardTransient(reserved.handle) catch {};
-        context.admission.release(behavior_count);
-        return 0;
-    };
-    context.present[object_index] = true;
-    context.positions[object_index] = .{ @floatCast(x), @floatCast(y) };
-    return fillRuntimeObjectHandle(context.generation, reserved.handle, context.world_epoch, output);
+    ) orelse return 0;
+    var result = std.mem.zeroes(runtime_core.PhaseActivationStructuralResult);
+    result.struct_size = @sizeOf(runtime_core.PhaseActivationStructuralResult);
+    var results = [_]runtime_core.PhaseActivationStructuralResult{result};
+    var batch = std.mem.zeroes(runtime_core.PhaseActivationBatch);
+    batch.structural = &request;
+    batch.structural_count = 1;
+    batch.structural_stride = @sizeOf(runtime_core.PhaseStructural);
+    context.submit(&batch, &results) catch return 0;
+    const index = context.handle_count;
+    context.handles[index] = results[0].object_ref;
+    context.positions[index] = .{ @floatCast(x), @floatCast(y) };
+    context.present[index] = true;
+    context.handle_count += 1;
+    return fillNativeObjectHandle(results[0].object_ref, output);
 }
 
 fn activationDestroyObject(
@@ -953,13 +875,23 @@ fn activationDestroyObject(
     object: ?*const behavior_runtime.NativeObjectHandle,
 ) callconv(.c) c_int {
     const context: *ActivationHostContext = @ptrCast(@alignCast(userdata orelse return 0));
-    if (!context.candidate_structural.canAppend(context.structural_generation) or
-        context.target_structural.count + context.candidate_structural.count >= context.target_structural.requests.len) return 0;
-    const slot = validateActivationObjectHandle(context, object) orelse return 0;
-    const handle = context.generation.runtimeHandleAt(slot) orelse return 0;
-    const record = context.generation.runtimeObject(handle) orelse return 0;
-    if (record.source_index != null) return 0;
-    if (!context.candidate_structural.append(.destroy, handle, context.structural_generation, record.behavior_count)) return 0;
+    const value = object orelse return 0;
+    const slot = context.indexOf(value) orelse return 0;
+    const request = phaseDestroyRequest(
+        context.generation,
+        context.domain,
+        context.successor_generation,
+        context.origin,
+        context.handles[slot],
+    ) orelse return 0;
+    var result = std.mem.zeroes(runtime_core.PhaseActivationStructuralResult);
+    result.struct_size = @sizeOf(runtime_core.PhaseActivationStructuralResult);
+    var results = [_]runtime_core.PhaseActivationStructuralResult{result};
+    var batch = std.mem.zeroes(runtime_core.PhaseActivationBatch);
+    batch.structural = &request;
+    batch.structural_count = 1;
+    batch.structural_stride = @sizeOf(runtime_core.PhaseStructural);
+    context.submit(&batch, &results) catch return 0;
     context.destroyed[slot] = true;
     return 1;
 }
@@ -972,10 +904,11 @@ fn activationResolveObject(
 ) callconv(.c) c_int {
     const context: *ActivationHostContext = @ptrCast(@alignCast(userdata orelse return 0));
     if (object_id == null or object_id_length == 0 or object_id_length > behavior_runtime.max_object_id_bytes) return 0;
-    const handle = context.generation.runtimeHandle(object_id[0..object_id_length]) orelse return 0;
-    const object_index = context.generation.objectIndexForRef(handle) orelse return 0;
-    if (context.destroyed[object_index]) return 0;
-    return fillRuntimeObjectHandle(context.generation, handle, context.world_epoch, out_object);
+    for (context.handles[0..context.handle_count], 0..) |handle, index| {
+        if (context.destroyed[index] or !std.mem.eql(u8, runtime_core.objectIdSlice(&handle), object_id[0..object_id_length])) continue;
+        return fillNativeObjectHandle(handle, out_object);
+    }
+    return 0;
 }
 
 fn activationGetObjectPosition(
@@ -985,7 +918,7 @@ fn activationGetObjectPosition(
     out_y: ?*f64,
 ) callconv(.c) c_int {
     const context: *ActivationHostContext = @ptrCast(@alignCast(userdata orelse return 0));
-    const slot = validateActivationObjectHandle(context, object) orelse return 0;
+    const slot = context.indexOf(object orelse return 0) orelse return 0;
     if (out_x == null or out_y == null) return 0;
     out_x.?.* = context.positions[slot][0];
     out_y.?.* = context.positions[slot][1];
@@ -999,36 +932,38 @@ fn activationSetObjectPosition(
     y: f64,
 ) callconv(.c) c_int {
     const context: *ActivationHostContext = @ptrCast(@alignCast(userdata orelse return 0));
-    const slot = validateActivationObjectHandle(context, object) orelse return 0;
+    const slot = context.indexOf(object orelse return 0) orelse return 0;
     if (!validPosition(x, y)) return 0;
+    var patch = std.mem.zeroes(runtime_core.PhasePositionPatch);
+    patch.struct_size = @sizeOf(runtime_core.PhasePositionPatch);
+    patch.object_ref = context.handles[slot];
+    patch.position = .{ @floatCast(x), @floatCast(y) };
+    var batch = std.mem.zeroes(runtime_core.PhaseActivationBatch);
+    batch.positions = &patch;
+    batch.position_count = 1;
+    batch.position_stride = @sizeOf(runtime_core.PhasePositionPatch);
+    context.submit(&batch, &[_]runtime_core.PhaseActivationStructuralResult{}) catch return 0;
     context.positions[slot] = .{ @floatCast(x), @floatCast(y) };
     return 1;
 }
 
 fn activationPostEvent(userdata: ?*anyopaque, event: ?*const behavior_runtime.NativePostedEvent) callconv(.c) c_int {
     const context: *ActivationHostContext = @ptrCast(@alignCast(userdata orelse return 0));
-    if (context.target_events.count + context.candidate_events.count >= context.target_events.events.len) return 0;
     const posted = event orelse return 0;
-    const target_slot = validateActivationObjectHandle(context, &posted.target) orelse return 0;
-    const target_handle = context.generation.runtimeHandleAt(target_slot) orelse return 0;
-    if (context.generation.runtimeObject(target_handle).?.state != .active or
-        validateActivationObjectHandle(context, &posted.sender) == null) return 0;
+    if (context.indexOf(&posted.target) == null or context.indexOf(&posted.sender) == null) return 0;
     if (posted.field_count > 0) {
         const fields = posted.fields orelse return 0;
         for (fields[0..posted.field_count]) |field| {
-            if (field.value.kind == 4 and validateActivationObjectHandle(context, &field.value.object_value) == null) return 0;
+            if (field.value.kind == runtime_core.phase_event_object and context.indexOf(&field.value.object_value) == null) return 0;
         }
     }
-    return @intFromBool(context.candidate_events.appendPosted(posted, 0));
-}
-
-fn validateActivationObjectHandle(
-    context: *ActivationHostContext,
-    object: ?*const behavior_runtime.NativeObjectHandle,
-) ?usize {
-    const slot = validateRuntimeObjectHandle(context.generation, context.world_epoch, object) orelse return null;
-    if (!context.present[slot] or context.destroyed[slot]) return null;
-    return slot;
+    var phase_event = phaseEventFromPosted(posted, context.domain, context.successor_generation) orelse return 0;
+    var batch = std.mem.zeroes(runtime_core.PhaseActivationBatch);
+    batch.events = &phase_event;
+    batch.event_count = 1;
+    batch.event_stride = @sizeOf(runtime_core.PhaseEvent);
+    context.submit(&batch, &[_]runtime_core.PhaseActivationStructuralResult{}) catch return 0;
+    return 1;
 }
 
 fn overlayResolveObject(
@@ -1115,15 +1050,18 @@ fn directSetObjectPosition(
 fn overlayPostEvent(userdata: ?*anyopaque, event: ?*const behavior_runtime.NativePostedEvent) callconv(.c) c_int {
     const context: *OverlayHostContext = @ptrCast(@alignCast(userdata orelse return 0));
     const posted = event orelse return 0;
+    if (context.event_count >= context.events.len) return 0;
     if (validateOverlayObjectHandle(context, &posted.target) == null or
         validateOverlayObjectHandle(context, &posted.sender) == null) return 0;
     if (posted.field_count > 0) {
         const fields = posted.fields orelse return 0;
         for (fields[0..posted.field_count]) |field| {
-            if (field.value.kind == 4 and validateOverlayObjectHandle(context, &field.value.object_value) == null) return 0;
+            if (field.value.kind == runtime_core.phase_event_object and validateOverlayObjectHandle(context, &field.value.object_value) == null) return 0;
         }
     }
-    return @intFromBool(context.events.appendPosted(posted, 0));
+    context.events[context.event_count] = phaseEventFromPosted(posted, .frame, 0) orelse return 0;
+    context.event_count += 1;
+    return 1;
 }
 
 fn validateOverlayObjectHandle(
@@ -1137,10 +1075,131 @@ fn validateOverlayObjectHandle(
 
 fn directPostEvent(userdata: ?*anyopaque, event: ?*const behavior_runtime.NativePostedEvent) callconv(.c) c_int {
     const context: *DirectHostContext = @ptrCast(@alignCast(userdata orelse return 0));
-    if (context.post_generation > max_event_drain_generation) return 0;
     const posted = event orelse return 0;
     if (!validRuntimePostedEventObjects(context.generation, context.world_epoch, posted)) return 0;
-    return @intFromBool(context.events.appendPosted(posted, context.post_generation));
+    const phase_event = phaseEventFromPosted(posted, context.domain, context.post_generation) orelse return 0;
+    _ = context.generation.core.submitPhaseEvents(&.{phase_event}) catch return 0;
+    return 1;
+}
+
+fn objectRefFromNative(value: *const behavior_runtime.NativeObjectHandle) ?runtime_core.ObjectRef {
+    if (!validObjectHandleShape(value)) return null;
+    var result = std.mem.zeroes(runtime_core.ObjectRef);
+    result.struct_size = @sizeOf(runtime_core.ObjectRef);
+    result.kind = value.kind;
+    result.world_epoch = value.world_epoch;
+    result.logical_generation = value.logical_generation;
+    result.object_id_length = @intCast(value.object_id_length);
+    @memcpy(result.object_id[0..value.object_id_length], value.object_id[0..value.object_id_length]);
+    return result;
+}
+
+fn fillNativeObjectHandle(value: runtime_core.ObjectRef, output: ?*behavior_runtime.NativeObjectHandle) c_int {
+    const result = output orelse return 0;
+    result.* = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
+    result.world_epoch = value.world_epoch;
+    result.logical_generation = value.logical_generation;
+    result.kind = value.kind;
+    result.object_id_length = value.object_id_length;
+    @memcpy(result.object_id[0..value.object_id_length], value.object_id[0..value.object_id_length]);
+    return 1;
+}
+
+fn nativeMatchesObjectRef(value: *const behavior_runtime.NativeObjectHandle, object_ref: runtime_core.ObjectRef) bool {
+    return value.world_epoch == object_ref.world_epoch and
+        value.logical_generation == object_ref.logical_generation and
+        value.kind == object_ref.kind and
+        value.object_id_length == object_ref.object_id_length and
+        std.mem.eql(u8, value.object_id[0..value.object_id_length], runtime_core.objectIdSlice(&object_ref));
+}
+
+fn phaseEventFromPosted(
+    posted: *const behavior_runtime.NativePostedEvent,
+    domain: runtime_core.PhaseDomain,
+    generation: u32,
+) ?runtime_core.PhaseEvent {
+    if (posted.name == null or posted.name_length == 0 or posted.name_length > 63 or
+        posted.field_count > 8 or (posted.field_count > 0 and posted.fields == null)) return null;
+    var event = std.mem.zeroes(runtime_core.PhaseEvent);
+    event.struct_size = @sizeOf(runtime_core.PhaseEvent);
+    event.domain = @intFromEnum(domain);
+    event.generation = generation;
+    event.has_sender = 1;
+    event.target = objectRefFromNative(&posted.target) orelse return null;
+    event.sender = objectRefFromNative(&posted.sender) orelse return null;
+    event.name_length = @intCast(posted.name_length);
+    @memcpy(event.name[0..posted.name_length], posted.name[0..posted.name_length]);
+    event.field_count = @intCast(posted.field_count);
+    if (posted.field_count > 0) {
+        const fields = posted.fields orelse return null;
+        for (fields[0..posted.field_count], 0..) |field, index| {
+            if (field.key == null or field.key_length == 0 or field.key_length > 31 or !validEventValue(&field.value)) return null;
+            event.fields[index].struct_size = @sizeOf(@TypeOf(event.fields[index]));
+            event.fields[index].value_kind = field.value.kind;
+            event.fields[index].key_length = @intCast(field.key_length);
+            @memcpy(event.fields[index].key[0..field.key_length], field.key[0..field.key_length]);
+            switch (field.value.kind) {
+                runtime_core.phase_event_boolean => event.fields[index].value.boolean_value = field.value.boolean_value,
+                runtime_core.phase_event_number => event.fields[index].value.number_value = field.value.number_value,
+                runtime_core.phase_event_string => {
+                    event.fields[index].value.string_value.length = @intCast(field.value.string_value_length);
+                    @memcpy(
+                        event.fields[index].value.string_value.bytes[0..field.value.string_value_length],
+                        field.value.string_value[0..field.value.string_value_length],
+                    );
+                },
+                runtime_core.phase_event_object => event.fields[index].value.object_value = objectRefFromNative(&field.value.object_value) orelse return null,
+                else => return null,
+            }
+        }
+    }
+    return event;
+}
+
+fn phaseSpawnRequest(
+    generation: *scene_generation_api.SceneGeneration,
+    domain: runtime_core.PhaseDomain,
+    successor_generation: u32,
+    origin: StructuralOrigin,
+    prototype_index: usize,
+    prototype: *const scene_api.SpawnPrototype,
+    position: [2]f32,
+) ?runtime_core.PhaseStructural {
+    if (!origin.isValid()) return null;
+    var request = std.mem.zeroes(runtime_core.PhaseStructural);
+    request.struct_size = @sizeOf(runtime_core.PhaseStructural);
+    request.operation = runtime_core.phase_operation_reserve_transient;
+    request.domain = @intFromEnum(domain);
+    request.generation = successor_generation;
+    request.behavior_count = prototype.behaviors.count;
+    request.prototype_key = @intCast(prototype_index);
+    request.script_id = origin.script_id;
+    request.origin = generation.runtimeHandle(origin.object_id.slice()) orelse return null;
+    request.transient_sprite.struct_size = @sizeOf(@TypeOf(request.transient_sprite));
+    request.transient_sprite.position = position;
+    request.transient_sprite.size = prototype.sprite.size;
+    request.transient_sprite.color = prototype.sprite.color;
+    request.transient_sprite.texture_id = prototype.sprite.textureId;
+    return request;
+}
+
+fn phaseDestroyRequest(
+    generation: *scene_generation_api.SceneGeneration,
+    domain: runtime_core.PhaseDomain,
+    successor_generation: u32,
+    origin: StructuralOrigin,
+    object_ref: runtime_core.ObjectRef,
+) ?runtime_core.PhaseStructural {
+    if (!origin.isValid()) return null;
+    var request = std.mem.zeroes(runtime_core.PhaseStructural);
+    request.struct_size = @sizeOf(runtime_core.PhaseStructural);
+    request.operation = runtime_core.phase_operation_request_destroy;
+    request.domain = @intFromEnum(domain);
+    request.generation = successor_generation;
+    request.script_id = origin.script_id;
+    request.object_ref = object_ref;
+    request.origin = generation.runtimeHandle(origin.object_id.slice()) orelse return null;
+    return request;
 }
 
 fn fillObjectHandle(
@@ -1278,205 +1337,6 @@ fn validRuntimePostedEventObjects(
     return true;
 }
 
-test "Behavior event drain rejects a ninth-generation successor before enqueue" {
-    var queue = EventQueue{};
-    var structural = StructuralQueue{};
-    var admission = BehaviorAdmission{};
-    var unused_generation: scene_generation_api.SceneGeneration = undefined;
-    const unused_event = std.mem.zeroes(behavior_runtime.NativePostedEvent);
-    var context = DirectHostContext{
-        .generation = &unused_generation,
-        .world_epoch = 1,
-        .events = &queue,
-        .structural = &structural,
-        .admission = &admission,
-        .post_generation = max_event_drain_generation + 1,
-    };
-    try std.testing.expectEqual(@as(c_int, 0), directPostEvent(&context, &unused_event));
-    try std.testing.expectEqual(@as(usize, 0), queue.count);
-}
-
-test "Direct Host resolves replacement entities and rejects stale object handles" {
-    var generation = try scene_generation_api.SceneGeneration.prepare(scene_api.default_scene, .{ .width = 1024, .height = 720 });
-    defer generation.deinit();
-    var queue = EventQueue{};
-    var structural = StructuralQueue{};
-    var admission = try BehaviorAdmission.init(&generation.scene);
-    var context = DirectHostContext{
-        .generation = &generation,
-        .world_epoch = 1,
-        .events = &queue,
-        .structural = &structural,
-        .admission = &admission,
-    };
-    const host = directNativeHost(&context);
-    const player_id = "player";
-    var object = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-
-    try std.testing.expectEqual(@as(c_int, 1), host.resolve_object.?(&context, player_id.ptr, player_id.len, &object));
-    const previous_entity = generation.playerEntity();
-    try generation.reset();
-    try std.testing.expect(previous_entity != generation.playerEntity());
-
-    var x: f64 = 0;
-    var y: f64 = 0;
-    try std.testing.expectEqual(@as(c_int, 1), host.get_object_position.?(&context, &object, &x, &y));
-    try std.testing.expectEqual(@as(c_int, 1), host.set_object_position.?(&context, &object, x + 3, y));
-    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(x + 3)), (try generation.objectPosition(generation.playerObjectIndex()))[0], 0.0001);
-
-    context.world_epoch += 1;
-    try std.testing.expectEqual(@as(c_int, 0), host.get_object_position.?(&context, &object, &x, &y));
-    try std.testing.expectEqual(@as(c_int, 0), host.set_object_position.?(&context, &object, x, y));
-    const unknown_id = "unknown";
-    try std.testing.expectEqual(@as(c_int, 0), host.resolve_object.?(&context, unknown_id.ptr, unknown_id.len, &object));
-    try std.testing.expectEqual(@as(c_int, 0), host.set_object_position.?(&context, &object, std.math.nan(f64), y));
-    try std.testing.expectEqual(@as(c_int, 0), host.resolve_object.?(null, player_id.ptr, player_id.len, &object));
-}
-
-test "Behavior admission rejects before Core reservation without consuming transient serial" {
-    const source =
-        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
-        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
-        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]},
-        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[]}],"prototypes":[
-        \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]}]}
-    ;
-    const scene = try scene_api.parse(std.testing.allocator, source);
-    var generation = try scene_generation_api.SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
-    defer generation.deinit();
-    var events = EventQueue{};
-    var structural = StructuralQueue{};
-    var admission = try BehaviorAdmission.init(&scene);
-    admission.admitted_count = behavior_runtime.max_binding_count;
-    var context = DirectHostContext{
-        .generation = &generation,
-        .world_epoch = 1,
-        .events = &events,
-        .structural = &structural,
-        .admission = &admission,
-    };
-    const prototype_id = "runtime-orb";
-    var object = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-    try std.testing.expectEqual(
-        @as(c_int, 0),
-        directSpawnObject(&context, prototype_id.ptr, prototype_id.len, 1, 2, &object),
-    );
-    try std.testing.expect(generation.runtimeHandle("runtime-0000000000000001") == null);
-    try std.testing.expectEqual(@as(usize, 0), structural.count);
-
-    admission.admitted_count -= 1;
-    try std.testing.expectEqual(
-        @as(c_int, 1),
-        directSpawnObject(&context, prototype_id.ptr, prototype_id.len, 1, 2, &object),
-    );
-    try std.testing.expectEqualStrings("runtime-0000000000000001", object.object_id[0..object.object_id_length]);
-    try std.testing.expectEqual(behavior_runtime.max_binding_count, admission.admitted_count);
-}
-
-test "Direct Host enforces exact structural request and successor budgets" {
-    const source =
-        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
-        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
-        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]},
-        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[]}],"prototypes":[
-        \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[]}]}
-    ;
-    const scene = try scene_api.parse(std.testing.allocator, source);
-    var generation = try scene_generation_api.SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
-    defer generation.deinit();
-    var events = EventQueue{};
-    var structural = StructuralQueue{};
-    var admission = try BehaviorAdmission.init(&scene);
-    var context = DirectHostContext{
-        .generation = &generation,
-        .world_epoch = 1,
-        .events = &events,
-        .structural = &structural,
-        .admission = &admission,
-    };
-    const prototype_id = "runtime-orb";
-    for (0..max_structural_requests_per_domain) |index| {
-        var object = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-        try std.testing.expectEqual(@as(c_int, 1), directSpawnObject(
-            &context,
-            prototype_id.ptr,
-            prototype_id.len,
-            @floatFromInt(index),
-            0,
-            &object,
-        ));
-    }
-    try std.testing.expectEqual(max_structural_requests_per_domain, structural.count);
-    var rejected = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-    try std.testing.expectEqual(@as(c_int, 0), directSpawnObject(&context, prototype_id.ptr, prototype_id.len, 0, 0, &rejected));
-    try std.testing.expectEqual(scene.objects.count + max_structural_requests_per_domain, generation.liveCount());
-
-    var source_object = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-    const player_id = "player";
-    try std.testing.expectEqual(@as(c_int, 1), directResolveObject(&context, player_id.ptr, player_id.len, &source_object));
-    try std.testing.expectEqual(@as(c_int, 0), directDestroyObject(&context, &source_object));
-
-    structural.clear();
-    context.structural_generation = max_structural_generation + 1;
-    try std.testing.expectEqual(@as(c_int, 0), directSpawnObject(&context, prototype_id.ptr, prototype_id.len, 0, 0, &rejected));
-    try std.testing.expectEqual(@as(usize, 0), structural.count);
-}
-
-test "Direct Host destroy failure leaves active transient object usable" {
-    const source =
-        \\{"schemaVersion":6,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
-        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
-        \\{"objectId":"hazard","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]},
-        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[]}],"prototypes":[
-        \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,2],"color":[1,1,1,1],"textureId":1},"behaviors":[]}]}
-    ;
-    const scene = try scene_api.parse(std.testing.allocator, source);
-    var generation = try scene_generation_api.SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
-    defer generation.deinit();
-    var events = EventQueue{};
-    var structural = StructuralQueue{ .next_sequence = std.math.maxInt(u64) };
-    var admission = try BehaviorAdmission.init(&scene);
-    var context = DirectHostContext{
-        .generation = &generation,
-        .world_epoch = 1,
-        .events = &events,
-        .structural = &structural,
-        .admission = &admission,
-    };
-    const prototype_id = "runtime-orb";
-    var rejected = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-    try std.testing.expectEqual(@as(c_int, 0), directSpawnObject(
-        &context,
-        prototype_id.ptr,
-        prototype_id.len,
-        12,
-        34,
-        &rejected,
-    ));
-    try std.testing.expectEqual(scene.objects.count, generation.liveCount());
-
-    structural.next_sequence = 1;
-    var pending = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-    try std.testing.expectEqual(@as(c_int, 1), directSpawnObject(
-        &context,
-        prototype_id.ptr,
-        prototype_id.len,
-        12,
-        34,
-        &pending,
-    ));
-    const reserved = generation.runtimeHandle("runtime-0000000000000001") orelse return error.MissingTransient;
-    try generation.activateTransient(reserved);
-    structural.clear();
-    structural.next_sequence = std.math.maxInt(u64);
-    var object = std.mem.zeroes(behavior_runtime.NativeObjectHandle);
-    try std.testing.expectEqual(@as(c_int, 1), fillRuntimeObjectHandle(&generation, reserved, context.world_epoch, &object));
-
-    try std.testing.expectEqual(@as(c_int, 0), directDestroyObject(&context, &object));
-    try std.testing.expectEqual(.active, generation.runtimeObject(reserved).?.state);
-    try std.testing.expectEqual(@as(usize, 0), structural.count);
-}
-
 pub fn loadWithIdentity(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1538,29 +1398,12 @@ pub fn initArtifactAtEpoch(
     errdefer prepared.deinit();
     const active = try allocator.create(behavior_runtime.ActiveSet);
     errdefer allocator.destroy(active);
-    const fixed_events = try allocator.create(EventQueue);
-    errdefer allocator.destroy(fixed_events);
-    fixed_events.* = .{};
-    const frame_events = try allocator.create(EventQueue);
-    errdefer allocator.destroy(frame_events);
-    frame_events.* = .{};
-    const fixed_structural = try allocator.create(StructuralQueue);
-    errdefer allocator.destroy(fixed_structural);
-    fixed_structural.* = .{};
-    const frame_structural = try allocator.create(StructuralQueue);
-    errdefer allocator.destroy(frame_structural);
-    frame_structural.* = .{};
     prepared.activateInto(active);
     return .{
         .allocator = allocator,
         .package = package,
         .active = active,
         .world_epoch = world_epoch,
-        .admission = try BehaviorAdmission.init(scene),
-        .fixed_events = fixed_events,
-        .frame_events = frame_events,
-        .fixed_structural = fixed_structural,
-        .frame_structural = frame_structural,
     };
 }
 

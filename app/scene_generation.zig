@@ -371,6 +371,10 @@ pub const SceneGeneration = struct {
         try self.refreshRuntimeMetadata();
     }
 
+    pub fn refreshPhaseProjection(self: *SceneGeneration) !void {
+        try self.refreshRuntimeMetadata();
+    }
+
     pub fn objectIdForEntity(self: *const SceneGeneration, entity: runtime_core.EntityId) ?scene_api.ObjectId {
         const view = (self.core.findByEntity(self.target, entity) catch return null) orelse return null;
         return objectId(view.object_ref) catch null;
