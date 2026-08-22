@@ -76,11 +76,11 @@ impl PhaseState {
     pub(crate) fn new() -> Self {
         Self {
             candidate: None,
-            active_bindings: Vec::new(),
+            active_bindings: Vec::with_capacity(MAX_BINDINGS as usize),
             admission_used: 0,
             active_phase: None,
-            event_queue: Vec::new(),
-            structural_queue: Vec::new(),
+            event_queue: Vec::with_capacity(EVENT_CAPACITY),
+            structural_queue: Vec::with_capacity(STRUCTURAL_CAPACITY),
             event_successor_generation: 0,
             structural_successor_generation: 0,
             event_has_drained: false,
