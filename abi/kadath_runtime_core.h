@@ -53,11 +53,38 @@ extern "C" {
 #define KADATH_RUNTIME_MUTATION_REQUEST_TRANSIENT_DESTROY 7U
 #define KADATH_RUNTIME_MUTATION_FINALIZE_TRANSIENT_DESTROY 8U
 
+#define KADATH_RUNTIME_PHASE_INTERFACE_V1 1U
+#define KADATH_RUNTIME_PHASE_DOMAIN_FIXED 1U
+#define KADATH_RUNTIME_PHASE_DOMAIN_FRAME 2U
+#define KADATH_RUNTIME_PHASE_MAX_GENERATION 8U
+#define KADATH_RUNTIME_PHASE_MAX_BINDINGS 256U
+#define KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN 64U
+#define KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN 64U
+#define KADATH_RUNTIME_PHASE_MAX_EVENT_NAME_BYTES 63U
+#define KADATH_RUNTIME_PHASE_MAX_EVENT_FIELDS 8U
+#define KADATH_RUNTIME_PHASE_MAX_EVENT_KEY_BYTES 31U
+#define KADATH_RUNTIME_PHASE_MAX_EVENT_STRING_BYTES 127U
+
+#define KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT 1U
+#define KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY 2U
+#define KADATH_RUNTIME_PHASE_OPERATION_DISCARD_RESERVATION 3U
+
+#define KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED 1U
+#define KADATH_RUNTIME_PHASE_COMPLETION_REJECTED 2U
+#define KADATH_RUNTIME_PHASE_COMPLETION_CANCELLED 3U
+
+#define KADATH_RUNTIME_PHASE_EVENT_VALUE_BOOLEAN 1U
+#define KADATH_RUNTIME_PHASE_EVENT_VALUE_NUMBER 2U
+#define KADATH_RUNTIME_PHASE_EVENT_VALUE_STRING 3U
+#define KADATH_RUNTIME_PHASE_EVENT_VALUE_OBJECT 4U
+
 #define KADATH_RUNTIME_DESTROY_DISPOSITION_NONE 0U
 #define KADATH_RUNTIME_DESTROY_CANCELLED_PENDING_SPAWN 1U
 #define KADATH_RUNTIME_DESTROY_AWAITING_FINALIZE 2U
 
 typedef struct kadath_runtime_core_t kadath_runtime_core_t;
+typedef struct kadath_runtime_phase_interface_v1_t kadath_runtime_phase_interface_v1_t;
+typedef struct kadath_runtime_phase_activation_batch_v1_t kadath_runtime_phase_activation_batch_v1_t;
 
 typedef struct kadath_runtime_object_ref_v1_t {
     uint32_t struct_size;
@@ -337,6 +364,242 @@ typedef struct kadath_runtime_object_authority_interface_t {
 // Thread-safe. Reentrant: yes.
 int32_t kadath_runtime_core_query_object_authority_interface(
     kadath_runtime_object_authority_interface_t* in_out_interface);
+
+typedef struct kadath_runtime_phase_begin_desc_v1_t {
+    uint32_t struct_size;
+    uint32_t domain;
+    uint64_t phase_sequence;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint64_t reserved[4];
+} kadath_runtime_phase_begin_desc_v1_t;
+
+typedef struct kadath_runtime_phase_binding_desc_v1_t {
+    uint32_t struct_size;
+    uint32_t behavior_count;
+    uint32_t script_id;
+    uint32_t reserved0;
+    kadath_runtime_object_ref_v1_t object_ref;
+    uint64_t reserved[4];
+} kadath_runtime_phase_binding_desc_v1_t;
+
+typedef struct kadath_runtime_phase_state_prepare_desc_v1_t {
+    uint32_t struct_size;
+    uint32_t target;
+    const kadath_runtime_phase_binding_desc_v1_t* bindings;
+    size_t binding_count;
+    size_t binding_stride;
+    uint64_t reserved[6];
+} kadath_runtime_phase_state_prepare_desc_v1_t;
+
+typedef union kadath_runtime_phase_event_value_v1_t {
+    int32_t boolean_value;
+    double number_value;
+    struct {
+        uint32_t length;
+        uint8_t bytes[128];
+    } string_value;
+    kadath_runtime_object_ref_v1_t object_value;
+} kadath_runtime_phase_event_value_v1_t;
+
+typedef struct kadath_runtime_phase_event_field_v1_t {
+    uint32_t struct_size;
+    uint32_t value_kind;
+    uint32_t key_length;
+    uint32_t reserved0;
+    uint8_t key[32];
+    kadath_runtime_phase_event_value_v1_t value;
+    uint64_t reserved[2];
+} kadath_runtime_phase_event_field_v1_t;
+
+typedef struct kadath_runtime_phase_event_v1_t {
+    uint32_t struct_size;
+    uint32_t domain;
+    uint64_t sequence;
+    uint32_t generation;
+    uint32_t field_count;
+    uint32_t has_sender;
+    uint32_t has_other;
+    kadath_runtime_object_ref_v1_t target;
+    kadath_runtime_object_ref_v1_t sender;
+    kadath_runtime_object_ref_v1_t other;
+    uint32_t name_length;
+    uint8_t name[64];
+    kadath_runtime_phase_event_field_v1_t fields[8];
+    uint64_t reserved[4];
+} kadath_runtime_phase_event_v1_t;
+
+typedef struct kadath_runtime_phase_structural_v1_t {
+    uint32_t struct_size;
+    uint32_t operation;
+    uint64_t sequence;
+    uint32_t domain;
+    uint32_t generation;
+    uint32_t behavior_count;
+    uint32_t prototype_key;
+    uint32_t script_id;
+    kadath_runtime_object_ref_v1_t object_ref;
+    kadath_runtime_object_ref_v1_t origin;
+    kadath_runtime_sprite_desc_v1_t transient_sprite;
+    uint64_t reserved[4];
+} kadath_runtime_phase_structural_v1_t;
+
+typedef struct kadath_runtime_phase_flush_info_v1_t {
+    uint32_t struct_size;
+    uint32_t domain;
+    uint64_t flush_token;
+    uint64_t phase_sequence;
+    size_t request_count;
+    uint64_t reserved[4];
+} kadath_runtime_phase_flush_info_v1_t;
+
+typedef struct kadath_runtime_phase_request_completion_v1_t {
+    uint32_t struct_size;
+    uint32_t status;
+    uint64_t sequence;
+    uint32_t error_code;
+    uint32_t destroy_disposition;
+    kadath_runtime_object_view_v1_t object;
+    uint64_t reserved[4];
+} kadath_runtime_phase_request_completion_v1_t;
+
+typedef struct kadath_runtime_phase_activation_batch_v1_t {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    uint64_t transaction_id;
+    size_t active_binding_capacity;
+    const kadath_runtime_position_patch_v1_t* positions;
+    size_t position_count;
+    size_t position_stride;
+    const kadath_runtime_phase_event_v1_t* events;
+    size_t event_count;
+    size_t event_stride;
+    const kadath_runtime_phase_structural_v1_t* structural;
+    size_t structural_count;
+    size_t structural_stride;
+    uint64_t reserved[6];
+} kadath_runtime_phase_activation_batch_v1_t;
+
+typedef struct kadath_runtime_phase_state_candidate_info_v1_t {
+    uint32_t struct_size;
+    uint32_t target;
+    uint32_t binding_count;
+    uint32_t reserved0;
+    uint64_t phase_epoch;
+    uint64_t reserved[4];
+} kadath_runtime_phase_state_candidate_info_v1_t;
+
+typedef struct kadath_runtime_phase_begin_result_v1_t {
+    uint32_t struct_size;
+    uint32_t domain;
+    uint64_t phase_sequence;
+    uint64_t reserved[4];
+} kadath_runtime_phase_begin_result_v1_t;
+
+typedef struct kadath_runtime_phase_batch_result_v1_t {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    size_t accepted_count;
+    uint64_t first_sequence;
+    uint64_t last_sequence;
+    uint64_t reserved[4];
+} kadath_runtime_phase_batch_result_v1_t;
+
+typedef struct kadath_runtime_phase_transaction_info_v1_t {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    uint64_t transaction_id;
+    uint64_t root_sequence;
+    uint64_t reserved[4];
+} kadath_runtime_phase_transaction_info_v1_t;
+
+typedef struct kadath_runtime_phase_activation_result_v1_t {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    uint32_t accepted_event_count;
+    uint32_t accepted_structural_count;
+    uint32_t cancelled_structural_count;
+    uint32_t active_binding_count;
+    kadath_runtime_object_view_v1_t root_object;
+    uint64_t reserved[4];
+} kadath_runtime_phase_activation_result_v1_t;
+
+struct kadath_runtime_phase_interface_v1_t {
+    uint32_t struct_size;
+    uint32_t interface_version;
+    /* Every pointer/count/stride argument below is caller-owned and borrowed only for the call.
+     * The Core retains POD values and opaque numeric tokens, never a caller pointer. All entry
+     * points are owner-thread-only and non-reentrant; output slots are caller-owned and are
+     * published only after complete preflight succeeds. */
+    int32_t (*prepare_phase_state)(
+        kadath_runtime_core_t* core,
+        const kadath_runtime_phase_state_prepare_desc_v1_t* desc,
+        kadath_runtime_phase_state_candidate_info_v1_t* out_info);
+    int32_t (*commit_phase_state)(kadath_runtime_core_t* core);
+    int32_t (*abort_phase_state)(kadath_runtime_core_t* core);
+    int32_t (*begin_phase)(
+        kadath_runtime_core_t* core,
+        const kadath_runtime_phase_begin_desc_v1_t* desc,
+        kadath_runtime_phase_begin_result_v1_t* out_result);
+    int32_t (*submit_events)(
+        kadath_runtime_core_t* core,
+        const kadath_runtime_phase_event_v1_t* events,
+        size_t item_count,
+        size_t item_stride,
+        kadath_runtime_phase_batch_result_v1_t* out_result);
+    int32_t (*drain_events)(
+        kadath_runtime_core_t* core,
+        uint32_t domain,
+        uint64_t phase_sequence,
+        kadath_runtime_phase_event_v1_t* output_events,
+        size_t output_capacity,
+        size_t* out_count);
+    int32_t (*submit_structural)(
+        kadath_runtime_core_t* core,
+        const kadath_runtime_phase_structural_v1_t* items,
+        size_t item_count,
+        size_t item_stride,
+        kadath_runtime_phase_request_completion_v1_t* acceptance_results,
+        size_t acceptance_capacity,
+        kadath_runtime_phase_batch_result_v1_t* out_result);
+    int32_t (*take_structural)(
+        kadath_runtime_core_t* core,
+        uint32_t domain,
+        uint64_t phase_sequence,
+        kadath_runtime_phase_flush_info_v1_t* out_flush_info,
+        kadath_runtime_phase_structural_v1_t* output_structural,
+        size_t output_capacity,
+        size_t* out_count);
+    int32_t (*begin_activation)(
+        kadath_runtime_core_t* core,
+        uint64_t flush_token,
+        uint64_t root_sequence,
+        kadath_runtime_phase_transaction_info_v1_t* out_info);
+    int32_t (*submit_activation)(
+        kadath_runtime_core_t* core,
+        uint64_t transaction_id,
+        const kadath_runtime_phase_activation_batch_v1_t* batch);
+    int32_t (*commit_activation)(
+        kadath_runtime_core_t* core,
+        uint64_t transaction_id,
+        kadath_runtime_phase_activation_result_v1_t* out_result);
+    int32_t (*abort_activation)(kadath_runtime_core_t* core, uint64_t transaction_id);
+    int32_t (*complete_structural)(
+        kadath_runtime_core_t* core,
+        uint64_t flush_token,
+        const kadath_runtime_phase_request_completion_v1_t* completions,
+        size_t completion_count,
+        size_t reserved_size);
+    int32_t (*abort_structural)(kadath_runtime_core_t* core, uint64_t flush_token);
+    int32_t (*end_phase)(kadath_runtime_core_t* core, uint32_t domain, uint64_t phase_sequence);
+    uint64_t reserved[8];
+};
+
+// Mode A + ADR-0003 section 3.2 caller-owned in/out descriptor.
+// The descriptor is borrowed for this call; the Core retains no function-table pointer.
+// Thread-safe and reentrant, like the Object Authority query.
+int32_t kadath_runtime_core_query_phase_interface(
+    kadath_runtime_phase_interface_v1_t* in_out_interface);
 
 #ifdef __cplusplus
 }

@@ -8,6 +8,11 @@
 #include "test_hooks.h"
 
 _Static_assert(KADATH_RUNTIME_OBJECT_AUTHORITY_INTERFACE_V1 == 1U, "interface version");
+_Static_assert(KADATH_RUNTIME_PHASE_INTERFACE_V1 == 1U, "phase interface version");
+_Static_assert(KADATH_RUNTIME_PHASE_MAX_GENERATION == 8U, "phase generation limit");
+_Static_assert(KADATH_RUNTIME_PHASE_MAX_BINDINGS == 256U, "phase admission limit");
+_Static_assert(KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN == 64U, "phase event limit");
+_Static_assert(KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN == 64U, "phase structural limit");
 _Static_assert(KADATH_RUNTIME_MAX_OBJECTS == 128U, "object limit");
 _Static_assert(KADATH_RUNTIME_TARGET_LIVE == 1U, "live target");
 _Static_assert(KADATH_RUNTIME_TARGET_CANDIDATE == 2U, "candidate target");
@@ -15,6 +20,8 @@ _Static_assert(KADATH_RUNTIME_QUERY_FIND_BY_ENTITY == 6U, "query tags");
 _Static_assert(KADATH_RUNTIME_MUTATION_FINALIZE_TRANSIENT_DESTROY == 8U, "mutation tags");
 _Static_assert(KADATH_ERR_RUNTIME_WRONG_THREAD == 0x4101, "runtime error start");
 _Static_assert(KADATH_ERR_RUNTIME_DUPLICATE_OBJECT_ID == 0x410B, "runtime error end");
+_Static_assert(KADATH_ERR_RUNTIME_PHASE_BUSY == 0x4110, "phase error start");
+_Static_assert(KADATH_ERR_RUNTIME_PHASE_NOT_DRAINED == 0x411B, "phase error end");
 
 _Static_assert(sizeof(kadath_runtime_object_ref_v1_t) == 128U, "ObjectRef ABI");
 _Static_assert(offsetof(kadath_runtime_object_ref_v1_t, object_id) == 32U, "ObjectRef ID offset");
@@ -30,6 +37,23 @@ _Static_assert(sizeof(kadath_runtime_mutation_result_t) == 272U, "mutation resul
 _Static_assert(sizeof(kadath_runtime_source_object_desc_v1_t) == 184U, "source descriptor ABI");
 _Static_assert(sizeof(kadath_runtime_scene_prepare_desc_t) == 96U, "prepare descriptor ABI");
 _Static_assert(sizeof(kadath_runtime_object_authority_interface_t) == 128U, "function table ABI");
+_Static_assert(sizeof(kadath_runtime_phase_begin_desc_v1_t) == 56U, "phase begin ABI");
+_Static_assert(sizeof(kadath_runtime_phase_binding_desc_v1_t) == 176U, "phase binding ABI");
+_Static_assert(sizeof(kadath_runtime_phase_state_prepare_desc_v1_t) == 80U, "phase prepare ABI");
+_Static_assert(sizeof(kadath_runtime_phase_event_field_v1_t) == 200U, "phase event field ABI");
+_Static_assert(sizeof(kadath_runtime_phase_structural_v1_t) == 400U, "phase structural ABI");
+_Static_assert(sizeof(kadath_runtime_phase_flush_info_v1_t) == 64U, "phase flush ABI");
+_Static_assert(sizeof(kadath_runtime_phase_request_completion_v1_t) == 280U, "phase completion ABI");
+_Static_assert(sizeof(kadath_runtime_phase_state_candidate_info_v1_t) == 56U, "phase candidate info ABI");
+_Static_assert(sizeof(kadath_runtime_phase_begin_result_v1_t) == 48U, "phase begin result ABI");
+_Static_assert(sizeof(kadath_runtime_phase_batch_result_v1_t) == 64U, "phase batch result ABI");
+_Static_assert(sizeof(kadath_runtime_phase_transaction_info_v1_t) == 56U, "phase transaction ABI");
+_Static_assert(sizeof(kadath_runtime_phase_activation_result_v1_t) == 280U, "phase activation result ABI");
+_Static_assert(sizeof(kadath_runtime_phase_activation_batch_v1_t) == 144U, "phase activation batch ABI");
+_Static_assert(sizeof(kadath_runtime_phase_interface_v1_t) == 192U, "phase interface ABI");
+_Static_assert(offsetof(kadath_runtime_phase_begin_desc_v1_t, phase_sequence) == 8U, "phase sequence offset");
+_Static_assert(offsetof(kadath_runtime_phase_event_v1_t, fields) > offsetof(kadath_runtime_phase_event_v1_t, name), "phase fields order");
+_Static_assert(offsetof(kadath_runtime_phase_structural_v1_t, object_ref) == 40U, "phase object ref offset");
 
 static kadath_runtime_object_authority_interface_t query_interface(void) {
     kadath_runtime_object_authority_interface_t interface_value;
@@ -40,6 +64,17 @@ static kadath_runtime_object_authority_interface_t query_interface(void) {
     if (kadath_runtime_core_query_object_authority_interface(&interface_value) != KADATH_OK) {
         memset(&interface_value, 0, sizeof(interface_value));
         return interface_value;
+    }
+    return interface_value;
+}
+
+static kadath_runtime_phase_interface_v1_t query_phase_interface(void) {
+    kadath_runtime_phase_interface_v1_t interface_value;
+    memset(&interface_value, 0, sizeof(interface_value));
+    interface_value.struct_size = (uint32_t)sizeof(interface_value);
+    interface_value.interface_version = KADATH_RUNTIME_PHASE_INTERFACE_V1;
+    if (kadath_runtime_core_query_phase_interface(&interface_value) != KADATH_OK) {
+        memset(&interface_value, 0, sizeof(interface_value));
     }
     return interface_value;
 }
@@ -889,6 +924,118 @@ static int misuse_contract(kadath_runtime_object_authority_interface_t* interfac
     return interface_value->destroy(&core) == KADATH_OK ? 0 : 86;
 }
 
+static int phase_commit_path(
+    kadath_runtime_object_authority_interface_t* object_interface,
+    kadath_runtime_phase_interface_v1_t* phase_interface) {
+    kadath_runtime_core_t* core = NULL;
+    int create_result = create_live_core(object_interface, &core);
+    if (create_result != 0) return 100 + create_result;
+
+    kadath_runtime_query_result_t player_result;
+    if (query_id(object_interface, core, "player", &player_result) != KADATH_OK ||
+        player_result.found != KADATH_RUNTIME_FOUND) {
+        return 150;
+    }
+    kadath_runtime_object_ref_v1_t player = player_result.payload.object.object_ref;
+
+    kadath_runtime_phase_begin_desc_v1_t begin;
+    kadath_runtime_phase_begin_result_v1_t begin_result;
+    memset(&begin, 0, sizeof(begin));
+    memset(&begin_result, 0, sizeof(begin_result));
+    begin.struct_size = (uint32_t)sizeof(begin);
+    begin.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    begin.phase_sequence = 77U;
+    begin_result.struct_size = (uint32_t)sizeof(begin_result);
+    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
+        begin_result.phase_sequence != 77U) {
+        return 151;
+    }
+
+    kadath_runtime_phase_event_v1_t event;
+    kadath_runtime_phase_batch_result_v1_t event_batch;
+    memset(&event, 0, sizeof(event));
+    memset(&event_batch, 0, sizeof(event_batch));
+    event.struct_size = (uint32_t)sizeof(event);
+    event.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    event.target = player;
+    event.name_length = 5U;
+    memcpy(event.name, "hello", 5U);
+    event_batch.struct_size = (uint32_t)sizeof(event_batch);
+    if (phase_interface->submit_events(core, &event, 1U, sizeof(event), &event_batch) != KADATH_OK ||
+        event_batch.accepted_count != 1U || event_batch.first_sequence == 0U) {
+        return 152;
+    }
+    kadath_runtime_phase_event_v1_t drained;
+    size_t drained_count = 0U;
+    memset(&drained, 0, sizeof(drained));
+    if (phase_interface->drain_events(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 77U, &drained, 1U, &drained_count) != KADATH_OK ||
+        drained_count != 1U || drained.sequence != event_batch.first_sequence || drained.generation != 0U) {
+        return 153;
+    }
+
+    kadath_runtime_phase_structural_v1_t structural;
+    kadath_runtime_phase_request_completion_v1_t acceptance;
+    kadath_runtime_phase_batch_result_v1_t structural_batch;
+    memset(&structural, 0, sizeof(structural));
+    memset(&acceptance, 0, sizeof(acceptance));
+    memset(&structural_batch, 0, sizeof(structural_batch));
+    structural.struct_size = (uint32_t)sizeof(structural);
+    structural.operation = KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT;
+    structural.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    structural.behavior_count = 1U;
+    structural.prototype_key = 7U;
+    structural.script_id = 11U;
+    structural.origin = player;
+    structural.transient_sprite.struct_size = (uint32_t)sizeof(structural.transient_sprite);
+    structural.transient_sprite.size[0] = 4.0F;
+    structural.transient_sprite.size[1] = 4.0F;
+    structural.transient_sprite.color[3] = 1.0F;
+    structural.transient_sprite.texture_id = 1U;
+    acceptance.struct_size = (uint32_t)sizeof(acceptance);
+    structural_batch.struct_size = (uint32_t)sizeof(structural_batch);
+    if (phase_interface->submit_structural(core, &structural, 1U, sizeof(structural), &acceptance, 1U, &structural_batch) != KADATH_OK ||
+        acceptance.status != KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED ||
+        acceptance.object.object_ref.object_id_length == 0U) {
+        return 154;
+    }
+    kadath_runtime_phase_structural_v1_t taken;
+    kadath_runtime_phase_flush_info_v1_t flush;
+    size_t taken_count = 0U;
+    memset(&taken, 0, sizeof(taken));
+    memset(&flush, 0, sizeof(flush));
+    flush.struct_size = (uint32_t)sizeof(flush);
+    if (phase_interface->take_structural(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 77U, &flush, &taken, 1U, &taken_count) != KADATH_OK ||
+        taken_count != 1U || flush.request_count != 1U || taken.sequence != structural_batch.first_sequence) {
+        return 155;
+    }
+    kadath_runtime_phase_transaction_info_v1_t transaction;
+    memset(&transaction, 0, sizeof(transaction));
+    transaction.struct_size = (uint32_t)sizeof(transaction);
+    if (phase_interface->begin_activation(core, flush.flush_token, taken.sequence, &transaction) != KADATH_OK) {
+        return 156;
+    }
+    kadath_runtime_phase_activation_batch_v1_t activation_batch;
+    memset(&activation_batch, 0, sizeof(activation_batch));
+    activation_batch.struct_size = (uint32_t)sizeof(activation_batch);
+    activation_batch.transaction_id = transaction.transaction_id;
+    if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_OK) {
+        return 157;
+    }
+    kadath_runtime_phase_activation_result_v1_t activation_result;
+    memset(&activation_result, 0, sizeof(activation_result));
+    activation_result.struct_size = (uint32_t)sizeof(activation_result);
+    if (phase_interface->commit_activation(core, transaction.transaction_id, &activation_result) != KADATH_OK ||
+        activation_result.root_object.lifecycle != KADATH_RUNTIME_LIFECYCLE_ACTIVE ||
+        activation_result.root_object.entity_value == KADATH_RUNTIME_ENTITY_INVALID) {
+        return 158;
+    }
+    if (phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 77U) != KADATH_OK ||
+        object_interface->destroy(&core) != KADATH_OK || core != NULL) {
+        return 159;
+    }
+    return 0;
+}
+
 int main(void) {
     kadath_runtime_object_authority_interface_t interface_value = query_interface();
     if (interface_value.create == NULL || interface_value.destroy == NULL ||
@@ -896,6 +1043,12 @@ int main(void) {
         interface_value.abort_scene == NULL || interface_value.query == NULL ||
         interface_value.mutate == NULL) {
         return 1;
+    }
+    kadath_runtime_phase_interface_v1_t phase_interface = query_phase_interface();
+    if (phase_interface.prepare_phase_state == NULL || phase_interface.begin_phase == NULL ||
+        phase_interface.submit_events == NULL || phase_interface.submit_structural == NULL ||
+        phase_interface.begin_activation == NULL || phase_interface.end_phase == NULL) {
+        return 2;
     }
     int normal_result = normal_path(&interface_value);
     if (normal_result != 0) {
@@ -915,6 +1068,8 @@ int main(void) {
     if (activation_result != 0) return activation_result;
     int query_result = query_batch_atomic(&interface_value);
     if (query_result != 0) return query_result;
+    int phase_result = phase_commit_path(&interface_value, &phase_interface);
+    if (phase_result != 0) return phase_result;
     int fault_result = fault_containment(&interface_value);
     if (fault_result != 0) return fault_result;
     return misuse_contract(&interface_value);

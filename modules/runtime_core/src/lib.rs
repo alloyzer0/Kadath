@@ -1,6 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod object_authority;
+mod phase_commit;
 mod world;
 
 use object_authority::{
@@ -28,6 +29,7 @@ struct RuntimeCore {
     candidate: Option<RuntimeState>,
     candidate_next_entity_value: Option<u64>,
     next_entity_value: u64,
+    phase: phase_commit::PhaseState,
     #[cfg(feature = "contract-test-hooks")]
     next_fault: Option<TestFault>,
 }
@@ -155,6 +157,7 @@ fn create(
         candidate: None,
         candidate_next_entity_value: None,
         next_entity_value: 1,
+        phase: phase_commit::PhaseState::new(),
         #[cfg(feature = "contract-test-hooks")]
         next_fault: None,
     };
@@ -1383,6 +1386,13 @@ pub extern "C" fn kadath_runtime_core_query_object_authority_interface(
     ffi_result(|| query_interface(in_out_interface))
 }
 
+#[no_mangle]
+pub extern "C" fn kadath_runtime_core_query_phase_interface(
+    in_out_interface: *mut abi::kadath_runtime_phase_interface_v1_t,
+) -> i32 {
+    ffi_result(|| phase_commit::query_interface(in_out_interface))
+}
+
 #[cfg(feature = "contract-test-hooks")]
 #[repr(C)]
 pub struct TestFaultDesc {
@@ -1451,6 +1461,7 @@ mod tests {
             candidate: None,
             candidate_next_entity_value: None,
             next_entity_value: 1,
+            phase: phase_commit::PhaseState::new(),
             #[cfg(feature = "contract-test-hooks")]
             next_fault: None,
         };

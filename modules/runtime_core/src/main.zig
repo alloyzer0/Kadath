@@ -13,6 +13,22 @@ pub const invalid_texture: TextureId = 0;
 
 pub const ObjectRef = c.kadath_runtime_object_ref_v1_t;
 pub const ObjectView = c.kadath_runtime_object_view_v1_t;
+pub const PhaseEvent = c.kadath_runtime_phase_event_v1_t;
+pub const PhaseStructural = c.kadath_runtime_phase_structural_v1_t;
+pub const PhaseCompletion = c.kadath_runtime_phase_request_completion_v1_t;
+pub const PhaseBatchResult = c.kadath_runtime_phase_batch_result_v1_t;
+pub const PhaseFlushInfo = c.kadath_runtime_phase_flush_info_v1_t;
+pub const PhaseActivationBatch = c.kadath_runtime_phase_activation_batch_v1_t;
+pub const PhaseActivationResult = c.kadath_runtime_phase_activation_result_v1_t;
+pub const PhaseTransactionInfo = c.kadath_runtime_phase_transaction_info_v1_t;
+pub const PhaseBinding = c.kadath_runtime_phase_binding_desc_v1_t;
+pub const PhaseStatePrepare = c.kadath_runtime_phase_state_prepare_desc_v1_t;
+pub const PhaseStateCandidateInfo = c.kadath_runtime_phase_state_candidate_info_v1_t;
+
+pub const PhaseDomain = enum(u32) {
+    fixed = c.KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+    frame = c.KADATH_RUNTIME_PHASE_DOMAIN_FRAME,
+};
 
 pub const Target = enum { live, candidate };
 pub const PrepareMode = enum { initial, restart, scene_reload };
@@ -71,6 +87,7 @@ pub const ActivationCommand = union(enum) {
 
 pub const RuntimeCore = struct {
     interface: c.kadath_runtime_object_authority_interface_t,
+    phase_interface: c.kadath_runtime_phase_interface_v1_t,
     handle: ?*c.kadath_runtime_core_t,
     owns_handle: bool = true,
 
@@ -79,16 +96,20 @@ pub const RuntimeCore = struct {
         interface.struct_size = @sizeOf(c.kadath_runtime_object_authority_interface_t);
         interface.interface_version = c.KADATH_RUNTIME_OBJECT_AUTHORITY_INTERFACE_V1;
         try check(c.kadath_runtime_core_query_object_authority_interface(&interface));
+        var phase_interface = std.mem.zeroes(c.kadath_runtime_phase_interface_v1_t);
+        phase_interface.struct_size = @sizeOf(c.kadath_runtime_phase_interface_v1_t);
+        phase_interface.interface_version = c.KADATH_RUNTIME_PHASE_INTERFACE_V1;
+        try check(c.kadath_runtime_core_query_phase_interface(&phase_interface));
         var create_desc = std.mem.zeroes(c.kadath_runtime_core_create_desc_t);
         create_desc.struct_size = @sizeOf(c.kadath_runtime_core_create_desc_t);
         var handle: ?*c.kadath_runtime_core_t = null;
         try check(interface.create.?(&create_desc, &handle));
         if (handle == null) return error.RuntimeCoreCreationFailed;
-        return .{ .interface = interface, .handle = handle };
+        return .{ .interface = interface, .phase_interface = phase_interface, .handle = handle };
     }
 
     pub fn borrow(self: *const RuntimeCore) RuntimeCore {
-        return .{ .interface = self.interface, .handle = self.handle, .owns_handle = false };
+        return .{ .interface = self.interface, .phase_interface = self.phase_interface, .handle = self.handle, .owns_handle = false };
     }
 
     pub fn takeOwnership(self: *RuntimeCore, previous: *RuntimeCore) void {
@@ -151,6 +172,105 @@ pub const RuntimeCore = struct {
 
     pub fn abortScene(self: *RuntimeCore) !void {
         try check(self.interface.abort_scene.?(self.handle));
+    }
+
+    pub fn preparePhaseState(self: *RuntimeCore, target: Target, bindings: []const PhaseBinding) !PhaseStateCandidateInfo {
+        if (bindings.len > c.KADATH_RUNTIME_PHASE_MAX_BINDINGS) return error.RuntimePhaseAdmissionCapacity;
+        var desc = std.mem.zeroes(PhaseStatePrepare);
+        desc.struct_size = @sizeOf(PhaseStatePrepare);
+        desc.target = cTarget(target);
+        desc.bindings = if (bindings.len == 0) null else bindings.ptr;
+        desc.binding_count = bindings.len;
+        desc.binding_stride = @sizeOf(PhaseBinding);
+        var info = std.mem.zeroes(PhaseStateCandidateInfo);
+        info.struct_size = @sizeOf(PhaseStateCandidateInfo);
+        try check(self.phase_interface.prepare_phase_state.?(self.handle, &desc, &info));
+        return info;
+    }
+
+    pub fn commitPhaseState(self: *RuntimeCore) !void {
+        try check(self.phase_interface.commit_phase_state.?(self.handle));
+    }
+
+    pub fn abortPhaseState(self: *RuntimeCore) !void {
+        try check(self.phase_interface.abort_phase_state.?(self.handle));
+    }
+
+    pub fn beginPhase(self: *RuntimeCore, domain: PhaseDomain, phase_sequence: u64) !void {
+        if (phase_sequence == 0) return error.InvalidRuntimePhaseSequence;
+        var desc = std.mem.zeroes(c.kadath_runtime_phase_begin_desc_v1_t);
+        desc.struct_size = @sizeOf(c.kadath_runtime_phase_begin_desc_v1_t);
+        desc.domain = @intFromEnum(domain);
+        desc.phase_sequence = phase_sequence;
+        var result = std.mem.zeroes(c.kadath_runtime_phase_begin_result_v1_t);
+        result.struct_size = @sizeOf(c.kadath_runtime_phase_begin_result_v1_t);
+        try check(self.phase_interface.begin_phase.?(self.handle, &desc, &result));
+    }
+
+    pub fn submitPhaseEvents(self: *RuntimeCore, events: []const PhaseEvent) !PhaseBatchResult {
+        if (events.len == 0 or events.len > c.KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN) return error.RuntimePhaseQueueCapacity;
+        var result = std.mem.zeroes(PhaseBatchResult);
+        result.struct_size = @sizeOf(PhaseBatchResult);
+        try check(self.phase_interface.submit_events.?(self.handle, events.ptr, events.len, @sizeOf(PhaseEvent), &result));
+        return result;
+    }
+
+    pub fn drainPhaseEvents(self: *RuntimeCore, domain: PhaseDomain, phase_sequence: u64, output: []PhaseEvent) !usize {
+        if (output.len == 0) return error.RuntimeCoreBufferTooSmall;
+        var count: usize = 0;
+        try check(self.phase_interface.drain_events.?(self.handle, @intFromEnum(domain), phase_sequence, output.ptr, output.len, &count));
+        return count;
+    }
+
+    pub fn submitPhaseStructural(self: *RuntimeCore, items: []const PhaseStructural, completions: []PhaseCompletion) !PhaseBatchResult {
+        if (items.len == 0 or items.len > c.KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN or completions.len < items.len) return error.RuntimePhaseQueueCapacity;
+        var result = std.mem.zeroes(PhaseBatchResult);
+        result.struct_size = @sizeOf(PhaseBatchResult);
+        try check(self.phase_interface.submit_structural.?(self.handle, items.ptr, items.len, @sizeOf(PhaseStructural), completions.ptr, completions.len, &result));
+        return result;
+    }
+
+    pub fn takePhaseStructural(self: *RuntimeCore, domain: PhaseDomain, phase_sequence: u64, output: []PhaseStructural) !struct { info: PhaseFlushInfo, count: usize } {
+        if (output.len == 0) return error.RuntimeCoreBufferTooSmall;
+        var info = std.mem.zeroes(PhaseFlushInfo);
+        info.struct_size = @sizeOf(PhaseFlushInfo);
+        var count: usize = 0;
+        try check(self.phase_interface.take_structural.?(self.handle, @intFromEnum(domain), phase_sequence, &info, output.ptr, output.len, &count));
+        return .{ .info = info, .count = count };
+    }
+
+    pub fn beginPhaseActivation(self: *RuntimeCore, flush_token: u64, root_sequence: u64) !PhaseTransactionInfo {
+        var info = std.mem.zeroes(PhaseTransactionInfo);
+        info.struct_size = @sizeOf(PhaseTransactionInfo);
+        try check(self.phase_interface.begin_activation.?(self.handle, flush_token, root_sequence, &info));
+        return info;
+    }
+
+    pub fn submitPhaseActivation(self: *RuntimeCore, transaction_id: u64, batch: *const PhaseActivationBatch) !void {
+        try check(self.phase_interface.submit_activation.?(self.handle, transaction_id, batch));
+    }
+
+    pub fn commitPhaseActivation(self: *RuntimeCore, transaction_id: u64) !PhaseActivationResult {
+        var result = std.mem.zeroes(PhaseActivationResult);
+        result.struct_size = @sizeOf(PhaseActivationResult);
+        try check(self.phase_interface.commit_activation.?(self.handle, transaction_id, &result));
+        return result;
+    }
+
+    pub fn abortPhaseActivation(self: *RuntimeCore, transaction_id: u64) !void {
+        try check(self.phase_interface.abort_activation.?(self.handle, transaction_id));
+    }
+
+    pub fn completePhaseStructural(self: *RuntimeCore, flush_token: u64, completions: []const PhaseCompletion) !void {
+        try check(self.phase_interface.complete_structural.?(self.handle, flush_token, if (completions.len == 0) null else completions.ptr, completions.len, 0));
+    }
+
+    pub fn abortPhaseStructural(self: *RuntimeCore, flush_token: u64) !void {
+        try check(self.phase_interface.abort_structural.?(self.handle, flush_token));
+    }
+
+    pub fn endPhase(self: *RuntimeCore, domain: PhaseDomain, phase_sequence: u64) !void {
+        try check(self.phase_interface.end_phase.?(self.handle, @intFromEnum(domain), phase_sequence));
     }
 
     pub fn snapshot(self: *const RuntimeCore, target: Target, active_only: bool, output: []ObjectView) ![]ObjectView {
@@ -432,6 +552,18 @@ fn check(result: i32) !void {
         c.KADATH_ERR_RUNTIME_TRANSIENT_ID_EXHAUSTED => error.TransientObjectIdExhausted,
         c.KADATH_ERR_RUNTIME_EPOCH_EXHAUSTED => error.RuntimeEpochExhausted,
         c.KADATH_ERR_RUNTIME_DUPLICATE_OBJECT_ID => error.DuplicateRuntimeObjectId,
+        c.KADATH_ERR_RUNTIME_PHASE_BUSY => error.RuntimePhaseBusy,
+        c.KADATH_ERR_RUNTIME_PHASE_INVALID_DOMAIN => error.InvalidRuntimePhaseDomain,
+        c.KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY => error.RuntimePhaseQueueCapacity,
+        c.KADATH_ERR_RUNTIME_PHASE_GENERATION_EXHAUSTED => error.RuntimePhaseGenerationExhausted,
+        c.KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED => error.RuntimePhaseSequenceExhausted,
+        c.KADATH_ERR_RUNTIME_PHASE_ADMISSION_CAPACITY => error.RuntimePhaseAdmissionCapacity,
+        c.KADATH_ERR_RUNTIME_PHASE_INVALID_REQUEST => error.InvalidRuntimePhaseRequest,
+        c.KADATH_ERR_RUNTIME_PHASE_TRANSACTION_BUSY => error.RuntimePhaseTransactionBusy,
+        c.KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST => error.StaleRuntimePhaseRequest,
+        c.KADATH_ERR_RUNTIME_PHASE_INVALID_COMMIT => error.InvalidRuntimePhaseCommit,
+        c.KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED => error.RuntimePhaseActiveRequired,
+        c.KADATH_ERR_RUNTIME_PHASE_NOT_DRAINED => error.RuntimePhaseNotDrained,
         else => error.RuntimeCoreCallFailed,
     };
 }
