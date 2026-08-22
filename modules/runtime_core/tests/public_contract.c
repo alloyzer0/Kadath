@@ -1012,7 +1012,6 @@ static int phase_commit_path(
     structural.transient_sprite.size[1] = 4.0F;
     structural.transient_sprite.color[3] = 1.0F;
     structural.transient_sprite.texture_id = 1U;
-    structural.transient_sprite.move_speed = 3.5F;
     acceptance.struct_size = (uint32_t)sizeof(acceptance);
     structural_batch.struct_size = (uint32_t)sizeof(structural_batch);
     if (phase_interface->submit_structural(core, &structural, 1U, sizeof(structural), &acceptance, 1U, &structural_batch) != KADATH_OK ||

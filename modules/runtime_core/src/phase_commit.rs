@@ -358,7 +358,7 @@ fn read_sprite(value: &abi::kadath_runtime_sprite_desc_v1_t) -> Result<Sprite, u
         texture_id: value.texture_id,
         move_speed: value.move_speed,
     };
-    if !sprite.is_valid() {
+    if !sprite.is_valid() || sprite.move_speed != 0.0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     Ok(sprite)
