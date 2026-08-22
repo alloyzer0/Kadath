@@ -386,6 +386,7 @@ typedef struct kadath_runtime_phase_binding_desc_v1_t {
 typedef struct kadath_runtime_phase_state_prepare_desc_v1_t {
     uint32_t struct_size;
     uint32_t target;
+    /* Mode A: borrowed for this call; Core does not retain the pointer. */
     const kadath_runtime_phase_binding_desc_v1_t* bindings;
     size_t binding_count;
     size_t binding_stride;
@@ -468,12 +469,15 @@ typedef struct kadath_runtime_phase_activation_batch_v1_t {
     uint32_t reserved0;
     uint64_t transaction_id;
     size_t active_binding_capacity;
+    /* Mode A: borrowed for submit_activation only; no pointer retention. */
     const kadath_runtime_position_patch_v1_t* positions;
     size_t position_count;
     size_t position_stride;
+    /* Mode A: borrowed for submit_activation only; no pointer retention. */
     const kadath_runtime_phase_event_v1_t* events;
     size_t event_count;
     size_t event_stride;
+    /* Mode A: borrowed for submit_activation only; no pointer retention. */
     const kadath_runtime_phase_structural_v1_t* structural;
     size_t structural_count;
     size_t structural_stride;
