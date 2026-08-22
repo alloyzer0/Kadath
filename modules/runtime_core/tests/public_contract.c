@@ -968,6 +968,7 @@ static int phase_commit_path(
     kadath_runtime_phase_event_v1_t drained;
     size_t drained_count = 0U;
     memset(&drained, 0, sizeof(drained));
+    drained.struct_size = (uint32_t)sizeof(drained);
     if (phase_interface->drain_events(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 77U, &drained, 1U, &drained_count) != KADATH_OK ||
         drained_count != 1U || drained.sequence != event_batch.first_sequence || drained.generation != 0U) {
         return 153;
@@ -1004,6 +1005,7 @@ static int phase_commit_path(
     memset(&taken, 0, sizeof(taken));
     memset(&flush, 0, sizeof(flush));
     flush.struct_size = (uint32_t)sizeof(flush);
+    taken.struct_size = (uint32_t)sizeof(taken);
     if (phase_interface->take_structural(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 77U, &flush, &taken, 1U, &taken_count) != KADATH_OK ||
         taken_count != 1U || flush.request_count != 1U || taken.sequence != structural_batch.first_sequence) {
         return 155;

@@ -181,6 +181,19 @@ fn valid_phase_output<T>(pointer: *mut T) -> Result<(), u32> {
     Ok(())
 }
 
+fn valid_output_array<T>(pointer: *mut T, count: usize) -> Result<(), u32> {
+    if pointer.is_null() || (pointer as usize) % mem::align_of::<T>() != 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    for index in 0..count {
+        let value = unsafe { pointer.add(index) };
+        if unsafe { read_struct_size(value) }? < mem::size_of::<T>() as u32 {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+    }
+    Ok(())
+}
+
 fn valid_event_field(field: &abi::kadath_runtime_phase_event_field_v1_t) -> Result<(), u32> {
     if field.struct_size < mem::size_of::<abi::kadath_runtime_phase_event_field_v1_t>() as u32
         || field.key_length > abi::KADATH_RUNTIME_PHASE_MAX_EVENT_KEY_BYTES
@@ -754,6 +767,7 @@ pub(crate) fn drain_events(
     if (output_ptr as usize) % mem::align_of::<abi::kadath_runtime_phase_event_v1_t>() != 0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
+    valid_output_array(output_ptr, output_capacity)?;
     let generation = core
         .phase
         .event_queue
@@ -872,6 +886,7 @@ pub(crate) fn submit_structural(
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }
+    valid_output_array(acceptance_ptr, item_count)?;
     let state = core
         .live
         .as_ref()
@@ -1026,6 +1041,7 @@ pub(crate) fn take_structural(
     if ranges_overlap(flush_range, output_range) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
+    valid_output_array(output_ptr, output_capacity)?;
     if core.phase.flush.is_some() || core.phase.activation.is_some() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
     }
