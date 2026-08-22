@@ -416,6 +416,7 @@ fn prepare_scene(
 
 fn commit_scene(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32> {
     let (core, _guard) = unsafe { enter_core(core_pointer) }?;
+    core.phase.ensure_scene_commit_allowed()?;
     let candidate = core
         .candidate
         .take()
@@ -426,6 +427,7 @@ fn commit_scene(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32
         .expect("candidate entity high-water accompanies candidate");
     core.live = Some(candidate);
     core.next_entity_value = next_entity_value;
+    core.phase.reset_after_scene_commit();
     Ok(())
 }
 

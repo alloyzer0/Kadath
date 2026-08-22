@@ -5,6 +5,7 @@ const c = @cImport({
 });
 
 pub const max_object_count: usize = c.KADATH_RUNTIME_MAX_OBJECTS;
+pub const max_phase_bindings: usize = c.KADATH_RUNTIME_PHASE_MAX_BINDINGS;
 pub const max_logical_generation: u64 = 9_007_199_254_740_991;
 pub const EntityId = u64;
 pub const invalid_entity: EntityId = c.KADATH_RUNTIME_ENTITY_INVALID;

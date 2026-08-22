@@ -55,6 +55,7 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     activation_results[0].struct_size = @sizeOf(runtime_core.PhaseActivationStructuralResult);
     activation.struct_size = @sizeOf(runtime_core.PhaseActivationBatch);
     activation.transaction_id = transaction.transaction_id;
+    activation.active_binding_capacity = runtime_core.max_phase_bindings;
     activation.structural = &structural;
     activation.structural_count = 1;
     activation.structural_stride = @sizeOf(runtime_core.PhaseStructural);
@@ -70,6 +71,7 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     var nested_activation = std.mem.zeroes(runtime_core.PhaseActivationBatch);
     nested_activation.struct_size = @sizeOf(runtime_core.PhaseActivationBatch);
     nested_activation.transaction_id = nested_transaction.transaction_id;
+    nested_activation.active_binding_capacity = runtime_core.max_phase_bindings;
     try core.submitPhaseActivation(nested_transaction.transaction_id, &nested_activation, &[_]runtime_core.PhaseActivationStructuralResult{});
     _ = try core.commitPhaseActivation(nested_transaction.transaction_id);
     try core.endPhase(.fixed, 77);
