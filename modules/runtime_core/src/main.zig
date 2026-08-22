@@ -16,6 +16,7 @@ pub const ObjectView = c.kadath_runtime_object_view_v1_t;
 pub const PhaseEvent = c.kadath_runtime_phase_event_v1_t;
 pub const PhaseStructural = c.kadath_runtime_phase_structural_v1_t;
 pub const PhaseCompletion = c.kadath_runtime_phase_request_completion_v1_t;
+pub const PhaseActivationStructuralResult = c.kadath_runtime_phase_activation_structural_result_v1_t;
 pub const PhaseBatchResult = c.kadath_runtime_phase_batch_result_v1_t;
 pub const PhaseFlushInfo = c.kadath_runtime_phase_flush_info_v1_t;
 pub const PhaseActivationBatch = c.kadath_runtime_phase_activation_batch_v1_t;
@@ -246,8 +247,12 @@ pub const RuntimeCore = struct {
         return info;
     }
 
-    pub fn submitPhaseActivation(self: *RuntimeCore, transaction_id: u64, batch: *const PhaseActivationBatch) !void {
-        try check(self.phase_interface.submit_activation.?(self.handle, transaction_id, batch));
+    pub fn submitPhaseActivation(self: *RuntimeCore, transaction_id: u64, batch: *const PhaseActivationBatch, results: []PhaseActivationStructuralResult) !void {
+        if (batch.structural_count > results.len) return error.RuntimeCoreBufferTooSmall;
+        var request = batch.*;
+        request.structural_results = if (results.len == 0) null else results.ptr;
+        request.structural_result_capacity = results.len;
+        try check(self.phase_interface.submit_activation.?(self.handle, transaction_id, &request));
     }
 
     pub fn commitPhaseActivation(self: *RuntimeCore, transaction_id: u64) !PhaseActivationResult {

@@ -464,6 +464,16 @@ typedef struct kadath_runtime_phase_request_completion_v1_t {
     uint64_t reserved[4];
 } kadath_runtime_phase_request_completion_v1_t;
 
+typedef struct kadath_runtime_phase_activation_structural_result_v1_t {
+    uint32_t struct_size;
+    uint32_t status;
+    uint64_t sequence;
+    uint32_t error_code;
+    uint32_t destroy_disposition;
+    kadath_runtime_object_ref_v1_t object_ref;
+    uint64_t reserved[4];
+} kadath_runtime_phase_activation_structural_result_v1_t;
+
 typedef struct kadath_runtime_phase_activation_batch_v1_t {
     uint32_t struct_size;
     uint32_t reserved0;
@@ -481,6 +491,10 @@ typedef struct kadath_runtime_phase_activation_batch_v1_t {
     const kadath_runtime_phase_structural_v1_t* structural;
     size_t structural_count;
     size_t structural_stride;
+    /* Caller-owned output array borrowed for submit_activation only; Core writes exactly
+     * structural_count entries after complete preflight and retains no pointer. */
+    kadath_runtime_phase_activation_structural_result_v1_t* structural_results;
+    size_t structural_result_capacity;
     uint64_t reserved[6];
 } kadath_runtime_phase_activation_batch_v1_t;
 

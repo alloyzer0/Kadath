@@ -44,6 +44,10 @@ struct Activation {
     positions: Vec<abi::kadath_runtime_position_patch_v1_t>,
     events: Vec<abi::kadath_runtime_phase_event_v1_t>,
     structural: Vec<abi::kadath_runtime_phase_structural_v1_t>,
+    staged_state: object_authority::RuntimeState,
+    staged_bindings: Vec<Binding>,
+    staged_used: u32,
+    cancelled_structural_count: u32,
 }
 
 #[derive(Clone)]
@@ -1268,6 +1272,10 @@ pub(crate) fn begin_activation(
         positions: Vec::new(),
         events: Vec::new(),
         structural: Vec::new(),
+        staged_state: state.clone(),
+        staged_bindings: core.phase.active_bindings.clone(),
+        staged_used: core.phase.admission_used,
+        cancelled_structural_count: 0,
     });
     let info = abi::kadath_runtime_phase_transaction_info_v1_t {
         struct_size: mem::size_of::<abi::kadath_runtime_phase_transaction_info_v1_t>() as u32,
@@ -1311,12 +1319,13 @@ pub(crate) fn submit_activation(
     if active.transaction_id != transaction_id {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
     }
-    let state = core
-        .live
-        .as_ref()
-        .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
     let domain = active.domain;
-    let domain_state = core.phase.domain(domain)?;
+    let mut staged_state = active.staged_state.clone();
+    let mut staged_bindings = active.staged_bindings.clone();
+    let mut staged_used = active.staged_used;
+    let existing_event_count = active.events.len();
+    let existing_structural_count = active.structural.len();
+    let domain_state = core.phase.domain(domain)?.clone();
 
     if batch.position_count > abi::KADATH_RUNTIME_MAX_OBJECTS as usize
         || batch.event_count > EVENT_CAPACITY
@@ -1356,12 +1365,46 @@ pub(crate) fn submit_activation(
         batch.structural_stride,
         mem::size_of::<abi::kadath_runtime_phase_structural_v1_t>(),
     )?;
+    let structural_result_range = if batch.structural_result_capacity == 0 {
+        if !batch.structural_results.is_null() {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        (
+            batch.structural_results as usize,
+            batch.structural_results as usize,
+        )
+    } else {
+        if batch.structural_results.is_null()
+            || (batch.structural_results as usize)
+                % mem::align_of::<abi::kadath_runtime_phase_activation_structural_result_v1_t>()
+                != 0
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        strided_range(
+            batch.structural_results as usize,
+            batch.structural_result_capacity,
+            mem::size_of::<abi::kadath_runtime_phase_activation_structural_result_v1_t>(),
+            mem::size_of::<abi::kadath_runtime_phase_activation_structural_result_v1_t>(),
+        )
+        .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?
+    };
+    if batch.structural_count > batch.structural_result_capacity {
+        return Err(abi::KADATH_ERR_BUFFER_TOO_SMALL);
+    }
+    if batch.structural_count != 0 {
+        valid_output_array(batch.structural_results, batch.structural_count)?;
+    }
     if ranges_overlap(batch_range, position_range)
         || ranges_overlap(batch_range, event_range)
         || ranges_overlap(batch_range, structural_range)
+        || ranges_overlap(batch_range, structural_result_range)
         || ranges_overlap(position_range, event_range)
         || ranges_overlap(position_range, structural_range)
         || ranges_overlap(event_range, structural_range)
+        || ranges_overlap(position_range, structural_result_range)
+        || ranges_overlap(event_range, structural_result_range)
+        || ranges_overlap(structural_range, structural_result_range)
     {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
@@ -1405,14 +1448,18 @@ pub(crate) fn submit_activation(
                 return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
             }
             let key = read_object_key(&value.object_ref)?;
-            if state.visible_exact(key).is_none() {
+            if staged_state.visible_exact(key).is_none() {
                 return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
             }
+            staged_state
+                .set_position(key, value.position)
+                .map_err(authority_error)?;
             positions.push(*value);
         }
     }
 
     let mut events = Vec::new();
+    let mut next_event_sequence = domain_state.next_event_sequence;
     if batch.event_count != 0 {
         if batch.events.is_null()
             || (batch.events as usize) % mem::align_of::<abi::kadath_runtime_phase_event_v1_t>()
@@ -1441,18 +1488,27 @@ pub(crate) fn submit_activation(
                     .cast::<abi::kadath_runtime_phase_event_v1_t>()
             };
             let value = unsafe { &*pointer };
-            validate_event(
+            let generation = validate_event(
                 value,
-                state,
+                &staged_state,
                 domain,
                 domain_state.event_successor_generation,
                 domain_state.event_has_drained,
             )?;
-            events.push(*value);
+            let mut copied = *value;
+            copied.sequence = PhaseState::next_sequence(&mut next_event_sequence)?;
+            copied.generation = generation;
+            events.push(copied);
         }
     }
 
     let mut structural = Vec::new();
+    let mut structural_results = Vec::new();
+    structural_results
+        .try_reserve_exact(batch.structural_count)
+        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    let mut next_structural_sequence = domain_state.next_structural_sequence;
+    let mut cancelled_structural_count = 0_u32;
     if batch.structural_count != 0 {
         if batch.structural.is_null()
             || (batch.structural as usize)
@@ -1485,21 +1541,106 @@ pub(crate) fn submit_activation(
                     .cast::<abi::kadath_runtime_phase_structural_v1_t>()
             };
             let value = unsafe { &*pointer };
-            validate_structural(
+            let generation = validate_structural(
                 value,
-                state,
+                &staged_state,
                 domain,
                 domain_state.structural_successor_generation,
                 domain_state.structural_has_drained,
             )?;
-            structural.push(*value);
+            let mut copied = *value;
+            copied.sequence = PhaseState::next_sequence(&mut next_structural_sequence)?;
+            copied.generation = generation;
+            let mut destroy_disposition = abi::KADATH_RUNTIME_DESTROY_DISPOSITION_NONE;
+            match copied.operation {
+                abi::KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT => {
+                    let sprite = read_sprite(&copied.transient_sprite)?;
+                    let record = staged_state
+                        .reserve_transient(
+                            copied.prototype_key,
+                            abi::KADATH_RUNTIME_OBJECT_KIND_SPRITE,
+                            sprite,
+                        )
+                        .map_err(authority_error)?
+                        .clone();
+                    let key = object_authority::ObjectKey {
+                        object_id: record.object_id,
+                        world_epoch: staged_state.world_epoch,
+                        logical_generation: record.logical_generation,
+                        kind: record.kind,
+                    };
+                    copied.object_ref = object_ref(&record, staged_state.world_epoch);
+                    PhaseState::admission_add(
+                        &mut staged_used,
+                        &mut staged_bindings,
+                        Binding {
+                            object: key,
+                            behavior_count: copied.behavior_count,
+                        },
+                    )?;
+                }
+                abi::KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY => {
+                    let key = read_object_key(&copied.object_ref)?;
+                    let disposition = staged_state.request_destroy(key).map_err(authority_error)?;
+                    destroy_disposition = match disposition {
+                        object_authority::DestroyDisposition::CancelledPendingSpawn => {
+                            cancelled_structural_count += 1;
+                            PhaseState::admission_remove(
+                                &mut staged_used,
+                                &mut staged_bindings,
+                                key,
+                            );
+                            abi::KADATH_RUNTIME_DESTROY_CANCELLED_PENDING_SPAWN
+                        }
+                        object_authority::DestroyDisposition::AwaitingFinalize => {
+                            abi::KADATH_RUNTIME_DESTROY_AWAITING_FINALIZE
+                        }
+                    };
+                }
+                abi::KADATH_RUNTIME_PHASE_OPERATION_DISCARD_RESERVATION => {
+                    let key = read_object_key(&copied.object_ref)?;
+                    staged_state.discard(key).map_err(authority_error)?;
+                    PhaseState::admission_remove(&mut staged_used, &mut staged_bindings, key);
+                    cancelled_structural_count += 1;
+                    destroy_disposition = abi::KADATH_RUNTIME_DESTROY_CANCELLED_PENDING_SPAWN;
+                }
+                _ => return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_REQUEST),
+            }
+            structural_results.push(
+                abi::kadath_runtime_phase_activation_structural_result_v1_t {
+                    struct_size: mem::size_of::<
+                        abi::kadath_runtime_phase_activation_structural_result_v1_t,
+                    >() as u32,
+                    status: abi::KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED,
+                    sequence: copied.sequence,
+                    error_code: 0,
+                    destroy_disposition,
+                    object_ref: copied.object_ref,
+                    reserved: [0; 4],
+                },
+            );
+            structural.push(copied);
         }
     }
-    if domain_state.event_queue.len() + events.len() > EVENT_CAPACITY
-        || domain_state.structural_queue.len() + structural.len() > STRUCTURAL_CAPACITY
+    if domain_state.event_queue.len() + existing_event_count + events.len() > EVENT_CAPACITY
+        || domain_state.structural_queue.len() + existing_structural_count + structural.len()
+            > STRUCTURAL_CAPACITY
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }
+    {
+        let domain_state = core.phase.domain_mut(domain)?;
+        domain_state.next_event_sequence = next_event_sequence;
+        domain_state.next_structural_sequence = next_structural_sequence;
+    }
+    let serial_high_water = staged_state.next_spawn_serial;
+    let live = core
+        .live
+        .as_mut()
+        .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
+    // The transaction plan remains private; only Object Authority's monotonic serial
+    // high-water is observable before commit so abort/failure can never reuse an ID.
+    live.next_spawn_serial = live.next_spawn_serial.max(serial_high_water);
     let active = core
         .phase
         .activation
@@ -1508,6 +1649,16 @@ pub(crate) fn submit_activation(
     active.positions.extend(positions);
     active.events.extend(events);
     active.structural.extend(structural);
+    active.staged_state = staged_state;
+    active.staged_bindings = staged_bindings;
+    active.staged_used = staged_used;
+    active.cancelled_structural_count = active
+        .cancelled_structural_count
+        .checked_add(cancelled_structural_count)
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)?;
+    for (index, result) in structural_results.into_iter().enumerate() {
+        unsafe { ptr::write(batch.structural_results.add(index), result) };
+    }
     Ok(())
 }
 
@@ -1537,13 +1688,10 @@ pub(crate) fn commit_activation(
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     let root_item = flush.entries[root_index].item;
     let root_key = read_object_key(&root_item.object_ref)?;
-    let mut state = core
-        .live
-        .clone()
-        .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let mut bindings = core.phase.active_bindings.clone();
-    let mut used = core.phase.admission_used;
-    let domain_state = core.phase.domain(domain)?;
+    let mut state = activation.staged_state.clone();
+    let bindings = activation.staged_bindings.clone();
+    let used = activation.staged_used;
+    let domain_state = core.phase.domain(domain)?.clone();
     let mut event_queue = domain_state.event_queue.clone();
     let mut structural_queue = domain_state.structural_queue.clone();
     if event_queue.len() + activation.events.len() > EVENT_CAPACITY
@@ -1553,6 +1701,9 @@ pub(crate) fn commit_activation(
     }
     let root_cancelled = state.visible_exact(root_key).is_none();
     if root_cancelled {
+        let mut bindings = core.phase.active_bindings.clone();
+        let mut used = core.phase.admission_used;
+        PhaseState::admission_remove(&mut used, &mut bindings, root_key);
         let mut entries = flush.entries;
         entries[root_index].completed = true;
         core.phase.flush[domain_index] = if entries.iter().all(|entry| entry.completed) {
@@ -1566,11 +1717,13 @@ pub(crate) fn commit_activation(
             reserved0: 0,
             accepted_event_count: 0,
             accepted_structural_count: 0,
-            cancelled_structural_count: 1,
-            active_binding_count: core.phase.admission_used,
+            cancelled_structural_count: activation.cancelled_structural_count.saturating_add(1),
+            active_binding_count: used,
             root_object: unsafe { mem::zeroed() },
             reserved: [0; 4],
         };
+        core.phase.active_bindings = bindings;
+        core.phase.admission_used = used;
         unsafe { ptr::write(out_ptr, result) };
         return Ok(());
     }
@@ -1578,112 +1731,16 @@ pub(crate) fn commit_activation(
     let next_entity = entity.checked_add(1).ok_or(abi::KADATH_ERR_INTERNAL)?;
     state.activate(root_key, entity).map_err(authority_error)?;
     let world_epoch = state.world_epoch;
-    for patch in &activation.positions {
-        state
-            .set_position(read_object_key(&patch.object_ref)?, patch.position)
-            .map_err(authority_error)?;
-    }
-    let successor_event_generation = domain_state.event_successor_generation;
-    let successor_structural_generation = domain_state.structural_successor_generation;
-    if successor_event_generation > MAX_GENERATION
-        || successor_structural_generation > MAX_GENERATION
-    {
-        return Err(abi::KADATH_ERR_RUNTIME_PHASE_GENERATION_EXHAUSTED);
-    }
-    let mut next_event_sequence = domain_state.next_event_sequence;
-    for _ in 0..activation.events.len() {
-        PhaseState::next_sequence(&mut next_event_sequence)?;
-    }
-    let mut next_structural_sequence = domain_state.next_structural_sequence;
-    for _ in 0..activation.structural.len() {
-        PhaseState::next_sequence(&mut next_structural_sequence)?;
-    }
-    // Sequence reservations are monotonic even when a later state operation fails.
-    {
-        let domain_state = core.phase.domain_mut(domain)?;
-        domain_state.next_event_sequence = next_event_sequence;
-        domain_state.next_structural_sequence = next_structural_sequence;
-    }
     let accepted_event_count = activation.events.len() as u32;
-    let first_event_sequence = next_event_sequence - activation.events.len() as u64;
-    for (offset, input) in activation.events.into_iter().enumerate() {
-        let mut event = input;
-        validate_event(
-            &event,
-            &state,
-            flush.domain,
-            successor_event_generation,
-            true,
-        )?;
-        event.sequence = first_event_sequence + offset as u64;
-        event.generation = successor_event_generation;
+    for event in activation.events {
         event_queue.push(EventEntry { item: event });
     }
-    let mut accepted_structural_count = 0_u32;
-    let mut cancelled_structural_count = 0_u32;
-    let first_structural_sequence = next_structural_sequence - activation.structural.len() as u64;
-    for (offset, input) in activation.structural.into_iter().enumerate() {
-        let mut item = input;
-        validate_structural(
-            &item,
-            &state,
-            flush.domain,
-            successor_structural_generation,
-            true,
-        )?;
-        item.sequence = first_structural_sequence + offset as u64;
-        item.generation = successor_structural_generation;
-        match item.operation {
-            abi::KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT => {
-                let sprite = read_sprite(&item.transient_sprite)?;
-                let record = state
-                    .reserve_transient(
-                        item.prototype_key,
-                        abi::KADATH_RUNTIME_OBJECT_KIND_SPRITE,
-                        sprite,
-                    )
-                    .map_err(authority_error)?
-                    .clone();
-                let key = object_authority::ObjectKey {
-                    object_id: record.object_id,
-                    world_epoch,
-                    logical_generation: record.logical_generation,
-                    kind: record.kind,
-                };
-                item.object_ref = object_ref(&record, world_epoch);
-                PhaseState::admission_add(
-                    &mut used,
-                    &mut bindings,
-                    Binding {
-                        object: key,
-                        behavior_count: item.behavior_count,
-                    },
-                )?;
-            }
-            abi::KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY => {
-                let key = read_object_key(&item.object_ref)?;
-                let disposition = state.request_destroy(key).map_err(authority_error)?;
-                if matches!(
-                    disposition,
-                    object_authority::DestroyDisposition::CancelledPendingSpawn
-                ) {
-                    PhaseState::admission_remove(&mut used, &mut bindings, key);
-                    cancelled_structural_count += 1;
-                }
-            }
-            abi::KADATH_RUNTIME_PHASE_OPERATION_DISCARD_RESERVATION => {
-                let key = read_object_key(&item.object_ref)?;
-                state.discard(key).map_err(authority_error)?;
-                PhaseState::admission_remove(&mut used, &mut bindings, key);
-                cancelled_structural_count += 1;
-            }
-            _ => return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_REQUEST),
-        }
+    let accepted_structural_count = activation.structural.len() as u32;
+    for item in activation.structural {
         structural_queue.push(StructuralEntry {
             item,
             completed: false,
         });
-        accepted_structural_count += 1;
     }
     let root_object = state
         .visible_exact(root_key)
@@ -1712,7 +1769,7 @@ pub(crate) fn commit_activation(
         reserved0: 0,
         accepted_event_count,
         accepted_structural_count,
-        cancelled_structural_count,
+        cancelled_structural_count: activation.cancelled_structural_count,
         active_binding_count: used,
         root_object,
         reserved: [0; 4],

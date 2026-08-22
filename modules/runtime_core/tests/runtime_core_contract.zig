@@ -51,10 +51,26 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     const flush = try core.takePhaseStructural(.fixed, 77, &taken);
     const transaction = try core.beginPhaseActivation(flush.info.flush_token, taken[0].sequence);
     var activation = std.mem.zeroes(runtime_core.PhaseActivationBatch);
+    var activation_results = [_]runtime_core.PhaseActivationStructuralResult{std.mem.zeroes(runtime_core.PhaseActivationStructuralResult)};
+    activation_results[0].struct_size = @sizeOf(runtime_core.PhaseActivationStructuralResult);
     activation.struct_size = @sizeOf(runtime_core.PhaseActivationBatch);
     activation.transaction_id = transaction.transaction_id;
-    try core.submitPhaseActivation(transaction.transaction_id, &activation);
+    activation.structural = &structural;
+    activation.structural_count = 1;
+    activation.structural_stride = @sizeOf(runtime_core.PhaseStructural);
+    try core.submitPhaseActivation(transaction.transaction_id, &activation, &activation_results);
+    try std.testing.expectEqual(@as(u32, 1), activation_results[0].status);
+    try std.testing.expect(activation_results[0].sequence != 0);
+    try std.testing.expect(activation_results[0].object_ref.object_id_length != 0);
     const activated = try core.commitPhaseActivation(transaction.transaction_id);
     try std.testing.expectEqual(@as(u32, 2), activated.root_object.lifecycle);
+    var nested_taken: [1]runtime_core.PhaseStructural = undefined;
+    const nested_flush = try core.takePhaseStructural(.fixed, 77, &nested_taken);
+    const nested_transaction = try core.beginPhaseActivation(nested_flush.info.flush_token, nested_taken[0].sequence);
+    var nested_activation = std.mem.zeroes(runtime_core.PhaseActivationBatch);
+    nested_activation.struct_size = @sizeOf(runtime_core.PhaseActivationBatch);
+    nested_activation.transaction_id = nested_transaction.transaction_id;
+    try core.submitPhaseActivation(nested_transaction.transaction_id, &nested_activation, &[_]runtime_core.PhaseActivationStructuralResult{});
+    _ = try core.commitPhaseActivation(nested_transaction.transaction_id);
     try core.endPhase(.fixed, 77);
 }

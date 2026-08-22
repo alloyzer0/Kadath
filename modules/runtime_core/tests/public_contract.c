@@ -44,12 +44,15 @@ _Static_assert(sizeof(kadath_runtime_phase_event_field_v1_t) == 200U, "phase eve
 _Static_assert(sizeof(kadath_runtime_phase_structural_v1_t) == 400U, "phase structural ABI");
 _Static_assert(sizeof(kadath_runtime_phase_flush_info_v1_t) == 64U, "phase flush ABI");
 _Static_assert(sizeof(kadath_runtime_phase_request_completion_v1_t) == 280U, "phase completion ABI");
+_Static_assert(sizeof(kadath_runtime_phase_activation_structural_result_v1_t) == 184U, "phase activation structural result ABI");
+_Static_assert(offsetof(kadath_runtime_phase_activation_structural_result_v1_t, object_ref) == 24U, "phase activation result object ref offset");
 _Static_assert(sizeof(kadath_runtime_phase_state_candidate_info_v1_t) == 56U, "phase candidate info ABI");
 _Static_assert(sizeof(kadath_runtime_phase_begin_result_v1_t) == 48U, "phase begin result ABI");
 _Static_assert(sizeof(kadath_runtime_phase_batch_result_v1_t) == 64U, "phase batch result ABI");
 _Static_assert(sizeof(kadath_runtime_phase_transaction_info_v1_t) == 56U, "phase transaction ABI");
 _Static_assert(sizeof(kadath_runtime_phase_activation_result_v1_t) == 280U, "phase activation result ABI");
-_Static_assert(sizeof(kadath_runtime_phase_activation_batch_v1_t) == 144U, "phase activation batch ABI");
+_Static_assert(sizeof(kadath_runtime_phase_activation_batch_v1_t) == 160U, "phase activation batch ABI");
+_Static_assert(offsetof(kadath_runtime_phase_activation_batch_v1_t, structural_results) == 96U, "phase activation result array offset");
 _Static_assert(sizeof(kadath_runtime_phase_interface_v1_t) == 192U, "phase interface ABI");
 _Static_assert(offsetof(kadath_runtime_phase_begin_desc_v1_t, phase_sequence) == 8U, "phase sequence offset");
 _Static_assert(offsetof(kadath_runtime_phase_event_v1_t, fields) > offsetof(kadath_runtime_phase_event_v1_t, name), "phase fields order");
@@ -1037,29 +1040,87 @@ static int phase_commit_path(
         return 156;
     }
     kadath_runtime_phase_activation_batch_v1_t activation_batch;
+    kadath_runtime_phase_structural_v1_t nested_structural;
+    kadath_runtime_phase_activation_structural_result_v1_t nested_result;
     memset(&activation_batch, 0, sizeof(activation_batch));
+    memset(&nested_structural, 0, sizeof(nested_structural));
+    memset(&nested_result, 0, sizeof(nested_result));
     activation_batch.struct_size = (uint32_t)sizeof(activation_batch);
     activation_batch.transaction_id = transaction.transaction_id;
+    nested_structural.struct_size = (uint32_t)sizeof(nested_structural);
+    nested_structural.operation = KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT;
+    nested_structural.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    nested_structural.behavior_count = 1U;
+    nested_structural.prototype_key = 13U;
+    nested_structural.script_id = 17U;
+    nested_structural.origin = player;
+    nested_structural.transient_sprite.struct_size = (uint32_t)sizeof(nested_structural.transient_sprite);
+    nested_structural.transient_sprite.size[0] = 3.0F;
+    nested_structural.transient_sprite.size[1] = 3.0F;
+    nested_structural.transient_sprite.color[3] = 1.0F;
+    nested_structural.transient_sprite.texture_id = 1U;
+    nested_result.struct_size = (uint32_t)sizeof(nested_result);
+    activation_batch.structural = &nested_structural;
+    activation_batch.structural_count = 1U;
+    activation_batch.structural_stride = sizeof(nested_structural);
+    activation_batch.structural_results = &nested_result;
+    activation_batch.structural_result_capacity = 1U;
     if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_OK) {
         return 157;
+    }
+    if (nested_result.status != KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED ||
+        nested_result.sequence == 0U || nested_result.object_ref.object_id_length == 0U ||
+        nested_result.destroy_disposition != KADATH_RUNTIME_DESTROY_DISPOSITION_NONE) {
+        return 158;
     }
     kadath_runtime_phase_activation_result_v1_t activation_result;
     memset(&activation_result, 0, sizeof(activation_result));
     activation_result.struct_size = (uint32_t)sizeof(activation_result);
     if (phase_interface->commit_activation(core, transaction.transaction_id, &activation_result) != KADATH_OK ||
         activation_result.root_object.lifecycle != KADATH_RUNTIME_LIFECYCLE_ACTIVE ||
-        activation_result.root_object.entity_value == KADATH_RUNTIME_ENTITY_INVALID) {
-        return 158;
+        activation_result.root_object.entity_value == KADATH_RUNTIME_ENTITY_INVALID ||
+        activation_result.accepted_structural_count != 1U) {
+        return 159;
+    }
+    kadath_runtime_phase_structural_v1_t nested_taken;
+    kadath_runtime_phase_flush_info_v1_t nested_flush;
+    size_t nested_taken_count = 0U;
+    memset(&nested_taken, 0, sizeof(nested_taken));
+    memset(&nested_flush, 0, sizeof(nested_flush));
+    nested_taken.struct_size = (uint32_t)sizeof(nested_taken);
+    nested_flush.struct_size = (uint32_t)sizeof(nested_flush);
+    if (phase_interface->take_structural(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 77U, &nested_flush,
+                                         &nested_taken, 1U, &nested_taken_count) != KADATH_OK ||
+        nested_taken_count != 1U || nested_taken.sequence != nested_result.sequence ||
+        memcmp(&nested_taken.object_ref, &nested_result.object_ref, sizeof(nested_result.object_ref)) != 0) {
+        return 160;
+    }
+    memset(&transaction, 0, sizeof(transaction));
+    transaction.struct_size = (uint32_t)sizeof(transaction);
+    if (phase_interface->begin_activation(core, nested_flush.flush_token, nested_taken.sequence, &transaction) != KADATH_OK) {
+        return 161;
+    }
+    memset(&activation_batch, 0, sizeof(activation_batch));
+    activation_batch.struct_size = (uint32_t)sizeof(activation_batch);
+    activation_batch.transaction_id = transaction.transaction_id;
+    if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_OK) {
+        return 162;
+    }
+    memset(&activation_result, 0, sizeof(activation_result));
+    activation_result.struct_size = (uint32_t)sizeof(activation_result);
+    if (phase_interface->commit_activation(core, transaction.transaction_id, &activation_result) != KADATH_OK ||
+        activation_result.root_object.lifecycle != KADATH_RUNTIME_LIFECYCLE_ACTIVE) {
+        return 163;
     }
     if (phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 77U) != KADATH_OK ||
         object_interface->destroy(&core) != KADATH_OK || core != NULL) {
-        return 159;
+        return 164;
     }
 
-    if (create_live_core(object_interface, &core) != 0) return 160;
+    if (create_live_core(object_interface, &core) != 0) return 170;
     if (query_id(object_interface, core, "player", &player_result) != KADATH_OK ||
         player_result.found != KADATH_RUNTIME_FOUND) {
-        return 161;
+        return 171;
     }
     player = player_result.payload.object.object_ref;
     memset(&begin, 0, sizeof(begin));
@@ -1068,7 +1129,7 @@ static int phase_commit_path(
     begin.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
     begin.phase_sequence = 78U;
     begin_result.struct_size = (uint32_t)sizeof(begin_result);
-    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK) return 162;
+    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK) return 172;
     memset(&structural, 0, sizeof(structural));
     structural.struct_size = (uint32_t)sizeof(structural);
     structural.operation = KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT;
@@ -1085,7 +1146,7 @@ static int phase_commit_path(
     acceptance.struct_size = (uint32_t)sizeof(acceptance);
     memset(&structural_batch, 0, sizeof(structural_batch));
     structural_batch.struct_size = (uint32_t)sizeof(structural_batch);
-    if (phase_interface->submit_structural(core, &structural, 1U, sizeof(structural), &acceptance, 1U, &structural_batch) != KADATH_OK) return 163;
+    if (phase_interface->submit_structural(core, &structural, 1U, sizeof(structural), &acceptance, 1U, &structural_batch) != KADATH_OK) return 173;
     kadath_runtime_phase_structural_v1_t destroy_request;
     kadath_runtime_phase_request_completion_v1_t destroy_acceptance;
     memset(&destroy_request, 0, sizeof(destroy_request));
@@ -1098,7 +1159,7 @@ static int phase_commit_path(
     memset(&structural_batch, 0, sizeof(structural_batch));
     structural_batch.struct_size = (uint32_t)sizeof(structural_batch);
     if (phase_interface->submit_structural(core, &destroy_request, 1U, sizeof(destroy_request), &destroy_acceptance, 1U, &structural_batch) != KADATH_OK ||
-        destroy_acceptance.destroy_disposition != KADATH_RUNTIME_DESTROY_CANCELLED_PENDING_SPAWN) return 164;
+        destroy_acceptance.destroy_disposition != KADATH_RUNTIME_DESTROY_CANCELLED_PENDING_SPAWN) return 174;
     kadath_runtime_phase_structural_v1_t taken_pair[2];
     kadath_runtime_phase_flush_info_v1_t pair_flush;
     size_t pair_count = 0U;
@@ -1107,7 +1168,7 @@ static int phase_commit_path(
     taken_pair[1].struct_size = (uint32_t)sizeof(taken_pair[1]);
     memset(&pair_flush, 0, sizeof(pair_flush));
     pair_flush.struct_size = (uint32_t)sizeof(pair_flush);
-    if (phase_interface->take_structural(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 78U, &pair_flush, taken_pair, 2U, &pair_count) != KADATH_OK || pair_count != 2U) return 165;
+    if (phase_interface->take_structural(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 78U, &pair_flush, taken_pair, 2U, &pair_count) != KADATH_OK || pair_count != 2U) return 175;
     kadath_runtime_phase_request_completion_v1_t pair_completions[2];
     memset(pair_completions, 0, sizeof(pair_completions));
     for (size_t index = 0; index < 2U; ++index) {
@@ -1117,7 +1178,7 @@ static int phase_commit_path(
     }
     if (phase_interface->complete_structural(core, pair_flush.flush_token, pair_completions, 2U, 0U) != KADATH_OK ||
         phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 78U) != KADATH_OK ||
-        object_interface->destroy(&core) != KADATH_OK || core != NULL) return 166;
+        object_interface->destroy(&core) != KADATH_OK || core != NULL) return 176;
     return 0;
 }
 
