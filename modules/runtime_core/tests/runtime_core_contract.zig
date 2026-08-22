@@ -304,3 +304,77 @@ test "Runtime Core Phase admission overflow preserves structural state" {
     try std.testing.expectEqual(@as(usize, 0), flush.count);
     try core.endPhase(.fixed, phase_sequence);
 }
+
+test "Runtime Core structural replay preserves bounded FIFO and successor generation" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    const sources = [_]runtime_core.SourceDesc{
+        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
+    };
+    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
+    try core.commitScene();
+    const player = (try core.findById(.live, "player")).?.object_ref;
+    const phase_sequence: u64 = 0x5354_5255_4354_5552;
+    try core.beginPhase(.fixed, phase_sequence);
+
+    var structural_items: [runtime_core.max_phase_structural]runtime_core.PhaseStructural = undefined;
+    var completions: [runtime_core.max_phase_structural]runtime_core.PhaseCompletion = undefined;
+    for (&structural_items, 0..) |*item, index| {
+        item.* = std.mem.zeroes(runtime_core.PhaseStructural);
+        item.struct_size = @sizeOf(runtime_core.PhaseStructural);
+        item.operation = runtime_core.phase_operation_reserve_transient;
+        item.domain = 1;
+        item.behavior_count = 1;
+        item.prototype_key = @intCast(index + 1);
+        item.script_id = @intCast(index + 1);
+        item.origin = player;
+        item.transient_sprite.struct_size = @sizeOf(@TypeOf(item.transient_sprite));
+        item.transient_sprite.size = .{ 4, 4 };
+        item.transient_sprite.color[3] = 1;
+        item.transient_sprite.texture_id = 1;
+        completions[index] = std.mem.zeroes(runtime_core.PhaseCompletion);
+        completions[index].struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    }
+    const batch = try core.submitPhaseStructural(structural_items[0..], completions[0..]);
+    try std.testing.expectEqual(@as(u64, 1), batch.first_sequence);
+    try std.testing.expectEqual(@as(u64, runtime_core.max_phase_structural), batch.last_sequence);
+    for (completions, 0..) |completion, index| {
+        try std.testing.expectEqual(@as(u32, runtime_core.phase_completion_accepted), completion.status);
+        try std.testing.expectEqual(@as(u64, @intCast(index + 1)), completion.sequence);
+        try std.testing.expect(completion.object.object_ref.object_id_length != 0);
+    }
+
+    var overflow_item = structural_items[0];
+    overflow_item.prototype_key = 999;
+    var overflow_completion = std.mem.zeroes(runtime_core.PhaseCompletion);
+    overflow_completion.struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    var overflow_items = [_]runtime_core.PhaseStructural{overflow_item};
+    var overflow_completions = [_]runtime_core.PhaseCompletion{overflow_completion};
+    try std.testing.expectError(
+        error.RuntimePhaseQueueCapacity,
+        core.submitPhaseStructural(overflow_items[0..], overflow_completions[0..]),
+    );
+
+    var taken: [runtime_core.max_phase_structural]runtime_core.PhaseStructural = undefined;
+    const flush = try core.takePhaseStructural(.fixed, phase_sequence, taken[0..]);
+    try std.testing.expectEqual(runtime_core.max_phase_structural, flush.count);
+    for (taken[0..flush.count], 0..) |item, index| {
+        try std.testing.expectEqual(@as(u64, @intCast(index + 1)), item.sequence);
+        try std.testing.expectEqual(@as(u32, 0), item.generation);
+    }
+    try core.abortPhaseStructural(flush.info.flush_token);
+
+    var successor_item = structural_items[0];
+    successor_item.prototype_key = 1_001;
+    var successor_completion = std.mem.zeroes(runtime_core.PhaseCompletion);
+    successor_completion.struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    var successor_items = [_]runtime_core.PhaseStructural{successor_item};
+    var successor_completions = [_]runtime_core.PhaseCompletion{successor_completion};
+    const successor_batch = try core.submitPhaseStructural(successor_items[0..], successor_completions[0..]);
+    try std.testing.expectEqual(@as(u64, runtime_core.max_phase_structural + 1), successor_batch.first_sequence);
+    const successor_flush = try core.takePhaseStructural(.fixed, phase_sequence, taken[0..]);
+    try std.testing.expectEqual(@as(usize, 1), successor_flush.count);
+    try std.testing.expectEqual(@as(u32, 1), taken[0].generation);
+    try core.abortPhaseStructural(successor_flush.info.flush_token);
+    try core.endPhase(.fixed, phase_sequence);
+}
