@@ -2,9 +2,9 @@
 
 ## 元信息
 
-- **状态**: 已确认；2026-08-21 ownership 对账更新
+- **状态**: 已确认；2026-08-22 Phase Commit implementation clarification
 - **初始日期**: 2026-06-04
-- **更新日期**: 2026-08-21
+- **更新日期**: 2026-08-22
 - **主题**: Kadath Runtime 当前态、目标态与迁移 seam
 - **依据**:
   - `ADR-0002`: 构建系统与项目结构
@@ -229,6 +229,16 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 - 通过 Rust/public C/Zig focused 与 Linux 产品矩阵；
 - 不以 Linux 证据宣告 Windows 产品验收；
 - 不修改 `.scratch/` 或新增 PowerShell 脚本。
+
+### 6.3 2026-08-22 Phase Commit implementation clarification
+
+`P1-Rust-Runtime-Core-Phase-Commit-01` 的 implementation target 已按独立冻结契约登记，但在 candidate 合并前仍属于 TARGET，不改变 `## 2 CURRENT` 图：
+
+- Rust Runtime Core 是 fixed/frame phase queue、event/structural sequence、generation、256 Behavior admission、fixed/frame 各 64 event 与 64 structural budget、flush token、activation transaction 和 same-flush/failure semantics 的唯一 authority；Object Authority v1 保持独立接口。
+- Zig Host 继续决定 **何时** begin/dispatch/flush/end，保留 clock、fixed accumulator、phase timing、Luau VM/C++ bridge、callback 执行、ActiveSet、callback staging、diagnostic、collision/contact observer、gameplay 与 render projection；Zig Runtime Core Adapter 不复制 Rust state machine。
+- Phase Interface v1 使用 versioned descriptor + opaque Core + bounded caller-owned POD batch；不得出现 VM/bridge pointer、Gameplay、Renderer、Window、Editor 或 scheduler 类型。`drain_events`/`take_structural` 每次一个最低 generation bucket，Host 外层循环至 queue/token 清空。
+- 同一实现 candidate 必须删除 Zig persistent phase queue/admission/sequence/generation writer；callback-local staging 可保留。Scene/KSCN/KSCP、Luau Host v4、Editor/Preview/Package wire、collision/gameplay migration、final render snapshot 和 Scheduler 不在本增量内。
+- 该 clarification 对应 Outer contract discovery `P1-Rust-Runtime-Core-Phase-Commit-01`，Inner baseline `444dc5b`；Linux 证据仍不代理 Windows/NTFS/HWND/Vulkan acceptance。
 
 ---
 

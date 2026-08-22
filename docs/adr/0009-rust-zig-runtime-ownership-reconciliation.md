@@ -286,6 +286,17 @@ Runtime Core 的外部 Interface 必须：
 - 本增量仍由 Zig `SceneGeneration` 将 active Object View 投影为现有 `RenderSprite` POD，只有 `P1-Rust-Runtime-Core-Gameplay-01` 建立专用 Rust render snapshot 后才删除该投影；
 - 上述临时分段不得形成 Zig/Rust 双写：Zig 不保存 object count、slot、logical generation、serial high-water、Entity 映射或 lifecycle writer，Rust 不接管 Behavior/queue/event/phase admission。
 
+### 5.3B 2026-08-22 Phase Commit 分段澄清
+
+`P1-Rust-Runtime-Core-Phase-Commit-01` 在收到独立 `GO_IMPLEMENT` 后，按已冻结 contract discovery 将 Phase Commit authority 从 Zig `BehaviorHost` 替换到同一 opaque Rust Runtime Core；本节记录目标态，不能在实现候选合并前反写为 CURRENT：
+
+- Rust Core 唯一拥有 fixed/frame event queue、structural queue、event/structural sequence、dispatch generation、256 Behavior admission、每 domain 64 event 与 64 structural budget，以及 structural flush token、activation transaction、same-flush cancellation 和 failure domain；fixed/frame 两个 domain 的 state 完全隔离。
+- Zig Host 继续拥有 clock、fixed accumulator、fixed-step 次数、frame timing、phase 调用时机、Luau VM/C++ bridge、callback 执行、ActiveSet 实例存储、callback-local staging、诊断、collision/contact observer、GameSession/gameplay 与 render projection；Adapter 只做 caller-owned POD 转换、调用编排和错误映射。
+- Phase Interface 是 Object Authority v1 的独立 versioned descriptor，不复用 Object Authority mutation tags，不建立构建产物级 global ABI version，不暴露 VM pointer、Gameplay、Renderer、Window、Editor 或 scheduler API。
+- `drain_events`/`take_structural` 只消费一个最低 generation bucket；Host 必须循环 drain → dispatch → submit successor → take/complete/activate，直至 queue 与 in-flight token 均为空。generation `0..8`、stale delivery drop、四个 64 budget、same-flush spawn→destroy 和 callback failure isolation 必须由 public C17 与 Zig consumer seam 观察。
+- 同一 candidate 必须删除 Zig persistent `EventQueue`、`StructuralQueue`、`BehaviorAdmission`、phase `next_sequence` 与 generation writer；允许保留 callback-local staging，但不得保留第二个长期 ledger 或 queue mirror。
+- Scene/KSCN/KSCP、Luau Host v4、Editor/Preview/Package wire、collision/gameplay authority、最终 Rust render snapshot 和 Scheduler 均不属于本增量；任何新增生产路径必须先回到 contract revision。
+
 ### 5.4 Scheduler
 
 Scheduler 只有在出现第二个真实异步消费者，或 Runtime Core 需要统一 completion ingestion 时才扩张。禁止为了提高 Rust 占比提前引入线程池、`rayon`、`tokio`、async runtime 或通用 task graph。
