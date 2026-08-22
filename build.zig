@@ -694,6 +694,32 @@ pub fn build(b: *std.Build) void {
         runtime_core_contract_step.dependOn(&runtime_core_contract_run.step);
         test_step.dependOn(runtime_core_contract_step);
 
+        if (target.result.os.tag == .linux) {
+            const runtime_core_bench_mod = b.createModule(.{
+                .root_source_file = b.path("tools/runtime-core-phase-bench.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            runtime_core_bench_mod.addImport("runtime_core", runtime_core_mod);
+            runtime_core_bench_mod.addLibraryPath(.{ .cwd_relative = library_path });
+            runtime_core_bench_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
+            runtime_core_bench_mod.linkSystemLibrary("gcc_s", .{});
+            runtime_core_bench_mod.linkSystemLibrary("util", .{});
+            runtime_core_bench_mod.linkSystemLibrary("rt", .{});
+            runtime_core_bench_mod.linkSystemLibrary("pthread", .{});
+            runtime_core_bench_mod.linkSystemLibrary("m", .{});
+            runtime_core_bench_mod.linkSystemLibrary("dl", .{});
+            const runtime_core_bench = b.addExecutable(.{
+                .name = "runtime-core-phase-bench",
+                .root_module = runtime_core_bench_mod,
+            });
+            runtime_core_bench.step.dependOn(runtime_core_cargo_step.?);
+            const runtime_core_bench_run = b.addRunArtifact(runtime_core_bench);
+            const runtime_core_bench_step = b.step("bench-runtime-core-phase", "Run the 10,000-batch Runtime Core Phase baseline");
+            runtime_core_bench_step.dependOn(&runtime_core_bench_run.step);
+        }
+
         const contract_rust_target = if (target.result.os.tag == .windows)
             "x86_64-pc-windows-gnu"
         else
