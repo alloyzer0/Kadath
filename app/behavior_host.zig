@@ -67,8 +67,6 @@ pub const Runtime = struct {
     world_epoch: u64 = 1,
     phase_serial: u64 = 1,
     active_phase: ?PhaseSession = null,
-    fixed_structural_generation: u32 = 0,
-    frame_structural_generation: u32 = 0,
     contact_active: [scene_api.max_scene_object_count]bool = [_]bool{false} ** scene_api.max_scene_object_count,
 
     pub fn deinit(self: *Runtime) void {
@@ -139,10 +137,6 @@ pub const Runtime = struct {
         }
         try self.preparePhaseState(generation);
         try self.commitPhaseState(generation);
-        switch (domain) {
-            .fixed => self.fixed_structural_generation = 0,
-            .frame => self.frame_structural_generation = 0,
-        }
         const session = PhaseSession{ .domain = domain, .sequence = self.phase_serial };
         try generation.core.beginPhase(domain, session.sequence);
         self.phase_serial += 1;
@@ -154,13 +148,6 @@ pub const Runtime = struct {
         const session = self.active_phase orelse return error.RuntimePhaseActiveRequired;
         if (session.domain != domain) return error.InvalidRuntimePhaseDomain;
         return session;
-    }
-
-    fn structuralGeneration(self: *const Runtime, domain: runtime_core.PhaseDomain) u32 {
-        return switch (domain) {
-            .fixed => self.fixed_structural_generation,
-            .frame => self.frame_structural_generation,
-        };
     }
 
     fn endPhase(self: *Runtime, generation: *scene_generation_api.SceneGeneration, session: PhaseSession) !void {
@@ -375,8 +362,6 @@ pub const Runtime = struct {
                     .generation = generation,
                     .world_epoch = self.world_epoch,
                     .domain = session.domain,
-                    .post_generation = event.generation + 1,
-                    .structural_generation = self.structuralGeneration(session.domain),
                 };
                 var host = directNativeHost(&context);
                 var native_fields: [8]behavior_runtime.NativeEventField = undefined;
@@ -442,11 +427,6 @@ pub const Runtime = struct {
             const taken = try generation.core.takePhaseStructural(session.domain, session.sequence, &requests);
             if (taken.count == 0) break;
             did_work = true;
-            const next_structural_generation = requests[0].generation + 1;
-            switch (session.domain) {
-                .fixed => self.fixed_structural_generation = next_structural_generation,
-                .frame => self.frame_structural_generation = next_structural_generation,
-            }
 
             var completions: [runtime_core.max_phase_structural]runtime_core.PhaseCompletion = undefined;
             var completion_count: usize = 0;
@@ -462,7 +442,6 @@ pub const Runtime = struct {
                                 transaction.transaction_id,
                                 session.domain,
                                 runtime_core.max_phase_bindings,
-                                request.generation + 1,
                             ) catch |err| {
                                 try generation.core.abortPhaseActivation(transaction.transaction_id);
                                 reportStructuralFailure(active, request, err, null);
@@ -529,7 +508,6 @@ pub const Runtime = struct {
                             transaction.transaction_id,
                             session.domain,
                             runtime_core.max_phase_bindings,
-                            request.generation + 1,
                         ) catch |err| {
                             candidate.deinit();
                             try generation.core.abortPhaseActivation(transaction.transaction_id);
@@ -646,8 +624,6 @@ const DirectHostContext = struct {
     generation: *scene_generation_api.SceneGeneration,
     world_epoch: u64,
     domain: runtime_core.PhaseDomain,
-    post_generation: u32 = 0,
-    structural_generation: u32 = 0,
     origin: StructuralOrigin = .{},
 };
 
@@ -662,7 +638,6 @@ const ActivationHostContext = struct {
     present: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
     destroyed: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
     handle_count: usize = 0,
-    successor_generation: u32,
     origin: StructuralOrigin = .{},
 
     fn init(
@@ -671,7 +646,6 @@ const ActivationHostContext = struct {
         transaction_id: u64,
         domain: runtime_core.PhaseDomain,
         active_binding_capacity: usize,
-        successor_generation: u32,
     ) !ActivationHostContext {
         var context = ActivationHostContext{
             .generation = generation,
@@ -679,7 +653,6 @@ const ActivationHostContext = struct {
             .transaction_id = transaction_id,
             .domain = domain,
             .active_binding_capacity = active_binding_capacity,
-            .successor_generation = successor_generation,
         };
         var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
         for (try generation.visibleHandles(&handles)) |handle| {
@@ -802,7 +775,6 @@ fn directSpawnObject(
     const request = phaseSpawnRequest(
         context.generation,
         context.domain,
-        context.structural_generation,
         context.origin,
         prototype_index,
         prototype,
@@ -822,7 +794,7 @@ fn directDestroyObject(
     const context: *DirectHostContext = @ptrCast(@alignCast(userdata orelse return 0));
     const slot = validateRuntimeObjectHandle(context.generation, context.world_epoch, object) orelse return 0;
     const handle = context.generation.runtimeHandleAt(slot) orelse return 0;
-    const request = phaseDestroyRequest(context.generation, context.domain, context.structural_generation, context.origin, handle) orelse return 0;
+    const request = phaseDestroyRequest(context.generation, context.domain, context.origin, handle) orelse return 0;
     var acceptance = std.mem.zeroes(runtime_core.PhaseCompletion);
     acceptance.struct_size = @sizeOf(runtime_core.PhaseCompletion);
     var acceptances = [_]runtime_core.PhaseCompletion{acceptance};
@@ -848,7 +820,6 @@ fn activationSpawnObject(
     const request = phaseSpawnRequest(
         context.generation,
         context.domain,
-        context.successor_generation,
         context.origin,
         prototype_index,
         prototype,
@@ -880,7 +851,6 @@ fn activationDestroyObject(
     const request = phaseDestroyRequest(
         context.generation,
         context.domain,
-        context.successor_generation,
         context.origin,
         context.handles[slot],
     ) orelse return 0;
@@ -957,7 +927,7 @@ fn activationPostEvent(userdata: ?*anyopaque, event: ?*const behavior_runtime.Na
             if (field.value.kind == runtime_core.phase_event_object and context.indexOf(&field.value.object_value) == null) return 0;
         }
     }
-    var phase_event = phaseEventFromPosted(posted, context.domain, context.successor_generation) orelse return 0;
+    var phase_event = phaseEventFromPosted(posted, context.domain) orelse return 0;
     var batch = std.mem.zeroes(runtime_core.PhaseActivationBatch);
     batch.events = &phase_event;
     batch.event_count = 1;
@@ -1059,7 +1029,7 @@ fn overlayPostEvent(userdata: ?*anyopaque, event: ?*const behavior_runtime.Nativ
             if (field.value.kind == runtime_core.phase_event_object and validateOverlayObjectHandle(context, &field.value.object_value) == null) return 0;
         }
     }
-    context.events[context.event_count] = phaseEventFromPosted(posted, .frame, 0) orelse return 0;
+    context.events[context.event_count] = phaseEventFromPosted(posted, .frame) orelse return 0;
     context.event_count += 1;
     return 1;
 }
@@ -1077,7 +1047,7 @@ fn directPostEvent(userdata: ?*anyopaque, event: ?*const behavior_runtime.Native
     const context: *DirectHostContext = @ptrCast(@alignCast(userdata orelse return 0));
     const posted = event orelse return 0;
     if (!validRuntimePostedEventObjects(context.generation, context.world_epoch, posted)) return 0;
-    const phase_event = phaseEventFromPosted(posted, context.domain, context.post_generation) orelse return 0;
+    const phase_event = phaseEventFromPosted(posted, context.domain) orelse return 0;
     _ = context.generation.core.submitPhaseEvents(&.{phase_event}) catch return 0;
     return 1;
 }
@@ -1116,14 +1086,12 @@ fn nativeMatchesObjectRef(value: *const behavior_runtime.NativeObjectHandle, obj
 fn phaseEventFromPosted(
     posted: *const behavior_runtime.NativePostedEvent,
     domain: runtime_core.PhaseDomain,
-    generation: u32,
 ) ?runtime_core.PhaseEvent {
     if (posted.name == null or posted.name_length == 0 or posted.name_length > 63 or
         posted.field_count > 8 or (posted.field_count > 0 and posted.fields == null)) return null;
     var event = std.mem.zeroes(runtime_core.PhaseEvent);
     event.struct_size = @sizeOf(runtime_core.PhaseEvent);
     event.domain = @intFromEnum(domain);
-    event.generation = generation;
     event.has_sender = 1;
     event.target = objectRefFromNative(&posted.target) orelse return null;
     event.sender = objectRefFromNative(&posted.sender) orelse return null;
@@ -1159,7 +1127,6 @@ fn phaseEventFromPosted(
 fn phaseSpawnRequest(
     generation: *scene_generation_api.SceneGeneration,
     domain: runtime_core.PhaseDomain,
-    successor_generation: u32,
     origin: StructuralOrigin,
     prototype_index: usize,
     prototype: *const scene_api.SpawnPrototype,
@@ -1170,7 +1137,6 @@ fn phaseSpawnRequest(
     request.struct_size = @sizeOf(runtime_core.PhaseStructural);
     request.operation = runtime_core.phase_operation_reserve_transient;
     request.domain = @intFromEnum(domain);
-    request.generation = successor_generation;
     request.behavior_count = prototype.behaviors.count;
     request.prototype_key = @intCast(prototype_index);
     request.script_id = origin.script_id;
@@ -1186,7 +1152,6 @@ fn phaseSpawnRequest(
 fn phaseDestroyRequest(
     generation: *scene_generation_api.SceneGeneration,
     domain: runtime_core.PhaseDomain,
-    successor_generation: u32,
     origin: StructuralOrigin,
     object_ref: runtime_core.ObjectRef,
 ) ?runtime_core.PhaseStructural {
@@ -1195,7 +1160,6 @@ fn phaseDestroyRequest(
     request.struct_size = @sizeOf(runtime_core.PhaseStructural);
     request.operation = runtime_core.phase_operation_request_destroy;
     request.domain = @intFromEnum(domain);
-    request.generation = successor_generation;
     request.script_id = origin.script_id;
     request.object_ref = object_ref;
     request.origin = generation.runtimeHandle(origin.object_id.slice()) orelse return null;
