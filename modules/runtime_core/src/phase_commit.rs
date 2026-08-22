@@ -39,6 +39,7 @@ struct Flush {
 #[derive(Clone)]
 struct Activation {
     transaction_id: u64,
+    domain: u32,
     root_sequence: u64,
     positions: Vec<abi::kadath_runtime_position_patch_v1_t>,
     events: Vec<abi::kadath_runtime_phase_event_v1_t>,
@@ -52,11 +53,9 @@ struct Candidate {
     bindings: Vec<Binding>,
 }
 
-pub(crate) struct PhaseState {
-    candidate: Option<Candidate>,
-    active_bindings: Vec<Binding>,
-    admission_used: u32,
-    active_phase: Option<(u32, u64)>,
+#[derive(Clone)]
+struct DomainState {
+    phase_sequence: Option<u64>,
     event_queue: Vec<EventEntry>,
     structural_queue: Vec<StructuralEntry>,
     event_successor_generation: u32,
@@ -65,9 +64,32 @@ pub(crate) struct PhaseState {
     structural_has_drained: bool,
     next_event_sequence: u64,
     next_structural_sequence: u64,
+}
+
+impl DomainState {
+    fn new() -> Self {
+        Self {
+            phase_sequence: None,
+            event_queue: Vec::with_capacity(EVENT_CAPACITY),
+            structural_queue: Vec::with_capacity(STRUCTURAL_CAPACITY),
+            event_successor_generation: 0,
+            structural_successor_generation: 0,
+            event_has_drained: false,
+            structural_has_drained: false,
+            next_event_sequence: 1,
+            next_structural_sequence: 1,
+        }
+    }
+}
+
+pub(crate) struct PhaseState {
+    candidate: Option<Candidate>,
+    active_bindings: Vec<Binding>,
+    admission_used: u32,
+    domains: [DomainState; 2],
     next_flush_token: u64,
     next_transaction_id: u64,
-    flush: Option<Flush>,
+    flush: [Option<Flush>; 2],
     activation: Option<Activation>,
 }
 
@@ -77,25 +99,29 @@ impl PhaseState {
             candidate: None,
             active_bindings: Vec::with_capacity(MAX_BINDINGS as usize),
             admission_used: 0,
-            active_phase: None,
-            event_queue: Vec::with_capacity(EVENT_CAPACITY),
-            structural_queue: Vec::with_capacity(STRUCTURAL_CAPACITY),
-            event_successor_generation: 0,
-            structural_successor_generation: 0,
-            event_has_drained: false,
-            structural_has_drained: false,
-            next_event_sequence: 1,
-            next_structural_sequence: 1,
+            domains: std::array::from_fn(|_| DomainState::new()),
             next_flush_token: 1,
             next_transaction_id: 1,
-            flush: None,
+            flush: [None, None],
             activation: None,
         }
     }
 
-    fn active_domain(&self) -> Result<(u32, u64), u32> {
-        self.active_phase
-            .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED)
+    fn domain_index(domain: u32) -> Result<usize, u32> {
+        match domain {
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED => Ok(0),
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME => Ok(1),
+            _ => Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_DOMAIN),
+        }
+    }
+
+    fn domain(&self, domain: u32) -> Result<&DomainState, u32> {
+        Ok(&self.domains[Self::domain_index(domain)?])
+    }
+
+    fn domain_mut(&mut self, domain: u32) -> Result<&mut DomainState, u32> {
+        let index = Self::domain_index(domain)?;
+        Ok(&mut self.domains[index])
     }
 
     fn next_sequence(value: &mut u64) -> Result<u64, u32> {
@@ -123,7 +149,7 @@ impl PhaseState {
     }
 
     fn check_phase(&self, domain: u32, phase_sequence: u64) -> Result<(), u32> {
-        if self.active_phase == Some((domain, phase_sequence)) {
+        if self.domain(domain)?.phase_sequence == Some(phase_sequence) {
             Ok(())
         } else {
             Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)
@@ -594,8 +620,12 @@ pub(crate) fn prepare_phase_state(
 }
 
 pub(crate) fn commit_phase_state(core: &mut RuntimeCore) -> Result<(), u32> {
-    if core.phase.active_phase.is_some()
-        || core.phase.flush.is_some()
+    if core
+        .phase
+        .domains
+        .iter()
+        .any(|domain| domain.phase_sequence.is_some())
+        || core.phase.flush.iter().any(Option::is_some)
         || core.phase.activation.is_some()
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
@@ -656,19 +686,17 @@ pub(crate) fn begin_phase(
     if core.live.is_none() {
         return Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE);
     }
-    if core.phase.active_phase.is_some()
-        || core.phase.flush.is_some()
-        || core.phase.activation.is_some()
-    {
+    let domain = core.phase.domain_mut(desc.domain)?;
+    if domain.phase_sequence.is_some() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
     }
-    core.phase.active_phase = Some((desc.domain, desc.phase_sequence));
-    core.phase.event_queue.clear();
-    core.phase.structural_queue.clear();
-    core.phase.event_successor_generation = 0;
-    core.phase.structural_successor_generation = 0;
-    core.phase.event_has_drained = false;
-    core.phase.structural_has_drained = false;
+    domain.phase_sequence = Some(desc.phase_sequence);
+    domain.event_queue.clear();
+    domain.structural_queue.clear();
+    domain.event_successor_generation = 0;
+    domain.structural_successor_generation = 0;
+    domain.event_has_drained = false;
+    domain.structural_has_drained = false;
     let result = abi::kadath_runtime_phase_begin_result_v1_t {
         struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32,
         domain: desc.domain,
@@ -686,7 +714,6 @@ pub(crate) fn submit_events(
     item_stride: usize,
     out_ptr: *mut abi::kadath_runtime_phase_batch_result_v1_t,
 ) -> Result<(), u32> {
-    let (domain, _phase_sequence) = core.phase.active_domain()?;
     if events_ptr.is_null() || out_ptr.is_null() || item_count == 0 || item_count > EVENT_CAPACITY {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
@@ -721,7 +748,12 @@ pub(crate) fn submit_events(
     if ranges_overlap(input_range, output_range) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    if core.phase.event_queue.len() + item_count > EVENT_CAPACITY {
+    let domain = unsafe { (*events_ptr).domain };
+    let domain_state = core.phase.domain(domain)?;
+    if domain_state.phase_sequence.is_none() {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED);
+    }
+    if domain_state.event_queue.len() + item_count > EVENT_CAPACITY {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }
     let state = core
@@ -732,7 +764,7 @@ pub(crate) fn submit_events(
     parsed
         .try_reserve_exact(item_count)
         .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
-    let mut sequence = core.phase.next_event_sequence;
+    let mut sequence = domain_state.next_event_sequence;
     for index in 0..item_count {
         let pointer = unsafe {
             events_ptr
@@ -745,8 +777,8 @@ pub(crate) fn submit_events(
             event,
             state,
             domain,
-            core.phase.event_successor_generation,
-            core.phase.event_has_drained,
+            domain_state.event_successor_generation,
+            domain_state.event_has_drained,
         )?;
         sequence = sequence
             .checked_add(1)
@@ -761,8 +793,9 @@ pub(crate) fn submit_events(
         parsed[0].item.sequence,
         parsed[item_count - 1].item.sequence,
     );
-    core.phase.next_event_sequence = sequence;
-    core.phase.event_queue.extend(parsed);
+    let domain_state = core.phase.domain_mut(domain)?;
+    domain_state.next_event_sequence = sequence;
+    domain_state.event_queue.extend(parsed);
     unsafe { ptr::write(out_ptr, result) };
     Ok(())
 }
@@ -775,7 +808,6 @@ pub(crate) fn drain_events(
     output_capacity: usize,
     out_count: *mut usize,
 ) -> Result<(), u32> {
-    let (active_domain, active_sequence) = core.phase.active_domain()?;
     if output_ptr.is_null()
         || out_count.is_null()
         || (out_count as usize) % mem::align_of::<usize>() != 0
@@ -783,17 +815,14 @@ pub(crate) fn drain_events(
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     core.phase.check_phase(domain, phase_sequence)?;
-    if domain != active_domain || phase_sequence != active_sequence {
-        return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
-    }
+    let domain_state = core.phase.domain(domain)?;
     if output_capacity == 0 {
         return Err(abi::KADATH_ERR_BUFFER_TOO_SMALL);
     }
     if (output_ptr as usize) % mem::align_of::<abi::kadath_runtime_phase_event_v1_t>() != 0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    let generation = core
-        .phase
+    let generation = domain_state
         .event_queue
         .iter()
         .map(|entry| entry.item.generation)
@@ -802,8 +831,7 @@ pub(crate) fn drain_events(
         unsafe { ptr::write(out_count, 0) };
         return Ok(());
     };
-    let count = core
-        .phase
+    let count = domain_state
         .event_queue
         .iter()
         .filter(|entry| entry.item.generation == generation)
@@ -829,8 +857,7 @@ pub(crate) fn drain_events(
         .as_ref()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
     let mut output_index = 0;
-    for entry in core
-        .phase
+    for entry in domain_state
         .event_queue
         .iter()
         .filter(|entry| entry.item.generation == generation)
@@ -840,11 +867,12 @@ pub(crate) fn drain_events(
             output_index += 1;
         }
     }
-    core.phase
+    let domain_state = core.phase.domain_mut(domain)?;
+    domain_state
         .event_queue
         .retain(|entry| entry.item.generation != generation);
-    core.phase.event_has_drained = true;
-    core.phase.event_successor_generation = generation.saturating_add(1);
+    domain_state.event_has_drained = true;
+    domain_state.event_successor_generation = generation.saturating_add(1);
     unsafe { ptr::write(out_count, output_index) };
     Ok(())
 }
@@ -858,7 +886,6 @@ pub(crate) fn submit_structural(
     acceptance_capacity: usize,
     out_ptr: *mut abi::kadath_runtime_phase_batch_result_v1_t,
 ) -> Result<(), u32> {
-    let (domain, _phase_sequence) = core.phase.active_domain()?;
     if items_ptr.is_null()
         || acceptance_ptr.is_null()
         || out_ptr.is_null()
@@ -914,8 +941,14 @@ pub(crate) fn submit_structural(
     {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    if core.phase.structural_queue.len() + item_count > STRUCTURAL_CAPACITY
-        || core.phase.flush.is_some()
+    let domain = unsafe { (*items_ptr).domain };
+    let domain_index = PhaseState::domain_index(domain)?;
+    let domain_state = core.phase.domain(domain)?;
+    if domain_state.phase_sequence.is_none() {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED);
+    }
+    if domain_state.structural_queue.len() + item_count > STRUCTURAL_CAPACITY
+        || core.phase.flush[domain_index].is_some()
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }
@@ -929,7 +962,7 @@ pub(crate) fn submit_structural(
     let mut staged_used = core.phase.admission_used;
     let mut staged_queue = Vec::new();
     let mut completions = Vec::new();
-    let mut next_sequence = core.phase.next_structural_sequence;
+    let mut next_sequence = domain_state.next_structural_sequence;
     for index in 0..item_count {
         let pointer = unsafe {
             items_ptr
@@ -942,8 +975,8 @@ pub(crate) fn submit_structural(
             item,
             &staged_state,
             domain,
-            core.phase.structural_successor_generation,
-            core.phase.structural_has_drained,
+            domain_state.structural_successor_generation,
+            domain_state.structural_has_drained,
         )?;
         let mut copied = *item;
         copied.sequence = PhaseState::next_sequence(&mut next_sequence)?;
@@ -1024,8 +1057,9 @@ pub(crate) fn submit_structural(
     core.live = Some(staged_state);
     core.phase.active_bindings = staged_bindings;
     core.phase.admission_used = staged_used;
-    core.phase.next_structural_sequence = next_sequence;
-    core.phase.structural_queue.extend(staged_queue);
+    let domain_state = core.phase.domain_mut(domain)?;
+    domain_state.next_structural_sequence = next_sequence;
+    domain_state.structural_queue.extend(staged_queue);
     for (index, completion) in completions.into_iter().enumerate() {
         unsafe { ptr::write(acceptance_ptr.add(index), completion) };
     }
@@ -1043,6 +1077,7 @@ pub(crate) fn take_structural(
     out_count: *mut usize,
 ) -> Result<(), u32> {
     core.phase.check_phase(domain, phase_sequence)?;
+    let domain_index = PhaseState::domain_index(domain)?;
     if flush_ptr.is_null() || output_ptr.is_null() || out_count.is_null() || output_capacity == 0 {
         return Err(if output_capacity == 0 {
             abi::KADATH_ERR_BUFFER_TOO_SMALL
@@ -1071,11 +1106,11 @@ pub(crate) fn take_structural(
     if ranges_overlap(flush_range, output_range) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    if core.phase.flush.is_some() || core.phase.activation.is_some() {
+    if core.phase.flush[domain_index].is_some() || core.phase.activation.is_some() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
     }
-    let generation = core
-        .phase
+    let domain_state = core.phase.domain(domain)?;
+    let generation = domain_state
         .structural_queue
         .iter()
         .map(|entry| entry.item.generation)
@@ -1084,8 +1119,7 @@ pub(crate) fn take_structural(
         unsafe { ptr::write(out_count, 0) };
         return Ok(());
     };
-    let count = core
-        .phase
+    let count = domain_state
         .structural_queue
         .iter()
         .filter(|entry| entry.item.generation == generation)
@@ -1116,17 +1150,19 @@ pub(crate) fn take_structural(
         .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
     let mut remaining = Vec::new();
     remaining
-        .try_reserve_exact(core.phase.structural_queue.len() - count)
+        .try_reserve_exact(domain_state.structural_queue.len() - count)
         .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
-    for entry in core.phase.structural_queue.drain(..) {
+    let domain_state = core.phase.domain_mut(domain)?;
+    for entry in domain_state.structural_queue.drain(..) {
         if entry.item.generation == generation {
             entries.push(entry);
         } else {
             remaining.push(entry);
         }
     }
-    core.phase.structural_queue = remaining;
-    core.phase.next_flush_token = next_token;
+    domain_state.structural_queue = remaining;
+    domain_state.structural_has_drained = true;
+    domain_state.structural_successor_generation = generation.saturating_add(1);
     for (index, entry) in entries.iter().enumerate() {
         unsafe { ptr::write(output_ptr.add(index), entry.item) };
     }
@@ -1138,14 +1174,13 @@ pub(crate) fn take_structural(
         request_count: entries.len(),
         reserved: [0; 4],
     };
-    core.phase.flush = Some(Flush {
+    core.phase.next_flush_token = next_token;
+    core.phase.flush[domain_index] = Some(Flush {
         token,
         domain,
         phase_sequence,
         entries,
     });
-    core.phase.structural_has_drained = true;
-    core.phase.structural_successor_generation = generation.saturating_add(1);
     unsafe {
         ptr::write(flush_ptr, info);
         ptr::write(out_count, count);
@@ -1159,22 +1194,21 @@ pub(crate) fn end_phase(
     phase_sequence: u64,
 ) -> Result<(), u32> {
     core.phase.check_phase(domain, phase_sequence)?;
-    if core.phase.flush.is_some()
+    let domain_state = core.phase.domain(domain)?;
+    if core.phase.flush[PhaseState::domain_index(domain)?].is_some()
         || core.phase.activation.is_some()
-        || core
-            .phase
+        || domain_state
             .event_queue
             .iter()
             .any(|entry| entry.item.domain == domain)
-        || core
-            .phase
+        || domain_state
             .structural_queue
             .iter()
             .any(|entry| entry.item.domain == domain)
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_NOT_DRAINED);
     }
-    core.phase.active_phase = None;
+    core.phase.domain_mut(domain)?.phase_sequence = None;
     Ok(())
 }
 
@@ -1188,9 +1222,17 @@ pub(crate) fn begin_activation(
     if core.phase.activation.is_some() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_TRANSACTION_BUSY);
     }
-    let flush = core
+    let flush_index = core
         .phase
         .flush
+        .iter()
+        .position(|flush| {
+            flush
+                .as_ref()
+                .is_some_and(|value| value.token == flush_token)
+        })
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
+    let flush = core.phase.flush[flush_index]
         .as_ref()
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     core.phase.check_phase(flush.domain, flush.phase_sequence)?;
@@ -1221,6 +1263,7 @@ pub(crate) fn begin_activation(
     let transaction_id = PhaseState::next_sequence(&mut core.phase.next_transaction_id)?;
     core.phase.activation = Some(Activation {
         transaction_id,
+        domain: flush.domain,
         root_sequence,
         positions: Vec::new(),
         events: Vec::new(),
@@ -1272,7 +1315,8 @@ pub(crate) fn submit_activation(
         .live
         .as_ref()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let (domain, _) = core.phase.active_domain()?;
+    let domain = active.domain;
+    let domain_state = core.phase.domain(domain)?;
 
     if batch.position_count > abi::KADATH_RUNTIME_MAX_OBJECTS as usize
         || batch.event_count > EVENT_CAPACITY
@@ -1401,8 +1445,8 @@ pub(crate) fn submit_activation(
                 value,
                 state,
                 domain,
-                core.phase.event_successor_generation,
-                core.phase.event_has_drained,
+                domain_state.event_successor_generation,
+                domain_state.event_has_drained,
             )?;
             events.push(*value);
         }
@@ -1445,14 +1489,14 @@ pub(crate) fn submit_activation(
                 value,
                 state,
                 domain,
-                core.phase.structural_successor_generation,
-                core.phase.structural_has_drained,
+                domain_state.structural_successor_generation,
+                domain_state.structural_has_drained,
             )?;
             structural.push(*value);
         }
     }
-    if core.phase.event_queue.len() + events.len() > EVENT_CAPACITY
-        || core.phase.structural_queue.len() + structural.len() > STRUCTURAL_CAPACITY
+    if domain_state.event_queue.len() + events.len() > EVENT_CAPACITY
+        || domain_state.structural_queue.len() + structural.len() > STRUCTURAL_CAPACITY
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }
@@ -1481,9 +1525,9 @@ pub(crate) fn commit_activation(
     if activation.transaction_id != transaction_id {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
     }
-    let flush = core
-        .phase
-        .flush
+    let domain = activation.domain;
+    let domain_index = PhaseState::domain_index(domain)?;
+    let flush = core.phase.flush[domain_index]
         .clone()
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     let root_index = flush
@@ -1499,8 +1543,9 @@ pub(crate) fn commit_activation(
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
     let mut bindings = core.phase.active_bindings.clone();
     let mut used = core.phase.admission_used;
-    let mut event_queue = core.phase.event_queue.clone();
-    let mut structural_queue = core.phase.structural_queue.clone();
+    let domain_state = core.phase.domain(domain)?;
+    let mut event_queue = domain_state.event_queue.clone();
+    let mut structural_queue = domain_state.structural_queue.clone();
     if event_queue.len() + activation.events.len() > EVENT_CAPACITY
         || structural_queue.len() + activation.structural.len() > STRUCTURAL_CAPACITY
     {
@@ -1510,7 +1555,7 @@ pub(crate) fn commit_activation(
     if root_cancelled {
         let mut entries = flush.entries;
         entries[root_index].completed = true;
-        core.phase.flush = if entries.iter().all(|entry| entry.completed) {
+        core.phase.flush[domain_index] = if entries.iter().all(|entry| entry.completed) {
             None
         } else {
             Some(Flush { entries, ..flush })
@@ -1538,24 +1583,27 @@ pub(crate) fn commit_activation(
             .set_position(read_object_key(&patch.object_ref)?, patch.position)
             .map_err(authority_error)?;
     }
-    let successor_event_generation = core.phase.event_successor_generation;
-    let successor_structural_generation = core.phase.structural_successor_generation;
+    let successor_event_generation = domain_state.event_successor_generation;
+    let successor_structural_generation = domain_state.structural_successor_generation;
     if successor_event_generation > MAX_GENERATION
         || successor_structural_generation > MAX_GENERATION
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_GENERATION_EXHAUSTED);
     }
-    let mut next_event_sequence = core.phase.next_event_sequence;
+    let mut next_event_sequence = domain_state.next_event_sequence;
     for _ in 0..activation.events.len() {
         PhaseState::next_sequence(&mut next_event_sequence)?;
     }
-    let mut next_structural_sequence = core.phase.next_structural_sequence;
+    let mut next_structural_sequence = domain_state.next_structural_sequence;
     for _ in 0..activation.structural.len() {
         PhaseState::next_sequence(&mut next_structural_sequence)?;
     }
     // Sequence reservations are monotonic even when a later state operation fails.
-    core.phase.next_event_sequence = next_event_sequence;
-    core.phase.next_structural_sequence = next_structural_sequence;
+    {
+        let domain_state = core.phase.domain_mut(domain)?;
+        domain_state.next_event_sequence = next_event_sequence;
+        domain_state.next_structural_sequence = next_structural_sequence;
+    }
     let accepted_event_count = activation.events.len() as u32;
     let first_event_sequence = next_event_sequence - activation.events.len() as u64;
     for (offset, input) in activation.events.into_iter().enumerate() {
@@ -1651,9 +1699,12 @@ pub(crate) fn commit_activation(
     core.live = Some(state);
     core.phase.active_bindings = bindings;
     core.phase.admission_used = used;
-    core.phase.event_queue = event_queue;
-    core.phase.structural_queue = structural_queue;
-    core.phase.flush = flush;
+    {
+        let domain_state = core.phase.domain_mut(domain)?;
+        domain_state.event_queue = event_queue;
+        domain_state.structural_queue = structural_queue;
+    }
+    core.phase.flush[domain_index] = flush;
     core.phase.activation = None;
     core.next_entity_value = next_entity;
     let result = abi::kadath_runtime_phase_activation_result_v1_t {
@@ -1679,13 +1730,12 @@ pub(crate) fn abort_activation(core: &mut RuntimeCore, transaction_id: u64) -> R
     if activation.transaction_id != transaction_id {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
     }
+    let domain_index = PhaseState::domain_index(activation.domain)?;
     let mut state = core
         .live
         .clone()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let flush = core
-        .phase
-        .flush
+    let flush = core.phase.flush[domain_index]
         .clone()
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     let root = flush
@@ -1707,7 +1757,7 @@ pub(crate) fn abort_activation(core: &mut RuntimeCore, transaction_id: u64) -> R
     core.live = Some(state);
     core.phase.active_bindings = bindings;
     core.phase.admission_used = used;
-    core.phase.flush = if entries.iter().all(|entry| entry.completed) {
+    core.phase.flush[domain_index] = if entries.iter().all(|entry| entry.completed) {
         None
     } else {
         Some(Flush { entries, ..flush })
@@ -1729,9 +1779,17 @@ pub(crate) fn complete_structural(
     if core.phase.activation.is_some() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_TRANSACTION_BUSY);
     }
-    let flush = core
+    let flush_index = core
         .phase
         .flush
+        .iter()
+        .position(|flush| {
+            flush
+                .as_ref()
+                .is_some_and(|value| value.token == flush_token)
+        })
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
+    let flush = core.phase.flush[flush_index]
         .clone()
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     if flush.token != flush_token {
@@ -1817,7 +1875,7 @@ pub(crate) fn complete_structural(
     core.live = Some(state);
     core.phase.active_bindings = bindings;
     core.phase.admission_used = used;
-    core.phase.flush = if entries.iter().all(|entry| entry.completed) {
+    core.phase.flush[flush_index] = if entries.iter().all(|entry| entry.completed) {
         None
     } else {
         Some(Flush { entries, ..flush })
@@ -1829,14 +1887,19 @@ pub(crate) fn abort_structural(core: &mut RuntimeCore, flush_token: u64) -> Resu
     if core.phase.activation.is_some() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_TRANSACTION_BUSY);
     }
-    let flush = core
+    let flush_index = core
         .phase
         .flush
+        .iter()
+        .position(|flush| {
+            flush
+                .as_ref()
+                .is_some_and(|value| value.token == flush_token)
+        })
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
+    let flush = core.phase.flush[flush_index]
         .clone()
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
-    if flush.token != flush_token {
-        return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
-    }
     let mut state = core
         .live
         .clone()
@@ -1865,7 +1928,7 @@ pub(crate) fn abort_structural(core: &mut RuntimeCore, flush_token: u64) -> Resu
     core.live = Some(state);
     core.phase.active_bindings = bindings;
     core.phase.admission_used = used;
-    core.phase.flush = None;
+    core.phase.flush[flush_index] = None;
     Ok(())
 }
 

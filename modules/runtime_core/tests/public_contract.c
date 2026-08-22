@@ -974,6 +974,26 @@ static int phase_commit_path(
         return 153;
     }
 
+    /* Fixed and frame domains may be active independently; their queues and sequences are isolated. */
+    begin.domain = KADATH_RUNTIME_PHASE_DOMAIN_FRAME;
+    begin.phase_sequence = 1U;
+    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK) return 154;
+    memset(&event, 0, sizeof(event));
+    memset(&event_batch, 0, sizeof(event_batch));
+    event.struct_size = (uint32_t)sizeof(event);
+    event.domain = KADATH_RUNTIME_PHASE_DOMAIN_FRAME;
+    event.target = player;
+    event.name_length = 5U;
+    memcpy(event.name, "frame", 5U);
+    event_batch.struct_size = (uint32_t)sizeof(event_batch);
+    if (phase_interface->submit_events(core, &event, 1U, sizeof(event), &event_batch) != KADATH_OK) return 155;
+    memset(&drained, 0, sizeof(drained));
+    drained.struct_size = (uint32_t)sizeof(drained);
+    drained_count = 0U;
+    if (phase_interface->drain_events(core, KADATH_RUNTIME_PHASE_DOMAIN_FRAME, 1U, &drained, 1U, &drained_count) != KADATH_OK ||
+        drained_count != 1U || drained.domain != KADATH_RUNTIME_PHASE_DOMAIN_FRAME) return 156;
+    if (phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FRAME, 1U) != KADATH_OK) return 157;
+
     kadath_runtime_phase_structural_v1_t structural;
     kadath_runtime_phase_request_completion_v1_t acceptance;
     kadath_runtime_phase_batch_result_v1_t structural_batch;
@@ -992,6 +1012,7 @@ static int phase_commit_path(
     structural.transient_sprite.size[1] = 4.0F;
     structural.transient_sprite.color[3] = 1.0F;
     structural.transient_sprite.texture_id = 1U;
+    structural.transient_sprite.move_speed = 3.5F;
     acceptance.struct_size = (uint32_t)sizeof(acceptance);
     structural_batch.struct_size = (uint32_t)sizeof(structural_batch);
     if (phase_interface->submit_structural(core, &structural, 1U, sizeof(structural), &acceptance, 1U, &structural_batch) != KADATH_OK ||
