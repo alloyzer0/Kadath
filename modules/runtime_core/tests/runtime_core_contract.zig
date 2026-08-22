@@ -242,3 +242,65 @@ test "Runtime Core Phase bounded command replay is reproducible across seeds" {
         try core.endPhase(.fixed, phase_sequence);
     }
 }
+
+test "Runtime Core Phase admission overflow preserves structural state" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    const sources = [_]runtime_core.SourceDesc{
+        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
+    };
+    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
+    try core.commitScene();
+    const player = (try core.findById(.live, "player")).?.object_ref;
+
+    var over_capacity: [runtime_core.max_phase_bindings / 4 + 1]runtime_core.PhaseBinding = undefined;
+    for (&over_capacity) |*binding| {
+        binding.* = std.mem.zeroes(runtime_core.PhaseBinding);
+        binding.struct_size = @sizeOf(runtime_core.PhaseBinding);
+        binding.object_ref = player;
+        binding.behavior_count = 4;
+    }
+    try std.testing.expectError(
+        error.RuntimePhaseAdmissionCapacity,
+        core.preparePhaseState(.live, over_capacity[0..]),
+    );
+
+    var bindings: [runtime_core.max_phase_bindings / 4]runtime_core.PhaseBinding = undefined;
+    for (&bindings) |*binding| {
+        binding.* = std.mem.zeroes(runtime_core.PhaseBinding);
+        binding.struct_size = @sizeOf(runtime_core.PhaseBinding);
+        binding.object_ref = player;
+        binding.behavior_count = 4;
+    }
+    const candidate = try core.preparePhaseState(.live, bindings[0..]);
+    try std.testing.expectEqual(@as(u32, runtime_core.max_phase_bindings / 4), candidate.binding_count);
+    try core.commitPhaseState();
+
+    const phase_sequence: u64 = 0x4144_4d49_5353_494f;
+    try core.beginPhase(.fixed, phase_sequence);
+    var structural = std.mem.zeroes(runtime_core.PhaseStructural);
+    structural.struct_size = @sizeOf(runtime_core.PhaseStructural);
+    structural.operation = runtime_core.phase_operation_reserve_transient;
+    structural.domain = 1;
+    structural.behavior_count = 1;
+    structural.prototype_key = 5;
+    structural.script_id = 19;
+    structural.origin = player;
+    structural.transient_sprite.struct_size = @sizeOf(@TypeOf(structural.transient_sprite));
+    structural.transient_sprite.size = .{ 4, 4 };
+    structural.transient_sprite.color[3] = 1;
+    structural.transient_sprite.texture_id = 1;
+    var completion = std.mem.zeroes(runtime_core.PhaseCompletion);
+    completion.struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    var structural_items = [_]runtime_core.PhaseStructural{structural};
+    var completions = [_]runtime_core.PhaseCompletion{completion};
+    try std.testing.expectError(
+        error.RuntimePhaseAdmissionCapacity,
+        core.submitPhaseStructural(structural_items[0..], completions[0..]),
+    );
+
+    var taken: [1]runtime_core.PhaseStructural = undefined;
+    const flush = try core.takePhaseStructural(.fixed, phase_sequence, taken[0..]);
+    try std.testing.expectEqual(@as(usize, 0), flush.count);
+    try core.endPhase(.fixed, phase_sequence);
+}
