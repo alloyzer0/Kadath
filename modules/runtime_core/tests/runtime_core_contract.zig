@@ -303,6 +303,23 @@ test "Runtime Core Phase admission overflow preserves structural state" {
     const flush = try core.takePhaseStructural(.fixed, phase_sequence, taken[0..]);
     try std.testing.expectEqual(@as(usize, 0), flush.count);
     try core.endPhase(.fixed, phase_sequence);
+
+    // A 255-binding state plus one accepted structural reservation must admit
+    // the exact 256th binding; only the 257th is overflow.
+    bindings[bindings.len - 1].behavior_count = 3;
+    const exact_candidate = try core.preparePhaseState(.live, bindings[0..]);
+    try std.testing.expectEqual(@as(u32, runtime_core.max_phase_bindings / 4), exact_candidate.binding_count);
+    try core.commitPhaseState();
+    try core.beginPhase(.fixed, phase_sequence + 1);
+    completion = std.mem.zeroes(runtime_core.PhaseCompletion);
+    completion.struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    completions[0] = completion;
+    const exact_batch = try core.submitPhaseStructural(structural_items[0..], completions[0..]);
+    try std.testing.expectEqual(@as(usize, 1), exact_batch.accepted_count);
+    const exact_flush = try core.takePhaseStructural(.fixed, phase_sequence + 1, taken[0..]);
+    try std.testing.expectEqual(@as(usize, 1), exact_flush.count);
+    try core.abortPhaseStructural(exact_flush.info.flush_token);
+    try core.endPhase(.fixed, phase_sequence + 1);
 }
 
 test "Runtime Core structural replay preserves bounded FIFO and successor generation" {

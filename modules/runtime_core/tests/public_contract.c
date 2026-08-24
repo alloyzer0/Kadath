@@ -1112,7 +1112,8 @@ static int phase_commit_path(
         nested_result.status != 0U || nested_result.sequence != 0U) {
         return 160;
     }
-    activation_batch.active_binding_capacity = KADATH_RUNTIME_PHASE_MAX_BINDINGS;
+    /* Root plus nested reservation requires exactly two caller slots. */
+    activation_batch.active_binding_capacity = 2U;
     if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_OK) {
         return 161;
     }
@@ -1338,7 +1339,34 @@ static int phase_commit_path(
     destroy_completion.struct_size = (uint32_t)sizeof(destroy_completion);
     destroy_completion.status = KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED;
     destroy_completion.sequence = nested_taken.sequence;
-    if (phase_interface->complete_structural(core, nested_flush.flush_token, &destroy_completion, 1U, 0U) != KADATH_OK ||
+    if (phase_interface->complete_structural(core, nested_flush.flush_token, &destroy_completion, 1U, 0U) != KADATH_OK) {
+        return 200;
+    }
+    /* ACCEPTED physically finalizes the hidden destroy and releases one of the
+     * 128 Object Authority slots; filling all 126 remaining slots must work. */
+    kadath_runtime_mutation_item_v1_t reserve_item;
+    kadath_runtime_mutation_result_t reserve_result;
+    memset(&reserve_item, 0, sizeof(reserve_item));
+    reserve_item.struct_size = (uint32_t)sizeof(reserve_item);
+    reserve_item.tag = KADATH_RUNTIME_MUTATION_RESERVE_TRANSIENT;
+    reserve_item.payload.transient.struct_size = (uint32_t)sizeof(reserve_item.payload.transient);
+    reserve_item.payload.transient.prototype_key = 47U;
+    reserve_item.payload.transient.kind = KADATH_RUNTIME_OBJECT_KIND_SPRITE;
+    reserve_item.payload.transient.sprite.struct_size = (uint32_t)sizeof(reserve_item.payload.transient.sprite);
+    reserve_item.payload.transient.sprite.size[0] = 1.0F;
+    reserve_item.payload.transient.sprite.size[1] = 1.0F;
+    reserve_item.payload.transient.sprite.color[3] = 1.0F;
+    reserve_item.payload.transient.sprite.texture_id = 1U;
+    for (size_t index = 0; index < KADATH_RUNTIME_MAX_OBJECTS - 2U; ++index) {
+        memset(&reserve_result, 0, sizeof(reserve_result));
+        reserve_result.struct_size = (uint32_t)sizeof(reserve_result);
+        if (mutate_one(object_interface, core, &reserve_item, &reserve_result) != KADATH_OK) {
+            return 236;
+        }
+    }
+    memset(&reserve_result, 0, sizeof(reserve_result));
+    reserve_result.struct_size = (uint32_t)sizeof(reserve_result);
+    if (mutate_one(object_interface, core, &reserve_item, &reserve_result) != KADATH_ERR_RUNTIME_OBJECT_CAPACITY ||
         phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 79U) != KADATH_OK ||
         object_interface->destroy(&core) != KADATH_OK || core != NULL) return 200;
     return 0;
