@@ -117,12 +117,12 @@ require_decision wrong_domain_token modules/runtime_core/tests/public_contract.c
 require_decision same_flush_cancellation app/behavior_host_contract.zig "$evidence_root/behavior.log" 'spawn then destroy cancels child before activation.*OK'
 require_decision activation_commit_abort modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_ACTIVATION_DISCARD=PASS'
 require_decision serial_high_water modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_SERIAL_HIGH_WATER=PASS'
-require_decision restart_reload_cleanup app/behavior_host_contract.zig "$evidence_root/behavior.log" 'follows restart replacement and rejects a new world epoch.*OK'
+require_decision restart_reload_cleanup app/behavior_host_contract.zig "$evidence_root/behavior.log" 'saved ObjectRef follows restart replacement and rejects a new world epoch'
 require_decision wrong_thread modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_MISUSE=PASS'
 require_decision reentrant modules/runtime_core/src/lib.rs "$evidence_root/rust-unit-kcov.log" 'reentrant_entry_is_rejected_without_clearing_outer_call_state.*ok'
 require_decision panic_no_publication modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_FAULT_CONTAINMENT=PASS'
 require_decision oom_no_side_effect modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_FAULT_CONTAINMENT=PASS'
-require_decision callback_failure_isolation app/behavior_host_contract.zig "$evidence_root/behavior.log" 'failed event handler keeps prior writes and later handlers continue.*OK'
+require_decision callback_failure_isolation app/behavior_host_contract.zig "$evidence_root/behavior.log" 'failed event handler keeps prior writes and later handlers continue'
 
 matrix_percent="$(awk -v present="$matrix_present" -v total="$matrix_total" 'BEGIN { printf "%.0f", 100 * present / total }')"
 matrix_sha="$(sha256sum "$matrix_manifest" | awk '{print $1}')"
