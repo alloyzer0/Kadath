@@ -140,6 +140,7 @@ struct EventEntry {
 #[derive(Clone, Copy)]
 struct StructuralEntry {
     item: abi::kadath_runtime_phase_structural_v1_t,
+    slot_hint: u8,
     completed: bool,
 }
 
@@ -326,6 +327,9 @@ impl PhaseState {
         bindings: &mut BoundedVec<Binding, { MAX_BINDINGS as usize }>,
         binding: Binding,
     ) -> Result<(), u32> {
+        if binding.behavior_count == 0 {
+            return Ok(());
+        }
         let next = used
             .checked_add(binding.behavior_count)
             .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_ADMISSION_CAPACITY)?;
@@ -1066,9 +1070,13 @@ pub(crate) fn drain_events(
         }
     }
     let domain_state = core.phase.domain_mut(domain)?;
-    domain_state
-        .event_queue
-        .retain(|entry| entry.item.generation != generation);
+    if count == domain_state.event_queue.len() {
+        domain_state.event_queue.clear();
+    } else {
+        domain_state
+            .event_queue
+            .retain(|entry| entry.item.generation != generation);
+    }
     domain_state.event_has_drained = true;
     domain_state.event_successor_generation = generation.saturating_add(1);
     unsafe { ptr::write(out_count, output_index) };
@@ -1180,6 +1188,7 @@ pub(crate) fn submit_structural(
         let mut copied = *item;
         copied.sequence = PhaseState::next_sequence(&mut next_sequence)?;
         copied.generation = generation;
+        let slot_hint;
         let mut disposition = abi::KADATH_RUNTIME_DESTROY_DISPOSITION_NONE;
         let mut view = unsafe { mem::zeroed::<abi::kadath_runtime_object_view_v1_t>() };
         match item.operation {
@@ -1187,13 +1196,18 @@ pub(crate) fn submit_structural(
                 let sprite = read_sprite(&item.transient_sprite)?;
                 read_object_key(&item.origin)
                     .map_err(|_| abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
-                let record = staged_state
-                    .reserve_transient(
+                let slot_index = staged_state
+                    .reserve_transient_slot(
                         item.prototype_key,
                         abi::KADATH_RUNTIME_OBJECT_KIND_SPRITE,
                         sprite,
                     )
-                    .map_err(authority_error)?
+                    .map_err(authority_error)?;
+                slot_hint = slot_index as u8;
+                let record = staged_state.slots[slot_index]
+                    .record
+                    .as_ref()
+                    .expect("reserved record exists")
                     .clone();
                 let object_key = object_authority::ObjectKey {
                     object_id: record.object_id,
@@ -1214,6 +1228,10 @@ pub(crate) fn submit_structural(
             }
             abi::KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY => {
                 let key = read_object_key(&item.object_ref)?;
+                slot_hint = staged_state
+                    .exact_index(key, true)
+                    .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?
+                    as u8;
                 let before = staged_state.visible_exact(key).cloned();
                 let result = staged_state.request_destroy(key).map_err(authority_error)?;
                 disposition = match result {
@@ -1245,6 +1263,7 @@ pub(crate) fn submit_structural(
         ))?;
         staged_queue.push(StructuralEntry {
             item: copied,
+            slot_hint,
             completed: false,
         })?;
     }
@@ -1947,6 +1966,10 @@ pub(crate) fn commit_activation(
     for item in activation.structural.iter().copied() {
         structural_queue.push(StructuralEntry {
             item,
+            slot_hint: read_object_key(&item.object_ref)
+                .ok()
+                .and_then(|key| state.exact_index(key, true))
+                .map_or(u8::MAX, |index| index as u8),
             completed: false,
         })?;
     }
@@ -2131,7 +2154,9 @@ pub(crate) fn complete_structural(
         if item.operation == abi::KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY
             && indexed.value.status == abi::KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED
         {
-            match state.finalize_destroy(key) {
+            match state
+                .finalize_destroy_index(flush.entries[indexed.entry_index].slot_hint as usize, key)
+            {
                 Ok(()) | Err(object_authority::AuthorityError::Stale) => {}
                 Err(other) => return Err(authority_error(other)),
             }
@@ -2167,33 +2192,70 @@ pub(crate) fn abort_structural(core: &mut RuntimeCore, flush_token: u64) -> Resu
                 .is_some_and(|value| value.token == flush_token)
         })
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
-    let flush = core.phase.flush[flush_index].ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
-    let mut state = core
+    let entries = core.phase.flush[flush_index]
+        .as_ref()
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?
+        .entries;
+    let state = core
         .live
-        .clone()
+        .as_ref()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
+    // Complete preflight before changing Object Authority or admission state.
+    for entry in &entries {
+        if entry.completed {
+            continue;
+        }
+        let key = read_object_key(&entry.item.object_ref)?;
+        let record = state
+            .exact_index_hint(entry.slot_hint as usize, key, true)
+            .and_then(|index| state.slots[index].record.as_ref());
+        match entry.item.operation {
+            abi::KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT => {
+                if record.is_some_and(|value| {
+                    value.source_index.is_some()
+                        || value.lifecycle != object_authority::Lifecycle::PendingSpawn
+                }) {
+                    return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_COMMIT);
+                }
+            }
+            abi::KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY => {
+                if record.is_some_and(|value| {
+                    value.source_index.is_some()
+                        || value.lifecycle != object_authority::Lifecycle::PendingDestroy
+                }) {
+                    return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_COMMIT);
+                }
+            }
+            _ => return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_REQUEST),
+        }
+    }
+    let state = core.live.as_mut().expect("live state passed preflight");
     let mut bindings = core.phase.active_bindings;
     let mut used = core.phase.admission_used;
-    for entry in &flush.entries {
+    for entry in &entries {
         if entry.completed {
             continue;
         }
         if entry.item.operation == abi::KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT {
             let key = read_object_key(&entry.item.object_ref)?;
-            if state.visible_exact(key).is_some() {
-                state.discard(key).map_err(authority_error)?;
+            if state
+                .exact_index_hint(entry.slot_hint as usize, key, false)
+                .is_some()
+            {
+                state
+                    .discard_index(entry.slot_hint as usize, key)
+                    .expect("reservation passed abort preflight");
             }
             PhaseState::admission_remove(&mut used, &mut bindings, key);
         } else if entry.item.operation == abi::KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY {
             let key = read_object_key(&entry.item.object_ref)?;
-            match state.finalize_destroy(key) {
+            match state.finalize_destroy_index(entry.slot_hint as usize, key) {
                 Ok(()) | Err(object_authority::AuthorityError::Stale) => {}
-                Err(other) => return Err(authority_error(other)),
+                Err(_) => unreachable!("destroy passed abort preflight"),
             }
             PhaseState::admission_remove(&mut used, &mut bindings, key);
         }
     }
-    core.live = Some(state);
     core.phase.active_bindings = bindings;
     core.phase.admission_used = used;
     core.phase.flush[flush_index] = None;

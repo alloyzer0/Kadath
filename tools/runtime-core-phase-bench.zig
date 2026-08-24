@@ -58,6 +58,11 @@ fn runDomain(
     target: runtime_core.ObjectRef,
     domain: runtime_core.PhaseDomain,
     samples: []u64,
+    event_submit_samples: []u64,
+    event_drain_samples: []u64,
+    structural_submit_samples: []u64,
+    structural_take_samples: []u64,
+    structural_abort_samples: []u64,
 ) !u64 {
     var events: [batch_size]runtime_core.PhaseEvent = undefined;
     for (&events, 0..) |*event, index| event.* = eventFor(target, domain, index);
@@ -85,13 +90,23 @@ fn runDomain(
         const phase_sequence = @as(u64, @intCast(index)) + 1;
         try core.beginPhase(domain, phase_sequence);
         const start = monotonicNs();
+        const event_submit_start = monotonicNs();
         _ = try core.submitPhaseEvents(events[0..]);
+        event_submit_samples[index] = monotonicNs() - event_submit_start;
+        const structural_submit_start = monotonicNs();
         _ = try core.submitPhaseStructural(structural[0..], completions[0..]);
+        structural_submit_samples[index] = monotonicNs() - structural_submit_start;
+        const event_drain_start = monotonicNs();
         const count = try core.drainPhaseEvents(domain, phase_sequence, drained[0..]);
+        event_drain_samples[index] = monotonicNs() - event_drain_start;
         if (count != batch_size) return error.InvalidBenchmarkBatch;
+        const structural_take_start = monotonicNs();
         const flush = try core.takePhaseStructural(domain, phase_sequence, taken[0..]);
+        structural_take_samples[index] = monotonicNs() - structural_take_start;
         if (flush.count != batch_size) return error.InvalidBenchmarkBatch;
+        const structural_abort_start = monotonicNs();
         try core.abortPhaseStructural(flush.info.flush_token);
+        structural_abort_samples[index] = monotonicNs() - structural_abort_start;
         sample.* = monotonicNs() - start;
         try core.endPhase(domain, phase_sequence);
     }
@@ -106,8 +121,53 @@ pub fn main() !void {
 
     var fixed_samples: [iterations]u64 = undefined;
     var frame_samples: [iterations]u64 = undefined;
-    const fixed_allocations = try runDomain(&core, player, .fixed, fixed_samples[0..]);
-    const frame_allocations = try runDomain(&core, player, .frame, frame_samples[0..]);
+    var event_submit_samples: [iterations]u64 = undefined;
+    var event_drain_samples: [iterations]u64 = undefined;
+    var structural_submit_samples: [iterations]u64 = undefined;
+    var structural_take_samples: [iterations]u64 = undefined;
+    var structural_abort_samples: [iterations]u64 = undefined;
+    const fixed_allocations = try runDomain(
+        &core,
+        player,
+        .fixed,
+        fixed_samples[0..],
+        event_submit_samples[0..],
+        event_drain_samples[0..],
+        structural_submit_samples[0..],
+        structural_take_samples[0..],
+        structural_abort_samples[0..],
+    );
+    std.debug.print(
+        "phase_commit_components domain=fixed event_submit_p95_ns={d} event_drain_p95_ns={d} structural_submit_p95_ns={d} structural_take_p95_ns={d} structural_abort_p95_ns={d}\n",
+        .{
+            percentile(event_submit_samples[0..], 95, 100),
+            percentile(event_drain_samples[0..], 95, 100),
+            percentile(structural_submit_samples[0..], 95, 100),
+            percentile(structural_take_samples[0..], 95, 100),
+            percentile(structural_abort_samples[0..], 95, 100),
+        },
+    );
+    const frame_allocations = try runDomain(
+        &core,
+        player,
+        .frame,
+        frame_samples[0..],
+        event_submit_samples[0..],
+        event_drain_samples[0..],
+        structural_submit_samples[0..],
+        structural_take_samples[0..],
+        structural_abort_samples[0..],
+    );
+    std.debug.print(
+        "phase_commit_components domain=frame event_submit_p95_ns={d} event_drain_p95_ns={d} structural_submit_p95_ns={d} structural_take_p95_ns={d} structural_abort_p95_ns={d}\n",
+        .{
+            percentile(event_submit_samples[0..], 95, 100),
+            percentile(event_drain_samples[0..], 95, 100),
+            percentile(structural_submit_samples[0..], 95, 100),
+            percentile(structural_take_samples[0..], 95, 100),
+            percentile(structural_abort_samples[0..], 95, 100),
+        },
+    );
 
     std.debug.print(
         "phase_commit_bench iterations={d} batch={d} fixed_p50_ns={d} fixed_p95_ns={d} frame_p50_ns={d} frame_p95_ns={d} fixed_allocations={d} frame_allocations={d}\n",

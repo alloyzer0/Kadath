@@ -94,6 +94,9 @@ PHASE3_MUTATION_MANIFEST_SHA256=000000000000000000000000000000000000000000000000
 EOF
 cat >>"$evidence_root/performance.report" <<'EOF'
 PHASE3_PERF_P95_RATIO=1.0
+PHASE3_CANDIDATE_WORST_P95_MEDIAN_NS=1
+PHASE3_PERF_OVERHEAD_NS_PER_ITEM=0
+PHASE3_PERF_PAIRED_RUNS=5
 PHASE3_PERF_RSS_RATIO=1.0
 PHASE3_STEADY_STATE_ALLOCATION_DELTA=0
 EOF
@@ -133,10 +136,13 @@ grep -Fqx 'PHASE3_QUALITY_GATE=BLOCKED' <<<"$missing_detail_output"
 # is not proven to be extracted from the frozen bfc5504 authority source.
 decision_manifest="$evidence_root/decision-matrix.tsv"
 mutation_manifest="$evidence_root/mutation-manifest.tsv"
+performance_manifest="$evidence_root/performance-manifest.tsv"
 printf 'decision\tPASS\texecuted-public-seam\n' >"$decision_manifest"
 printf 'id\tKILLED\tdiff-sha\tpublic-seam\n' >"$mutation_manifest"
+printf 'run\tcandidate\toracle\n1\tsha\tsha\n' >"$performance_manifest"
 decision_manifest_sha="$(sha256sum "$decision_manifest" | awk '{print $1}')"
 mutation_manifest_sha="$(sha256sum "$mutation_manifest" | awk '{print $1}')"
+performance_manifest_sha="$(sha256sum "$performance_manifest" | awk '{print $1}')"
 cat >"$evidence_root/coverage.report" <<EOF
 PHASE3_REPORT_VERSION=1
 PHASE3_CANDIDATE_SHA=$candidate_sha
@@ -170,6 +176,11 @@ PHASE3_CANDIDATE_SHA=$candidate_sha
 PHASE3_COMMAND=complete-performance-probe
 PHASE3_PERF_STATUS=PASS
 PHASE3_PERF_P95_RATIO=1.0
+PHASE3_CANDIDATE_WORST_P95_MEDIAN_NS=1
+PHASE3_PERF_OVERHEAD_NS_PER_ITEM=0
+PHASE3_PERF_PAIRED_RUNS=5
+PHASE3_PERF_MANIFEST=$performance_manifest
+PHASE3_PERF_MANIFEST_SHA256=$performance_manifest_sha
 PHASE3_PERF_RSS_RATIO=1.0
 PHASE3_STEADY_STATE_ALLOCATION_DELTA=0
 PHASE3_CANDIDATE_BENCHMARK=$candidate_benchmark

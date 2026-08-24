@@ -123,6 +123,8 @@ pub(crate) struct RuntimeState {
     pub(crate) next_spawn_serial: u64,
     pub(crate) bounds: Bounds,
     pub(crate) slots: [Slot; MAX_OBJECTS],
+    record_count: usize,
+    next_available_slot: usize,
     authored_source_count: u8,
     authored_sources: [Option<SourceObject>; MAX_OBJECTS],
 }
@@ -140,6 +142,8 @@ impl RuntimeState {
             next_spawn_serial,
             bounds,
             slots: std::array::from_fn(|_| Slot::default()),
+            record_count: sources.len(),
+            next_available_slot: sources.len(),
             authored_source_count: sources.len() as u8,
             authored_sources: std::array::from_fn(|_| None),
         };
@@ -167,10 +171,7 @@ impl RuntimeState {
     }
 
     pub(crate) fn record_count(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|slot| slot.record.is_some())
-            .count()
+        self.record_count
     }
 
     pub(crate) fn visible_count(&self, active_only: bool) -> usize {
@@ -228,6 +229,14 @@ impl RuntimeState {
                 slot.logical_generation = (slot.logical_generation + 1).min(MAX_LOGICAL_GENERATION);
             }
         }
+        next.record_count = sources.len();
+        next.next_available_slot = next
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.record.is_none() && slot.logical_generation < MAX_LOGICAL_GENERATION
+            })
+            .unwrap_or(MAX_OBJECTS);
         for (index, ((source, entity_value), current)) in sources
             .iter()
             .zip(entity_values.iter().copied())
@@ -356,7 +365,11 @@ impl RuntimeState {
         Ok(())
     }
 
-    fn exact_index(&self, key: ObjectKey, include_pending_destroy: bool) -> Option<usize> {
+    pub(crate) fn exact_index(
+        &self,
+        key: ObjectKey,
+        include_pending_destroy: bool,
+    ) -> Option<usize> {
         if key.world_epoch != self.world_epoch {
             return None;
         }
@@ -370,33 +383,63 @@ impl RuntimeState {
         })
     }
 
+    pub(crate) fn exact_index_hint(
+        &self,
+        index: usize,
+        key: ObjectKey,
+        include_pending_destroy: bool,
+    ) -> Option<usize> {
+        if key.world_epoch != self.world_epoch {
+            return None;
+        }
+        self.slots.get(index)?.record.as_ref().and_then(|record| {
+            ((include_pending_destroy || record.lifecycle != Lifecycle::PendingDestroy)
+                && record.object_id == key.object_id
+                && record.logical_generation == key.logical_generation
+                && record.kind == key.kind)
+                .then_some(index)
+        })
+    }
+
     pub(crate) fn reserve_transient(
         &mut self,
         prototype_key: u32,
         kind: u32,
-        mut sprite: Sprite,
+        sprite: Sprite,
     ) -> Result<&Record, AuthorityError> {
+        let slot_index = self.reserve_transient_slot(prototype_key, kind, sprite)?;
+        Ok(self.slots[slot_index]
+            .record
+            .as_ref()
+            .expect("reserved record exists"))
+    }
+
+    pub(crate) fn reserve_transient_slot(
+        &mut self,
+        prototype_key: u32,
+        kind: u32,
+        mut sprite: Sprite,
+    ) -> Result<usize, AuthorityError> {
         if self.record_count() >= MAX_OBJECTS {
             return Err(AuthorityError::Capacity);
         }
-        let slot_index = self
-            .slots
-            .iter()
-            .position(|slot| {
-                slot.record.is_none() && slot.logical_generation < MAX_LOGICAL_GENERATION
-            })
-            .ok_or(AuthorityError::Capacity)?;
+        let slot_index = self.next_available_slot;
+        if slot_index == MAX_OBJECTS {
+            return Err(AuthorityError::Capacity);
+        }
         let mut serial = self.next_spawn_serial;
         let object_id = loop {
             if serial == u64::MAX {
                 return Err(AuthorityError::SerialExhausted);
             }
             let candidate = ObjectId::runtime(serial);
-            if self
-                .slots
+            // `next_spawn_serial` is a persistent high-water mark, so a
+            // previously issued transient can never own this or any later ID.
+            // Only authored IDs can collide with the generated namespace.
+            if self.authored_sources[..self.authored_source_count as usize]
                 .iter()
-                .filter_map(|slot| slot.record.as_ref())
-                .all(|record| record.object_id != candidate)
+                .flatten()
+                .all(|source| source.object_id != candidate)
             {
                 break candidate;
             }
@@ -416,10 +459,14 @@ impl RuntimeState {
             entity_value: 0,
             spawn_serial: serial,
         });
-        Ok(self.slots[slot_index]
-            .record
-            .as_ref()
-            .expect("reserved record exists"))
+        self.record_count += 1;
+        self.next_available_slot = self.slots[slot_index + 1..]
+            .iter()
+            .position(|slot| {
+                slot.record.is_none() && slot.logical_generation < MAX_LOGICAL_GENERATION
+            })
+            .map_or(MAX_OBJECTS, |offset| slot_index + 1 + offset);
+        Ok(slot_index)
     }
 
     pub(crate) fn activate(
@@ -442,6 +489,17 @@ impl RuntimeState {
 
     pub(crate) fn discard(&mut self, key: ObjectKey) -> Result<(), AuthorityError> {
         let index = self.exact_index(key, true).ok_or(AuthorityError::Stale)?;
+        self.discard_index(index, key)
+    }
+
+    pub(crate) fn discard_index(
+        &mut self,
+        index: usize,
+        key: ObjectKey,
+    ) -> Result<(), AuthorityError> {
+        let index = self
+            .exact_index_hint(index, key, true)
+            .ok_or(AuthorityError::Stale)?;
         let record = self.slots[index]
             .record
             .as_ref()
@@ -483,6 +541,17 @@ impl RuntimeState {
 
     pub(crate) fn finalize_destroy(&mut self, key: ObjectKey) -> Result<(), AuthorityError> {
         let index = self.exact_index(key, true).ok_or(AuthorityError::Stale)?;
+        self.finalize_destroy_index(index, key)
+    }
+
+    pub(crate) fn finalize_destroy_index(
+        &mut self,
+        index: usize,
+        key: ObjectKey,
+    ) -> Result<(), AuthorityError> {
+        let index = self
+            .exact_index_hint(index, key, true)
+            .ok_or(AuthorityError::Stale)?;
         let record = self.slots[index]
             .record
             .as_ref()
@@ -499,8 +568,12 @@ impl RuntimeState {
 
     fn release(&mut self, index: usize) {
         self.slots[index].record = None;
+        self.record_count -= 1;
         self.slots[index].logical_generation =
             (self.slots[index].logical_generation + 1).min(MAX_LOGICAL_GENERATION);
+        if self.slots[index].logical_generation < MAX_LOGICAL_GENERATION {
+            self.next_available_slot = self.next_available_slot.min(index);
+        }
     }
 }
 

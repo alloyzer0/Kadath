@@ -201,7 +201,11 @@ if [[ -z "$performance_report" ]]; then
     blocked+=("performance report missing")
 elif ! report_bound_to_candidate "$performance_report" ||
     ! report_has_key "$performance_report" PHASE3_PERF_STATUS PASS ||
-    ! metric_at_most "$performance_report" PHASE3_PERF_P95_RATIO 1.25 ||
+    ! metric_at_most "$performance_report" PHASE3_CANDIDATE_WORST_P95_MEDIAN_NS 100000 ||
+    ! metric_at_most "$performance_report" PHASE3_PERF_OVERHEAD_NS_PER_ITEM 512 ||
+    ! report_has_key "$performance_report" PHASE3_PERF_PAIRED_RUNS 5 ||
+    ! grep -Eq '^PHASE3_PERF_MANIFEST_SHA256=[0-9a-f]{64}$' "$performance_report" ||
+    ! report_file_matches_hash "$performance_report" PHASE3_PERF_MANIFEST PHASE3_PERF_MANIFEST_SHA256 ||
     ! metric_at_most "$performance_report" PHASE3_PERF_RSS_RATIO 1.25 ||
     ! report_has_key "$performance_report" PHASE3_STEADY_STATE_ALLOCATION_DELTA 0; then
     perf_status=BLOCKED
