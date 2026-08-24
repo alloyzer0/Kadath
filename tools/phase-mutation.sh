@@ -144,7 +144,7 @@ for index in "${!ids[@]}"; do
         status=UNVIABLE
         unviable=$((unviable + 1))
     else
-        kill_test="$(grep -Em1 "(^error: '.*' failed:$|^[0-9]+/[0-9]+ .*\.(test\.)?.*\.(FAIL|ERROR)|^test .* \.\.\. FAILED$|^error: test command failed|^failed command:)" "$log" || true)"
+        kill_test="$(grep -Em1 "(^error: '.*' failed:$|^error: process exited with error code [0-9]+$|^[0-9]+/[0-9]+ .*\.(test\.)?.*\.(FAIL|ERROR)|^test .* \.\.\. FAILED$|^error: test command failed|^failed command:)" "$log" || true)"
         if [[ -n "$kill_test" ]]; then
             status=KILLED
             killed=$((killed + 1))
