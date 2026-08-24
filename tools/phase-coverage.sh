@@ -29,19 +29,21 @@ mkdir -p "$evidence_root"
 evidence_root="$(cd -- "$evidence_root" && pwd)"
 kcov="$(cd -- "$(dirname -- "$kcov")" && pwd)/$(basename -- "$kcov")"
 
-emit_name="phase-coverage-${candidate_sha:0:12}"
+emit_prefix="$evidence_root/emit"
+emit_name="contracts"
 (
 cd -- "$repository_root"
 cargo test --locked --manifest-path modules/runtime_core/Cargo.toml \
     >"$evidence_root/rust-unit.log" 2>&1
 zig build emit-phase-runtime-core-contract emit-phase-public-c-contract emit-phase-behavior-contract \
+    --prefix "$emit_prefix" \
     -Dphase-quality-evidence=true -Dphase-quality-emit-dir="$emit_name" --summary all \
     >"$evidence_root/emit.log" 2>&1
 )
 
-runtime_binary="$repository_root/zig-out/$emit_name/runtime-core-contract"
-public_binary="$repository_root/zig-out/$emit_name/runtime-core-public-contract"
-behavior_binary="$repository_root/zig-out/$emit_name/behavior-host-contract"
+runtime_binary="$emit_prefix/$emit_name/runtime-core-contract"
+public_binary="$emit_prefix/$emit_name/runtime-core-public-contract"
+behavior_binary="$emit_prefix/$emit_name/behavior-host-contract"
 rust_unit_binary="$(find "$repository_root/target/debug/deps" -maxdepth 1 -type f \
     -name 'kadath_runtime_core-*' -printf '%T@ %m %p\n' |
     awk '$2 == 700 { print }' | sort -nr | head -n 1 | cut -d' ' -f3-)"
