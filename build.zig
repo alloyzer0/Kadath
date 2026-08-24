@@ -191,6 +191,9 @@ pub fn build(b: *std.Build) void {
     const configured_glslc = b.option([]const u8, "glslc", "Absolute path to the glslc executable");
     const configured_alsa_include_dir = b.option([]const u8, "alsa-include-dir", "Directory containing alsa/asoundlib.h");
     const configured_alsa_library_dir = b.option([]const u8, "alsa-library-dir", "Directory containing libasound.so");
+    const phase_quality_evidence = b.option(bool, "phase-quality-evidence", "Build Runtime Core with non-production Phase allocation counters") orelse false;
+    const phase_quality_behavior_filter = b.option([]const u8, "phase-quality-behavior-filter", "Run only matching Behavior Host contracts for Phase coverage evidence");
+    const phase_quality_emit_dir = b.option([]const u8, "phase-quality-emit-dir", "Install Phase evidence executables into this directory without running them");
     var linux_platform_contract_binary: ?std.Build.LazyPath = null;
     var linux_window_verifier_binary: ?std.Build.LazyPath = null;
     const mingw_gcc_runtime_dir: ?[]const u8 = if (target.result.os.tag == .windows)
@@ -389,6 +392,7 @@ pub fn build(b: *std.Build) void {
             cargo_target_dir,
         });
         if (optimize != .Debug) cargo_build.addArg("--release");
+        if (phase_quality_evidence) cargo_build.addArgs(&.{ "--features", "phase-quality-evidence" });
 
         // Cargo 产物必须先生成，再由 Zig 的 GNU 链接器合入同一可执行文件。
         exe.step.dependOn(&cargo_build.step);
@@ -455,6 +459,7 @@ pub fn build(b: *std.Build) void {
             cargo_target_dir,
         });
         if (optimize != .Debug) cargo_build.addArg("--release");
+        if (phase_quality_evidence) cargo_build.addArgs(&.{ "--features", "phase-quality-evidence" });
 
         exe.step.dependOn(&cargo_build.step);
         const rust_profile = if (optimize == .Debug) "debug" else "release";
@@ -599,7 +604,14 @@ pub fn build(b: *std.Build) void {
         behavior_host_test_mod.addImport("behavior_scene_binding", behavior_scene_binding_mod.?);
         behavior_host_test_mod.addImport("platform", platform_mod);
         behavior_host_test_mod.addImport("runtime_core", runtime_core_mod);
-        const behavior_host_tests = b.addTest(.{ .root_module = behavior_host_test_mod });
+        const behavior_host_tests = b.addTest(.{
+            .root_module = behavior_host_test_mod,
+            .filters = if (phase_quality_behavior_filter) |filter| &.{filter} else &.{},
+            // kcov can consume Zig's LLVM DWARF v5 line tables, while the
+            // self-hosted backend currently leaves the Phase evidence seam
+            // without an auditable Zig source denominator.
+            .use_llvm = if (phase_quality_emit_dir != null) true else null,
+        });
         behavior_host_tests.step.dependOn(native_step);
         if (runtime_core_library_path) |library_path| {
             behavior_host_tests.step.dependOn(runtime_core_cargo_step.?);
@@ -625,6 +637,14 @@ pub fn build(b: *std.Build) void {
             }
         }
         const behavior_host_test_run = b.addRunArtifact(behavior_host_tests);
+        if (phase_quality_emit_dir) |emit_dir| {
+            const install_behavior_host_evidence = b.addInstallArtifact(behavior_host_tests, .{
+                .dest_dir = .{ .override = .{ .custom = emit_dir } },
+                .dest_sub_path = "behavior-host-contract",
+            });
+            const emit_behavior_host_evidence = b.step("emit-phase-behavior-contract", "Emit the Behavior Host Phase contract without running it");
+            emit_behavior_host_evidence.dependOn(&install_behavior_host_evidence.step);
+        }
         const behavior_tool_test_mod = b.createModule(.{
             .root_source_file = b.path("tools/behavior-script-tool.zig"),
             .target = target,
@@ -687,9 +707,20 @@ pub fn build(b: *std.Build) void {
             runtime_core_contract_mod.linkSystemLibrary("m", .{});
             runtime_core_contract_mod.linkSystemLibrary("dl", .{});
         }
-        const runtime_core_contract_tests = b.addTest(.{ .root_module = runtime_core_contract_mod });
+        const runtime_core_contract_tests = b.addTest(.{
+            .root_module = runtime_core_contract_mod,
+            .use_llvm = if (phase_quality_emit_dir != null) true else null,
+        });
         runtime_core_contract_tests.step.dependOn(runtime_core_cargo_step.?);
         const runtime_core_contract_run = b.addRunArtifact(runtime_core_contract_tests);
+        if (phase_quality_emit_dir) |emit_dir| {
+            const install_runtime_core_evidence = b.addInstallArtifact(runtime_core_contract_tests, .{
+                .dest_dir = .{ .override = .{ .custom = emit_dir } },
+                .dest_sub_path = "runtime-core-contract",
+            });
+            const emit_runtime_core_evidence = b.step("emit-phase-runtime-core-contract", "Emit the Runtime Core Phase contract without running it");
+            emit_runtime_core_evidence.dependOn(&install_runtime_core_evidence.step);
+        }
         const runtime_core_contract_step = b.step("test-runtime-core", "Run Runtime Core public Zig Adapter contracts");
         runtime_core_contract_step.dependOn(&runtime_core_contract_run.step);
         test_step.dependOn(runtime_core_contract_step);
@@ -780,6 +811,14 @@ pub fn build(b: *std.Build) void {
         });
         runtime_core_public_c.step.dependOn(&contract_cargo_build.step);
         const runtime_core_public_c_run = b.addRunArtifact(runtime_core_public_c);
+        if (phase_quality_emit_dir) |emit_dir| {
+            const install_runtime_core_public_c_evidence = b.addInstallArtifact(runtime_core_public_c, .{
+                .dest_dir = .{ .override = .{ .custom = emit_dir } },
+                .dest_sub_path = "runtime-core-public-contract",
+            });
+            const emit_runtime_core_public_c_evidence = b.step("emit-phase-public-c-contract", "Emit the Runtime Core public C17 contract without running it");
+            emit_runtime_core_public_c_evidence.dependOn(&install_runtime_core_public_c_evidence.step);
+        }
         const runtime_core_public_c_step = b.step("test-runtime-core-public-c", "Run Runtime Core public C17 contracts and fault hooks");
         runtime_core_public_c_step.dependOn(&runtime_core_public_c_run.step);
         test_step.dependOn(runtime_core_public_c_step);

@@ -9,6 +9,7 @@ pub const max_phase_bindings: usize = c.KADATH_RUNTIME_PHASE_MAX_BINDINGS;
 pub const max_phase_events: usize = c.KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN;
 pub const max_phase_structural: usize = c.KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN;
 pub const max_phase_generation: u32 = c.KADATH_RUNTIME_PHASE_MAX_GENERATION;
+pub const max_phase_event_fields: usize = c.KADATH_RUNTIME_PHASE_MAX_EVENT_FIELDS;
 pub const phase_operation_reserve_transient: u32 = c.KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT;
 pub const phase_operation_request_destroy: u32 = c.KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY;
 pub const phase_operation_discard_reservation: u32 = c.KADATH_RUNTIME_PHASE_OPERATION_DISCARD_RESERVATION;

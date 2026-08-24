@@ -3,7 +3,12 @@ use crate::{
     read_object_key, read_struct_size, reserved_is_zero, strided_range, RuntimeCore,
 };
 use crate::{object_authority, world::Sprite};
-use std::{mem, ptr};
+use std::{
+    alloc::{alloc, Layout},
+    mem,
+    ops::{Index, IndexMut},
+    ptr,
+};
 
 const MAX_GENERATION: u32 = abi::KADATH_RUNTIME_PHASE_MAX_GENERATION;
 const MAX_BINDINGS: u32 = abi::KADATH_RUNTIME_PHASE_MAX_BINDINGS;
@@ -11,29 +16,145 @@ const MAX_BEHAVIORS_PER_BINDING: u32 = abi::KADATH_RUNTIME_PHASE_MAX_BEHAVIORS_P
 const EVENT_CAPACITY: usize = abi::KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN as usize;
 const STRUCTURAL_CAPACITY: usize = abi::KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN as usize;
 
-#[derive(Clone)]
+/// A fixed-capacity staging buffer for the Phase contract's bounded resources.
+///
+/// All stored Phase values are POD/Copy. Keeping their storage inline makes the
+/// public 64/256 limits the actual allocation boundary as well as the semantic
+/// boundary: after `RuntimeCore::create`, event and structural traffic cannot
+/// allocate merely because another bounded batch was submitted.
+#[derive(Clone, Copy)]
+struct BoundedVec<T: Copy, const CAPACITY: usize> {
+    items: [mem::MaybeUninit<T>; CAPACITY],
+    len: usize,
+}
+
+impl<T: Copy, const CAPACITY: usize> BoundedVec<T, CAPACITY> {
+    fn new() -> Self {
+        Self {
+            items: [mem::MaybeUninit::uninit(); CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn as_slice(&self) -> &[T] {
+        // SAFETY: `0..len` is initialized exclusively by `push`/`extend_from_slice`,
+        // and `len` never exceeds the backing array's capacity.
+        unsafe { std::slice::from_raw_parts(self.items.as_ptr().cast::<T>(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: same initialized-prefix invariant as `as_slice`; the mutable
+        // borrow of `self` guarantees unique access to the returned prefix.
+        unsafe { std::slice::from_raw_parts_mut(self.items.as_mut_ptr().cast::<T>(), self.len) }
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.as_slice().iter()
+    }
+
+    fn push(&mut self, value: T) -> Result<(), u32> {
+        if self.len == CAPACITY {
+            return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+        }
+        self.items[self.len].write(value);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn extend_from_slice(&mut self, values: &[T]) -> Result<(), u32> {
+        if values.len() > CAPACITY - self.len {
+            return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+        }
+        for value in values {
+            self.items[self.len].write(*value);
+            self.len += 1;
+        }
+        Ok(())
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        let mut output = 0;
+        for input in 0..self.len {
+            let value = self.as_slice()[input];
+            if keep(&value) {
+                self.items[output].write(value);
+                output += 1;
+            }
+        }
+        self.len = output;
+    }
+
+    fn swap_remove(&mut self, index: usize) -> T {
+        let value = self.as_slice()[index];
+        let tail = self.as_slice()[self.len - 1];
+        self.len -= 1;
+        if index != self.len {
+            self.items[index].write(tail);
+        }
+        value
+    }
+}
+
+impl<T: Copy, const CAPACITY: usize> Index<usize> for BoundedVec<T, CAPACITY> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_slice()[index]
+    }
+}
+
+impl<T: Copy, const CAPACITY: usize> IndexMut<usize> for BoundedVec<T, CAPACITY> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.as_mut_slice()[index]
+    }
+}
+
+impl<'a, T: Copy, const CAPACITY: usize> IntoIterator for &'a BoundedVec<T, CAPACITY> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Binding {
     object: object_authority::ObjectKey,
     behavior_count: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct EventEntry {
     item: abi::kadath_runtime_phase_event_v1_t,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct StructuralEntry {
     item: abi::kadath_runtime_phase_structural_v1_t,
     completed: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
+struct IndexedCompletion {
+    entry_index: usize,
+    value: abi::kadath_runtime_phase_request_completion_v1_t,
+}
+
+#[derive(Clone, Copy)]
 struct Flush {
     token: u64,
     domain: u32,
     phase_sequence: u64,
-    entries: Vec<StructuralEntry>,
+    entries: BoundedVec<StructuralEntry, STRUCTURAL_CAPACITY>,
 }
 
 #[derive(Clone)]
@@ -43,27 +164,27 @@ struct Activation {
     root_sequence: u64,
     root_key: object_authority::ObjectKey,
     root_self_destroyed: bool,
-    positions: Vec<abi::kadath_runtime_position_patch_v1_t>,
-    events: Vec<abi::kadath_runtime_phase_event_v1_t>,
-    structural: Vec<abi::kadath_runtime_phase_structural_v1_t>,
+    positions: BoundedVec<abi::kadath_runtime_position_patch_v1_t, STRUCTURAL_CAPACITY>,
+    events: BoundedVec<abi::kadath_runtime_phase_event_v1_t, EVENT_CAPACITY>,
+    structural: BoundedVec<abi::kadath_runtime_phase_structural_v1_t, STRUCTURAL_CAPACITY>,
     staged_state: object_authority::RuntimeState,
-    staged_bindings: Vec<Binding>,
+    staged_bindings: BoundedVec<Binding, { MAX_BINDINGS as usize }>,
     staged_used: u32,
     cancelled_structural_count: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Candidate {
     target: u32,
     phase_epoch: u64,
-    bindings: Vec<Binding>,
+    bindings: BoundedVec<Binding, { MAX_BINDINGS as usize }>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct DomainState {
     phase_sequence: Option<u64>,
-    event_queue: Vec<EventEntry>,
-    structural_queue: Vec<StructuralEntry>,
+    event_queue: BoundedVec<EventEntry, EVENT_CAPACITY>,
+    structural_queue: BoundedVec<StructuralEntry, STRUCTURAL_CAPACITY>,
     event_successor_generation: u32,
     structural_successor_generation: u32,
     event_has_drained: bool,
@@ -76,8 +197,8 @@ impl DomainState {
     fn new() -> Self {
         Self {
             phase_sequence: None,
-            event_queue: Vec::with_capacity(EVENT_CAPACITY),
-            structural_queue: Vec::with_capacity(STRUCTURAL_CAPACITY),
+            event_queue: BoundedVec::new(),
+            structural_queue: BoundedVec::new(),
             event_successor_generation: 0,
             structural_successor_generation: 0,
             event_has_drained: false,
@@ -90,7 +211,7 @@ impl DomainState {
 
 pub(crate) struct PhaseState {
     candidate: Option<Candidate>,
-    active_bindings: Vec<Binding>,
+    active_bindings: BoundedVec<Binding, { MAX_BINDINGS as usize }>,
     admission_used: u32,
     domains: [DomainState; 2],
     next_flush_token: u64,
@@ -100,16 +221,25 @@ pub(crate) struct PhaseState {
 }
 
 impl PhaseState {
-    pub(crate) fn new() -> Self {
-        Self {
-            candidate: None,
-            active_bindings: Vec::with_capacity(MAX_BINDINGS as usize),
-            admission_used: 0,
-            domains: std::array::from_fn(|_| DomainState::new()),
-            next_flush_token: 1,
-            next_transaction_id: 1,
-            flush: [None, None],
-            activation: None,
+    pub(crate) fn new_boxed() -> Result<Box<Self>, u32> {
+        let pointer = unsafe { alloc(Layout::new::<Self>()) }.cast::<Self>();
+        if pointer.is_null() {
+            return Err(abi::KADATH_ERR_OUT_OF_MEMORY);
+        }
+        // Build the large bounded arena directly in its final heap allocation.
+        // This allocation occurs once at Core creation; Phase traffic only reuses
+        // the initialized inline capacities below.
+        unsafe {
+            ptr::addr_of_mut!((*pointer).candidate).write(None);
+            ptr::addr_of_mut!((*pointer).active_bindings).write(BoundedVec::new());
+            ptr::addr_of_mut!((*pointer).admission_used).write(0);
+            ptr::addr_of_mut!((*pointer).domains[0]).write(DomainState::new());
+            ptr::addr_of_mut!((*pointer).domains[1]).write(DomainState::new());
+            ptr::addr_of_mut!((*pointer).next_flush_token).write(1);
+            ptr::addr_of_mut!((*pointer).next_transaction_id).write(1);
+            ptr::addr_of_mut!((*pointer).flush).write([None, None]);
+            ptr::addr_of_mut!((*pointer).activation).write(None);
+            Ok(Box::from_raw(pointer))
         }
     }
 
@@ -193,7 +323,7 @@ impl PhaseState {
 
     fn admission_add(
         used: &mut u32,
-        bindings: &mut Vec<Binding>,
+        bindings: &mut BoundedVec<Binding, { MAX_BINDINGS as usize }>,
         binding: Binding,
     ) -> Result<(), u32> {
         let next = used
@@ -203,13 +333,15 @@ impl PhaseState {
             return Err(abi::KADATH_ERR_RUNTIME_PHASE_ADMISSION_CAPACITY);
         }
         *used = next;
-        bindings.push(binding);
+        bindings
+            .push(binding)
+            .map_err(|_| abi::KADATH_ERR_RUNTIME_PHASE_ADMISSION_CAPACITY)?;
         Ok(())
     }
 
     fn admission_remove(
         used: &mut u32,
-        bindings: &mut Vec<Binding>,
+        bindings: &mut BoundedVec<Binding, { MAX_BINDINGS as usize }>,
         key: object_authority::ObjectKey,
     ) {
         if let Some(index) = bindings.iter().position(|binding| binding.object == key) {
@@ -623,10 +755,7 @@ pub(crate) fn prepare_phase_state(
         _ => unreachable!(),
     }
     .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let mut bindings = Vec::new();
-    bindings
-        .try_reserve_exact(desc.binding_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    let mut bindings = BoundedVec::new();
     let mut used = 0_u32;
     for index in 0..desc.binding_count {
         let pointer = unsafe {
@@ -653,10 +782,12 @@ pub(crate) fn prepare_phase_state(
         if used > MAX_BINDINGS {
             return Err(abi::KADATH_ERR_RUNTIME_PHASE_ADMISSION_CAPACITY);
         }
-        bindings.push(Binding {
-            object: key,
-            behavior_count: value.behavior_count,
-        });
+        bindings
+            .push(Binding {
+                object: key,
+                behavior_count: value.behavior_count,
+            })
+            .map_err(|_| abi::KADATH_ERR_RUNTIME_PHASE_ADMISSION_CAPACITY)?;
     }
     let candidate = Candidate {
         target: desc.target,
@@ -822,10 +953,6 @@ pub(crate) fn submit_events(
         .live
         .as_ref()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let mut parsed = Vec::new();
-    parsed
-        .try_reserve_exact(item_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
     let mut sequence = domain_state.next_event_sequence;
     for index in 0..item_count {
         let pointer = unsafe {
@@ -845,19 +972,28 @@ pub(crate) fn submit_events(
         sequence = sequence
             .checked_add(1)
             .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)?;
-        let mut copied = *event;
-        copied.sequence = sequence - 1;
-        copied.generation = generation;
-        parsed.push(EventEntry { item: copied });
+        let _ = generation;
     }
-    let result = write_batch_result(
-        item_count,
-        parsed[0].item.sequence,
-        parsed[item_count - 1].item.sequence,
-    );
+    let first_sequence = domain_state.next_event_sequence;
+    let result = write_batch_result(item_count, first_sequence, sequence - 1);
     let domain_state = core.phase.domain_mut(domain)?;
     domain_state.next_event_sequence = sequence;
-    domain_state.event_queue.extend(parsed);
+    for index in 0..item_count {
+        let pointer = unsafe {
+            events_ptr
+                .cast::<u8>()
+                .add(index * item_stride)
+                .cast::<abi::kadath_runtime_phase_event_v1_t>()
+        };
+        let mut copied = unsafe { *pointer };
+        copied.sequence = first_sequence + index as u64;
+        copied.generation = PhaseState::normalize_generation(
+            copied.generation,
+            domain_state.event_successor_generation,
+            domain_state.event_has_drained,
+        )?;
+        domain_state.event_queue.push(EventEntry { item: copied })?;
+    }
     unsafe { ptr::write(out_ptr, result) };
     Ok(())
 }
@@ -1020,10 +1156,11 @@ pub(crate) fn submit_structural(
         .as_ref()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
     let mut staged_state = state.clone();
-    let mut staged_bindings = core.phase.active_bindings.clone();
+    let mut staged_bindings = core.phase.active_bindings;
     let mut staged_used = core.phase.admission_used;
-    let mut staged_queue = Vec::new();
-    let mut completions = Vec::new();
+    let mut staged_queue = BoundedVec::<StructuralEntry, STRUCTURAL_CAPACITY>::new();
+    let mut completions =
+        BoundedVec::<abi::kadath_runtime_phase_request_completion_v1_t, STRUCTURAL_CAPACITY>::new();
     let mut next_sequence = domain_state.next_structural_sequence;
     for index in 0..item_count {
         let pointer = unsafe {
@@ -1105,11 +1242,11 @@ pub(crate) fn submit_structural(
             0,
             disposition,
             view,
-        ));
+        ))?;
         staged_queue.push(StructuralEntry {
             item: copied,
             completed: false,
-        });
+        })?;
     }
     let result = write_batch_result(
         item_count,
@@ -1121,8 +1258,10 @@ pub(crate) fn submit_structural(
     core.phase.admission_used = staged_used;
     let domain_state = core.phase.domain_mut(domain)?;
     domain_state.next_structural_sequence = next_sequence;
-    domain_state.structural_queue.extend(staged_queue);
-    for (index, completion) in completions.into_iter().enumerate() {
+    domain_state
+        .structural_queue
+        .extend_from_slice(staged_queue.as_slice())?;
+    for (index, completion) in completions.iter().copied().enumerate() {
         unsafe { ptr::write(acceptance_ptr.add(index), completion) };
     }
     unsafe { ptr::write(out_ptr, result) };
@@ -1204,20 +1343,14 @@ pub(crate) fn take_structural(
     let next_token = token
         .checked_add(1)
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)?;
-    let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
-    let mut remaining = Vec::new();
-    remaining
-        .try_reserve_exact(domain_state.structural_queue.len() - count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    let mut entries = BoundedVec::<StructuralEntry, STRUCTURAL_CAPACITY>::new();
+    let mut remaining = BoundedVec::<StructuralEntry, STRUCTURAL_CAPACITY>::new();
     let domain_state = core.phase.domain_mut(domain)?;
-    for entry in domain_state.structural_queue.drain(..) {
+    for entry in domain_state.structural_queue.iter().copied() {
         if entry.item.generation == generation {
-            entries.push(entry);
+            entries.push(entry)?;
         } else {
-            remaining.push(entry);
+            remaining.push(entry)?;
         }
     }
     domain_state.structural_queue = remaining;
@@ -1330,11 +1463,11 @@ pub(crate) fn begin_activation(
         root_sequence,
         root_key: key,
         root_self_destroyed: false,
-        positions: Vec::new(),
-        events: Vec::new(),
-        structural: Vec::new(),
+        positions: BoundedVec::new(),
+        events: BoundedVec::new(),
+        structural: BoundedVec::new(),
         staged_state: state.clone(),
-        staged_bindings: core.phase.active_bindings.clone(),
+        staged_bindings: core.phase.active_bindings,
         staged_used: core.phase.admission_used,
         cancelled_structural_count: 0,
     });
@@ -1384,11 +1517,11 @@ pub(crate) fn submit_activation(
     let root_key = active.root_key;
     let mut root_self_destroyed = active.root_self_destroyed;
     let mut staged_state = active.staged_state.clone();
-    let mut staged_bindings = active.staged_bindings.clone();
+    let mut staged_bindings = active.staged_bindings;
     let mut staged_used = active.staged_used;
     let existing_event_count = active.events.len();
     let existing_structural_count = active.structural.len();
-    let domain_state = core.phase.domain(domain)?.clone();
+    let domain_state = *core.phase.domain(domain)?;
 
     if batch.position_count > abi::KADATH_RUNTIME_MAX_OBJECTS as usize
         || batch.event_count > EVENT_CAPACITY
@@ -1472,7 +1605,8 @@ pub(crate) fn submit_activation(
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
 
-    let mut positions = Vec::new();
+    let mut positions =
+        BoundedVec::<abi::kadath_runtime_position_patch_v1_t, STRUCTURAL_CAPACITY>::new();
     if batch.position_count != 0 {
         if batch.positions.is_null()
             || (batch.positions as usize)
@@ -1491,9 +1625,6 @@ pub(crate) fn submit_activation(
         {
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
-        positions
-            .try_reserve_exact(batch.position_count)
-            .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
         for index in 0..batch.position_count {
             let pointer = unsafe {
                 batch
@@ -1517,11 +1648,11 @@ pub(crate) fn submit_activation(
             staged_state
                 .set_position(key, value.position)
                 .map_err(authority_error)?;
-            positions.push(*value);
+            positions.push(*value)?;
         }
     }
 
-    let mut events = Vec::new();
+    let mut events = BoundedVec::<abi::kadath_runtime_phase_event_v1_t, EVENT_CAPACITY>::new();
     let mut next_event_sequence = domain_state.next_event_sequence;
     if batch.event_count != 0 {
         if batch.events.is_null()
@@ -1539,9 +1670,6 @@ pub(crate) fn submit_activation(
         {
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
-        events
-            .try_reserve_exact(batch.event_count)
-            .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
         for index in 0..batch.event_count {
             let pointer = unsafe {
                 batch
@@ -1561,15 +1689,16 @@ pub(crate) fn submit_activation(
             let mut copied = *value;
             copied.sequence = PhaseState::next_sequence(&mut next_event_sequence)?;
             copied.generation = generation;
-            events.push(copied);
+            events.push(copied)?;
         }
     }
 
-    let mut structural = Vec::new();
-    let mut structural_results = Vec::new();
-    structural_results
-        .try_reserve_exact(batch.structural_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    let mut structural =
+        BoundedVec::<abi::kadath_runtime_phase_structural_v1_t, STRUCTURAL_CAPACITY>::new();
+    let mut structural_results = BoundedVec::<
+        abi::kadath_runtime_phase_activation_structural_result_v1_t,
+        STRUCTURAL_CAPACITY,
+    >::new();
     let mut next_structural_sequence = domain_state.next_structural_sequence;
     let mut cancelled_structural_count = 0_u32;
     if batch.structural_count != 0 {
@@ -1592,9 +1721,6 @@ pub(crate) fn submit_activation(
         {
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
-        structural
-            .try_reserve_exact(batch.structural_count)
-            .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
         for index in 0..batch.structural_count {
             let pointer = unsafe {
                 batch
@@ -1691,8 +1817,8 @@ pub(crate) fn submit_activation(
                     object_ref: copied.object_ref,
                     reserved: [0; 4],
                 },
-            );
-            structural.push(copied);
+            )?;
+            structural.push(copied)?;
         }
     }
     if domain_state.event_queue.len() + existing_event_count + events.len() > EVENT_CAPACITY
@@ -1722,9 +1848,9 @@ pub(crate) fn submit_activation(
         .activation
         .as_mut()
         .expect("transaction remains active");
-    active.positions.extend(positions);
-    active.events.extend(events);
-    active.structural.extend(structural);
+    active.positions.extend_from_slice(positions.as_slice())?;
+    active.events.extend_from_slice(events.as_slice())?;
+    active.structural.extend_from_slice(structural.as_slice())?;
     active.staged_state = staged_state;
     active.staged_bindings = staged_bindings;
     active.staged_used = staged_used;
@@ -1733,7 +1859,7 @@ pub(crate) fn submit_activation(
         .cancelled_structural_count
         .checked_add(cancelled_structural_count)
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)?;
-    for (index, result) in structural_results.into_iter().enumerate() {
+    for (index, result) in structural_results.iter().copied().enumerate() {
         unsafe { ptr::write(batch.structural_results.add(index), result) };
     }
     Ok(())
@@ -1755,9 +1881,8 @@ pub(crate) fn commit_activation(
     }
     let domain = activation.domain;
     let domain_index = PhaseState::domain_index(domain)?;
-    let flush = core.phase.flush[domain_index]
-        .clone()
-        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
+    let flush =
+        core.phase.flush[domain_index].ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     let root_index = flush
         .entries
         .iter()
@@ -1766,11 +1891,11 @@ pub(crate) fn commit_activation(
     let root_item = flush.entries[root_index].item;
     let root_key = read_object_key(&root_item.object_ref)?;
     let mut state = activation.staged_state.clone();
-    let bindings = activation.staged_bindings.clone();
+    let bindings = activation.staged_bindings;
     let used = activation.staged_used;
-    let domain_state = core.phase.domain(domain)?.clone();
-    let mut event_queue = domain_state.event_queue.clone();
-    let mut structural_queue = domain_state.structural_queue.clone();
+    let domain_state = *core.phase.domain(domain)?;
+    let mut event_queue = domain_state.event_queue;
+    let mut structural_queue = domain_state.structural_queue;
     if event_queue.len() + activation.events.len() > EVENT_CAPACITY
         || structural_queue.len() + activation.structural.len() > STRUCTURAL_CAPACITY
     {
@@ -1778,7 +1903,7 @@ pub(crate) fn commit_activation(
     }
     let root_cancelled = state.visible_exact(root_key).is_none();
     if root_cancelled {
-        let mut bindings = core.phase.active_bindings.clone();
+        let mut bindings = core.phase.active_bindings;
         let mut used = core.phase.admission_used;
         PhaseState::admission_remove(&mut used, &mut bindings, root_key);
         let mut entries = flush.entries;
@@ -1815,15 +1940,15 @@ pub(crate) fn commit_activation(
     }
     let world_epoch = state.world_epoch;
     let accepted_event_count = activation.events.len() as u32;
-    for event in activation.events {
-        event_queue.push(EventEntry { item: event });
+    for event in activation.events.iter().copied() {
+        event_queue.push(EventEntry { item: event })?;
     }
     let accepted_structural_count = activation.structural.len() as u32;
-    for item in activation.structural {
+    for item in activation.structural.iter().copied() {
         structural_queue.push(StructuralEntry {
             item,
             completed: false,
-        });
+        })?;
     }
     let root_object = state
         .visible_exact(root_key)
@@ -1875,9 +2000,8 @@ pub(crate) fn abort_activation(core: &mut RuntimeCore, transaction_id: u64) -> R
         .live
         .clone()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let flush = core.phase.flush[domain_index]
-        .clone()
-        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
+    let flush =
+        core.phase.flush[domain_index].ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     let root = flush
         .entries
         .iter()
@@ -1885,7 +2009,7 @@ pub(crate) fn abort_activation(core: &mut RuntimeCore, transaction_id: u64) -> R
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     let key = read_object_key(&root.item.object_ref)?;
     state.discard(key).map_err(authority_error)?;
-    let mut bindings = core.phase.active_bindings.clone();
+    let mut bindings = core.phase.active_bindings;
     let mut used = core.phase.admission_used;
     PhaseState::admission_remove(&mut used, &mut bindings, key);
     let mut entries = flush.entries;
@@ -1929,19 +2053,16 @@ pub(crate) fn complete_structural(
                 .is_some_and(|value| value.token == flush_token)
         })
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
-    let flush = core.phase.flush[flush_index]
-        .clone()
-        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
+    let flush = core.phase.flush[flush_index].ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     if flush.token != flush_token {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
     }
-    let remaining: Vec<_> = flush
+    let remaining_count = flush
         .entries
         .iter()
-        .enumerate()
-        .filter(|(_, entry)| !entry.completed)
-        .collect();
-    if completion_count != remaining.len() {
+        .filter(|entry| !entry.completed)
+        .count();
+    if completion_count != remaining_count {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_COMMIT);
     }
     if completion_count > 0
@@ -1961,11 +2082,8 @@ pub(crate) fn complete_structural(
         )
         .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
     }
-    let mut seen = vec![false; flush.entries.len()];
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(completion_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    let mut seen = [false; STRUCTURAL_CAPACITY];
+    let mut values = BoundedVec::<IndexedCompletion, STRUCTURAL_CAPACITY>::new();
     for index in 0..completion_count {
         let pointer = unsafe { completions_ptr.add(index) };
         let value = unsafe { &*pointer };
@@ -1990,25 +2108,28 @@ pub(crate) fn complete_structural(
             return Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST);
         }
         seen[entry_index] = true;
-        values.push((entry_index, *value));
+        values.push(IndexedCompletion {
+            entry_index,
+            value: *value,
+        })?;
     }
     let mut state = core
         .live
         .clone()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let mut bindings = core.phase.active_bindings.clone();
+    let mut bindings = core.phase.active_bindings;
     let mut used = core.phase.admission_used;
-    for (entry_index, completion) in &values {
-        let item = &flush.entries[*entry_index].item;
+    for indexed in &values {
+        let item = &flush.entries[indexed.entry_index].item;
         let key = read_object_key(&item.object_ref)?;
         if item.operation == abi::KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT {
-            if completion.status != abi::KADATH_RUNTIME_PHASE_COMPLETION_CANCELLED {
+            if indexed.value.status != abi::KADATH_RUNTIME_PHASE_COMPLETION_CANCELLED {
                 return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_COMMIT);
             }
             continue;
         }
         if item.operation == abi::KADATH_RUNTIME_PHASE_OPERATION_REQUEST_DESTROY
-            && completion.status == abi::KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED
+            && indexed.value.status == abi::KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED
         {
             match state.finalize_destroy(key) {
                 Ok(()) | Err(object_authority::AuthorityError::Stale) => {}
@@ -2018,8 +2139,8 @@ pub(crate) fn complete_structural(
         }
     }
     let mut entries = flush.entries;
-    for (entry_index, _) in values {
-        entries[entry_index].completed = true;
+    for indexed in &values {
+        entries[indexed.entry_index].completed = true;
     }
     core.live = Some(state);
     core.phase.active_bindings = bindings;
@@ -2046,14 +2167,12 @@ pub(crate) fn abort_structural(core: &mut RuntimeCore, flush_token: u64) -> Resu
                 .is_some_and(|value| value.token == flush_token)
         })
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
-    let flush = core.phase.flush[flush_index]
-        .clone()
-        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
+    let flush = core.phase.flush[flush_index].ok_or(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)?;
     let mut state = core
         .live
         .clone()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let mut bindings = core.phase.active_bindings.clone();
+    let mut bindings = core.phase.active_bindings;
     let mut used = core.phase.admission_used;
     for entry in &flush.entries {
         if entry.completed {
@@ -2149,4 +2268,118 @@ pub(crate) fn query_interface(
     };
     unsafe { ptr::write(in_out, value) };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_vec_preserves_order_and_capacity() {
+        let mut values = BoundedVec::<u32, 3>::new();
+        assert_eq!(values.len(), 0);
+        values.push(10).expect("first value");
+        values
+            .extend_from_slice(&[20, 30])
+            .expect("remaining capacity");
+        assert_eq!(values.as_slice(), &[10, 20, 30]);
+        assert_eq!(
+            values.push(40),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+        );
+        assert_eq!(
+            values.extend_from_slice(&[40]),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+        );
+        values.retain(|value| *value != 20);
+        assert_eq!(values.as_slice(), &[10, 30]);
+        assert_eq!(values.swap_remove(0), 10);
+        assert_eq!(values.as_slice(), &[30]);
+        values.clear();
+        assert_eq!(values.len(), 0);
+    }
+
+    #[test]
+    fn domains_generations_and_admission_are_bounded() {
+        assert_eq!(
+            PhaseState::domain_index(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED),
+            Ok(0)
+        );
+        assert_eq!(
+            PhaseState::domain_index(abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME),
+            Ok(1)
+        );
+        assert_eq!(
+            PhaseState::domain_index(0),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_DOMAIN)
+        );
+
+        assert_eq!(PhaseState::normalize_generation(0, 0, false), Ok(0));
+        assert_eq!(PhaseState::normalize_generation(0, 4, true), Ok(4));
+        assert_eq!(PhaseState::normalize_generation(4, 4, true), Ok(4));
+        assert_eq!(
+            PhaseState::normalize_generation(3, 4, true),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_REQUEST)
+        );
+        assert_eq!(
+            PhaseState::normalize_generation(MAX_GENERATION + 1, 0, false),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_GENERATION_EXHAUSTED)
+        );
+        assert_eq!(
+            PhaseState::normalize_generation(0, MAX_GENERATION + 1, true),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_GENERATION_EXHAUSTED)
+        );
+
+        let mut used = MAX_BINDINGS - 1;
+        let mut bindings = BoundedVec::<Binding, { MAX_BINDINGS as usize }>::new();
+        let key = object_authority::ObjectKey {
+            object_id: object_authority::ObjectId::runtime(1),
+            world_epoch: 1,
+            logical_generation: 1,
+            kind: abi::KADATH_RUNTIME_OBJECT_KIND_SPRITE,
+        };
+        PhaseState::admission_add(
+            &mut used,
+            &mut bindings,
+            Binding {
+                object: key,
+                behavior_count: 1,
+            },
+        )
+        .expect("last admission");
+        assert_eq!(used, MAX_BINDINGS);
+        assert_eq!(
+            PhaseState::admission_add(
+                &mut used,
+                &mut bindings,
+                Binding {
+                    object: key,
+                    behavior_count: 1,
+                },
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_ADMISSION_CAPACITY)
+        );
+        PhaseState::admission_remove(&mut used, &mut bindings, key);
+        assert_eq!(used, MAX_BINDINGS - 1);
+        assert_eq!(bindings.len(), 0);
+    }
+
+    #[test]
+    fn output_and_union_helpers_reject_nonzero_sentinels() {
+        let mut result: abi::kadath_runtime_phase_activation_structural_result_v1_t =
+            unsafe { mem::zeroed() };
+        result.struct_size = mem::size_of_val(&result) as u32;
+        assert_eq!(valid_activation_structural_results(&mut result, 1), Ok(()));
+        result.status = 1;
+        assert_eq!(
+            valid_activation_structural_results(&mut result, 1),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+
+        let bytes = [0_u8; 8];
+        assert!(union_tail_zero(&bytes, 4));
+        let bytes = [0_u8, 0, 0, 0, 1, 0, 0, 0];
+        assert!(!union_tail_zero(&bytes, 4));
+        assert!(!union_tail_zero(&bytes, bytes.len() + 1));
+    }
 }

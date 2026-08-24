@@ -10,6 +10,7 @@ crate-type = ["staticlib", "rlib"]
 
 [features]
 contract-test-hooks = []
+phase-quality-evidence = []
 
 [build-dependencies]
 bindgen = "=0.72.1"

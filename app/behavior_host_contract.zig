@@ -40,7 +40,13 @@ fn makeRuntimeFixture(
     var snapshot = try manifest.loadSnapshot(std.testing.io, std.testing.allocator, tmp.dir, manifest_source);
     defer snapshot.deinit();
     var diagnostic = builder.Diagnostic{};
-    var built = try builder.build(std.testing.allocator, &snapshot, &diagnostic);
+    var built = builder.build(std.testing.allocator, &snapshot, &diagnostic) catch |err| {
+        std.debug.print("Behavior fixture build failed: source={s}, diagnostic={s}\n", .{
+            diagnostic.sourceName(),
+            diagnostic.message(),
+        });
+        return err;
+    };
     defer built.deinit();
 
     const scene = try scene_api.parse(std.testing.allocator, runtime_scene_source);
@@ -862,6 +868,68 @@ test "event overflow disables only the producer and drains accepted events" {
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
     try fixture.runtime.finishFrame(&fixture.generation, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 75), (try fixture.generation.objectPosition(2))[0], 0.0001);
+}
+
+test "event payload values cross the Core Phase seam without losing type or identity" {
+    const payload_manifest =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/payload.luau"},
+        \\{"scriptId":2,"source":"scripts/no-op.luau"}]}
+    ;
+    const payload_source =
+        \\--!strict
+        \\local function post_typed(self: Kadath.Object, amount: number)
+        \\    local goal = kadath.scene.find("goal")
+        \\    if not goal then error("missing goal") end
+        \\    local payload = ({
+        \\        enabled = true,
+        \\        amount = amount,
+        \\        label = "phase",
+        \\        target = goal,
+        \\    } :: any)
+        \\    kadath.event.post(self, "typed", payload)
+        \\end
+        \\return {
+        \\    on_start = function(self: Kadath.Object)
+        \\        post_typed(self, 4)
+        \\    end,
+        \\    update = function(self: Kadath.Object, dt: number)
+        \\        post_typed(self, 4 + dt - dt)
+        \\    end,
+        \\    on_event = function(self: Kadath.Object, event: Kadath.Event)
+        \\        local payload = event.payload :: any
+        \\        if event.name == "typed" and
+        \\            payload["enabled"] == true and
+        \\            payload["amount"] == 4 and
+        \\            payload["label"] == "phase" and
+        \\            payload["target"]:id() == "goal" then
+        \\            self:translate(7, 0)
+        \\        end
+        \\    end,
+        \\}
+    ;
+    const payload_scene =
+        \\{"schemaVersion":5,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]},
+        \\{"objectId":"hazard-1","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[5,6],"color":[1,0,0,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(
+        payload_manifest,
+        &.{
+            .{ .path = "scripts/payload.luau", .source = payload_source },
+            .{ .path = "scripts/no-op.luau", .source = no_op_source },
+        },
+        payload_scene,
+    );
+    defer fixture.deinit();
+
+    const start = try fixture.runtime.onStart(&fixture.generation);
+    try fixture.generation.applyTranslationDeltas(start.slice());
+    try fixture.runtime.publishStartupEvents(&fixture.generation, &start);
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+    try std.testing.expectApproxEqAbs(@as(f32, 15), (try fixture.generation.objectPosition(1))[0], 0.0001);
 }
 
 test "failed event handler keeps prior writes and later handlers continue" {

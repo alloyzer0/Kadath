@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <threads.h>
 
@@ -965,6 +966,17 @@ static int phase_commit_path(
         return 151;
     }
 
+    /* Wrong domain/phase identity is stale and must not write the caller count. */
+    size_t stale_drain_count = 88U;
+    kadath_runtime_phase_event_v1_t stale_drain;
+    memset(&stale_drain, 0, sizeof(stale_drain));
+    stale_drain.struct_size = (uint32_t)sizeof(stale_drain);
+    if (phase_interface->drain_events(core, KADATH_RUNTIME_PHASE_DOMAIN_FRAME, 77U,
+                                      &stale_drain, 1U, &stale_drain_count) != KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST ||
+        stale_drain_count != 88U) {
+        return 224;
+    }
+
     size_t empty_drain_count = 99U;
     uintptr_t invalid_event_address = UINTPTR_MAX & ~((uintptr_t)_Alignof(kadath_runtime_phase_event_v1_t) - 1U);
     kadath_runtime_phase_event_v1_t* invalid_event_output =
@@ -1050,11 +1062,17 @@ static int phase_commit_path(
         taken_count != 1U || flush.request_count != 1U || taken.sequence != structural_batch.first_sequence) {
         return 157;
     }
+    if (phase_interface->abort_structural(core, flush.flush_token + 1U) != KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST) {
+        return 232;
+    }
     kadath_runtime_phase_transaction_info_v1_t transaction;
     memset(&transaction, 0, sizeof(transaction));
     transaction.struct_size = (uint32_t)sizeof(transaction);
     if (phase_interface->begin_activation(core, flush.flush_token, taken.sequence, &transaction) != KADATH_OK) {
         return 158;
+    }
+    if (phase_interface->abort_activation(core, transaction.transaction_id + 1U) != KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST) {
+        return 225;
     }
     kadath_runtime_phase_activation_batch_v1_t activation_batch;
     kadath_runtime_phase_structural_v1_t nested_structural;
@@ -1480,6 +1498,106 @@ static int activation_discard_path(
     return 0;
 }
 
+static int activation_abort_preserves_identity_high_water(
+    kadath_runtime_object_authority_interface_t* object_interface,
+    kadath_runtime_phase_interface_v1_t* phase_interface) {
+    kadath_runtime_core_t* core = NULL;
+    if (create_live_core(object_interface, &core) != 0) return 240;
+    kadath_runtime_query_result_t player_result;
+    if (query_id(object_interface, core, "player", &player_result) != KADATH_OK) return 241;
+
+    kadath_runtime_phase_begin_desc_v1_t begin;
+    kadath_runtime_phase_begin_result_v1_t begin_result;
+    memset(&begin, 0, sizeof(begin));
+    memset(&begin_result, 0, sizeof(begin_result));
+    begin.struct_size = (uint32_t)sizeof(begin);
+    begin.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    begin.phase_sequence = 81U;
+    begin_result.struct_size = (uint32_t)sizeof(begin_result);
+    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK) return 242;
+
+    kadath_runtime_phase_structural_v1_t root;
+    kadath_runtime_phase_request_completion_v1_t acceptance;
+    kadath_runtime_phase_batch_result_v1_t batch_result;
+    memset(&root, 0, sizeof(root));
+    memset(&acceptance, 0, sizeof(acceptance));
+    memset(&batch_result, 0, sizeof(batch_result));
+    root.struct_size = (uint32_t)sizeof(root);
+    root.operation = KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT;
+    root.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    root.behavior_count = 1U;
+    root.prototype_key = 41U;
+    root.origin = player_result.payload.object.object_ref;
+    root.transient_sprite.struct_size = (uint32_t)sizeof(root.transient_sprite);
+    root.transient_sprite.size[0] = 2.0F;
+    root.transient_sprite.size[1] = 2.0F;
+    root.transient_sprite.color[3] = 1.0F;
+    root.transient_sprite.texture_id = 1U;
+    acceptance.struct_size = (uint32_t)sizeof(acceptance);
+    batch_result.struct_size = (uint32_t)sizeof(batch_result);
+    if (phase_interface->submit_structural(core, &root, 1U, sizeof(root),
+                                           &acceptance, 1U, &batch_result) != KADATH_OK) return 243;
+
+    kadath_runtime_phase_structural_v1_t taken;
+    kadath_runtime_phase_flush_info_v1_t flush;
+    size_t taken_count = 0U;
+    memset(&taken, 0, sizeof(taken));
+    memset(&flush, 0, sizeof(flush));
+    taken.struct_size = (uint32_t)sizeof(taken);
+    flush.struct_size = (uint32_t)sizeof(flush);
+    if (phase_interface->take_structural(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 81U,
+                                         &flush, &taken, 1U, &taken_count) != KADATH_OK ||
+        taken_count != 1U) return 244;
+
+    kadath_runtime_phase_transaction_info_v1_t transaction;
+    memset(&transaction, 0, sizeof(transaction));
+    transaction.struct_size = (uint32_t)sizeof(transaction);
+    if (phase_interface->begin_activation(core, flush.flush_token, taken.sequence,
+                                          &transaction) != KADATH_OK) return 245;
+
+    kadath_runtime_phase_structural_v1_t nested = root;
+    kadath_runtime_phase_activation_structural_result_v1_t nested_result;
+    kadath_runtime_phase_activation_batch_v1_t activation_batch;
+    memset(&nested_result, 0, sizeof(nested_result));
+    memset(&activation_batch, 0, sizeof(activation_batch));
+    nested.prototype_key = 43U;
+    nested.sequence = 0U;
+    memset(&nested.object_ref, 0, sizeof(nested.object_ref));
+    nested_result.struct_size = (uint32_t)sizeof(nested_result);
+    activation_batch.struct_size = (uint32_t)sizeof(activation_batch);
+    activation_batch.transaction_id = transaction.transaction_id;
+    activation_batch.active_binding_capacity = KADATH_RUNTIME_PHASE_MAX_BINDINGS;
+    activation_batch.structural = &nested;
+    activation_batch.structural_count = 1U;
+    activation_batch.structural_stride = sizeof(nested);
+    activation_batch.structural_results = &nested_result;
+    activation_batch.structural_result_capacity = 1U;
+    if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_OK ||
+        nested_result.object_ref.object_id_length == 0U ||
+        phase_interface->abort_activation(core, transaction.transaction_id) != KADATH_OK) return 246;
+
+    memset(&acceptance, 0, sizeof(acceptance));
+    memset(&batch_result, 0, sizeof(batch_result));
+    acceptance.struct_size = (uint32_t)sizeof(acceptance);
+    batch_result.struct_size = (uint32_t)sizeof(batch_result);
+    if (phase_interface->submit_structural(core, &root, 1U, sizeof(root),
+                                           &acceptance, 1U, &batch_result) != KADATH_OK ||
+        memcmp(&acceptance.object.object_ref, &nested_result.object_ref,
+               sizeof(nested_result.object_ref)) == 0) return 247;
+    memset(&taken, 0, sizeof(taken));
+    memset(&flush, 0, sizeof(flush));
+    taken.struct_size = (uint32_t)sizeof(taken);
+    flush.struct_size = (uint32_t)sizeof(flush);
+    taken_count = 0U;
+    if (phase_interface->take_structural(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 81U,
+                                         &flush, &taken, 1U, &taken_count) != KADATH_OK ||
+        taken_count != 1U ||
+        phase_interface->abort_structural(core, flush.flush_token) != KADATH_OK ||
+        phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 81U) != KADATH_OK ||
+        object_interface->destroy(&core) != KADATH_OK || core != NULL) return 248;
+    return 0;
+}
+
 int main(void) {
     kadath_runtime_object_authority_interface_t interface_value = query_interface();
     if (interface_value.create == NULL || interface_value.destroy == NULL ||
@@ -1514,9 +1632,18 @@ int main(void) {
     if (query_result != 0) return query_result;
     int phase_result = phase_commit_path(&interface_value, &phase_interface);
     if (phase_result != 0) return phase_result;
+    puts("PHASE3_PUBLIC_PHASE_COMMIT_PATH=PASS");
     int discard_result = activation_discard_path(&interface_value, &phase_interface);
     if (discard_result != 0) return discard_result;
+    puts("PHASE3_PUBLIC_ACTIVATION_DISCARD=PASS");
+    int high_water_result = activation_abort_preserves_identity_high_water(&interface_value, &phase_interface);
+    if (high_water_result != 0) return high_water_result;
+    puts("PHASE3_PUBLIC_SERIAL_HIGH_WATER=PASS");
     int fault_result = fault_containment(&interface_value);
     if (fault_result != 0) return fault_result;
-    return misuse_contract(&interface_value);
+    puts("PHASE3_PUBLIC_FAULT_CONTAINMENT=PASS");
+    int misuse_result = misuse_contract(&interface_value);
+    if (misuse_result != 0) return misuse_result;
+    puts("PHASE3_PUBLIC_MISUSE=PASS");
+    return 0;
 }

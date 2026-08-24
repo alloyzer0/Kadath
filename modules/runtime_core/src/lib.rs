@@ -17,6 +17,62 @@ use std::{
 };
 use world::{Bounds, Sprite};
 
+#[cfg(feature = "phase-quality-evidence")]
+mod quality_evidence {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+
+    pub(crate) struct CountingAllocator;
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if ENABLED.load(Ordering::Relaxed) {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if ENABLED.load(Ordering::Relaxed) {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if ENABLED.load(Ordering::Relaxed) {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe { System.realloc(pointer, layout, new_size) }
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn kadath_runtime_core_phase_quality_begin_allocation_count() {
+        ALLOCATIONS.store(0, Ordering::SeqCst);
+        ENABLED.store(true, Ordering::SeqCst);
+    }
+
+    #[no_mangle]
+    pub extern "C" fn kadath_runtime_core_phase_quality_end_allocation_count() -> u64 {
+        ENABLED.store(false, Ordering::SeqCst);
+        ALLOCATIONS.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(feature = "phase-quality-evidence")]
+#[global_allocator]
+static PHASE_QUALITY_ALLOCATOR: quality_evidence::CountingAllocator =
+    quality_evidence::CountingAllocator;
+
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod abi {
     include!(concat!(env!("OUT_DIR"), "/kadath_runtime_core_bindings.rs"));
@@ -29,7 +85,7 @@ struct RuntimeCore {
     candidate: Option<RuntimeState>,
     candidate_next_entity_value: Option<u64>,
     next_entity_value: u64,
-    phase: phase_commit::PhaseState,
+    phase: Box<phase_commit::PhaseState>,
     #[cfg(feature = "contract-test-hooks")]
     next_fault: Option<TestFault>,
 }
@@ -77,7 +133,7 @@ unsafe fn read_struct_size<T>(pointer: *const T) -> Result<u32, u32> {
 
 #[cfg(feature = "contract-test-hooks")]
 fn trigger_test_fault(core: &mut RuntimeCore, entry: u32) -> Result<(), u32> {
-    if !core.next_fault.is_some_and(|fault| fault.entry == entry) {
+    if core.next_fault.is_none_or(|fault| fault.entry != entry) {
         return Ok(());
     }
     let fault = core.next_fault.take().expect("matching test fault exists");
@@ -157,7 +213,7 @@ fn create(
         candidate: None,
         candidate_next_entity_value: None,
         next_entity_value: 1,
-        phase: phase_commit::PhaseState::new(),
+        phase: phase_commit::PhaseState::new_boxed()?,
         #[cfg(feature = "contract-test-hooks")]
         next_fault: None,
     };
@@ -1463,7 +1519,7 @@ mod tests {
             candidate: None,
             candidate_next_entity_value: None,
             next_entity_value: 1,
-            phase: phase_commit::PhaseState::new(),
+            phase: phase_commit::PhaseState::new_boxed().expect("phase arena allocation"),
             #[cfg(feature = "contract-test-hooks")]
             next_fault: None,
         };
