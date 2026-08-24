@@ -141,7 +141,7 @@ printf 'decision\tPASS\texecuted-public-seam\n' >"$decision_manifest"
 printf 'id\tstatus\tdiff-sha\tpublic-seam\n' >"$mutation_manifest"
 for id in stale_target_visibility_bypass same_flush_cancelled_root_bypass \
     activation_position_atomicity_bypass activation_failure_isolation_bypass; do
-    printf '%s\tKILLED\tdiff-sha\tpublic-seam\n' "$id" >>"$mutation_manifest"
+    printf "%s\tKILLED\tdiff-sha\tpublic-seam\terror: 'critical public seam' failed:\n" "$id" >>"$mutation_manifest"
 done
 printf 'run\tcandidate\toracle\n1\tsha\tsha\n' >"$performance_manifest"
 decision_manifest_sha="$(sha256sum "$decision_manifest" | awk '{print $1}')"

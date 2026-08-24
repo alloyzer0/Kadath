@@ -135,7 +135,10 @@ mutation_manifest_has_critical_kills() {
     [[ -f "$manifest" ]] || return 1
     for id in stale_target_visibility_bypass same_flush_cancelled_root_bypass \
         activation_position_atomicity_bypass activation_failure_isolation_bypass; do
-        grep -Eq "^${id}[[:space:]]+KILLED[[:space:]]" "$manifest" || return 1
+        awk -F '\t' -v id="$id" '
+            $1 == id && $2 == "KILLED" && $5 ~ /^error: '\''.*'\'' failed:$/ { found = 1 }
+            END { exit !found }
+        ' "$manifest" || return 1
     done
 }
 
