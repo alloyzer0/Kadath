@@ -81,14 +81,19 @@ pub const SceneGeneration = struct {
 
     pub fn commitPrepared(self: *SceneGeneration, previous: *SceneGeneration) !void {
         if (self.target != .candidate) return error.RuntimeCoreInvalidState;
+        // Complete every fallible projection query while both candidates remain private.
+        // After commitScene, ownership transfer and the target flip are no-fail operations.
+        try self.refreshRuntimeMetadata();
         try self.core.commitScene();
         self.core.takeOwnership(&previous.core);
         self.target = .live;
-        try self.refreshRuntimeMetadata();
     }
 
     pub fn deinit(self: *SceneGeneration) void {
         if (self.target == .candidate) {
+            self.core.abortPhaseState() catch |err| {
+                std.log.err("Runtime Core Phase candidate abort failed: {s}", .{@errorName(err)});
+            };
             self.core.abortScene() catch |err| {
                 std.log.err("Runtime Core candidate abort failed: {s}", .{@errorName(err)});
             };

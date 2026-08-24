@@ -179,6 +179,7 @@ struct Candidate {
     target: u32,
     phase_epoch: u64,
     bindings: BoundedVec<Binding, { MAX_BINDINGS as usize }>,
+    ready: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -254,10 +255,15 @@ impl PhaseState {
         {
             return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
         }
+        if self.candidate.is_some_and(|candidate| {
+            candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE && !candidate.ready
+        }) {
+            return Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE);
+        }
         Ok(())
     }
 
-    pub(crate) fn reset_after_scene_commit(&mut self) {
+    pub(crate) fn commit_after_scene(&mut self) {
         self.active_bindings.clear();
         self.admission_used = 0;
         for domain in &mut self.domains {
@@ -271,6 +277,17 @@ impl PhaseState {
         }
         self.flush = [None, None];
         self.activation = None;
+        if self.candidate.is_some_and(|candidate| {
+            candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE && candidate.ready
+        }) {
+            let candidate = self.candidate.take().expect("ready candidate exists");
+            self.active_bindings = candidate.bindings;
+            self.admission_used = self
+                .active_bindings
+                .iter()
+                .map(|binding| binding.behavior_count)
+                .sum();
+        }
     }
 
     fn domain_index(domain: u32) -> Result<usize, u32> {
@@ -797,6 +814,7 @@ pub(crate) fn prepare_phase_state(
         target: desc.target,
         phase_epoch: state.world_epoch,
         bindings,
+        ready: false,
     };
     let info = abi::kadath_runtime_phase_state_candidate_info_v1_t {
         struct_size: mem::size_of::<abi::kadath_runtime_phase_state_candidate_info_v1_t>() as u32,
@@ -830,14 +848,22 @@ pub(crate) fn commit_phase_state(core: &mut RuntimeCore) -> Result<(), u32> {
     if candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE && core.candidate.is_none() {
         return Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE);
     }
-    let candidate = core.phase.candidate.take().expect("candidate exists");
-    core.phase.active_bindings = candidate.bindings;
-    core.phase.admission_used = core
-        .phase
-        .active_bindings
-        .iter()
-        .map(|binding| binding.behavior_count)
-        .sum();
+    if candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE {
+        core.phase
+            .candidate
+            .as_mut()
+            .expect("candidate exists")
+            .ready = true;
+    } else {
+        let candidate = core.phase.candidate.take().expect("candidate exists");
+        core.phase.active_bindings = candidate.bindings;
+        core.phase.admission_used = core
+            .phase
+            .active_bindings
+            .iter()
+            .map(|binding| binding.behavior_count)
+            .sum();
+    }
     Ok(())
 }
 
@@ -859,6 +885,23 @@ pub(crate) fn begin_phase(
     if desc_size < mem::size_of::<abi::kadath_runtime_phase_begin_desc_v1_t>() as u32
         || out_size < mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32
     {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let desc_range = strided_range(
+        desc_ptr as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_phase_begin_desc_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let output_range = strided_range(
+        out_ptr as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    if ranges_overlap(desc_range, output_range) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     let desc = unsafe { &*desc_ptr };
@@ -1545,6 +1588,14 @@ pub(crate) fn submit_activation(
     if batch.position_count > abi::KADATH_RUNTIME_MAX_OBJECTS as usize
         || batch.event_count > EVENT_CAPACITY
         || batch.structural_count > STRUCTURAL_CAPACITY
+    {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+    }
+    if active
+        .positions
+        .len()
+        .checked_add(batch.position_count)
+        .is_none_or(|count| count > STRUCTURAL_CAPACITY)
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }

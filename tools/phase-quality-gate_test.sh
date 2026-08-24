@@ -138,7 +138,11 @@ decision_manifest="$evidence_root/decision-matrix.tsv"
 mutation_manifest="$evidence_root/mutation-manifest.tsv"
 performance_manifest="$evidence_root/performance-manifest.tsv"
 printf 'decision\tPASS\texecuted-public-seam\n' >"$decision_manifest"
-printf 'id\tKILLED\tdiff-sha\tpublic-seam\n' >"$mutation_manifest"
+printf 'id\tstatus\tdiff-sha\tpublic-seam\n' >"$mutation_manifest"
+for id in stale_target_visibility_bypass same_flush_cancelled_root_bypass \
+    activation_position_atomicity_bypass activation_failure_isolation_bypass; do
+    printf '%s\tKILLED\tdiff-sha\tpublic-seam\n' "$id" >>"$mutation_manifest"
+done
 printf 'run\tcandidate\toracle\n1\tsha\tsha\n' >"$performance_manifest"
 decision_manifest_sha="$(sha256sum "$decision_manifest" | awk '{print $1}')"
 mutation_manifest_sha="$(sha256sum "$mutation_manifest" | awk '{print $1}')"
@@ -167,6 +171,7 @@ PHASE3_MUTATION_KILLED=1
 PHASE3_MUTATION_SURVIVED=0
 PHASE3_MUTATION_UNVIABLE=0
 PHASE3_CRITICAL_SURVIVORS=0
+PHASE3_MUTATION_CRITICAL_DOMAINS=stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation
 PHASE3_MUTATION_MANIFEST_SHA256=$mutation_manifest_sha
 PHASE3_MUTATION_MANIFEST=$mutation_manifest
 EOF

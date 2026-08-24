@@ -1,12 +1,13 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const runtime_core = @import("runtime_core");
+const c = @cImport({
+    @cDefine("KADATH_RUNTIME_PHASE_QUALITY_EVIDENCE", "1");
+    @cInclude("kadath_runtime_core.h");
+});
 
 const iterations = 10_000;
 const batch_size = runtime_core.max_phase_events;
-
-extern fn kadath_runtime_core_phase_quality_begin_allocation_count() callconv(.c) void;
-extern fn kadath_runtime_core_phase_quality_end_allocation_count() callconv(.c) u64;
 
 fn monotonicNs() u64 {
     if (builtin.os.tag != .linux) return 0;
@@ -80,7 +81,9 @@ fn runDomain(
         completions[index].struct_size = @sizeOf(runtime_core.PhaseCompletion);
     }
 
-    kadath_runtime_core_phase_quality_begin_allocation_count();
+    if (c.kadath_runtime_core_phase_quality_begin_allocation_count() != c.KADATH_OK) {
+        return error.AllocationCounterUnavailable;
+    }
     for (samples, 0..) |*sample, index| {
         const phase_sequence = @as(u64, @intCast(index)) + 1;
         try core.beginPhase(domain, phase_sequence);
@@ -95,7 +98,11 @@ fn runDomain(
         sample.* = monotonicNs() - start;
         try core.endPhase(domain, phase_sequence);
     }
-    return kadath_runtime_core_phase_quality_end_allocation_count();
+    var allocation_count: u64 = 0;
+    if (c.kadath_runtime_core_phase_quality_end_allocation_count(&allocation_count) != c.KADATH_OK) {
+        return error.AllocationCounterUnavailable;
+    }
+    return allocation_count;
 }
 
 pub fn main() !void {

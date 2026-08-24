@@ -19,6 +19,7 @@ use world::{Bounds, Sprite};
 
 #[cfg(feature = "phase-quality-evidence")]
 mod quality_evidence {
+    use crate::abi;
     use std::{
         alloc::{GlobalAlloc, Layout, System},
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -56,15 +57,24 @@ mod quality_evidence {
     }
 
     #[no_mangle]
-    pub extern "C" fn kadath_runtime_core_phase_quality_begin_allocation_count() {
+    pub extern "C" fn kadath_runtime_core_phase_quality_begin_allocation_count() -> i32 {
         ALLOCATIONS.store(0, Ordering::SeqCst);
         ENABLED.store(true, Ordering::SeqCst);
+        0
     }
 
     #[no_mangle]
-    pub extern "C" fn kadath_runtime_core_phase_quality_end_allocation_count() -> u64 {
+    pub extern "C" fn kadath_runtime_core_phase_quality_end_allocation_count(
+        out_allocation_count: *mut u64,
+    ) -> i32 {
+        if out_allocation_count.is_null()
+            || (out_allocation_count as usize) % std::mem::align_of::<u64>() != 0
+        {
+            return abi::KADATH_ERR_INVALID_ARGUMENT as i32;
+        }
         ENABLED.store(false, Ordering::SeqCst);
-        ALLOCATIONS.load(Ordering::SeqCst)
+        unsafe { out_allocation_count.write(ALLOCATIONS.load(Ordering::SeqCst)) };
+        0
     }
 }
 
@@ -483,7 +493,7 @@ fn commit_scene(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32
         .expect("candidate entity high-water accompanies candidate");
     core.live = Some(candidate);
     core.next_entity_value = next_entity_value;
-    core.phase.reset_after_scene_commit();
+    core.phase.commit_after_scene();
     Ok(())
 }
 

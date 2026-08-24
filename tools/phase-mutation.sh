@@ -22,6 +22,11 @@ candidate_sha="$(git -C "$repository_root" rev-parse --verify "${candidate_sha}^
     printf '%s\n' "candidate SHA is not current HEAD" >&2
     exit 1
 }
+git -C "$repository_root" diff --quiet --ignore-submodules -- &&
+    git -C "$repository_root" diff --cached --quiet --ignore-submodules -- || {
+    printf '%s\n' "candidate worktree or index has tracked changes" >&2
+    exit 1
+}
 [[ -n "$evidence_root" ]] || { usage >&2; exit 1; }
 mkdir -p "$evidence_root"
 evidence_root="$(cd -- "$evidence_root" && pwd)"
@@ -55,6 +60,10 @@ ids=(
     completion_count_inversion
     reserve_completion_status_inversion
     destroy_completion_status_inversion
+    stale_target_visibility_bypass
+    same_flush_cancelled_root_bypass
+    activation_position_atomicity_bypass
+    activation_failure_isolation_bypass
 )
 olds=(
     '            abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME => Ok(1),'
@@ -69,6 +78,21 @@ olds=(
     '    if completion_count != remaining_count {'
     '            if indexed.value.status != abi::KADATH_RUNTIME_PHASE_COMPLETION_CANCELLED {'
     '            && indexed.value.status == abi::KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED'
+    '            .is_some_and(|record| record.lifecycle == object_authority::Lifecycle::Active)'
+    '    let root_cancelled = state.visible_exact(key).is_none()'
+    '        .is_none_or(|count| count > STRUCTURAL_CAPACITY)'
+    'pub(crate) fn commit_activation(
+    core: &mut RuntimeCore,
+    transaction_id: u64,
+    out_ptr: *mut abi::kadath_runtime_phase_activation_result_v1_t,
+) -> Result<(), u32> {
+    valid_phase_output(out_ptr)?;
+    let activation = core
+        .phase
+        .activation
+        .clone()
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_TRANSACTION_BUSY)?;
+    if activation.transaction_id != transaction_id {'
 )
 news=(
     '            abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME => Ok(0),'
@@ -83,6 +107,21 @@ news=(
     '    if completion_count == remaining_count {'
     '            if indexed.value.status == abi::KADATH_RUNTIME_PHASE_COMPLETION_CANCELLED {'
     '            && indexed.value.status != abi::KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED'
+    '            .is_some_and(|record| record.lifecycle != object_authority::Lifecycle::Active)'
+    '    let root_cancelled = state.visible_exact(key).is_some()'
+    '        .is_none_or(|count| count >= STRUCTURAL_CAPACITY)'
+    'pub(crate) fn commit_activation(
+    core: &mut RuntimeCore,
+    transaction_id: u64,
+    out_ptr: *mut abi::kadath_runtime_phase_activation_result_v1_t,
+) -> Result<(), u32> {
+    valid_phase_output(out_ptr)?;
+    let activation = core
+        .phase
+        .activation
+        .clone()
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_TRANSACTION_BUSY)?;
+    if activation.transaction_id == transaction_id {'
 )
 
 manifest="$evidence_root/mutation-manifest.tsv"
@@ -153,6 +192,7 @@ PHASE3_MUTATION_KILLED=$killed
 PHASE3_MUTATION_SURVIVED=$survived
 PHASE3_MUTATION_UNVIABLE=$unviable
 PHASE3_CRITICAL_SURVIVORS=$survived
+PHASE3_MUTATION_CRITICAL_DOMAINS=stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation
 PHASE3_MUTATION_MANIFEST_SHA256=$manifest_sha
 PHASE3_MUTATION_MANIFEST=$manifest
 EOF

@@ -732,6 +732,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .link_libc = true,
             });
+            runtime_core_bench_mod.addIncludePath(b.path("abi"));
             runtime_core_bench_mod.addImport("runtime_core", runtime_core_mod);
             runtime_core_bench_mod.addLibraryPath(.{ .cwd_relative = library_path });
             runtime_core_bench_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
@@ -749,6 +750,14 @@ pub fn build(b: *std.Build) void {
             const runtime_core_bench_run = b.addRunArtifact(runtime_core_bench);
             const runtime_core_bench_step = b.step("bench-runtime-core-phase", "Run the 10,000-batch Runtime Core Phase baseline");
             runtime_core_bench_step.dependOn(&runtime_core_bench_run.step);
+            if (phase_quality_emit_dir) |emit_dir| {
+                const install_runtime_core_bench = b.addInstallArtifact(runtime_core_bench, .{
+                    .dest_dir = .{ .override = .{ .custom = emit_dir } },
+                    .dest_sub_path = "runtime-core-phase-bench",
+                });
+                const emit_runtime_core_bench = b.step("emit-phase-runtime-core-bench", "Emit the Runtime Core Phase benchmark without running it");
+                emit_runtime_core_bench.dependOn(&install_runtime_core_bench.step);
+            }
         }
 
         const contract_rust_target = if (target.result.os.tag == .windows)

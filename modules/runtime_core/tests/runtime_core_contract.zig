@@ -322,6 +322,63 @@ test "Runtime Core Phase admission overflow preserves structural state" {
     try core.endPhase(.fixed, phase_sequence + 1);
 }
 
+test "candidate Phase admission stays private until paired Scene commit" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    const sources = [_]runtime_core.SourceDesc{
+        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
+    };
+    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
+    try core.commitScene();
+    const live_player = (try core.findById(.live, "player")).?.object_ref;
+
+    _ = try core.prepare(.restart, .{ 0, 0 }, .{ 100, 100 }, &sources);
+    const candidate_player = (try core.findById(.candidate, "player")).?.object_ref;
+    var bindings: [runtime_core.max_phase_bindings / 4]runtime_core.PhaseBinding = undefined;
+    for (&bindings) |*binding| {
+        binding.* = std.mem.zeroes(runtime_core.PhaseBinding);
+        binding.struct_size = @sizeOf(runtime_core.PhaseBinding);
+        binding.object_ref = candidate_player;
+        binding.behavior_count = 4;
+    }
+    _ = try core.preparePhaseState(.candidate, bindings[0..]);
+    try core.commitPhaseState();
+
+    var request = std.mem.zeroes(runtime_core.PhaseStructural);
+    request.struct_size = @sizeOf(runtime_core.PhaseStructural);
+    request.operation = runtime_core.phase_operation_reserve_transient;
+    request.domain = @intFromEnum(runtime_core.PhaseDomain.fixed);
+    request.behavior_count = 1;
+    request.prototype_key = 5;
+    request.origin = live_player;
+    request.transient_sprite.struct_size = @sizeOf(@TypeOf(request.transient_sprite));
+    request.transient_sprite.size = .{ 4, 4 };
+    request.transient_sprite.color[3] = 1;
+    request.transient_sprite.texture_id = 1;
+    var completion = std.mem.zeroes(runtime_core.PhaseCompletion);
+    completion.struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    var requests = [_]runtime_core.PhaseStructural{request};
+    var completions = [_]runtime_core.PhaseCompletion{completion};
+
+    try core.beginPhase(.fixed, 0x5041_4952_4c49_5645);
+    _ = try core.submitPhaseStructural(requests[0..], completions[0..]);
+    var taken: [1]runtime_core.PhaseStructural = undefined;
+    const flush = try core.takePhaseStructural(.fixed, 0x5041_4952_4c49_5645, taken[0..]);
+    try core.abortPhaseStructural(flush.info.flush_token);
+    try core.endPhase(.fixed, 0x5041_4952_4c49_5645);
+
+    try core.commitScene();
+    requests[0].origin = candidate_player;
+    completions[0] = std.mem.zeroes(runtime_core.PhaseCompletion);
+    completions[0].struct_size = @sizeOf(runtime_core.PhaseCompletion);
+    try core.beginPhase(.fixed, 0x5041_4952_4e45_5753);
+    try std.testing.expectError(
+        error.RuntimePhaseAdmissionCapacity,
+        core.submitPhaseStructural(requests[0..], completions[0..]),
+    );
+    try core.endPhase(.fixed, 0x5041_4952_4e45_5753);
+}
+
 test "Runtime Core structural replay preserves bounded FIFO and successor generation" {
     var core = try runtime_core.RuntimeCore.init();
     defer core.deinit();

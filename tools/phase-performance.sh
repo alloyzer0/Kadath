@@ -22,6 +22,11 @@ candidate_sha="$(git -C "$repository_root" rev-parse --verify "${candidate_sha}^
     printf '%s\n' "candidate SHA is not current HEAD" >&2
     exit 1
 }
+git -C "$repository_root" diff --quiet --ignore-submodules -- &&
+    git -C "$repository_root" diff --cached --quiet --ignore-submodules -- || {
+    printf '%s\n' "candidate worktree or index has tracked changes" >&2
+    exit 1
+}
 [[ -n "$evidence_root" ]] || { usage >&2; exit 1; }
 mkdir -p "$evidence_root"
 evidence_root="$(cd -- "$evidence_root" && pwd)"
@@ -92,13 +97,16 @@ zig build-exe -OReleaseSafe \
     -femit-bin="$oracle_benchmark"
 
 candidate_build_log="$evidence_root/candidate-build.log"
+candidate_emit_prefix="$evidence_root/candidate-emit"
 (
 cd -- "$repository_root"
-zig build bench-runtime-core-phase \
-    -Doptimize=ReleaseSafe -Dphase-quality-evidence=true --summary all \
+zig build emit-phase-runtime-core-bench \
+    --prefix "$candidate_emit_prefix" \
+    -Doptimize=ReleaseSafe -Dphase-quality-evidence=true \
+    -Dphase-quality-emit-dir=bench --summary all \
     >"$candidate_build_log" 2>&1
 )
-candidate_benchmark="$(find "$repository_root/.zig-cache/o" -maxdepth 2 -type f -name runtime-core-phase-bench -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
+candidate_benchmark="$candidate_emit_prefix/bench/runtime-core-phase-bench"
 [[ -x "$candidate_benchmark" ]] || exit 1
 candidate_benchmark_sha="$(sha256sum "$candidate_benchmark" | awk '{print $1}')"
 oracle_benchmark_sha="$(sha256sum "$oracle_benchmark" | awk '{print $1}')"
@@ -186,7 +194,7 @@ EOF
 cat >"$performance_report" <<EOF
 PHASE3_REPORT_VERSION=1
 PHASE3_CANDIDATE_SHA=$candidate_sha
-PHASE3_COMMAND=zig build bench-runtime-core-phase -Doptimize=ReleaseSafe -Dphase-quality-evidence=true
+PHASE3_COMMAND=zig build emit-phase-runtime-core-bench --prefix $candidate_emit_prefix -Doptimize=ReleaseSafe -Dphase-quality-evidence=true -Dphase-quality-emit-dir=bench
 PHASE3_PERF_STATUS=$status
 PHASE3_CANDIDATE_BENCHMARK=$candidate_benchmark
 PHASE3_CANDIDATE_BENCHMARK_SHA256=$candidate_benchmark_sha

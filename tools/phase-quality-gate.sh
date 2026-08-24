@@ -128,6 +128,17 @@ report_file_matches_hash() {
     [[ "$actual" == "$expected" ]]
 }
 
+mutation_manifest_has_critical_kills() {
+    local report=$1
+    local manifest id
+    manifest=$(sed -n 's/^PHASE3_MUTATION_MANIFEST=//p' "$report")
+    [[ -f "$manifest" ]] || return 1
+    for id in stale_target_visibility_bypass same_flush_cancelled_root_bypass \
+        activation_position_atomicity_bypass activation_failure_isolation_bypass; do
+        grep -Eq "^${id}[[:space:]]+KILLED[[:space:]]" "$manifest" || return 1
+    done
+}
+
 metric_at_most() {
     local report=$1
     local key=$2
@@ -144,6 +155,12 @@ if [[ -z "$candidate_sha" ]] || ! resolved_candidate=$(git rev-parse --verify "$
     blocked+=("candidate SHA mismatch")
 else
     candidate_sha=$resolved_candidate
+fi
+if ! git diff --quiet --ignore-submodules -- ||
+    ! git diff --cached --quiet --ignore-submodules --; then
+    candidate_status=BLOCKED
+    candidate_reason="candidate worktree or index has tracked changes"
+    blocked+=("candidate worktree is dirty")
 fi
 
 rust_llvm_bin="$(rustc --print sysroot 2>/dev/null)/lib/rustlib/$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')/bin"
@@ -188,8 +205,10 @@ elif ! report_bound_to_candidate "$mutation_report" ||
     ! report_has_key "$mutation_report" PHASE3_MUTATION_SURVIVED 0 ||
     ! report_has_key "$mutation_report" PHASE3_MUTATION_UNVIABLE 0 ||
     ! report_has_key "$mutation_report" PHASE3_CRITICAL_SURVIVORS 0 ||
+    ! report_has_key "$mutation_report" PHASE3_MUTATION_CRITICAL_DOMAINS stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation ||
     ! grep -Eq '^PHASE3_MUTATION_MANIFEST_SHA256=[0-9a-f]{64}$' "$mutation_report" ||
-    ! report_file_matches_hash "$mutation_report" PHASE3_MUTATION_MANIFEST PHASE3_MUTATION_MANIFEST_SHA256; then
+    ! report_file_matches_hash "$mutation_report" PHASE3_MUTATION_MANIFEST PHASE3_MUTATION_MANIFEST_SHA256 ||
+    ! mutation_manifest_has_critical_kills "$mutation_report"; then
     mutation_status=BLOCKED
     mutation_reason="mutation report schema, SHA, command, or metrics invalid"
     blocked+=("mutation report is not verifiable PASS")

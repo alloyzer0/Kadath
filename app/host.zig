@@ -536,11 +536,11 @@ pub const Host = struct {
                 try applyScriptCommandsToGeneration(&replacement, commands);
             }
         }
-        try replacement.commitPrepared(&self.generation);
         if (candidate_behavior.isLoaded()) {
             try candidate_behavior.preparePhaseState(&replacement);
             try candidate_behavior.commitPhaseState(&replacement);
         }
+        try replacement.commitPrepared(&self.generation);
         var previous_generation = self.generation;
         var previous_registry = self.texture_registry;
         var previous_behavior = self.behavior_runtime;
@@ -587,9 +587,9 @@ pub const Host = struct {
             errdefer candidate.deinit();
             const batch = try candidate.onStart(&replacement);
             try replacement.applyTranslationDeltas(batch.slice());
-            try replacement.commitPrepared(&self.generation);
             try candidate.preparePhaseState(&replacement);
             try candidate.commitPhaseState(&replacement);
+            try replacement.commitPrepared(&self.generation);
             var previous_generation = self.generation;
             var previous_behavior = self.behavior_runtime;
             self.generation = replacement;

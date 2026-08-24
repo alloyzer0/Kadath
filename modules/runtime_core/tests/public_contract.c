@@ -961,6 +961,30 @@ static int phase_commit_path(
     begin.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
     begin.phase_sequence = 77U;
     begin_result.struct_size = (uint32_t)sizeof(begin_result);
+    union {
+        kadath_runtime_phase_begin_desc_v1_t desc;
+        kadath_runtime_phase_begin_result_v1_t result;
+    } aliased_begin;
+    memset(&aliased_begin, 0, sizeof(aliased_begin));
+    aliased_begin.desc.struct_size = (uint32_t)sizeof(aliased_begin.desc);
+    aliased_begin.desc.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    aliased_begin.desc.phase_sequence = 76U;
+    if (phase_interface->begin_phase(core, &aliased_begin.desc, &aliased_begin.result) != KADATH_ERR_INVALID_ARGUMENT ||
+        aliased_begin.desc.phase_sequence != 76U) {
+        return 249;
+    }
+    _Alignas(kadath_runtime_phase_begin_desc_v1_t) unsigned char misaligned_begin_storage[
+        sizeof(kadath_runtime_phase_begin_desc_v1_t) + 1U];
+    memset(misaligned_begin_storage, 0, sizeof(misaligned_begin_storage));
+    uint32_t misaligned_begin_size = (uint32_t)sizeof(kadath_runtime_phase_begin_desc_v1_t);
+    memcpy(misaligned_begin_storage + 1U, &misaligned_begin_size, sizeof(misaligned_begin_size));
+    if (phase_interface->begin_phase(
+            core,
+            (const kadath_runtime_phase_begin_desc_v1_t*)(const void*)(misaligned_begin_storage + 1U),
+            &begin_result) != KADATH_ERR_INVALID_ARGUMENT ||
+        begin_result.phase_sequence != 0U) {
+        return 252;
+    }
     if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
         begin_result.phase_sequence != 77U) {
         return 151;
@@ -1083,6 +1107,20 @@ static int phase_commit_path(
     activation_batch.struct_size = (uint32_t)sizeof(activation_batch);
     activation_batch.transaction_id = transaction.transaction_id;
     activation_batch.active_binding_capacity = KADATH_RUNTIME_PHASE_MAX_BINDINGS;
+    kadath_runtime_position_patch_v1_t activation_positions[KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN];
+    memset(activation_positions, 0, sizeof(activation_positions));
+    for (size_t index = 0; index < KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN; ++index) {
+        activation_positions[index].struct_size = (uint32_t)sizeof(activation_positions[index]);
+        activation_positions[index].object_ref = taken.object_ref;
+        activation_positions[index].position[0] = (float)index;
+        activation_positions[index].position[1] = (float)(index + 1U);
+    }
+    activation_batch.positions = activation_positions;
+    activation_batch.position_count = KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN;
+    activation_batch.position_stride = sizeof(activation_positions[0]);
+    if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_OK) {
+        return 250;
+    }
     nested_structural.struct_size = (uint32_t)sizeof(nested_structural);
     nested_structural.operation = KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT;
     nested_structural.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
@@ -1101,12 +1139,14 @@ static int phase_commit_path(
     activation_batch.structural_stride = sizeof(nested_structural);
     activation_batch.structural_results = &nested_result;
     activation_batch.structural_result_capacity = 1U;
+    activation_batch.position_count = 0U;
     nested_result.reserved[0] = 1U;
     if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_ERR_INVALID_ARGUMENT ||
         nested_result.reserved[0] != 1U || nested_result.status != 0U) {
         return 159;
     }
     nested_result.reserved[0] = 0U;
+    activation_batch.position_count = 0U;
     activation_batch.active_binding_capacity = 1U;
     if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_ERR_BUFFER_TOO_SMALL ||
         nested_result.status != 0U || nested_result.sequence != 0U) {
@@ -1114,11 +1154,19 @@ static int phase_commit_path(
     }
     /* Root plus nested reservation requires exactly two caller slots. */
     activation_batch.active_binding_capacity = 2U;
+    activation_batch.position_count = 1U;
+    if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY ||
+        nested_result.status != 0U || nested_result.sequence != 0U) {
+        return 251;
+    }
+    activation_batch.position_count = 0U;
+    activation_batch.positions = NULL;
+    activation_batch.position_stride = 0U;
     if (phase_interface->submit_activation(core, transaction.transaction_id, &activation_batch) != KADATH_OK) {
         return 161;
     }
     if (nested_result.status != KADATH_RUNTIME_PHASE_COMPLETION_ACCEPTED ||
-        nested_result.sequence == 0U || nested_result.object_ref.object_id_length == 0U ||
+        nested_result.sequence != taken.sequence + 1U || nested_result.object_ref.object_id_length == 0U ||
         nested_result.destroy_disposition != KADATH_RUNTIME_DESTROY_DISPOSITION_NONE) {
         return 161;
     }

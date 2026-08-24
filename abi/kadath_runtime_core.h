@@ -620,6 +620,14 @@ struct kadath_runtime_phase_interface_v1_t {
 int32_t kadath_runtime_core_query_phase_interface(
     kadath_runtime_phase_interface_v1_t* in_out_interface);
 
+/* Evidence-only extension: opt in explicitly when compiling the Phase benchmark.
+ * These symbols are absent from normal Runtime Core builds and are not part of
+ * the production Phase v1 interface descriptor. */
+#if defined(KADATH_RUNTIME_PHASE_QUALITY_EVIDENCE)
+int32_t kadath_runtime_core_phase_quality_begin_allocation_count(void);
+int32_t kadath_runtime_core_phase_quality_end_allocation_count(uint64_t* out_allocation_count);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

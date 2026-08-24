@@ -24,6 +24,11 @@ candidate_sha="$(git -C "$repository_root" rev-parse --verify "${candidate_sha}^
     printf '%s\n' "candidate SHA is not current HEAD" >&2
     exit 1
 }
+git -C "$repository_root" diff --quiet --ignore-submodules -- &&
+    git -C "$repository_root" diff --cached --quiet --ignore-submodules -- || {
+    printf '%s\n' "candidate worktree or index has tracked changes" >&2
+    exit 1
+}
 [[ -n "$evidence_root" && -x "$kcov" ]] || { usage >&2; exit 1; }
 mkdir -p "$evidence_root"
 evidence_root="$(cd -- "$evidence_root" && pwd)"
@@ -120,6 +125,7 @@ require_decision same_flush_cancellation app/behavior_host_contract.zig "$eviden
 require_decision activation_commit_abort modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_ACTIVATION_DISCARD=PASS'
 require_decision serial_high_water modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_SERIAL_HIGH_WATER=PASS'
 require_decision restart_reload_cleanup app/behavior_host_contract.zig "$evidence_root/behavior.log" 'saved ObjectRef follows restart replacement and rejects a new world epoch'
+require_decision paired_scene_phase_commit modules/runtime_core/tests/runtime_core_contract.zig "$evidence_root/runtime.log" 'candidate Phase admission stays private until paired Scene commit.*OK'
 require_decision wrong_thread modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_MISUSE=PASS'
 require_decision reentrant modules/runtime_core/src/lib.rs "$evidence_root/rust-unit-kcov.log" 'reentrant_entry_is_rejected_without_clearing_outer_call_state.*ok'
 require_decision panic_no_publication modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_FAULT_CONTAINMENT=PASS'
