@@ -134,7 +134,8 @@ mutation_manifest_has_critical_kills() {
     manifest=$(sed -n 's/^PHASE3_MUTATION_MANIFEST=//p' "$report")
     [[ -f "$manifest" ]] || return 1
     for id in stale_target_visibility_bypass same_flush_cancelled_root_bypass \
-        activation_position_atomicity_bypass activation_failure_isolation_bypass; do
+        activation_position_atomicity_bypass activation_failure_isolation_bypass \
+        paired_scene_abort_retention; do
         awk -F '\t' -v id="$id" '
             $1 == id && $2 == "KILLED" &&
                 ($5 ~ /^error: '\''.*'\'' failed:$/ ||
@@ -187,7 +188,11 @@ elif ! report_bound_to_candidate "$coverage_report" ||
     ! grep -Eq '^PHASE3_COVERAGE_BEHAVIOR_HOST_PERCENT=([9][0-9]|100)(\.[0-9]+)?$' "$coverage_report" ||
     ! report_has_key "$coverage_report" PHASE3_DECISION_MATRIX_PERCENT 100 ||
     ! grep -Eq '^PHASE3_DECISION_MATRIX_MANIFEST_SHA256=[0-9a-f]{64}$' "$coverage_report" ||
-    ! report_file_matches_hash "$coverage_report" PHASE3_DECISION_MATRIX_EVIDENCE PHASE3_DECISION_MATRIX_MANIFEST_SHA256; then
+    ! report_file_matches_hash "$coverage_report" PHASE3_DECISION_MATRIX_EVIDENCE PHASE3_DECISION_MATRIX_MANIFEST_SHA256 ||
+    ! report_file_matches_hash "$coverage_report" PHASE3_COVERAGE_RUST_UNIT_BINARY PHASE3_COVERAGE_RUST_UNIT_BINARY_SHA256 ||
+    ! report_file_matches_hash "$coverage_report" PHASE3_COVERAGE_RUNTIME_BINARY PHASE3_COVERAGE_RUNTIME_BINARY_SHA256 ||
+    ! report_file_matches_hash "$coverage_report" PHASE3_COVERAGE_PUBLIC_BINARY PHASE3_COVERAGE_PUBLIC_BINARY_SHA256 ||
+    ! report_file_matches_hash "$coverage_report" PHASE3_COVERAGE_BEHAVIOR_BINARY PHASE3_COVERAGE_BEHAVIOR_BINARY_SHA256; then
     coverage_status=BLOCKED
     coverage_reason="coverage report schema, SHA, command, or metrics invalid"
     blocked+=("coverage report is not verifiable PASS")
@@ -210,7 +215,7 @@ elif ! report_bound_to_candidate "$mutation_report" ||
     ! report_has_key "$mutation_report" PHASE3_MUTATION_SURVIVED 0 ||
     ! report_has_key "$mutation_report" PHASE3_MUTATION_UNVIABLE 0 ||
     ! report_has_key "$mutation_report" PHASE3_CRITICAL_SURVIVORS 0 ||
-    ! report_has_key "$mutation_report" PHASE3_MUTATION_CRITICAL_DOMAINS stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation ||
+    ! report_has_key "$mutation_report" PHASE3_MUTATION_CRITICAL_DOMAINS stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation,paired_scene_atomicity ||
     ! grep -Eq '^PHASE3_MUTATION_MANIFEST_SHA256=[0-9a-f]{64}$' "$mutation_report" ||
     ! report_file_matches_hash "$mutation_report" PHASE3_MUTATION_MANIFEST PHASE3_MUTATION_MANIFEST_SHA256 ||
     ! mutation_manifest_has_critical_kills "$mutation_report"; then

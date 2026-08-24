@@ -36,9 +36,10 @@ kcov="$(cd -- "$(dirname -- "$kcov")" && pwd)/$(basename -- "$kcov")"
 
 emit_prefix="$evidence_root/emit"
 emit_name="contracts"
+cargo_target="$evidence_root/cargo-target"
 (
 cd -- "$repository_root"
-cargo test --locked --manifest-path modules/runtime_core/Cargo.toml \
+CARGO_TARGET_DIR="$cargo_target" cargo test --locked --manifest-path modules/runtime_core/Cargo.toml --no-run \
     >"$evidence_root/rust-unit.log" 2>&1
 zig build emit-phase-runtime-core-contract emit-phase-public-c-contract emit-phase-behavior-contract \
     --prefix "$emit_prefix" \
@@ -49,10 +50,14 @@ zig build emit-phase-runtime-core-contract emit-phase-public-c-contract emit-pha
 runtime_binary="$emit_prefix/$emit_name/runtime-core-contract"
 public_binary="$emit_prefix/$emit_name/runtime-core-public-contract"
 behavior_binary="$emit_prefix/$emit_name/behavior-host-contract"
-rust_unit_binary="$(find "$repository_root/target/debug/deps" -maxdepth 1 -type f \
-    -name 'kadath_runtime_core-*' -printf '%T@ %m %p\n' |
-    awk '$2 == 700 { print }' | sort -nr | head -n 1 | cut -d' ' -f3-)"
+rust_unit_binary="$(find "$cargo_target/debug/deps" -maxdepth 1 -type f \
+    -name 'kadath_runtime_core-*' -perm -u+x -print -quit)"
 [[ -x "$runtime_binary" && -x "$public_binary" && -x "$behavior_binary" && -x "$rust_unit_binary" ]] || exit 1
+
+rust_unit_binary_sha="$(sha256sum "$rust_unit_binary" | awk '{print $1}')"
+runtime_binary_sha="$(sha256sum "$runtime_binary" | awk '{print $1}')"
+public_binary_sha="$(sha256sum "$public_binary" | awk '{print $1}')"
+behavior_binary_sha="$(sha256sum "$behavior_binary" | awk '{print $1}')"
 
 kcov_library_dir="${KCOV_LIBRARY_DIR:-}"
 if [[ -n "$kcov_library_dir" ]]; then
@@ -126,6 +131,7 @@ require_decision activation_commit_abort modules/runtime_core/tests/public_contr
 require_decision serial_high_water modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_SERIAL_HIGH_WATER=PASS'
 require_decision restart_reload_cleanup app/behavior_host_contract.zig "$evidence_root/behavior.log" 'saved ObjectRef follows restart replacement and rejects a new world epoch'
 require_decision paired_scene_phase_commit modules/runtime_core/tests/runtime_core_contract.zig "$evidence_root/runtime.log" 'candidate Phase admission stays private until paired Scene commit.*OK'
+require_decision paired_scene_phase_abort modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_PAIRED_ABORT=PASS'
 require_decision wrong_thread modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_MISUSE=PASS'
 require_decision reentrant modules/runtime_core/src/lib.rs "$evidence_root/rust-unit-kcov.log" 'reentrant_entry_is_rejected_without_clearing_outer_call_state.*ok'
 require_decision panic_no_publication modules/runtime_core/tests/public_contract.c "$evidence_root/public.log" 'PHASE3_PUBLIC_FAULT_CONTAINMENT=PASS'
@@ -156,6 +162,14 @@ PHASE3_COVERAGE_ZIG_ADAPTER_PERCENT=$adapter_percent
 PHASE3_COVERAGE_ZIG_ADAPTER_LINES=$adapter_covered/$adapter_total
 PHASE3_COVERAGE_BEHAVIOR_HOST_PERCENT=$behavior_percent
 PHASE3_COVERAGE_BEHAVIOR_HOST_LINES=$behavior_covered/$behavior_total
+PHASE3_COVERAGE_RUST_UNIT_BINARY=$rust_unit_binary
+PHASE3_COVERAGE_RUST_UNIT_BINARY_SHA256=$rust_unit_binary_sha
+PHASE3_COVERAGE_RUNTIME_BINARY=$runtime_binary
+PHASE3_COVERAGE_RUNTIME_BINARY_SHA256=$runtime_binary_sha
+PHASE3_COVERAGE_PUBLIC_BINARY=$public_binary
+PHASE3_COVERAGE_PUBLIC_BINARY_SHA256=$public_binary_sha
+PHASE3_COVERAGE_BEHAVIOR_BINARY=$behavior_binary
+PHASE3_COVERAGE_BEHAVIOR_BINARY_SHA256=$behavior_binary_sha
 PHASE3_DECISION_MATRIX_PERCENT=$matrix_percent
 PHASE3_DECISION_MATRIX_COUNT=$matrix_present/$matrix_total
 PHASE3_DECISION_MATRIX_MANIFEST_SHA256=$matrix_sha

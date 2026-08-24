@@ -140,7 +140,8 @@ performance_manifest="$evidence_root/performance-manifest.tsv"
 printf 'decision\tPASS\texecuted-public-seam\n' >"$decision_manifest"
 printf 'id\tstatus\tdiff-sha\tpublic-seam\n' >"$mutation_manifest"
 for id in stale_target_visibility_bypass same_flush_cancelled_root_bypass \
-    activation_position_atomicity_bypass activation_failure_isolation_bypass; do
+    activation_position_atomicity_bypass activation_failure_isolation_bypass \
+    paired_scene_abort_retention; do
     printf "%s\tKILLED\tdiff-sha\tpublic-seam\terror: 'critical public seam' failed:\n" "$id" >>"$mutation_manifest"
 done
 printf 'run\tcandidate\toracle\n1\tsha\tsha\n' >"$performance_manifest"
@@ -171,7 +172,7 @@ PHASE3_MUTATION_KILLED=1
 PHASE3_MUTATION_SURVIVED=0
 PHASE3_MUTATION_UNVIABLE=0
 PHASE3_CRITICAL_SURVIVORS=0
-PHASE3_MUTATION_CRITICAL_DOMAINS=stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation
+PHASE3_MUTATION_CRITICAL_DOMAINS=stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation,paired_scene_atomicity
 PHASE3_MUTATION_MANIFEST_SHA256=$mutation_manifest_sha
 PHASE3_MUTATION_MANIFEST=$mutation_manifest
 EOF
@@ -206,6 +207,40 @@ PHASE3_ORACLE_BENCHMARK_SHA256=$oracle_benchmark_sha
 PHASE3_ORACLE_FIXED_P95_NS=1
 PHASE3_ORACLE_FRAME_P95_NS=1
 EOF
+
+# A complete aggregate coverage report without the exact binaries executed by
+# the coverage runner must remain blocked, even when its percentages and
+# decision manifest are otherwise valid.
+set +e
+unbound_coverage_output="$($runner \
+    --candidate-sha "$candidate_sha" \
+    --candidate-benchmark "$candidate_benchmark" \
+    --oracle-worktree "$evidence_root/oracle" \
+    --oracle-benchmark "$oracle_benchmark" \
+    --coverage-report "$evidence_root/coverage.report" \
+    --mutation-report "$evidence_root/mutation.report" \
+    --performance-report "$evidence_root/performance.report" \
+    --oracle-report "$evidence_root/oracle.report" 2>&1)"
+unbound_coverage_status=$?
+set -e
+if [[ "$unbound_coverage_status" -ne 2 ]]; then
+    printf 'coverage without binary provenance must be blocked, got %s\n%s\n' \
+        "$unbound_coverage_status" "$unbound_coverage_output" >&2
+    exit 1
+fi
+grep -Fqx 'PHASE3_COVERAGE=BLOCKED' <<<"$unbound_coverage_output"
+
+# Bind all four executed coverage binaries so the following probe isolates the
+# independently expected oracle source mismatch.
+for binary_name in rust-unit runtime public behavior; do
+    binary_path="$evidence_root/$binary_name-coverage-binary"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$binary_path"
+    chmod +x "$binary_path"
+    binary_key="$(tr '[:lower:]-' '[:upper:]_' <<<"$binary_name")"
+    binary_sha="$(sha256sum "$binary_path" | awk '{print $1}')"
+    printf 'PHASE3_COVERAGE_%s_BINARY=%s\n' "$binary_key" "$binary_path" >>"$evidence_root/coverage.report"
+    printf 'PHASE3_COVERAGE_%s_BINARY_SHA256=%s\n' "$binary_key" "$binary_sha" >>"$evidence_root/coverage.report"
+done
 set +e
 unbound_oracle_output="$($runner \
     --candidate-sha "$candidate_sha" \
@@ -224,3 +259,4 @@ if [[ "$unbound_oracle_status" -ne 2 ]]; then
     exit 1
 fi
 grep -Fqx 'PHASE3_QUALITY_GATE=BLOCKED' <<<"$unbound_oracle_output"
+grep -Fqx 'PHASE3_COVERAGE=READY' <<<"$unbound_oracle_output"

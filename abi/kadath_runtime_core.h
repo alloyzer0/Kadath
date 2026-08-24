@@ -624,7 +624,15 @@ int32_t kadath_runtime_core_query_phase_interface(
  * These symbols are absent from normal Runtime Core builds and are not part of
  * the production Phase v1 interface descriptor. */
 #if defined(KADATH_RUNTIME_PHASE_QUALITY_EVIDENCE)
+/* Mode: no cross-boundary allocation or borrowed pointers.
+ * Lifetime: no caller-owned or Core-owned storage crosses this call.
+ * Single-thread: the evidence benchmark must serialize begin/end pairs on one thread.
+ * Reentrant: no. Failure leaves the allocation counter state unchanged. */
 int32_t kadath_runtime_core_phase_quality_begin_allocation_count(void);
+/* Mode: caller-allocates, callee-writes the uint64_t output.
+ * Lifetime: out_allocation_count is borrowed only for this call; the Core retains no pointer.
+ * Single-thread: the evidence benchmark must serialize begin/end pairs on one thread.
+ * Reentrant: no. Success writes the completed count; failure leaves output unchanged. */
 int32_t kadath_runtime_core_phase_quality_end_allocation_count(uint64_t* out_allocation_count);
 #endif
 

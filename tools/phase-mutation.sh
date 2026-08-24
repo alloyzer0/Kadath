@@ -64,6 +64,7 @@ ids=(
     same_flush_cancelled_root_bypass
     activation_position_atomicity_bypass
     activation_failure_isolation_bypass
+    paired_scene_abort_retention
 )
 olds=(
     '            abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME => Ok(1),'
@@ -82,6 +83,7 @@ olds=(
     '    let root_cancelled = state.visible_exact(key).is_none()'
     '        .is_none_or(|count| count > STRUCTURAL_CAPACITY)'
     '    if activation.transaction_id != transaction_id {'
+    '            .is_some_and(|candidate| candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE)'
 )
 news=(
     '            abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME => Ok(0),'
@@ -100,6 +102,7 @@ news=(
     '    let root_cancelled = state.visible_exact(key).is_some()'
     '        .is_none_or(|count| count >= STRUCTURAL_CAPACITY)'
     '    if activation.transaction_id == transaction_id {'
+    '            .is_some_and(|candidate| candidate.target != abi::KADATH_RUNTIME_TARGET_CANDIDATE)'
 )
 
 manifest="$evidence_root/mutation-manifest.tsv"
@@ -176,7 +179,7 @@ PHASE3_MUTATION_KILLED=$killed
 PHASE3_MUTATION_SURVIVED=$survived
 PHASE3_MUTATION_UNVIABLE=$unviable
 PHASE3_CRITICAL_SURVIVORS=$survived
-PHASE3_MUTATION_CRITICAL_DOMAINS=stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation
+PHASE3_MUTATION_CRITICAL_DOMAINS=stale_delivery,same_flush_cancellation,activation_atomicity,failure_isolation,paired_scene_atomicity
 PHASE3_MUTATION_MANIFEST_SHA256=$manifest_sha
 PHASE3_MUTATION_MANIFEST=$manifest
 EOF

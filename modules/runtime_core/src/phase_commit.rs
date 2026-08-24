@@ -290,6 +290,15 @@ impl PhaseState {
         }
     }
 
+    pub(crate) fn abort_with_scene_candidate(&mut self) {
+        if self
+            .candidate
+            .is_some_and(|candidate| candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE)
+        {
+            self.candidate = None;
+        }
+    }
+
     fn domain_index(domain: u32) -> Result<usize, u32> {
         match domain {
             abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED => Ok(0),

@@ -501,6 +501,7 @@ fn abort_scene(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32>
     let (core, _guard) = unsafe { enter_core(core_pointer) }?;
     core.candidate = None;
     core.candidate_next_entity_value = None;
+    core.phase.abort_with_scene_candidate();
     Ok(())
 }
 

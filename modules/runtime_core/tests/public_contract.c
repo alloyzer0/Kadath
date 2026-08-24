@@ -308,6 +308,29 @@ static int query_id(
     return interface_value->query(core, &batch, result, 1U);
 }
 
+static int query_candidate_id(
+    kadath_runtime_object_authority_interface_t* interface_value,
+    kadath_runtime_core_t* core,
+    const char* object_id,
+    kadath_runtime_query_result_t* result) {
+    kadath_runtime_query_item_v1_t item;
+    kadath_runtime_query_batch_t batch;
+    memset(&item, 0, sizeof(item));
+    memset(&batch, 0, sizeof(batch));
+    memset(result, 0, sizeof(*result));
+    item.struct_size = (uint32_t)sizeof(item);
+    item.tag = KADATH_RUNTIME_QUERY_FIND_BY_ID;
+    item.payload.object_id.data = (const uint8_t*)object_id;
+    item.payload.object_id.length = strlen(object_id);
+    batch.struct_size = (uint32_t)sizeof(batch);
+    batch.target = KADATH_RUNTIME_TARGET_CANDIDATE;
+    batch.items = &item;
+    batch.item_count = 1U;
+    batch.item_stride = sizeof(item);
+    result->struct_size = (uint32_t)sizeof(*result);
+    return interface_value->query(core, &batch, result, 1U);
+}
+
 static int prepare_candidate_again(
     kadath_runtime_object_authority_interface_t* interface_value,
     kadath_runtime_core_t* core,
@@ -1420,6 +1443,110 @@ static int phase_commit_path(
     return 0;
 }
 
+static int aborted_scene_discards_paired_phase_candidate(
+    kadath_runtime_object_authority_interface_t* object_interface,
+    kadath_runtime_phase_interface_v1_t* phase_interface) {
+    kadath_runtime_core_t* core = NULL;
+    if (create_live_core(object_interface, &core) != 0) return 260;
+
+    kadath_runtime_source_object_desc_v1_t sources[2];
+    kadath_runtime_scene_prepare_desc_t scene_desc;
+    kadath_runtime_scene_candidate_info_t scene_info;
+    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
+    fill_source(&sources[1], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+    memset(&scene_desc, 0, sizeof(scene_desc));
+    memset(&scene_info, 0, sizeof(scene_info));
+    scene_desc.struct_size = (uint32_t)sizeof(scene_desc);
+    scene_desc.mode = KADATH_RUNTIME_PREPARE_RESTART;
+    scene_desc.bounds_max[0] = 100.0F;
+    scene_desc.bounds_max[1] = 100.0F;
+    scene_desc.source_objects = sources;
+    scene_desc.source_object_count = 2U;
+    scene_desc.source_object_stride = sizeof(sources[0]);
+    scene_info.struct_size = (uint32_t)sizeof(scene_info);
+    if (object_interface->prepare_scene(core, &scene_desc, &scene_info) != KADATH_OK) return 261;
+
+    kadath_runtime_query_result_t candidate_player;
+    if (query_candidate_id(object_interface, core, "player", &candidate_player) != KADATH_OK ||
+        candidate_player.found != KADATH_RUNTIME_FOUND) return 262;
+
+    kadath_runtime_phase_binding_desc_v1_t bindings[KADATH_RUNTIME_PHASE_MAX_BINDINGS / 4U];
+    memset(bindings, 0, sizeof(bindings));
+    for (size_t index = 0; index < sizeof(bindings) / sizeof(bindings[0]); ++index) {
+        bindings[index].struct_size = (uint32_t)sizeof(bindings[index]);
+        bindings[index].object_ref = candidate_player.payload.object.object_ref;
+        bindings[index].behavior_count = KADATH_RUNTIME_PHASE_MAX_BEHAVIORS_PER_BINDING;
+    }
+    kadath_runtime_phase_state_prepare_desc_v1_t phase_desc;
+    kadath_runtime_phase_state_candidate_info_v1_t phase_info;
+    memset(&phase_desc, 0, sizeof(phase_desc));
+    memset(&phase_info, 0, sizeof(phase_info));
+    phase_desc.struct_size = (uint32_t)sizeof(phase_desc);
+    phase_desc.target = KADATH_RUNTIME_TARGET_CANDIDATE;
+    phase_desc.bindings = bindings;
+    phase_desc.binding_count = sizeof(bindings) / sizeof(bindings[0]);
+    phase_desc.binding_stride = sizeof(bindings[0]);
+    phase_info.struct_size = (uint32_t)sizeof(phase_info);
+    if (phase_interface->prepare_phase_state(core, &phase_desc, &phase_info) != KADATH_OK ||
+        phase_interface->commit_phase_state(core) != KADATH_OK ||
+        object_interface->abort_scene(core) != KADATH_OK) return 263;
+
+    memset(&scene_info, 0, sizeof(scene_info));
+    scene_info.struct_size = (uint32_t)sizeof(scene_info);
+    if (object_interface->prepare_scene(core, &scene_desc, &scene_info) != KADATH_OK ||
+        object_interface->commit_scene(core) != KADATH_OK) return 264;
+
+    kadath_runtime_query_result_t live_player;
+    if (query_id(object_interface, core, "player", &live_player) != KADATH_OK ||
+        live_player.found != KADATH_RUNTIME_FOUND) return 265;
+    kadath_runtime_phase_begin_desc_v1_t begin;
+    kadath_runtime_phase_begin_result_v1_t begin_result;
+    memset(&begin, 0, sizeof(begin));
+    memset(&begin_result, 0, sizeof(begin_result));
+    begin.struct_size = (uint32_t)sizeof(begin);
+    begin.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    begin.phase_sequence = 82U;
+    begin_result.struct_size = (uint32_t)sizeof(begin_result);
+    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK) return 266;
+
+    kadath_runtime_phase_structural_v1_t request;
+    kadath_runtime_phase_request_completion_v1_t acceptance;
+    kadath_runtime_phase_batch_result_v1_t batch_result;
+    memset(&request, 0, sizeof(request));
+    memset(&acceptance, 0, sizeof(acceptance));
+    memset(&batch_result, 0, sizeof(batch_result));
+    request.struct_size = (uint32_t)sizeof(request);
+    request.operation = KADATH_RUNTIME_PHASE_OPERATION_RESERVE_TRANSIENT;
+    request.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    request.behavior_count = 1U;
+    request.prototype_key = 53U;
+    request.origin = live_player.payload.object.object_ref;
+    request.transient_sprite.struct_size = (uint32_t)sizeof(request.transient_sprite);
+    request.transient_sprite.size[0] = 1.0F;
+    request.transient_sprite.size[1] = 1.0F;
+    request.transient_sprite.color[3] = 1.0F;
+    request.transient_sprite.texture_id = 1U;
+    acceptance.struct_size = (uint32_t)sizeof(acceptance);
+    batch_result.struct_size = (uint32_t)sizeof(batch_result);
+    if (phase_interface->submit_structural(core, &request, 1U, sizeof(request),
+                                           &acceptance, 1U, &batch_result) != KADATH_OK) return 267;
+
+    kadath_runtime_phase_structural_v1_t taken;
+    kadath_runtime_phase_flush_info_v1_t flush;
+    size_t taken_count = 0U;
+    memset(&taken, 0, sizeof(taken));
+    memset(&flush, 0, sizeof(flush));
+    taken.struct_size = (uint32_t)sizeof(taken);
+    flush.struct_size = (uint32_t)sizeof(flush);
+    if (phase_interface->take_structural(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 82U,
+                                         &flush, &taken, 1U, &taken_count) != KADATH_OK ||
+        taken_count != 1U ||
+        phase_interface->abort_structural(core, flush.flush_token) != KADATH_OK ||
+        phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 82U) != KADATH_OK ||
+        object_interface->destroy(&core) != KADATH_OK || core != NULL) return 268;
+    return 0;
+}
+
 static int activation_discard_path(
     kadath_runtime_object_authority_interface_t* object_interface,
     kadath_runtime_phase_interface_v1_t* phase_interface) {
@@ -1709,6 +1836,10 @@ int main(void) {
     int phase_result = phase_commit_path(&interface_value, &phase_interface);
     if (phase_result != 0) return phase_result;
     puts("PHASE3_PUBLIC_PHASE_COMMIT_PATH=PASS");
+    int paired_abort_result = aborted_scene_discards_paired_phase_candidate(
+        &interface_value, &phase_interface);
+    if (paired_abort_result != 0) return paired_abort_result;
+    puts("PHASE3_PUBLIC_PAIRED_ABORT=PASS");
     int discard_result = activation_discard_path(&interface_value, &phase_interface);
     if (discard_result != 0) return discard_result;
     puts("PHASE3_PUBLIC_ACTIVATION_DISCARD=PASS");
