@@ -81,18 +81,7 @@ olds=(
     '            .is_some_and(|record| record.lifecycle == object_authority::Lifecycle::Active)'
     '    let root_cancelled = state.visible_exact(key).is_none()'
     '        .is_none_or(|count| count > STRUCTURAL_CAPACITY)'
-    'pub(crate) fn commit_activation(
-    core: &mut RuntimeCore,
-    transaction_id: u64,
-    out_ptr: *mut abi::kadath_runtime_phase_activation_result_v1_t,
-) -> Result<(), u32> {
-    valid_phase_output(out_ptr)?;
-    let activation = core
-        .phase
-        .activation
-        .clone()
-        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_TRANSACTION_BUSY)?;
-    if activation.transaction_id != transaction_id {'
+    '    if activation.transaction_id != transaction_id {'
 )
 news=(
     '            abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME => Ok(0),'
@@ -110,18 +99,7 @@ news=(
     '            .is_some_and(|record| record.lifecycle != object_authority::Lifecycle::Active)'
     '    let root_cancelled = state.visible_exact(key).is_some()'
     '        .is_none_or(|count| count >= STRUCTURAL_CAPACITY)'
-    'pub(crate) fn commit_activation(
-    core: &mut RuntimeCore,
-    transaction_id: u64,
-    out_ptr: *mut abi::kadath_runtime_phase_activation_result_v1_t,
-) -> Result<(), u32> {
-    valid_phase_output(out_ptr)?;
-    let activation = core
-        .phase
-        .activation
-        .clone()
-        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_TRANSACTION_BUSY)?;
-    if activation.transaction_id == transaction_id {'
+    '    if activation.transaction_id == transaction_id {'
 )
 
 manifest="$evidence_root/mutation-manifest.tsv"
@@ -134,14 +112,20 @@ for index in "${!ids[@]}"; do
     old=${olds[$index]}
     new=${news[$index]}
     matches="$(grep -Fc -- "$old" "$source_file")"
-    if [[ "$matches" -ne 1 ]]; then
+    expected_matches=1
+    if [[ "${ids[$index]}" == activation_failure_isolation_bypass ]]; then
+        # commit_activation and abort_activation deliberately share the same
+        # transaction guard; mutate only the first (commit) occurrence.
+        expected_matches=2
+    fi
+    if [[ "$matches" -ne "$expected_matches" ]]; then
         printf '%s\tUNVIABLE\tmissing-source-anchor\t%s\n' "${ids[$index]}" "$test_command" >>"$manifest"
         unviable=$((unviable + 1))
         continue
     fi
     OLD="$old" NEW="$new" perl -0pi -e '
         BEGIN { $old = $ENV{"OLD"}; $new = $ENV{"NEW"}; }
-        $count += s/\Q$old\E/$new/g;
+        $count += s/\Q$old\E/$new/;
         END { die "mutation anchor count=$count\n" unless $count == 1; }
     ' "$source_file"
     diff_file="$evidence_root/${ids[$index]}.diff"
