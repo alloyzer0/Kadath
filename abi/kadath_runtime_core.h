@@ -79,6 +79,17 @@ extern "C" {
 #define KADATH_RUNTIME_PHASE_EVENT_VALUE_STRING 3U
 #define KADATH_RUNTIME_PHASE_EVENT_VALUE_OBJECT 4U
 
+#define KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1 1U
+#define KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING 1U
+#define KADATH_RUNTIME_GAMEPLAY_PHASE_WON 2U
+#define KADATH_RUNTIME_GAMEPLAY_PHASE_LOST 3U
+#define KADATH_RUNTIME_GAMEPLAY_CAUSE_NONE 0U
+#define KADATH_RUNTIME_GAMEPLAY_CAUSE_TIMER 1U
+#define KADATH_RUNTIME_GAMEPLAY_CAUSE_HAZARD 2U
+#define KADATH_RUNTIME_GAMEPLAY_CAUSE_GOAL 3U
+#define KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE 0U
+#define KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL 1U
+
 #define KADATH_RUNTIME_DESTROY_DISPOSITION_NONE 0U
 #define KADATH_RUNTIME_DESTROY_CANCELLED_PENDING_SPAWN 1U
 #define KADATH_RUNTIME_DESTROY_AWAITING_FINALIZE 2U
@@ -86,6 +97,9 @@ extern "C" {
 typedef struct kadath_runtime_core_t kadath_runtime_core_t;
 typedef struct kadath_runtime_phase_interface_v1_t kadath_runtime_phase_interface_v1_t;
 typedef struct kadath_runtime_phase_activation_batch_v1_t kadath_runtime_phase_activation_batch_v1_t;
+typedef struct kadath_runtime_gameplay_outcome_v1_t kadath_runtime_gameplay_outcome_v1_t;
+typedef struct kadath_runtime_gameplay_step_result_v1_t kadath_runtime_gameplay_step_result_v1_t;
+typedef struct kadath_runtime_render_item_v1_t kadath_runtime_render_item_v1_t;
 
 typedef struct kadath_runtime_object_ref_v1_t {
     uint32_t struct_size;
@@ -619,6 +633,170 @@ struct kadath_runtime_phase_interface_v1_t {
 // Thread-safe and reentrant, like the Object Authority query.
 int32_t kadath_runtime_core_query_phase_interface(
     kadath_runtime_phase_interface_v1_t* in_out_interface);
+
+typedef struct kadath_runtime_gameplay_hazard_desc_v1_t {
+    uint32_t struct_size;
+    uint32_t movement_mode;
+    kadath_runtime_object_ref_v1_t object_ref;
+    float patrol_min_y;
+    float patrol_max_y;
+    float patrol_speed;
+    uint32_t reserved0;
+    uint64_t reserved[4];
+} kadath_runtime_gameplay_hazard_desc_v1_t;
+
+typedef struct kadath_runtime_gameplay_desc_v1_t {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    float time_limit_seconds;
+    uint32_t hazard_count;
+    kadath_runtime_object_ref_v1_t player;
+    kadath_runtime_object_ref_v1_t goal;
+    const kadath_runtime_gameplay_hazard_desc_v1_t* hazards;
+    size_t hazard_stride;
+    uint64_t reserved[6];
+} kadath_runtime_gameplay_desc_v1_t;
+
+typedef struct kadath_runtime_gameplay_candidate_info_v1_t {
+    uint32_t struct_size;
+    uint32_t hazard_count;
+    uint64_t world_epoch;
+    uint64_t reserved[4];
+} kadath_runtime_gameplay_candidate_info_v1_t;
+
+typedef struct kadath_runtime_gameplay_begin_fixed_desc_v1_t {
+    uint32_t struct_size;
+    float dt_seconds;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint64_t reserved[4];
+} kadath_runtime_gameplay_begin_fixed_desc_v1_t;
+
+typedef struct kadath_runtime_gameplay_commit_fixed_desc_v1_t {
+    uint32_t struct_size;
+    int8_t move_x;
+    int8_t move_y;
+    uint8_t reserved_input[2];
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint64_t step_token;
+    uint64_t reserved[4];
+} kadath_runtime_gameplay_commit_fixed_desc_v1_t;
+
+typedef struct kadath_runtime_gameplay_outcome_buffer_v1_t {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    kadath_runtime_gameplay_outcome_v1_t* outcomes;
+    size_t outcome_capacity;
+    size_t outcome_stride;
+    uint64_t reserved[4];
+} kadath_runtime_gameplay_outcome_buffer_v1_t;
+
+typedef struct kadath_runtime_render_buffer_v1_t {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    kadath_runtime_render_item_v1_t* items;
+    size_t item_capacity;
+    size_t item_stride;
+    uint64_t reserved[4];
+} kadath_runtime_render_buffer_v1_t;
+
+typedef struct kadath_runtime_gameplay_snapshot_v1_t {
+    uint32_t struct_size;
+    uint32_t phase;
+    uint32_t cause;
+    uint32_t accepts_input;
+    uint64_t world_epoch;
+    uint64_t last_outcome_sequence;
+    float time_remaining_seconds;
+    uint32_t reserved0;
+    size_t render_count;
+    uint64_t reserved[4];
+} kadath_runtime_gameplay_snapshot_v1_t;
+
+struct kadath_runtime_gameplay_step_result_v1_t {
+    uint32_t struct_size;
+    uint32_t phase;
+    uint32_t cause;
+    uint32_t accepts_input;
+    float time_remaining_seconds;
+    uint32_t reserved0;
+    uint64_t step_token;
+    size_t submitted_contact_event_count;
+    size_t outcome_count;
+    uint64_t reserved[4];
+};
+
+struct kadath_runtime_gameplay_outcome_v1_t {
+    uint32_t struct_size;
+    uint32_t phase;
+    uint32_t cause;
+    uint32_t has_other;
+    uint64_t sequence;
+    kadath_runtime_object_ref_v1_t player;
+    kadath_runtime_object_ref_v1_t other;
+    uint64_t reserved[4];
+};
+
+struct kadath_runtime_render_item_v1_t {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    kadath_runtime_object_ref_v1_t object_ref;
+    uint64_t entity_value;
+    float position[2];
+    float size[2];
+    float final_color[4];
+    uint32_t texture_id;
+    uint32_t reserved1;
+    uint64_t reserved[4];
+};
+
+typedef struct kadath_runtime_gameplay_interface_v1_t {
+    uint32_t struct_size;
+    uint32_t interface_version;
+    /* Mode D opaque Core; Mode A caller-owned input/output descriptors. All
+     * pointed-to ranges are borrowed for this call only. Single-owner-thread,
+     * non-reentrant. Success publishes only a
+     * private Gameplay candidate; failure leaves candidate/output unchanged. */
+    int32_t (*prepare_gameplay_state)(
+        kadath_runtime_core_t* core,
+        const kadath_runtime_gameplay_desc_v1_t* desc,
+        kadath_runtime_gameplay_candidate_info_v1_t* out_info);
+    /* Mode D opaque Core; Mode A caller-owned begin descriptor, capacity-1
+     * outcome buffer, and result. Single-owner-thread, non-reentrant. Success opens exactly one step;
+     * failure publishes neither step state nor output/outcome bytes. */
+    int32_t (*begin_fixed_step)(
+        kadath_runtime_core_t* core,
+        const kadath_runtime_gameplay_begin_fixed_desc_v1_t* desc,
+        kadath_runtime_gameplay_outcome_buffer_v1_t* outcome_buffer,
+        kadath_runtime_gameplay_step_result_v1_t* out_result);
+    /* Mode D opaque Core; Mode A caller-owned commit descriptor, capacity-1
+     * outcome buffer, and result. Single-owner-thread, non-reentrant. Success atomically publishes the
+     * fixed Gameplay/Object result after Phase event admission; failure leaves
+     * authoritative state and caller outputs unchanged. */
+    int32_t (*commit_fixed_step)(
+        kadath_runtime_core_t* core,
+        const kadath_runtime_gameplay_commit_fixed_desc_v1_t* desc,
+        kadath_runtime_gameplay_outcome_buffer_v1_t* outcome_buffer,
+        kadath_runtime_gameplay_step_result_v1_t* out_result);
+    /* Mode D opaque Core plus scalar token; no caller allocation. Single-owner-
+     * thread and non-reentrant. Success closes the matching open step. */
+    int32_t (*abort_fixed_step)(kadath_runtime_core_t* core, uint64_t step_token);
+    /* Mode D opaque Core; Mode A caller-owned bounded render storage and
+     * snapshot output, borrowed only for this call. Single-owner-thread,
+     * non-reentrant. Success publishes one
+     * coherent idle-boundary snapshot; failure writes neither range. */
+    int32_t (*publish_snapshot)(
+        kadath_runtime_core_t* core,
+        kadath_runtime_render_buffer_v1_t* render_buffer,
+        kadath_runtime_gameplay_snapshot_v1_t* out_snapshot);
+    uint64_t reserved[8];
+} kadath_runtime_gameplay_interface_v1_t;
+
+// Mode A caller-owned in/out descriptor, borrowed only for this call.
+// No opaque Core is supplied; this query is thread-safe and reentrant.
+int32_t kadath_runtime_core_query_gameplay_interface(
+    kadath_runtime_gameplay_interface_v1_t* in_out_interface);
 
 /* Evidence-only extension: opt in explicitly when compiling the Phase benchmark.
  * These symbols are absent from normal Runtime Core builds and are not part of

@@ -240,6 +240,17 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 - 同一实现 candidate 必须删除 Zig persistent phase queue/admission/sequence/generation writer；callback-local staging 可保留。Scene/KSCN/KSCP、Luau Host v4、Editor/Preview/Package wire、collision/gameplay migration、final render snapshot 和 Scheduler 不在本增量内。
 - 该 clarification 对应 Outer contract discovery `P1-Rust-Runtime-Core-Phase-Commit-01`，Inner baseline `444dc5b`；Linux 证据仍不代理 Windows/NTFS/HWND/Vulkan acceptance。
 
+### 6.4 2026-08-25 Gameplay implementation clarification
+
+`P1-Rust-Runtime-Core-Gameplay-01` 在 Object Authority 与 Phase Commit 已交付的同一 opaque Core 上完成最后一个 authority cluster；本节记录 implementation candidate 的目标态，在合并前不反写 `## 2 CURRENT`：
+
+- Rust Runtime Core 唯一拥有 `Playing/Won/Lost`、timer、terminal cause、outcome sequence high-water、Player↔source Goal/Hazard strict-AABB contact ledger、legacy patrol movement、Player final tint 与 coherent render/gameplay snapshot；Zig 不保存跨 step 的 Gameplay/contact/outcome mirror。
+- Scene publication 固定为 Object prepare → Gameplay prepare → Phase prepare/ready → Object commit。Object、Gameplay、Phase 任一 candidate 缺失或 Phase 未 ready 时拒绝，成功时一次发布；restart 仅允许从 terminal live state进入，并保留 step/outcome high-water，Scene reload 递增 epoch 且清空 contact。
+- Zig Host 仍决定 fixed/frame 时机、Luau callback dispatch、structural settle、Renderer、Audio 与日志消费；Rust 不依赖 Luau VM、Window、RHI、Renderer、Audio、Editor 或 package wire。
+- `begin_fixed_step`先裁决timer并返回capacity-1 one-shot outcome；`commit_fixed_step`在World movement后计算contact，按 source order 生成全部 end 后全部 begin 的Phase event，并在Phase容量预检后原子发布Gameplay plan。Hazard在Goal之前裁决，edge-touch与transient不参与contact。
+- Render publication只消费Rust caller-owned bounded snapshot。`SceneGeneration`在堆上拥有已解码Scene并以指针传递，避免固定容量Scene在Windows调用链上形成大型按值栈副本；KSCN schema、wire和容量不变。
+- 同一candidate删除 Zig `GameSession`、collision/contact ledger和final gameplay projection；`app/game.zig`、`app/collision.zig`不再作为生产authority存在。Linux quality/product证据与Windows HWND/Vulkan/NTFS验收仍分别记录，任何缺失不得提升为PASS。
+
 ---
 
 ## 7. Scheduler 与后台工作

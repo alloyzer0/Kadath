@@ -1057,7 +1057,7 @@ fn verifyPackageAudioGameplay(
     window: c.xcb_window_t,
     runtime_stderr: []const u8,
 ) !void {
-    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Game session lost: timer expired", 5_000);
+    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Game session lost: timer expired, sequence=1", 5_000);
     try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Audio cue played: lost", 2_000);
 
     const restart = try keycodeForKeysym(context.connection, c.XK_r);
@@ -1082,8 +1082,18 @@ fn verifyPackageAudioGameplay(
     timestamp += 1;
     try sendKey(context, window, right, c.XCB_KEY_RELEASE, timestamp);
 
-    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Game session won:", 2_000);
+    try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Game session won: player=player overlapped goal=goal, sequence=2", 2_000);
     try waitForRuntimeLog(allocator, io, runtime, runtime_stderr, "Audio cue played: won", 2_000);
+
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, runtime_stderr, allocator, .limited(8 * 1024 * 1024));
+    defer allocator.free(log);
+    if (std.mem.count(u8, log, "Game session lost:") != 1 or
+        std.mem.count(u8, log, "Game session won:") != 1 or
+        std.mem.count(u8, log, "Audio cue played: lost") != 1 or
+        std.mem.count(u8, log, "Audio cue played: won") != 1)
+    {
+        return error.GameplayOutcomeWasNotExactlyOnce;
+    }
 }
 
 fn waitForRuntimeLog(

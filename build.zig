@@ -25,6 +25,10 @@ fn addBehaviorScriptGraph(
         ".zig-cache/behavior-script-{s}-{s}",
         .{ @tagName(target.result.os.tag), @tagName(optimize) },
     ));
+    const cmake_zig_exe = if (target.result.os.tag == .windows)
+        std.mem.replaceOwned(u8, b.allocator, b.graph.zig_exe, "\\", "/") catch @panic("OOM")
+    else
+        b.graph.zig_exe;
     const behavior_configure = b.addSystemCommand(&.{
         "cmake",
         "-G",
@@ -34,9 +38,9 @@ fn addBehaviorScriptGraph(
         "-B",
         behavior_build_dir,
         b.fmt("-DCMAKE_BUILD_TYPE={s}", .{behavior_build_type}),
-        b.fmt("-DCMAKE_C_COMPILER={s}", .{b.graph.zig_exe}),
+        b.fmt("-DCMAKE_C_COMPILER={s}", .{cmake_zig_exe}),
         "-DCMAKE_C_COMPILER_ARG1=cc",
-        b.fmt("-DCMAKE_CXX_COMPILER={s}", .{b.graph.zig_exe}),
+        b.fmt("-DCMAKE_CXX_COMPILER={s}", .{cmake_zig_exe}),
         "-DCMAKE_CXX_COMPILER_ARG1=c++",
         "-DLUAU_BUILD_CLI=OFF",
         "-DLUAU_BUILD_TESTS=OFF",
@@ -194,6 +198,10 @@ pub fn build(b: *std.Build) void {
     const phase_quality_evidence = b.option(bool, "phase-quality-evidence", "Build Runtime Core with non-production Phase allocation counters") orelse false;
     const phase_quality_behavior_filter = b.option([]const u8, "phase-quality-behavior-filter", "Run only matching Behavior Host contracts for Phase coverage evidence");
     const phase_quality_emit_dir = b.option([]const u8, "phase-quality-emit-dir", "Install Phase evidence executables into this directory without running them");
+    const gameplay_quality_evidence = b.option(bool, "gameplay-quality-evidence", "Build Runtime Core with non-production Gameplay allocation counters") orelse false;
+    const gameplay_quality_emit_dir = b.option([]const u8, "gameplay-quality-emit-dir", "Install Gameplay evidence executables into this directory without running them");
+    const quality_evidence_enabled = phase_quality_evidence or gameplay_quality_evidence;
+    const quality_emit_dir = gameplay_quality_emit_dir orelse phase_quality_emit_dir;
     var linux_platform_contract_binary: ?std.Build.LazyPath = null;
     var linux_window_verifier_binary: ?std.Build.LazyPath = null;
     const mingw_gcc_runtime_dir: ?[]const u8 = if (target.result.os.tag == .windows)
@@ -392,7 +400,7 @@ pub fn build(b: *std.Build) void {
             cargo_target_dir,
         });
         if (optimize != .Debug) cargo_build.addArg("--release");
-        if (phase_quality_evidence) cargo_build.addArgs(&.{ "--features", "phase-quality-evidence" });
+        if (quality_evidence_enabled) cargo_build.addArgs(&.{ "--features", "phase-quality-evidence" });
 
         // Cargo 产物必须先生成，再由 Zig 的 GNU 链接器合入同一可执行文件。
         exe.step.dependOn(&cargo_build.step);
@@ -459,7 +467,7 @@ pub fn build(b: *std.Build) void {
             cargo_target_dir,
         });
         if (optimize != .Debug) cargo_build.addArg("--release");
-        if (phase_quality_evidence) cargo_build.addArgs(&.{ "--features", "phase-quality-evidence" });
+        if (quality_evidence_enabled) cargo_build.addArgs(&.{ "--features", "phase-quality-evidence" });
 
         exe.step.dependOn(&cargo_build.step);
         const rust_profile = if (optimize == .Debug) "debug" else "release";
@@ -610,7 +618,7 @@ pub fn build(b: *std.Build) void {
             // kcov can consume Zig's LLVM DWARF v5 line tables, while the
             // self-hosted backend currently leaves the Phase evidence seam
             // without an auditable Zig source denominator.
-            .use_llvm = if (phase_quality_emit_dir != null) true else null,
+            .use_llvm = if (quality_emit_dir != null) true else null,
         });
         behavior_host_tests.step.dependOn(native_step);
         if (runtime_core_library_path) |library_path| {
@@ -637,7 +645,7 @@ pub fn build(b: *std.Build) void {
             }
         }
         const behavior_host_test_run = b.addRunArtifact(behavior_host_tests);
-        if (phase_quality_emit_dir) |emit_dir| {
+        if (quality_emit_dir) |emit_dir| {
             const install_behavior_host_evidence = b.addInstallArtifact(behavior_host_tests, .{
                 .dest_dir = .{ .override = .{ .custom = emit_dir } },
                 .dest_sub_path = "behavior-host-contract",
@@ -709,11 +717,11 @@ pub fn build(b: *std.Build) void {
         }
         const runtime_core_contract_tests = b.addTest(.{
             .root_module = runtime_core_contract_mod,
-            .use_llvm = if (phase_quality_emit_dir != null) true else null,
+            .use_llvm = if (quality_emit_dir != null) true else null,
         });
         runtime_core_contract_tests.step.dependOn(runtime_core_cargo_step.?);
         const runtime_core_contract_run = b.addRunArtifact(runtime_core_contract_tests);
-        if (phase_quality_emit_dir) |emit_dir| {
+        if (quality_emit_dir) |emit_dir| {
             const install_runtime_core_evidence = b.addInstallArtifact(runtime_core_contract_tests, .{
                 .dest_dir = .{ .override = .{ .custom = emit_dir } },
                 .dest_sub_path = "runtime-core-contract",
@@ -750,13 +758,71 @@ pub fn build(b: *std.Build) void {
             const runtime_core_bench_run = b.addRunArtifact(runtime_core_bench);
             const runtime_core_bench_step = b.step("bench-runtime-core-phase", "Run the 10,000-batch Runtime Core Phase baseline");
             runtime_core_bench_step.dependOn(&runtime_core_bench_run.step);
-            if (phase_quality_emit_dir) |emit_dir| {
+            if (quality_emit_dir) |emit_dir| {
                 const install_runtime_core_bench = b.addInstallArtifact(runtime_core_bench, .{
                     .dest_dir = .{ .override = .{ .custom = emit_dir } },
                     .dest_sub_path = "runtime-core-phase-bench",
                 });
                 const emit_runtime_core_bench = b.step("emit-phase-runtime-core-bench", "Emit the Runtime Core Phase benchmark without running it");
                 emit_runtime_core_bench.dependOn(&install_runtime_core_bench.step);
+            }
+
+            if (gameplay_quality_evidence) {
+                const gameplay_bench_mod = b.createModule(.{
+                    .root_source_file = b.path("tools/runtime-core-gameplay-bench.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                });
+                gameplay_bench_mod.addIncludePath(b.path("abi"));
+                gameplay_bench_mod.addImport("runtime_core", runtime_core_mod);
+                gameplay_bench_mod.addLibraryPath(.{ .cwd_relative = library_path });
+                gameplay_bench_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
+                gameplay_bench_mod.linkSystemLibrary("gcc_s", .{});
+                gameplay_bench_mod.linkSystemLibrary("util", .{});
+                gameplay_bench_mod.linkSystemLibrary("rt", .{});
+                gameplay_bench_mod.linkSystemLibrary("pthread", .{});
+                gameplay_bench_mod.linkSystemLibrary("m", .{});
+                gameplay_bench_mod.linkSystemLibrary("dl", .{});
+                const gameplay_bench = b.addExecutable(.{
+                    .name = "runtime-core-gameplay-bench",
+                    .root_module = gameplay_bench_mod,
+                });
+                gameplay_bench.step.dependOn(runtime_core_cargo_step.?);
+                const gameplay_bench_run = b.addRunArtifact(gameplay_bench);
+                const gameplay_bench_step = b.step("bench-runtime-core-gameplay", "Run the 10,000-step Runtime Core Gameplay benchmark");
+                gameplay_bench_step.dependOn(&gameplay_bench_run.step);
+                if (gameplay_quality_emit_dir) |emit_dir| {
+                    const install_gameplay_bench = b.addInstallArtifact(gameplay_bench, .{
+                        .dest_dir = .{ .override = .{ .custom = emit_dir } },
+                        .dest_sub_path = "runtime-core-gameplay-bench",
+                    });
+                    const emit_gameplay_bench = b.step("emit-runtime-core-gameplay-bench", "Emit the Runtime Core Gameplay benchmark without running it");
+                    emit_gameplay_bench.dependOn(&install_gameplay_bench.step);
+                }
+            }
+
+            const gameplay_oracle_mod = b.createModule(.{
+                .root_source_file = b.path("tools/runtime-gameplay-oracle-bench.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            gameplay_oracle_mod.addIncludePath(b.path("abi"));
+            const gameplay_oracle = b.addExecutable(.{
+                .name = "runtime-gameplay-oracle-bench",
+                .root_module = gameplay_oracle_mod,
+            });
+            const gameplay_oracle_run = b.addRunArtifact(gameplay_oracle);
+            const gameplay_oracle_step = b.step("bench-runtime-gameplay-oracle", "Run the 10,000-step frozen Zig Gameplay oracle benchmark");
+            gameplay_oracle_step.dependOn(&gameplay_oracle_run.step);
+            if (gameplay_quality_emit_dir) |emit_dir| {
+                const install_gameplay_oracle = b.addInstallArtifact(gameplay_oracle, .{
+                    .dest_dir = .{ .override = .{ .custom = emit_dir } },
+                    .dest_sub_path = "runtime-gameplay-oracle-bench",
+                });
+                const emit_gameplay_oracle = b.step("emit-runtime-gameplay-oracle-bench", "Emit the frozen Zig Gameplay oracle benchmark without running it");
+                emit_gameplay_oracle.dependOn(&install_gameplay_oracle.step);
             }
         }
 
@@ -820,7 +886,7 @@ pub fn build(b: *std.Build) void {
         });
         runtime_core_public_c.step.dependOn(&contract_cargo_build.step);
         const runtime_core_public_c_run = b.addRunArtifact(runtime_core_public_c);
-        if (phase_quality_emit_dir) |emit_dir| {
+        if (quality_emit_dir) |emit_dir| {
             const install_runtime_core_public_c_evidence = b.addInstallArtifact(runtime_core_public_c, .{
                 .dest_dir = .{ .override = .{ .custom = emit_dir } },
                 .dest_sub_path = "runtime-core-public-contract",

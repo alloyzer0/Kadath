@@ -5,6 +5,7 @@ const builder = @import("behavior_package_builder");
 const manifest = @import("behavior_manifest");
 const scene_api = @import("scene.zig");
 const scene_generation_api = @import("scene_generation.zig");
+const runtime_core = @import("runtime_core");
 
 const ScriptFile = struct {
     path: []const u8,
@@ -50,7 +51,7 @@ fn makeRuntimeFixture(
     defer built.deinit();
 
     const scene = try scene_api.parse(std.testing.allocator, runtime_scene_source);
-    var generation = try scene_generation_api.SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
+    var generation = try scene_generation_api.SceneGeneration.prepare(&scene, .{ .width = 1024, .height = 720 });
     errdefer generation.deinit();
     const runtime = try behavior_host.initArtifact(std.testing.allocator, built.bytes, &scene);
     return .{ .generation = generation, .runtime = runtime };
@@ -535,7 +536,7 @@ test "candidate on_start rebuilds and updates live transient Behavior state" {
     const transient_index = fixture.generation.objectIndex("runtime-0000000000000001") orelse return error.MissingTransientRuntimeObject;
     try std.testing.expectApproxEqAbs(@as(f32, 15), (try fixture.generation.objectPosition(transient_index))[0], 0.0001);
 
-    var candidate = try fixture.runtime.cloneForRestart(std.testing.allocator, &fixture.generation.scene);
+    var candidate = try fixture.runtime.cloneForRestart(std.testing.allocator, fixture.generation.scene);
     defer candidate.deinit();
     const batch = try candidate.onStart(&fixture.generation);
     try fixture.generation.applyTranslationDeltas(batch.slice());
@@ -556,7 +557,7 @@ test "Behavior Host applies on_start and fixed commands in Scene order" {
     defer built.deinit();
 
     const scene = try scene_api.parse(std.testing.allocator, scene_source);
-    var generation = try scene_generation_api.SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
+    var generation = try scene_generation_api.SceneGeneration.prepare(&scene, .{ .width = 1024, .height = 720 });
     defer generation.deinit();
     var runtime = try behavior_host.initArtifact(std.testing.allocator, built.bytes, &scene);
     defer runtime.deinit();
@@ -580,10 +581,10 @@ test "Behavior Host applies on_start and fixed commands in Scene order" {
     try std.testing.expectApproxEqAbs(@as(f32, 44), (try generation.objectPosition(1))[1], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 5), (try generation.objectPosition(2))[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 10), (try generation.objectPosition(2))[1], 0.0001);
-    try runtime.finishFixedStep(&generation, &[_]bool{ false, false, false }, .{});
+    try runtime.finishFixedStep(&generation, .{});
     try runtime.runFixed(&generation, 0.5, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 39), (try generation.objectPosition(1))[1], 0.0001);
-    try runtime.finishFixedStep(&generation, &[_]bool{ false, false, false }, .{});
+    try runtime.finishFixedStep(&generation, .{});
     const before_frame_events = (try generation.objectPosition(2))[0];
     try runtime.runUpdate(&generation, 0.25, .{});
     try std.testing.expectApproxEqAbs(before_frame_events, (try generation.objectPosition(2))[0], 0.0001);
@@ -621,7 +622,7 @@ test "Behavior Host discards failed on_start overlay mutations" {
     defer built.deinit();
 
     const scene = try scene_api.parse(std.testing.allocator, failing_scene_source);
-    var generation = try scene_generation_api.SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
+    var generation = try scene_generation_api.SceneGeneration.prepare(&scene, .{ .width = 1024, .height = 720 });
     defer generation.deinit();
     var runtime = try behavior_host.initArtifact(std.testing.allocator, built.bytes, &scene);
     defer runtime.deinit();
@@ -668,7 +669,7 @@ test "Behavior Host schedules zero one or many fixed hooks and exactly one updat
 
         for (0..fixed_count) |_| {
             try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, .{});
-            try fixture.runtime.finishFixedStep(&fixture.generation, &[_]bool{ false, false, false }, .{});
+            try fixture.runtime.finishFixedStep(&fixture.generation, .{});
         }
         try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
         try fixture.runtime.finishFrame(&fixture.generation, .{});
@@ -769,11 +770,11 @@ test "failed active Binding keeps prior writes and isolates later hooks" {
     try std.testing.expectApproxEqAbs(@as(f32, 9), (try fixture.generation.objectPosition(2))[0], 0.0001);
     try std.testing.expect(!fixture.runtime.active.?.bindingEnabled(1));
     try std.testing.expect(fixture.runtime.active.?.bindingEnabled(2));
-    try fixture.runtime.finishFixedStep(&fixture.generation, &[_]bool{ false, false, false }, .{});
+    try fixture.runtime.finishFixedStep(&fixture.generation, .{});
 
     try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 14), (try fixture.generation.objectPosition(2))[0], 0.0001);
-    try fixture.runtime.finishFixedStep(&fixture.generation, &[_]bool{ false, false, false }, .{});
+    try fixture.runtime.finishFixedStep(&fixture.generation, .{});
 }
 
 test "contact events are directed and deliver end before begin" {
@@ -808,13 +809,25 @@ test "contact events are directed and deliver end before begin" {
     );
     defer fixture.deinit();
 
-    const touching_hazard = [_]bool{ false, true, false };
-    try fixture.runtime.finishFixedStep(&fixture.generation, &touching_hazard, .{});
+    try fixture.generation.setObjectPosition(2, .{ 30, 40 });
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    const first = try fixture.generation.beginGameplayFixed(1.0 / 60.0, &outcome);
+    try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, .{});
+    _ = try fixture.generation.commitGameplayFixed(first.step_token, .{}, &outcome);
+    try fixture.runtime.finishFixedStep(&fixture.generation, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 2), (try fixture.generation.objectPosition(1))[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 2), (try fixture.generation.objectPosition(2))[0], 0.0001);
 
-    const touching_goal = [_]bool{ true, false, false };
-    try fixture.runtime.finishFixedStep(&fixture.generation, &touching_goal, .{});
+    // Frame phases have their own caller sequence. Interleaving one must not
+    // make the next Gameplay step token ineligible for the fixed Phase.
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+
+    try fixture.generation.setObjectPosition(2, .{ 10, 20 });
+    const second = try fixture.generation.beginGameplayFixed(1.0 / 60.0, &outcome);
+    try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, .{});
+    _ = try fixture.generation.commitGameplayFixed(second.step_token, .{}, &outcome);
+    try fixture.runtime.finishFixedStep(&fixture.generation, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 21), (try fixture.generation.objectPosition(1))[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 212), (try fixture.generation.objectPosition(2))[0], 0.0001);
 }
@@ -1071,6 +1084,9 @@ test "saved ObjectRef follows restart replacement and rejects a new world epoch"
     const start = try fixture.runtime.onStart(&fixture.generation);
     try fixture.generation.applyTranslationDeltas(start.slice());
     const previous_entity = fixture.generation.playerEntity();
+    var restart_outcome: runtime_core.GameplayOutcome = undefined;
+    const terminal = try fixture.generation.beginGameplayFixed(3.0, &restart_outcome);
+    try fixture.generation.core.abortGameplayFixed(terminal.step_token);
     try fixture.generation.reset();
     try std.testing.expect(previous_entity != fixture.generation.playerEntity());
 

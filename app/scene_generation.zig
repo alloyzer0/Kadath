@@ -1,21 +1,7 @@
 const std = @import("std");
-const collision = @import("collision.zig");
 const runtime_core = @import("runtime_core");
 const scene_api = @import("scene.zig");
 const PlatformExtent = @import("platform").WindowExtent;
-
-pub const SceneContactTarget = struct {
-    object_index: u8,
-    object_id: scene_api.ObjectId,
-    entity: runtime_core.EntityId,
-};
-
-pub const SceneContacts = struct {
-    player_entity: runtime_core.EntityId,
-    hazard: ?SceneContactTarget = null,
-    goal: ?SceneContactTarget = null,
-    touching: [scene_api.max_scene_object_count]bool = [_]bool{false} ** scene_api.max_scene_object_count,
-};
 
 pub const ObjectPositionUpdate = struct {
     object_index: u8,
@@ -44,38 +30,38 @@ pub const ReservedSpawn = struct {
 
 pub const ActivationCommand = runtime_core.ActivationCommand;
 
-const HazardState = struct {
+const HazardSource = struct {
     object_index: u8 = 0,
-    entity: runtime_core.EntityId = runtime_core.invalid_entity,
-    y: f32 = 0.0,
-    direction: f32 = 1.0,
 };
 
 pub const SceneGeneration = struct {
-    scene: scene_api.Scene,
+    scene: *scene_api.Scene,
     core: runtime_core.RuntimeCore,
     target: runtime_core.Target,
     extent: PlatformExtent,
     player_index: u8,
     goal_index: u8,
-    hazards: [scene_api.max_scene_object_count]HazardState = [_]HazardState{.{}} ** scene_api.max_scene_object_count,
+    hazards: [scene_api.max_scene_object_count]HazardSource = [_]HazardSource{.{}} ** scene_api.max_scene_object_count,
     hazard_count: u8 = 0,
     goal_position: [2]f32,
+    phase_candidate_ready: bool = false,
 
-    pub fn prepare(value: scene_api.Scene, extent: PlatformExtent) !SceneGeneration {
+    pub fn prepare(value: *const scene_api.Scene, extent: PlatformExtent) !SceneGeneration {
         var core = try runtime_core.RuntimeCore.init();
         errdefer core.deinit();
         var generation = try prepareWithCore(value, extent, core, .initial, .live);
+        errdefer std.heap.page_allocator.destroy(generation.scene);
+        try generation.ensurePairedPhaseCandidate();
         try generation.core.commitScene();
-        try generation.refreshRuntimeMetadata();
+        generation.phase_candidate_ready = false;
         return generation;
     }
 
-    pub fn prepareRestart(value: scene_api.Scene, extent: PlatformExtent, previous: *const SceneGeneration) !SceneGeneration {
+    pub fn prepareRestart(value: *const scene_api.Scene, extent: PlatformExtent, previous: *const SceneGeneration) !SceneGeneration {
         return prepareWithCore(value, extent, previous.core.borrow(), .restart, .candidate);
     }
 
-    pub fn prepareSceneReload(value: scene_api.Scene, extent: PlatformExtent, previous: *const SceneGeneration) !SceneGeneration {
+    pub fn prepareSceneReload(value: *const scene_api.Scene, extent: PlatformExtent, previous: *const SceneGeneration) !SceneGeneration {
         return prepareWithCore(value, extent, previous.core.borrow(), .scene_reload, .candidate);
     }
 
@@ -84,7 +70,9 @@ pub const SceneGeneration = struct {
         // Complete every fallible projection query while both candidates remain private.
         // After commitScene, ownership transfer and the target flip are no-fail operations.
         try self.refreshRuntimeMetadata();
+        try self.ensurePairedPhaseCandidate();
         try self.core.commitScene();
+        self.phase_candidate_ready = false;
         self.core.takeOwnership(&previous.core);
         self.target = .live;
     }
@@ -99,42 +87,33 @@ pub const SceneGeneration = struct {
             };
         }
         self.core.deinit();
+        std.heap.page_allocator.destroy(self.scene);
         self.hazard_count = 0;
     }
 
     pub fn reset(self: *SceneGeneration) !void {
         var sources: [scene_api.max_scene_object_count]runtime_core.SourceDesc = undefined;
-        const source_slice = sourceDescriptors(&self.scene, &sources);
+        const source_slice = sourceDescriptors(self.scene, &sources);
         _ = try self.core.prepare(.restart, .{ 0, 0 }, boundsMax(self.extent), source_slice);
-        try self.core.commitScene();
-        self.goal_position = self.scene.goal().sprite.position;
-        for (self.hazards[0..self.hazard_count]) |*hazard| {
-            const object = &self.scene.objects.entries[hazard.object_index];
-            hazard.y = object.sprite.position[1];
-            hazard.direction = 1.0;
+        errdefer {
+            self.core.abortPhaseState() catch {};
+            self.core.abortScene() catch {};
+            self.phase_candidate_ready = false;
         }
-        try self.refreshRuntimeMetadata();
-        try self.setGoalPosition(self.scene.goal().sprite.position);
+        self.phase_candidate_ready = false;
+        try self.prepareGameplay();
+        try self.ensurePairedPhaseCandidate();
+        try self.core.commitScene();
+        self.phase_candidate_ready = false;
+        self.goal_position = self.scene.goal().sprite.position;
     }
 
-    pub fn stepFixed(self: *SceneGeneration, dt_seconds: f32, input: runtime_core.InputSnapshot) !void {
-        if (!std.math.isFinite(dt_seconds) or dt_seconds < 0.0) return error.InvalidFixedDelta;
-        if (self.scene.schemaVersion == scene_api.legacy_object_schema_version) {
-            var patches: [scene_api.max_scene_object_count]runtime_core.PositionPatch = undefined;
-            var count: usize = 0;
-            for (self.hazards[0..self.hazard_count]) |*hazard| {
-                const object = &self.scene.objects.entries[hazard.object_index];
-                const advanced = advancePatrol(hazard.y, hazard.direction, object.patrol, dt_seconds);
-                hazard.y = advanced.y;
-                hazard.direction = advanced.direction;
-                const object_ref = self.runtimeHandleAt(hazard.object_index) orelse return error.UnknownSceneObject;
-                patches[count] = .{ .object_ref = object_ref, .position = .{ object.sprite.position[0], hazard.y } };
-                count += 1;
-            }
-            if (count != 0) try self.core.applyPositions(self.target, patches[0..count]);
-        }
-        try self.core.stepFixed(dt_seconds, input);
-        try self.refreshRuntimeMetadata();
+    pub fn beginGameplayFixed(self: *SceneGeneration, dt_seconds: f32, outcome: *runtime_core.GameplayOutcome) !runtime_core.GameplayStepResult {
+        return self.core.beginGameplayFixed(dt_seconds, outcome);
+    }
+
+    pub fn commitGameplayFixed(self: *SceneGeneration, token: u64, input: runtime_core.InputSnapshot, outcome: *runtime_core.GameplayOutcome) !runtime_core.GameplayStepResult {
+        return self.core.commitGameplayFixed(token, input, outcome);
     }
 
     pub fn applyTranslationDeltas(self: *SceneGeneration, deltas: []const [2]f64) !void {
@@ -173,39 +152,9 @@ pub const SceneGeneration = struct {
         try self.setGoalPosition(self.goal_position);
     }
 
-    pub fn observeContacts(self: *const SceneGeneration) !SceneContacts {
-        var sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
-        const ordered = try self.extractSprites(&sprites);
-        const player_entity = self.playerEntity();
-        const player = bodyForEntity(ordered, player_entity) orelse return error.WorldProducedNoPlayerSprite;
-        var contacts = SceneContacts{ .player_entity = player_entity };
-        for (self.hazards[0..self.hazard_count]) |hazard| {
-            const hazard_entity = self.entityForObject(hazard.object_index) orelse return error.WorldProducedNoHazardSprite;
-            const hazard_body = bodyForEntity(ordered, hazard_entity) orelse return error.WorldProducedNoHazardSprite;
-            if (collision.queryContact(player, hazard_body) != null) {
-                contacts.touching[hazard.object_index] = true;
-                if (contacts.hazard == null) contacts.hazard = .{
-                    .object_index = hazard.object_index,
-                    .object_id = self.scene.objects.entries[hazard.object_index].objectId,
-                    .entity = hazard_entity,
-                };
-            }
-        }
-        const goal_entity = self.goalEntity();
-        const goal = bodyForEntity(ordered, goal_entity) orelse return error.WorldProducedNoGoalSprite;
-        if (collision.queryContact(player, goal) != null) {
-            contacts.touching[self.goal_index] = true;
-            contacts.goal = .{ .object_index = self.goal_index, .object_id = self.scene.objects.entries[self.goal_index].objectId, .entity = goal_entity };
-        }
-        return contacts;
-    }
-
-    pub fn extractSprites(self: *const SceneGeneration, output: []runtime_core.RenderSprite) ![]runtime_core.RenderSprite {
-        var views: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
-        const active = try self.core.snapshot(self.target, true, &views);
-        if (output.len < active.len) return error.WorldRenderBufferTooSmall;
-        for (active, 0..) |view, index| output[index] = renderSprite(view);
-        return output[0..active.len];
+    pub fn extractSprites(self: *SceneGeneration, output: []runtime_core.RenderSprite) !struct { sprites: []runtime_core.RenderSprite, snapshot: runtime_core.GameplaySnapshot } {
+        const snapshot = try self.core.gameplaySnapshot(output);
+        return .{ .sprites = output[0..snapshot.render_count], .snapshot = snapshot };
     }
 
     pub fn reserveTransient(self: *SceneGeneration, prototype_id: []const u8, position: [2]f32) !ReservedSpawn {
@@ -340,9 +289,6 @@ pub const SceneGeneration = struct {
         const handle = self.runtimeHandleAt(object_index) orelse return error.UnknownSceneObject;
         try self.core.applyPositions(self.target, &.{.{ .object_ref = handle, .position = position }});
         if (object_index == self.goal_index) self.goal_position = (try self.core.resolve(self.target, handle)).?.position;
-        for (self.hazards[0..self.hazard_count]) |*hazard| {
-            if (hazard.object_index == object_index) hazard.y = (try self.core.resolve(self.target, handle)).?.position[1];
-        }
     }
 
     pub fn applyObjectPositionsAtomically(self: *SceneGeneration, updates: []const ObjectPositionUpdate) !void {
@@ -380,6 +326,20 @@ pub const SceneGeneration = struct {
         try self.refreshRuntimeMetadata();
     }
 
+    pub fn preparePhaseState(self: *SceneGeneration, bindings: []const runtime_core.PhaseBinding) !void {
+        _ = try self.core.preparePhaseState(self.target, bindings);
+    }
+
+    pub fn commitPhaseState(self: *SceneGeneration) !void {
+        try self.core.commitPhaseState();
+        if (self.target == .candidate) self.phase_candidate_ready = true;
+    }
+
+    pub fn abortPhaseState(self: *SceneGeneration) !void {
+        try self.core.abortPhaseState();
+        if (self.target == .candidate) self.phase_candidate_ready = false;
+    }
+
     pub fn objectIdForEntity(self: *const SceneGeneration, entity: runtime_core.EntityId) ?scene_api.ObjectId {
         const view = (self.core.findByEntity(self.target, entity) catch return null) orelse return null;
         return objectId(view.object_ref) catch null;
@@ -390,48 +350,74 @@ pub const SceneGeneration = struct {
     }
 
     pub fn primaryHazardY(self: *const SceneGeneration) f32 {
-        return self.hazards[0].y;
+        if (self.hazard_count == 0) return 0;
+        return (self.objectPosition(self.hazards[0].object_index) catch return 0)[1];
     }
 
     fn refreshRuntimeMetadata(self: *SceneGeneration) !void {
-        for (self.hazards[0..self.hazard_count]) |*hazard| {
-            const handle = self.runtimeHandleAt(hazard.object_index) orelse return error.UnknownSceneObject;
-            const view = try self.core.resolve(self.target, handle) orelse return error.UnknownSceneObject;
-            hazard.entity = view.entity_value;
-            hazard.y = view.position[1];
-        }
         const goal_handle = self.runtimeHandleAt(self.goal_index) orelse return error.UnknownSceneObject;
         self.goal_position = (try self.core.resolve(self.target, goal_handle) orelse return error.UnknownSceneObject).position;
+    }
+
+    fn prepareGameplay(self: *SceneGeneration) !void {
+        var hazards: [scene_api.max_scene_object_count - 2]runtime_core.HazardDesc = undefined;
+        for (self.hazards[0..self.hazard_count], 0..) |hazard, index| {
+            const object = &self.scene.objects.entries[hazard.object_index];
+            const legacy = self.scene.schemaVersion == scene_api.legacy_object_schema_version;
+            hazards[index] = .{
+                .object_ref = (try self.core.findById(.candidate, object.objectId.slice()) orelse return error.UnknownSceneObject).object_ref,
+                .legacy_patrol = legacy,
+                .patrol_min_y = if (legacy) object.patrol.minY else 0,
+                .patrol_max_y = if (legacy) object.patrol.maxY else 0,
+                .patrol_speed = if (legacy) object.patrol.speed else 0,
+            };
+        }
+        try self.core.prepareGameplay(
+            3.0,
+            (try self.core.findById(.candidate, self.scene.objects.entries[self.player_index].objectId.slice()) orelse return error.UnknownSceneObject).object_ref,
+            (try self.core.findById(.candidate, self.scene.objects.entries[self.goal_index].objectId.slice()) orelse return error.UnknownSceneObject).object_ref,
+            hazards[0..self.hazard_count],
+        );
+    }
+
+    fn ensurePairedPhaseCandidate(self: *SceneGeneration) !void {
+        if (self.phase_candidate_ready) return;
+        _ = try self.core.preparePhaseState(.candidate, &.{});
+        try self.core.commitPhaseState();
+        self.phase_candidate_ready = true;
     }
 };
 
 fn prepareWithCore(
-    value: scene_api.Scene,
+    value: *const scene_api.Scene,
     extent: PlatformExtent,
     core_value: runtime_core.RuntimeCore,
     mode: runtime_core.PrepareMode,
     target: runtime_core.Target,
 ) !SceneGeneration {
-    try scene_api.validate(&value);
+    try scene_api.validate(value);
+    const owned_scene = try std.heap.page_allocator.create(scene_api.Scene);
+    errdefer std.heap.page_allocator.destroy(owned_scene);
+    owned_scene.* = value.*;
     var core = core_value;
     errdefer if (mode != .initial) core.abortScene() catch {};
     var sources: [scene_api.max_scene_object_count]runtime_core.SourceDesc = undefined;
-    _ = try core.prepare(mode, .{ 0, 0 }, boundsMax(extent), sourceDescriptors(&value, &sources));
+    _ = try core.prepare(mode, .{ 0, 0 }, boundsMax(extent), sourceDescriptors(value, &sources));
     var player_index: ?u8 = null;
     var goal_index: ?u8 = null;
-    var hazards = [_]HazardState{.{}} ** scene_api.max_scene_object_count;
+    var hazards = [_]HazardSource{.{}} ** scene_api.max_scene_object_count;
     var hazard_count: u8 = 0;
     for (value.objects.slice(), 0..) |object, index| switch (object.kind) {
         .sprite => {},
         .player => player_index = @intCast(index),
         .goal => goal_index = @intCast(index),
         .patrol_hazard => {
-            hazards[hazard_count] = .{ .object_index = @intCast(index), .y = object.sprite.position[1] };
+            hazards[hazard_count] = .{ .object_index = @intCast(index) };
             hazard_count += 1;
         },
     };
-    return .{
-        .scene = value,
+    var generation = SceneGeneration{
+        .scene = owned_scene,
         .core = core,
         .target = target,
         .extent = extent,
@@ -440,7 +426,10 @@ fn prepareWithCore(
         .hazards = hazards,
         .hazard_count = hazard_count,
         .goal_position = value.goal().sprite.position,
+        .phase_candidate_ready = false,
     };
+    try generation.prepareGameplay();
+    return generation;
 }
 
 fn sourceDescriptors(scene: *const scene_api.Scene, output: []runtime_core.SourceDesc) []runtime_core.SourceDesc {
@@ -503,53 +492,44 @@ fn record(view: runtime_core.ObjectView) !RuntimeRecord {
     };
 }
 
-const AdvancedPatrol = struct { y: f32, direction: f32 };
-
-fn advancePatrol(y: f32, direction: f32, patrol: scene_api.PatrolPayload, dt_seconds: f32) AdvancedPatrol {
-    if (patrol.speed == 0.0 or dt_seconds == 0.0) return .{ .y = y, .direction = direction };
-    const min_y: f64 = patrol.minY;
-    const max_y: f64 = patrol.maxY;
-    const span = max_y - min_y;
-    const period = span * 2.0;
-    const signed_distance: f64 = @as(f64, patrol.speed) * @as(f64, dt_seconds) * @as(f64, direction);
-    const phase = @mod(@as(f64, y) - min_y + signed_distance, period);
-    if (phase < span) return .{ .y = @floatCast(min_y + phase), .direction = 1.0 };
-    if (phase > span) return .{ .y = @floatCast(max_y - (phase - span)), .direction = -1.0 };
-    return .{ .y = patrol.maxY, .direction = -1.0 };
-}
-
 fn clampPosition(position: [2]f32, size: [2]f32, extent: PlatformExtent) [2]f32 {
     const max_x = @max(0.0, @as(f32, @floatFromInt(extent.width)) - size[0]);
     const max_y = @max(0.0, @as(f32, @floatFromInt(extent.height)) - size[1]);
     return .{ @min(@max(position[0], 0.0), max_x), @min(@max(position[1], 0.0), max_y) };
 }
 
-fn renderSprite(view: runtime_core.ObjectView) runtime_core.RenderSprite {
-    return .{ .entity_id = view.entity_value, .position = view.position, .size = view.size, .color = view.color, .texture_id = view.texture_id };
+fn testGameplayStep(generation: *SceneGeneration, dt_seconds: f32, input: runtime_core.InputSnapshot) !struct { result: runtime_core.GameplayStepResult, outcome: runtime_core.GameplayOutcome } {
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    const begin = try generation.beginGameplayFixed(dt_seconds, &outcome);
+    try generation.core.beginPhase(.fixed, begin.step_token);
+    const result = try generation.commitGameplayFixed(begin.step_token, input, &outcome);
+    var events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
+    for (&events) |*event| {
+        event.* = std.mem.zeroes(runtime_core.PhaseEvent);
+        event.struct_size = @sizeOf(runtime_core.PhaseEvent);
+    }
+    _ = try generation.core.drainPhaseEvents(.fixed, begin.step_token, &events);
+    try generation.core.endPhase(.fixed, begin.step_token);
+    return .{ .result = result, .outcome = outcome };
 }
 
-fn findSprite(sprites: []const runtime_core.RenderSprite, entity: runtime_core.EntityId) ?runtime_core.RenderSprite {
-    for (sprites) |sprite| if (sprite.entity_id == entity) return sprite;
-    return null;
-}
-
-fn bodyForEntity(sprites: []const runtime_core.RenderSprite, entity: runtime_core.EntityId) ?collision.Body {
-    const sprite = findSprite(sprites, entity) orelse return null;
-    return .{ .entity_id = entity, .aabb = .{ .position = sprite.position, .size = sprite.size } };
+test "SceneGeneration keeps fixed-capacity Scene storage out of line" {
+    try std.testing.expect(@sizeOf(scene_api.Scene) > 400 * 1024);
+    try std.testing.expect(@sizeOf(SceneGeneration) < 64 * 1024);
 }
 
 test "SceneGeneration preserves source order and updates independent hazards" {
-    var generation = try SceneGeneration.prepare(scene_api.default_scene, .{ .width = 1024, .height = 720 });
+    var generation = try SceneGeneration.prepare(&scene_api.default_scene, .{ .width = 1024, .height = 720 });
     defer generation.deinit();
     var before: [scene_api.max_scene_object_count]runtime_core.RenderSprite = undefined;
-    const initial = try generation.extractSprites(&before);
+    const initial = (try generation.extractSprites(&before)).sprites;
     try std.testing.expectEqual(@as(usize, 5), initial.len);
-    try std.testing.expectEqual(generation.entityForObject(0).?, initial[0].entity_id);
+    try std.testing.expectEqual(generation.entityForObject(0).?, initial[0].entity_value);
     const first_y = initial[2].position[1];
     const second_y = initial[3].position[1];
-    try generation.stepFixed(1.0 / 60.0, .{});
+    _ = try testGameplayStep(&generation, 1.0 / 60.0, .{});
     var after: [scene_api.max_scene_object_count]runtime_core.RenderSprite = undefined;
-    const stepped = try generation.extractSprites(&after);
+    const stepped = (try generation.extractSprites(&after)).sprites;
     try std.testing.expect(stepped[2].position[1] != first_y);
     try std.testing.expect(stepped[3].position[1] != second_y);
     try std.testing.expect(stepped[2].position[1] - first_y != stepped[3].position[1] - second_y);
@@ -569,44 +549,48 @@ test "SceneGeneration activates and despawns transient prototype objects without
         .prototypeId = try scene_api.PrototypeId.init("runtime-orb"),
         .sprite = .{ .size = .{ 12, 8 }, .color = .{ 1, 1, 1, 1 }, .textureId = 1 },
     };
-    var generation = try SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
+    var generation = try SceneGeneration.prepare(&scene, .{ .width = 1024, .height = 720 });
     defer generation.deinit();
     const pending = try generation.reserveTransient("runtime-orb", .{ 20, 30 });
     var sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
-    try std.testing.expectEqual(scene.objects.count, (try generation.extractSprites(&sprites)).len);
+    try std.testing.expectEqual(scene.objects.count, (try generation.extractSprites(&sprites)).sprites.len);
     try generation.activateTransient(pending.handle);
-    try std.testing.expectEqual(scene.objects.count + 1, (try generation.extractSprites(&sprites)).len);
+    try std.testing.expectEqual(scene.objects.count + 1, (try generation.extractSprites(&sprites)).sprites.len);
     try generation.requestTransientDestroy(pending.handle);
     try generation.commitTransientDestroy(pending.handle);
     try std.testing.expect(generation.runtimeObject(pending.handle) == null);
     const restart_transient = try generation.reserveTransient("runtime-orb", .{ 40, 50 });
     try generation.activateTransient(restart_transient.handle);
+    _ = try testGameplayStep(&generation, 3.0, .{});
     try generation.reset();
     try std.testing.expect(generation.runtimeObject(restart_transient.handle) == null);
     const after_restart = try generation.reserveTransient("runtime-orb", .{ 60, 70 });
     try std.testing.expectEqualStrings("runtime-0000000000000003", after_restart.object_id.slice());
 }
 
-test "SceneGeneration reports contact with any patrol hazard" {
+test "SceneGeneration reports contact with any patrol hazard through Gameplay outcome" {
     var value = scene_api.default_scene;
     const player_index = value.objects.indexOfKind(.player).?;
     value.objects.entries[player_index].sprite.position = value.objects.entries[3].sprite.position;
     value.objects.entries[player_index].sprite.size = .{ 1.0, 1.0 };
-    var generation = try SceneGeneration.prepare(value, .{ .width = 1024, .height = 720 });
+    var generation = try SceneGeneration.prepare(&value, .{ .width = 1024, .height = 720 });
     defer generation.deinit();
-    const contacts = try generation.observeContacts();
-    try std.testing.expectEqualStrings("hazard-2", contacts.hazard.?.object_id.slice());
+    const step = try testGameplayStep(&generation, 0.0, .{});
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), step.result.cause);
+    try std.testing.expectEqualStrings("hazard-2", runtime_core.objectIdSlice(&step.outcome.other));
 }
 
 test "SceneGeneration patrol reflection remains bounded after large travel" {
-    var generation = try SceneGeneration.prepare(scene_api.default_scene, .{ .width = 1024, .height = 720 });
+    var generation = try SceneGeneration.prepare(&scene_api.default_scene, .{ .width = 1024, .height = 720 });
     defer generation.deinit();
-    try generation.stepFixed(1000.0, .{});
+    _ = try testGameplayStep(&generation, 1000.0, .{});
     for (generation.hazards[0..generation.hazard_count]) |hazard| {
         const patrol = generation.scene.objects.entries[hazard.object_index].patrol;
-        try std.testing.expect(hazard.y >= patrol.minY and hazard.y <= patrol.maxY);
+        const y = (try generation.objectPosition(hazard.object_index))[1];
+        try std.testing.expect(y >= patrol.minY and y <= patrol.maxY);
     }
-    try std.testing.expectError(error.InvalidFixedDelta, generation.stepFixed(-1.0, .{}));
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    try std.testing.expectError(error.InvalidRuntimeCoreArgument, generation.beginGameplayFixed(-1.0, &outcome));
 }
 
 test "SceneGeneration behavior schema stops native patrol and applies one atomic translation batch" {
@@ -617,13 +601,13 @@ test "SceneGeneration behavior schema stops native patrol and applies one atomic
         object.behaviors.count = 1;
         object.behaviors.entries[0].scriptId = 1;
     }
-    var generation = try SceneGeneration.prepare(value, .{ .width = 1024, .height = 720 });
+    var generation = try SceneGeneration.prepare(&value, .{ .width = 1024, .height = 720 });
     defer generation.deinit();
     var before_storage: [scene_api.max_scene_object_count]runtime_core.RenderSprite = undefined;
-    const before = try generation.extractSprites(&before_storage);
-    try generation.stepFixed(1.0, .{});
+    const before = (try generation.extractSprites(&before_storage)).sprites;
+    _ = try testGameplayStep(&generation, 1.0, .{});
     var native_step_storage: [scene_api.max_scene_object_count]runtime_core.RenderSprite = undefined;
-    const native_step = try generation.extractSprites(&native_step_storage);
+    const native_step = (try generation.extractSprites(&native_step_storage)).sprites;
     try std.testing.expectEqual(before[2].position, native_step[2].position);
     try std.testing.expectEqual(before[3].position, native_step[3].position);
 
@@ -632,7 +616,7 @@ test "SceneGeneration behavior schema stops native patrol and applies one atomic
     deltas[3] = .{ -2, -7 };
     try generation.applyTranslationDeltas(deltas[0..value.objects.count]);
     var after_storage: [scene_api.max_scene_object_count]runtime_core.RenderSprite = undefined;
-    const after = try generation.extractSprites(&after_storage);
+    const after = (try generation.extractSprites(&after_storage)).sprites;
     try std.testing.expectApproxEqAbs(before[2].position[1] + 5, after[2].position[1], 0.0001);
     try std.testing.expectApproxEqAbs(before[3].position[0] - 2, after[3].position[0], 0.0001);
     try std.testing.expectApproxEqAbs(before[3].position[1] - 7, after[3].position[1], 0.0001);
@@ -652,14 +636,15 @@ test "SceneGeneration restart and reload keep live isolated until candidate comm
         .prototypeId = try scene_api.PrototypeId.init("runtime-orb"),
         .sprite = .{ .size = .{ 2, 2 }, .color = .{ 1, 1, 1, 1 }, .textureId = 1 },
     };
-    var generation = try SceneGeneration.prepare(scene, .{ .width = 1024, .height = 720 });
+    var generation = try SceneGeneration.prepare(&scene, .{ .width = 1024, .height = 720 });
     defer generation.deinit();
     const original_player = generation.runtimeHandle("player") orelse return error.MissingPlayer;
     const original_entity = generation.playerEntity();
     const transient = try generation.reserveTransient("runtime-orb", .{ 10, 20 });
     try generation.activateTransient(transient.handle);
+    _ = try testGameplayStep(&generation, 3.0, .{});
 
-    var restart = try SceneGeneration.prepareRestart(scene, generation.extent, &generation);
+    var restart = try SceneGeneration.prepareRestart(&scene, generation.extent, &generation);
     var restart_needs_cleanup = true;
     defer if (restart_needs_cleanup) restart.deinit();
     const restart_player = restart.runtimeHandle("player") orelse return error.MissingPlayer;
@@ -675,7 +660,7 @@ test "SceneGeneration restart and reload keep live isolated until candidate comm
     const after_restart = try generation.reserveTransient("runtime-orb", .{ 30, 40 });
     try std.testing.expectEqualStrings("runtime-0000000000000002", after_restart.object_id.slice());
 
-    var reload = try SceneGeneration.prepareSceneReload(scene, generation.extent, &generation);
+    var reload = try SceneGeneration.prepareSceneReload(&scene, generation.extent, &generation);
     var reload_needs_cleanup = true;
     defer if (reload_needs_cleanup) reload.deinit();
     try std.testing.expect(reload.runtimeObject(original_player) == null);

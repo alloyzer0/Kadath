@@ -3,13 +3,18 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <threads.h>
+#endif
 
 #include "kadath_runtime_core.h"
 #include "test_hooks.h"
 
 _Static_assert(KADATH_RUNTIME_OBJECT_AUTHORITY_INTERFACE_V1 == 1U, "interface version");
 _Static_assert(KADATH_RUNTIME_PHASE_INTERFACE_V1 == 1U, "phase interface version");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1 == 1U, "gameplay interface version");
 _Static_assert(KADATH_RUNTIME_PHASE_MAX_GENERATION == 8U, "phase generation limit");
 _Static_assert(KADATH_RUNTIME_PHASE_MAX_BINDINGS == 256U, "phase admission limit");
 _Static_assert(KADATH_RUNTIME_PHASE_MAX_BEHAVIORS_PER_BINDING == 4U, "phase per-binding behavior limit");
@@ -18,12 +23,23 @@ _Static_assert(KADATH_RUNTIME_PHASE_MAX_STRUCTURAL_PER_DOMAIN == 64U, "phase str
 _Static_assert(KADATH_RUNTIME_MAX_OBJECTS == 128U, "object limit");
 _Static_assert(KADATH_RUNTIME_TARGET_LIVE == 1U, "live target");
 _Static_assert(KADATH_RUNTIME_TARGET_CANDIDATE == 2U, "candidate target");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING == 1U, "gameplay playing phase");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_PHASE_WON == 2U, "gameplay won phase");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_PHASE_LOST == 3U, "gameplay lost phase");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_CAUSE_NONE == 0U, "gameplay none cause");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_CAUSE_TIMER == 1U, "gameplay timer cause");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_CAUSE_HAZARD == 2U, "gameplay hazard cause");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_CAUSE_GOAL == 3U, "gameplay goal cause");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE == 0U, "gameplay static hazard movement");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL == 1U, "gameplay legacy hazard movement");
 _Static_assert(KADATH_RUNTIME_QUERY_FIND_BY_ENTITY == 6U, "query tags");
 _Static_assert(KADATH_RUNTIME_MUTATION_FINALIZE_TRANSIENT_DESTROY == 8U, "mutation tags");
 _Static_assert(KADATH_ERR_RUNTIME_WRONG_THREAD == 0x4101, "runtime error start");
 _Static_assert(KADATH_ERR_RUNTIME_DUPLICATE_OBJECT_ID == 0x410B, "runtime error end");
 _Static_assert(KADATH_ERR_RUNTIME_PHASE_BUSY == 0x4110, "phase error start");
 _Static_assert(KADATH_ERR_RUNTIME_PHASE_NOT_DRAINED == 0x411B, "phase error end");
+_Static_assert(KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE == 0x4120, "gameplay error start");
+_Static_assert(KADATH_ERR_RUNTIME_GAMEPLAY_SEQUENCE_EXHAUSTED == 0x4123, "gameplay error end");
 
 _Static_assert(sizeof(kadath_runtime_object_ref_v1_t) == 128U, "ObjectRef ABI");
 _Static_assert(offsetof(kadath_runtime_object_ref_v1_t, object_id) == 32U, "ObjectRef ID offset");
@@ -56,6 +72,20 @@ _Static_assert(sizeof(kadath_runtime_phase_activation_result_v1_t) == 280U, "pha
 _Static_assert(sizeof(kadath_runtime_phase_activation_batch_v1_t) == 160U, "phase activation batch ABI");
 _Static_assert(offsetof(kadath_runtime_phase_activation_batch_v1_t, structural_results) == 96U, "phase activation result array offset");
 _Static_assert(sizeof(kadath_runtime_phase_interface_v1_t) == 192U, "phase interface ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_hazard_desc_v1_t) == 184U, "gameplay hazard ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_desc_v1_t) == 336U, "gameplay descriptor ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_candidate_info_v1_t) == 48U, "gameplay candidate ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_begin_fixed_desc_v1_t) == 48U, "gameplay begin ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_commit_fixed_desc_v1_t) == 56U, "gameplay commit ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_outcome_buffer_v1_t) == 64U, "gameplay outcome buffer ABI");
+_Static_assert(sizeof(kadath_runtime_render_buffer_v1_t) == 64U, "gameplay render buffer ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_snapshot_v1_t) == 80U, "gameplay snapshot ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_step_result_v1_t) == 80U, "gameplay step ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_outcome_v1_t) == 312U, "gameplay outcome ABI");
+_Static_assert(sizeof(kadath_runtime_render_item_v1_t) == 216U, "gameplay render item ABI");
+_Static_assert(sizeof(kadath_runtime_gameplay_interface_v1_t) == 112U, "gameplay interface ABI");
+_Static_assert(offsetof(kadath_runtime_gameplay_outcome_v1_t, player) > offsetof(kadath_runtime_gameplay_outcome_v1_t, sequence), "gameplay outcome order");
+_Static_assert(offsetof(kadath_runtime_render_item_v1_t, final_color) > offsetof(kadath_runtime_render_item_v1_t, position), "gameplay render order");
 _Static_assert(offsetof(kadath_runtime_phase_begin_desc_v1_t, phase_sequence) == 8U, "phase sequence offset");
 _Static_assert(offsetof(kadath_runtime_phase_event_v1_t, fields) > offsetof(kadath_runtime_phase_event_v1_t, name), "phase fields order");
 _Static_assert(offsetof(kadath_runtime_phase_structural_v1_t, object_ref) == 40U, "phase object ref offset");
@@ -79,6 +109,17 @@ static kadath_runtime_phase_interface_v1_t query_phase_interface(void) {
     interface_value.struct_size = (uint32_t)sizeof(interface_value);
     interface_value.interface_version = KADATH_RUNTIME_PHASE_INTERFACE_V1;
     if (kadath_runtime_core_query_phase_interface(&interface_value) != KADATH_OK) {
+        memset(&interface_value, 0, sizeof(interface_value));
+    }
+    return interface_value;
+}
+
+static kadath_runtime_gameplay_interface_v1_t query_gameplay_interface(void) {
+    kadath_runtime_gameplay_interface_v1_t interface_value;
+    memset(&interface_value, 0, sizeof(interface_value));
+    interface_value.struct_size = (uint32_t)sizeof(interface_value);
+    interface_value.interface_version = KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1;
+    if (kadath_runtime_core_query_gameplay_interface(&interface_value) != KADATH_OK) {
         memset(&interface_value, 0, sizeof(interface_value));
     }
     return interface_value;
@@ -109,6 +150,18 @@ static void fill_source(
     source->sprite.move_speed = move_speed;
 }
 
+static void fill_canonical_sources(kadath_runtime_source_object_desc_v1_t sources[3]) {
+    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
+    fill_source(&sources[1], "hazard", KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD, 60.0F, 0.0F);
+    fill_source(&sources[2], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+}
+
+static int prepare_gameplay_candidate(
+    kadath_runtime_object_authority_interface_t* object_interface,
+    kadath_runtime_core_t* core);
+static int prepare_empty_phase_candidate(kadath_runtime_core_t* core);
+static int make_gameplay_terminal(kadath_runtime_core_t* core);
+
 static int normal_path(kadath_runtime_object_authority_interface_t* interface_value) {
     kadath_runtime_core_create_desc_t create_desc;
     kadath_runtime_core_t* core = NULL;
@@ -118,9 +171,8 @@ static int normal_path(kadath_runtime_object_authority_interface_t* interface_va
         return 10;
     }
 
-    kadath_runtime_source_object_desc_v1_t sources[2];
-    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
-    fill_source(&sources[1], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+    kadath_runtime_source_object_desc_v1_t sources[3];
+    fill_canonical_sources(sources);
 
     kadath_runtime_scene_prepare_desc_t prepare_desc;
     kadath_runtime_scene_candidate_info_t candidate_info;
@@ -131,11 +183,11 @@ static int normal_path(kadath_runtime_object_authority_interface_t* interface_va
     prepare_desc.bounds_max[0] = 100.0F;
     prepare_desc.bounds_max[1] = 100.0F;
     prepare_desc.source_objects = sources;
-    prepare_desc.source_object_count = 2U;
+    prepare_desc.source_object_count = 3U;
     prepare_desc.source_object_stride = sizeof(sources[0]);
     candidate_info.struct_size = (uint32_t)sizeof(candidate_info);
     if (interface_value->prepare_scene(core, &prepare_desc, &candidate_info) != KADATH_OK ||
-        candidate_info.world_epoch != 1U || candidate_info.source_object_count != 2U) {
+        candidate_info.world_epoch != 1U || candidate_info.source_object_count != 3U) {
         return 11;
     }
 
@@ -155,15 +207,17 @@ static int normal_path(kadath_runtime_object_authority_interface_t* interface_va
     result.struct_size = (uint32_t)sizeof(result);
     if (interface_value->query(core, &batch, &result, 1U) != KADATH_OK ||
         result.found != KADATH_RUNTIME_FOUND || result.payload.state_info.world_epoch != 1U ||
-        result.payload.state_info.object_count != 2U) {
+        result.payload.state_info.object_count != 3U) {
         return 12;
     }
 
-    if (interface_value->commit_scene(core) != KADATH_OK) {
+    if (prepare_gameplay_candidate(interface_value, core) != 0 ||
+        prepare_empty_phase_candidate(core) != 0 ||
+        interface_value->commit_scene(core) != KADATH_OK) {
         return 13;
     }
 
-    kadath_runtime_object_view_v1_t objects[2];
+    kadath_runtime_object_view_v1_t objects[3];
     memset(objects, 0xA5, sizeof(objects));
     memset(&item, 0, sizeof(item));
     memset(&batch, 0, sizeof(batch));
@@ -171,7 +225,7 @@ static int normal_path(kadath_runtime_object_authority_interface_t* interface_va
     item.struct_size = (uint32_t)sizeof(item);
     item.tag = KADATH_RUNTIME_QUERY_VISIBLE_OBJECTS;
     item.payload.object_buffer.objects = objects;
-    item.payload.object_buffer.object_capacity = 2U;
+    item.payload.object_buffer.object_capacity = 3U;
     item.payload.object_buffer.object_stride = sizeof(objects[0]);
     batch.struct_size = (uint32_t)sizeof(batch);
     batch.target = KADATH_RUNTIME_TARGET_LIVE;
@@ -180,11 +234,13 @@ static int normal_path(kadath_runtime_object_authority_interface_t* interface_va
     batch.item_stride = sizeof(item);
     result.struct_size = (uint32_t)sizeof(result);
     if (interface_value->query(core, &batch, &result, 1U) != KADATH_OK ||
-        result.payload.snapshot.object_count != 2U ||
+        result.payload.snapshot.object_count != 3U ||
         objects[0].object_ref.object_id_length != 6U ||
         memcmp(objects[0].object_ref.object_id, "player", 6U) != 0 ||
-        objects[1].object_ref.object_id_length != 4U ||
-        memcmp(objects[1].object_ref.object_id, "goal", 4U) != 0) {
+        objects[1].object_ref.object_id_length != 6U ||
+        memcmp(objects[1].object_ref.object_id, "hazard", 6U) != 0 ||
+        objects[2].object_ref.object_id_length != 4U ||
+        memcmp(objects[2].object_ref.object_id, "goal", 4U) != 0) {
         return 14;
     }
 
@@ -198,7 +254,7 @@ static int create_live_core(
     kadath_runtime_object_authority_interface_t* interface_value,
     kadath_runtime_core_t** out_core) {
     kadath_runtime_core_create_desc_t create_desc;
-    kadath_runtime_source_object_desc_v1_t sources[2];
+    kadath_runtime_source_object_desc_v1_t sources[3];
     kadath_runtime_scene_prepare_desc_t prepare_desc;
     kadath_runtime_scene_candidate_info_t candidate_info;
 
@@ -207,8 +263,7 @@ static int create_live_core(
     if (interface_value->create(&create_desc, out_core) != KADATH_OK || *out_core == NULL) {
         return 20;
     }
-    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
-    fill_source(&sources[1], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+    fill_canonical_sources(sources);
     memset(&prepare_desc, 0, sizeof(prepare_desc));
     memset(&candidate_info, 0, sizeof(candidate_info));
     prepare_desc.struct_size = (uint32_t)sizeof(prepare_desc);
@@ -216,10 +271,12 @@ static int create_live_core(
     prepare_desc.bounds_max[0] = 100.0F;
     prepare_desc.bounds_max[1] = 100.0F;
     prepare_desc.source_objects = sources;
-    prepare_desc.source_object_count = 2U;
+    prepare_desc.source_object_count = 3U;
     prepare_desc.source_object_stride = sizeof(sources[0]);
     candidate_info.struct_size = (uint32_t)sizeof(candidate_info);
     if (interface_value->prepare_scene(*out_core, &prepare_desc, &candidate_info) != KADATH_OK ||
+        prepare_gameplay_candidate(interface_value, *out_core) != 0 ||
+        prepare_empty_phase_candidate(*out_core) != 0 ||
         interface_value->commit_scene(*out_core) != KADATH_OK) {
         return 21;
     }
@@ -331,15 +388,96 @@ static int query_candidate_id(
     return interface_value->query(core, &batch, result, 1U);
 }
 
+static int prepare_gameplay_candidate(
+    kadath_runtime_object_authority_interface_t* object_interface,
+    kadath_runtime_core_t* core) {
+    kadath_runtime_query_result_t player;
+    kadath_runtime_query_result_t hazard;
+    kadath_runtime_query_result_t goal;
+    if (query_candidate_id(object_interface, core, "player", &player) != KADATH_OK ||
+        query_candidate_id(object_interface, core, "hazard", &hazard) != KADATH_OK ||
+        query_candidate_id(object_interface, core, "goal", &goal) != KADATH_OK ||
+        player.found != KADATH_RUNTIME_FOUND || hazard.found != KADATH_RUNTIME_FOUND ||
+        goal.found != KADATH_RUNTIME_FOUND) {
+        return 1;
+    }
+
+    kadath_runtime_gameplay_hazard_desc_v1_t hazard_desc;
+    kadath_runtime_gameplay_desc_v1_t gameplay_desc;
+    kadath_runtime_gameplay_candidate_info_v1_t gameplay_info;
+    memset(&hazard_desc, 0, sizeof(hazard_desc));
+    memset(&gameplay_desc, 0, sizeof(gameplay_desc));
+    memset(&gameplay_info, 0, sizeof(gameplay_info));
+    hazard_desc.struct_size = (uint32_t)sizeof(hazard_desc);
+    hazard_desc.movement_mode = KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE;
+    hazard_desc.object_ref = hazard.payload.object.object_ref;
+    gameplay_desc.struct_size = (uint32_t)sizeof(gameplay_desc);
+    gameplay_desc.time_limit_seconds = 3.0F;
+    gameplay_desc.hazard_count = 1U;
+    gameplay_desc.player = player.payload.object.object_ref;
+    gameplay_desc.goal = goal.payload.object.object_ref;
+    gameplay_desc.hazards = &hazard_desc;
+    gameplay_desc.hazard_stride = sizeof(hazard_desc);
+    gameplay_info.struct_size = (uint32_t)sizeof(gameplay_info);
+    kadath_runtime_gameplay_interface_v1_t gameplay_interface = query_gameplay_interface();
+    return gameplay_interface.prepare_gameplay_state != NULL &&
+                   gameplay_interface.prepare_gameplay_state(core, &gameplay_desc, &gameplay_info) == KADATH_OK
+               ? 0
+               : 2;
+}
+
+static int prepare_empty_phase_candidate(kadath_runtime_core_t* core) {
+    kadath_runtime_phase_interface_v1_t phase_interface = query_phase_interface();
+    kadath_runtime_phase_state_prepare_desc_v1_t desc;
+    kadath_runtime_phase_state_candidate_info_v1_t info;
+    memset(&desc, 0, sizeof(desc));
+    memset(&info, 0, sizeof(info));
+    desc.struct_size = (uint32_t)sizeof(desc);
+    desc.target = KADATH_RUNTIME_TARGET_CANDIDATE;
+    desc.binding_stride = sizeof(kadath_runtime_phase_binding_desc_v1_t);
+    info.struct_size = (uint32_t)sizeof(info);
+    return phase_interface.prepare_phase_state != NULL &&
+                   phase_interface.prepare_phase_state(core, &desc, &info) == KADATH_OK &&
+                   phase_interface.commit_phase_state(core) == KADATH_OK
+               ? 0
+               : 3;
+}
+
+static int make_gameplay_terminal(kadath_runtime_core_t* core) {
+    kadath_runtime_gameplay_interface_v1_t gameplay_interface = query_gameplay_interface();
+    kadath_runtime_gameplay_begin_fixed_desc_v1_t desc;
+    kadath_runtime_gameplay_outcome_v1_t outcome;
+    kadath_runtime_gameplay_outcome_buffer_v1_t buffer;
+    kadath_runtime_gameplay_step_result_v1_t result;
+    memset(&desc, 0, sizeof(desc));
+    memset(&outcome, 0, sizeof(outcome));
+    memset(&buffer, 0, sizeof(buffer));
+    memset(&result, 0, sizeof(result));
+    desc.struct_size = (uint32_t)sizeof(desc);
+    desc.dt_seconds = 3.0F;
+    outcome.struct_size = (uint32_t)sizeof(outcome);
+    buffer.struct_size = (uint32_t)sizeof(buffer);
+    buffer.outcomes = &outcome;
+    buffer.outcome_capacity = 1U;
+    buffer.outcome_stride = sizeof(outcome);
+    result.struct_size = (uint32_t)sizeof(result);
+    if (gameplay_interface.begin_fixed_step == NULL ||
+        gameplay_interface.begin_fixed_step(core, &desc, &buffer, &result) != KADATH_OK ||
+        result.phase != KADATH_RUNTIME_GAMEPLAY_PHASE_LOST ||
+        gameplay_interface.abort_fixed_step(core, result.step_token) != KADATH_OK) {
+        return 4;
+    }
+    return 0;
+}
+
 static int prepare_candidate_again(
     kadath_runtime_object_authority_interface_t* interface_value,
     kadath_runtime_core_t* core,
     uint32_t mode) {
-    kadath_runtime_source_object_desc_v1_t sources[2];
+    kadath_runtime_source_object_desc_v1_t sources[3];
     kadath_runtime_scene_prepare_desc_t prepare_desc;
     kadath_runtime_scene_candidate_info_t candidate_info;
-    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
-    fill_source(&sources[1], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+    fill_canonical_sources(sources);
     memset(&prepare_desc, 0, sizeof(prepare_desc));
     memset(&candidate_info, 0, sizeof(candidate_info));
     prepare_desc.struct_size = (uint32_t)sizeof(prepare_desc);
@@ -347,7 +485,7 @@ static int prepare_candidate_again(
     prepare_desc.bounds_max[0] = 100.0F;
     prepare_desc.bounds_max[1] = 100.0F;
     prepare_desc.source_objects = sources;
-    prepare_desc.source_object_count = 2U;
+    prepare_desc.source_object_count = 3U;
     prepare_desc.source_object_stride = sizeof(sources[0]);
     candidate_info.struct_size = (uint32_t)sizeof(candidate_info);
     int32_t prepare_result =
@@ -362,10 +500,14 @@ static int prepare_again(
     kadath_runtime_object_authority_interface_t* interface_value,
     kadath_runtime_core_t* core,
     uint32_t mode) {
-    if (prepare_candidate_again(interface_value, core, mode) != 0) {
+    if ((mode != KADATH_RUNTIME_PREPARE_RESTART || make_gameplay_terminal(core) == 0) &&
+        prepare_candidate_again(interface_value, core, mode) == 0 &&
+        prepare_gameplay_candidate(interface_value, core) == 0 &&
+        prepare_empty_phase_candidate(core) == 0) {
+        return interface_value->commit_scene(core) == KADATH_OK ? 0 : 31;
+    } else {
         return 30;
     }
-    return interface_value->commit_scene(core) == KADATH_OK ? 0 : 31;
 }
 
 static int transient_lifecycle(kadath_runtime_object_authority_interface_t* interface_value) {
@@ -757,7 +899,7 @@ static int query_batch_atomic(kadath_runtime_object_authority_interface_t* inter
     batch.item_count = 3U;
     batch.item_stride = sizeof(items[0]);
     if (interface_value->query(core, &batch, results, 3U) != KADATH_OK ||
-        results[0].payload.state_info.object_count != 2U ||
+        results[0].payload.state_info.object_count != 3U ||
         results[1].found != KADATH_RUNTIME_FOUND ||
         results[2].found != KADATH_RUNTIME_NOT_FOUND) {
         return 60;
@@ -907,7 +1049,11 @@ typedef struct wrong_thread_context_t {
     int32_t result;
 } wrong_thread_context_t;
 
+#if defined(_WIN32)
+static DWORD WINAPI call_core_on_wrong_thread(LPVOID userdata) {
+#else
 static int call_core_on_wrong_thread(void* userdata) {
+#endif
     wrong_thread_context_t* context = (wrong_thread_context_t*)userdata;
     context->result = context->interface_value->abort_scene(context->core);
     return 0;
@@ -952,6 +1098,15 @@ static int misuse_contract(kadath_runtime_object_authority_interface_t* interfac
         return 84;
     }
     wrong_thread_context_t context = { interface_value, core, KADATH_OK };
+#if defined(_WIN32)
+    HANDLE thread = CreateThread(NULL, 0U, call_core_on_wrong_thread, &context, 0U, NULL);
+    DWORD thread_result = 1U;
+    if (thread == NULL || WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0 ||
+        GetExitCodeThread(thread, &thread_result) == 0 || CloseHandle(thread) == 0 ||
+        thread_result != 0U || context.result != KADATH_ERR_RUNTIME_WRONG_THREAD) {
+        return 85;
+    }
+#else
     thrd_t thread;
     int thread_result = 0;
     if (thrd_create(&thread, call_core_on_wrong_thread, &context) != thrd_success ||
@@ -959,7 +1114,168 @@ static int misuse_contract(kadath_runtime_object_authority_interface_t* interfac
         context.result != KADATH_ERR_RUNTIME_WRONG_THREAD) {
         return 85;
     }
+#endif
     return interface_value->destroy(&core) == KADATH_OK ? 0 : 86;
+}
+
+static int gameplay_contract_path(
+    kadath_runtime_object_authority_interface_t* object_interface,
+    kadath_runtime_phase_interface_v1_t* phase_interface,
+    kadath_runtime_gameplay_interface_v1_t* gameplay_interface) {
+    kadath_runtime_gameplay_interface_v1_t probe;
+    kadath_runtime_gameplay_interface_v1_t probe_sentinel;
+    memset(&probe, 0xA5, sizeof(probe));
+    probe.struct_size = 4U;
+    probe.interface_version = KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1;
+    memcpy(&probe_sentinel, &probe, sizeof(probe));
+    if (kadath_runtime_core_query_gameplay_interface(NULL) != KADATH_ERR_INVALID_ARGUMENT ||
+        kadath_runtime_core_query_gameplay_interface(&probe) != KADATH_ERR_INVALID_ARGUMENT ||
+        memcmp(&probe, &probe_sentinel, sizeof(probe)) != 0) return 97;
+    memset(&probe, 0, sizeof(probe));
+    probe.struct_size = (uint32_t)sizeof(probe);
+    probe.interface_version = UINT32_MAX;
+    memcpy(&probe_sentinel, &probe, sizeof(probe));
+    if (kadath_runtime_core_query_gameplay_interface(&probe) != KADATH_ERR_NOT_SUPPORTED ||
+        memcmp(&probe, &probe_sentinel, sizeof(probe)) != 0) return 98;
+    memset(&probe, 0, sizeof(probe));
+    probe.struct_size = (uint32_t)sizeof(probe);
+    probe.interface_version = KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1;
+    probe.reserved[0] = 1U;
+    memcpy(&probe_sentinel, &probe, sizeof(probe));
+    if (kadath_runtime_core_query_gameplay_interface(&probe) != KADATH_ERR_INVALID_ARGUMENT ||
+        memcmp(&probe, &probe_sentinel, sizeof(probe)) != 0) return 99;
+
+    kadath_runtime_core_t* core = NULL;
+    if (create_live_core(object_interface, &core) != 0) return 87;
+
+    kadath_runtime_render_item_v1_t render_items[3];
+    kadath_runtime_render_buffer_v1_t render_buffer;
+    kadath_runtime_gameplay_snapshot_v1_t snapshot;
+    memset(render_items, 0, sizeof(render_items));
+    for (size_t index = 0; index < 3U; ++index) {
+        render_items[index].struct_size = (uint32_t)sizeof(render_items[index]);
+    }
+    memset(&render_buffer, 0, sizeof(render_buffer));
+    memset(&snapshot, 0, sizeof(snapshot));
+    render_buffer.struct_size = (uint32_t)sizeof(render_buffer);
+    render_buffer.items = render_items;
+    render_buffer.item_capacity = 3U;
+    render_buffer.item_stride = sizeof(render_items[0]);
+    snapshot.struct_size = (uint32_t)sizeof(snapshot);
+    if (gameplay_interface->publish_snapshot(core, &render_buffer, &snapshot) != KADATH_OK ||
+        snapshot.phase != KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING || snapshot.accepts_input != 1U ||
+        snapshot.render_count != 3U || snapshot.last_outcome_sequence != 0U) return 88;
+
+    kadath_runtime_render_item_v1_t panic_render_sentinel[3];
+    kadath_runtime_gameplay_snapshot_v1_t panic_snapshot_sentinel;
+    memcpy(panic_render_sentinel, render_items, sizeof(render_items));
+    memset(&snapshot, 0xA5, sizeof(snapshot));
+    snapshot.struct_size = (uint32_t)sizeof(snapshot);
+    memcpy(&panic_snapshot_sentinel, &snapshot, sizeof(snapshot));
+    if (arm_fault(core, KADATH_RUNTIME_TEST_ENTRY_QUERY, KADATH_RUNTIME_TEST_FAULT_PANIC_BEFORE_PUBLICATION) != KADATH_OK ||
+        gameplay_interface->publish_snapshot(core, &render_buffer, &snapshot) != KADATH_ERR_INTERNAL ||
+        memcmp(render_items, panic_render_sentinel, sizeof(render_items)) != 0 ||
+        memcmp(&snapshot, &panic_snapshot_sentinel, sizeof(snapshot)) != 0) return 100;
+
+    kadath_runtime_gameplay_begin_fixed_desc_v1_t begin;
+    kadath_runtime_gameplay_outcome_v1_t outcome;
+    kadath_runtime_gameplay_outcome_buffer_v1_t outcome_buffer;
+    kadath_runtime_gameplay_step_result_v1_t step;
+    memset(&begin, 0, sizeof(begin));
+    memset(&outcome, 0, sizeof(outcome));
+    memset(&outcome_buffer, 0, sizeof(outcome_buffer));
+    memset(&step, 0, sizeof(step));
+    begin.struct_size = (uint32_t)sizeof(begin);
+    outcome.struct_size = (uint32_t)sizeof(outcome);
+    outcome_buffer.struct_size = (uint32_t)sizeof(outcome_buffer);
+    outcome_buffer.outcomes = &outcome;
+    outcome_buffer.outcome_capacity = 1U;
+    outcome_buffer.outcome_stride = sizeof(outcome);
+    step.struct_size = (uint32_t)sizeof(step);
+    if (gameplay_interface->begin_fixed_step(core, &begin, &outcome_buffer, &step) != KADATH_OK ||
+        step.phase != KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING || step.outcome_count != 0U) return 89;
+
+    kadath_runtime_gameplay_step_result_v1_t busy_step;
+    kadath_runtime_gameplay_outcome_v1_t busy_outcome;
+    memset(&busy_step, 0xA5, sizeof(busy_step));
+    memset(&busy_outcome, 0xA5, sizeof(busy_outcome));
+    busy_step.struct_size = (uint32_t)sizeof(busy_step);
+    busy_outcome.struct_size = (uint32_t)sizeof(busy_outcome);
+    kadath_runtime_gameplay_step_result_v1_t busy_step_sentinel = busy_step;
+    kadath_runtime_gameplay_outcome_v1_t busy_outcome_sentinel = busy_outcome;
+    outcome_buffer.outcomes = &busy_outcome;
+    if (gameplay_interface->begin_fixed_step(core, &begin, &outcome_buffer, &busy_step) !=
+            KADATH_ERR_RUNTIME_GAMEPLAY_STEP_BUSY ||
+        memcmp(&busy_step, &busy_step_sentinel, sizeof(busy_step)) != 0 ||
+        memcmp(&busy_outcome, &busy_outcome_sentinel, sizeof(busy_outcome)) != 0) return 90;
+    outcome_buffer.outcomes = &outcome;
+
+    kadath_runtime_phase_begin_desc_v1_t phase_begin;
+    kadath_runtime_phase_begin_result_v1_t phase_begin_result;
+    memset(&phase_begin, 0, sizeof(phase_begin));
+    memset(&phase_begin_result, 0, sizeof(phase_begin_result));
+    phase_begin.struct_size = (uint32_t)sizeof(phase_begin);
+    phase_begin.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    phase_begin.phase_sequence = step.step_token;
+    phase_begin_result.struct_size = (uint32_t)sizeof(phase_begin_result);
+    if (phase_interface->begin_phase(core, &phase_begin, &phase_begin_result) != KADATH_OK) return 91;
+
+    kadath_runtime_gameplay_commit_fixed_desc_v1_t commit;
+    kadath_runtime_gameplay_step_result_v1_t committed;
+    memset(&commit, 0, sizeof(commit));
+    memset(&committed, 0, sizeof(committed));
+    commit.struct_size = (uint32_t)sizeof(commit);
+    commit.step_token = step.step_token;
+    memset(&committed, 0xA5, sizeof(committed));
+    committed.struct_size = (uint32_t)sizeof(committed);
+    memset(&outcome, 0xA5, sizeof(outcome));
+    outcome.struct_size = (uint32_t)sizeof(outcome);
+    kadath_runtime_gameplay_step_result_v1_t committed_sentinel = committed;
+    kadath_runtime_gameplay_outcome_v1_t commit_outcome_sentinel = outcome;
+    if (arm_fault(core, KADATH_RUNTIME_TEST_ENTRY_MUTATE, KADATH_RUNTIME_TEST_FAULT_ALLOCATION_FAILURE) != KADATH_OK ||
+        gameplay_interface->commit_fixed_step(core, &commit, &outcome_buffer, &committed) != KADATH_ERR_OUT_OF_MEMORY ||
+        memcmp(&committed, &committed_sentinel, sizeof(committed)) != 0 ||
+        memcmp(&outcome, &commit_outcome_sentinel, sizeof(outcome)) != 0) return 101;
+    memset(&committed, 0, sizeof(committed));
+    memset(&outcome, 0, sizeof(outcome));
+    committed.struct_size = (uint32_t)sizeof(committed);
+    outcome.struct_size = (uint32_t)sizeof(outcome);
+    if (gameplay_interface->commit_fixed_step(core, &commit, &outcome_buffer, &committed) != KADATH_OK ||
+        committed.phase != KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING || committed.outcome_count != 0U ||
+        phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, step.step_token) != KADATH_OK) return 92;
+
+    begin.dt_seconds = 3.0F;
+    memset(&outcome, 0, sizeof(outcome));
+    memset(&step, 0, sizeof(step));
+    outcome.struct_size = (uint32_t)sizeof(outcome);
+    step.struct_size = (uint32_t)sizeof(step);
+    if (gameplay_interface->begin_fixed_step(core, &begin, &outcome_buffer, &step) != KADATH_OK ||
+        step.phase != KADATH_RUNTIME_GAMEPLAY_PHASE_LOST || step.outcome_count != 1U ||
+        outcome.sequence != 1U || outcome.cause != KADATH_RUNTIME_GAMEPLAY_CAUSE_TIMER ||
+        gameplay_interface->abort_fixed_step(core, step.step_token) != KADATH_OK) return 93;
+
+    kadath_runtime_gameplay_snapshot_v1_t small_snapshot;
+    memset(render_items, 0xA5, sizeof(render_items));
+    for (size_t index = 0; index < 3U; ++index) {
+        render_items[index].struct_size = (uint32_t)sizeof(render_items[index]);
+    }
+    kadath_runtime_render_item_v1_t render_sentinels[3];
+    memcpy(render_sentinels, render_items, sizeof(render_items));
+    memset(&small_snapshot, 0xA5, sizeof(small_snapshot));
+    small_snapshot.struct_size = (uint32_t)sizeof(small_snapshot);
+    kadath_runtime_gameplay_snapshot_v1_t small_snapshot_sentinel = small_snapshot;
+    render_buffer.item_capacity = 2U;
+    if (gameplay_interface->publish_snapshot(core, &render_buffer, &small_snapshot) != KADATH_ERR_BUFFER_TOO_SMALL ||
+        memcmp(&small_snapshot, &small_snapshot_sentinel, sizeof(small_snapshot)) != 0 ||
+        memcmp(render_items, render_sentinels, sizeof(render_items)) != 0) return 94;
+    render_buffer.item_capacity = 3U;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.struct_size = (uint32_t)sizeof(snapshot);
+    if (gameplay_interface->publish_snapshot(core, &render_buffer, &snapshot) != KADATH_OK ||
+        snapshot.phase != KADATH_RUNTIME_GAMEPLAY_PHASE_LOST || snapshot.accepts_input != 0U ||
+        snapshot.last_outcome_sequence != 1U || render_items[0].final_color[0] != 0.95F) return 95;
+
+    return object_interface->destroy(&core) == KADATH_OK ? 0 : 96;
 }
 
 static int phase_commit_path(
@@ -968,6 +1284,7 @@ static int phase_commit_path(
     kadath_runtime_core_t* core = NULL;
     int create_result = create_live_core(object_interface, &core);
     if (create_result != 0) return 100 + create_result;
+    if (make_gameplay_terminal(core) != 0) return 149;
 
     kadath_runtime_query_result_t player_result;
     if (query_id(object_interface, core, "player", &player_result) != KADATH_OK ||
@@ -1066,6 +1383,7 @@ static int phase_commit_path(
     if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_ERR_RUNTIME_PHASE_BUSY ||
         begin_result.phase_sequence != UINT64_MAX) return 154;
     if (prepare_candidate_again(object_interface, core, KADATH_RUNTIME_PREPARE_RESTART) != 0 ||
+        prepare_gameplay_candidate(object_interface, core) != 0 ||
         object_interface->commit_scene(core) != KADATH_ERR_RUNTIME_PHASE_BUSY) return 155;
 
     kadath_runtime_phase_structural_v1_t structural;
@@ -1236,12 +1554,14 @@ static int phase_commit_path(
     if (phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 77U) != KADATH_OK) {
         return 167;
     }
-    if (object_interface->commit_scene(core) != KADATH_OK) return 168;
+    if (prepare_empty_phase_candidate(core) != 0 ||
+        object_interface->commit_scene(core) != KADATH_OK) return 168;
     memset(&begin_result, 0, sizeof(begin_result));
     begin_result.struct_size = (uint32_t)sizeof(begin_result);
     if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
         begin_result.domain != KADATH_RUNTIME_PHASE_DOMAIN_FRAME) return 169;
     if (prepare_candidate_again(object_interface, core, KADATH_RUNTIME_PREPARE_SCENE_RELOAD) != 0 ||
+        prepare_gameplay_candidate(object_interface, core) != 0 ||
         object_interface->commit_scene(core) != KADATH_ERR_RUNTIME_PHASE_BUSY) return 170;
     memset(&event, 0, sizeof(event));
     memset(&event_batch, 0, sizeof(event_batch));
@@ -1258,6 +1578,7 @@ static int phase_commit_path(
     if (phase_interface->drain_events(core, KADATH_RUNTIME_PHASE_DOMAIN_FRAME, 1U, &drained, 1U, &drained_count) != KADATH_OK ||
         drained_count != 1U || drained.domain != KADATH_RUNTIME_PHASE_DOMAIN_FRAME) return 172;
     if (phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FRAME, 1U) != KADATH_OK ||
+        prepare_empty_phase_candidate(core) != 0 ||
         object_interface->commit_scene(core) != KADATH_OK ||
         object_interface->destroy(&core) != KADATH_OK || core != NULL) return 173;
 
@@ -1414,7 +1735,8 @@ static int phase_commit_path(
         return 200;
     }
     /* ACCEPTED physically finalizes the hidden destroy and releases one of the
-     * 128 Object Authority slots; filling all 126 remaining slots must work. */
+     * 128 Object Authority slots; with three authored Gameplay sources,
+     * filling all 125 remaining slots must work. */
     kadath_runtime_mutation_item_v1_t reserve_item;
     kadath_runtime_mutation_result_t reserve_result;
     memset(&reserve_item, 0, sizeof(reserve_item));
@@ -1428,7 +1750,7 @@ static int phase_commit_path(
     reserve_item.payload.transient.sprite.size[1] = 1.0F;
     reserve_item.payload.transient.sprite.color[3] = 1.0F;
     reserve_item.payload.transient.sprite.texture_id = 1U;
-    for (size_t index = 0; index < KADATH_RUNTIME_MAX_OBJECTS - 2U; ++index) {
+    for (size_t index = 0; index < KADATH_RUNTIME_MAX_OBJECTS - 3U; ++index) {
         memset(&reserve_result, 0, sizeof(reserve_result));
         reserve_result.struct_size = (uint32_t)sizeof(reserve_result);
         if (mutate_one(object_interface, core, &reserve_item, &reserve_result) != KADATH_OK) {
@@ -1448,12 +1770,12 @@ static int aborted_scene_discards_paired_phase_candidate(
     kadath_runtime_phase_interface_v1_t* phase_interface) {
     kadath_runtime_core_t* core = NULL;
     if (create_live_core(object_interface, &core) != 0) return 260;
+    if (make_gameplay_terminal(core) != 0) return 260;
 
-    kadath_runtime_source_object_desc_v1_t sources[2];
+    kadath_runtime_source_object_desc_v1_t sources[3];
     kadath_runtime_scene_prepare_desc_t scene_desc;
     kadath_runtime_scene_candidate_info_t scene_info;
-    fill_source(&sources[0], "player", KADATH_RUNTIME_OBJECT_KIND_PLAYER, 10.0F, 20.0F);
-    fill_source(&sources[1], "goal", KADATH_RUNTIME_OBJECT_KIND_GOAL, 80.0F, 0.0F);
+    fill_canonical_sources(sources);
     memset(&scene_desc, 0, sizeof(scene_desc));
     memset(&scene_info, 0, sizeof(scene_info));
     scene_desc.struct_size = (uint32_t)sizeof(scene_desc);
@@ -1461,10 +1783,11 @@ static int aborted_scene_discards_paired_phase_candidate(
     scene_desc.bounds_max[0] = 100.0F;
     scene_desc.bounds_max[1] = 100.0F;
     scene_desc.source_objects = sources;
-    scene_desc.source_object_count = 2U;
+    scene_desc.source_object_count = 3U;
     scene_desc.source_object_stride = sizeof(sources[0]);
     scene_info.struct_size = (uint32_t)sizeof(scene_info);
     if (object_interface->prepare_scene(core, &scene_desc, &scene_info) != KADATH_OK) return 261;
+    if (prepare_gameplay_candidate(object_interface, core) != 0) return 261;
 
     kadath_runtime_query_result_t candidate_player;
     if (query_candidate_id(object_interface, core, "player", &candidate_player) != KADATH_OK ||
@@ -1494,6 +1817,8 @@ static int aborted_scene_discards_paired_phase_candidate(
     memset(&scene_info, 0, sizeof(scene_info));
     scene_info.struct_size = (uint32_t)sizeof(scene_info);
     if (object_interface->prepare_scene(core, &scene_desc, &scene_info) != KADATH_OK ||
+        prepare_gameplay_candidate(object_interface, core) != 0 ||
+        prepare_empty_phase_candidate(core) != 0 ||
         object_interface->commit_scene(core) != KADATH_OK) return 264;
 
     kadath_runtime_query_result_t live_player;
@@ -1815,6 +2140,18 @@ int main(void) {
         phase_interface.begin_activation == NULL || phase_interface.end_phase == NULL) {
         return 2;
     }
+    kadath_runtime_gameplay_interface_v1_t gameplay_interface;
+    memset(&gameplay_interface, 0, sizeof(gameplay_interface));
+    gameplay_interface.struct_size = (uint32_t)sizeof(gameplay_interface);
+    gameplay_interface.interface_version = KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1;
+    if (kadath_runtime_core_query_gameplay_interface(&gameplay_interface) != KADATH_OK ||
+        gameplay_interface.prepare_gameplay_state == NULL ||
+        gameplay_interface.begin_fixed_step == NULL ||
+        gameplay_interface.commit_fixed_step == NULL ||
+        gameplay_interface.abort_fixed_step == NULL ||
+        gameplay_interface.publish_snapshot == NULL) {
+        return 3;
+    }
     int normal_result = normal_path(&interface_value);
     if (normal_result != 0) {
         return normal_result;
@@ -1833,6 +2170,9 @@ int main(void) {
     if (activation_result != 0) return activation_result;
     int query_result = query_batch_atomic(&interface_value);
     if (query_result != 0) return query_result;
+    int gameplay_result = gameplay_contract_path(&interface_value, &phase_interface, &gameplay_interface);
+    if (gameplay_result != 0) return gameplay_result;
+    puts("PHASE3_PUBLIC_GAMEPLAY_PATH=PASS");
     int phase_result = phase_commit_path(&interface_value, &phase_interface);
     if (phase_result != 0) return phase_result;
     puts("PHASE3_PUBLIC_PHASE_COMMIT_PATH=PASS");

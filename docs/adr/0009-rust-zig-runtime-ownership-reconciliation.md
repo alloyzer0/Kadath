@@ -276,6 +276,17 @@ Runtime Core 的外部 Interface 必须：
 - 输出只读 render/event snapshot；
 - 使 render extraction 不承担 gameplay mutation。
 
+#### C.1 2026-08-25 Gameplay implementation 分段澄清
+
+`P1-Rust-Runtime-Core-Gameplay-01` 收到独立 `GO_IMPLEMENT` 后，按冻结并窄修订的contract将Gameplay作为同一opaque Runtime Core内的深Module实现：
+
+- Rust唯一拥有session phase/timer/cause、outcome与step token high-water、previous contact ledger、strict Player↔source Goal/Hazard collision、legacy patrol、terminal priority和Player final tint；Zig只保留本次调用结果、caller-owned scratch与render count。
+- Scene transaction必须配齐Object、Gameplay和ready Phase candidate后由Object commit一次发布。restart要求live Gameplay已terminal，保持epoch/source identity和sequence high-water；reload令epoch加一；两者都清空timer/contact transient state。
+- fixed顺序为timer begin、terminal input suppression、Luau fixed/direct mutation、Rust movement、Rust contact、Hazard优先于Goal、全部contact end后全部begin、Phase settle、frame callback、Rust snapshot。contact event与普通fixed event共享既有64条Phase硬预算并fail closed。
+- Rust public seam只暴露versioned C17 descriptor、capacity-1 outcome、step result与caller-owned bounded snapshot；不暴露VM、Renderer、Audio、Window或Editor类型。Host继续将successful outcome映射到一次Audio cue与一次日志，失败不反向写Gameplay。
+- `SceneGeneration`改为堆上持有解码后的固定容量Scene，并通过指针进入prepare/restart/reload路径；legacy v4 decoder写入caller storage。该内存形状修复不改变Scene/KSCN/KSCP schema、wire、容量或Gameplay语义。
+- 同一candidate删除`app/game.zig`、`app/collision.zig`及BehaviorHost/Host中的persistent contact、GameSession和final tint writer，遵循replace-not-layer。
+
 ### 5.3A 2026-08-21 Object Authority 分段澄清
 
 `P1-Rust-Runtime-Core-Object-Authority-01` 的独立 contract discovery 已冻结以下分段；本节是 dated clarification，不改写上述长期 TARGET：

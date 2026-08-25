@@ -1,5 +1,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod gameplay;
 mod object_authority;
 mod phase_commit;
 mod world;
@@ -94,8 +95,11 @@ struct RuntimeCore {
     live: Option<RuntimeState>,
     candidate: Option<RuntimeState>,
     candidate_next_entity_value: Option<u64>,
+    candidate_mode: Option<u32>,
     next_entity_value: u64,
     phase: Box<phase_commit::PhaseState>,
+    gameplay: Option<gameplay::State>,
+    gameplay_candidate: Option<gameplay::State>,
     #[cfg(feature = "contract-test-hooks")]
     next_fault: Option<TestFault>,
 }
@@ -107,11 +111,8 @@ struct TestFault {
     fault: u32,
 }
 
-#[cfg(feature = "contract-test-hooks")]
 const TEST_ENTRY_PREPARE: u32 = 1;
-#[cfg(feature = "contract-test-hooks")]
 const TEST_ENTRY_QUERY: u32 = 2;
-#[cfg(feature = "contract-test-hooks")]
 const TEST_ENTRY_MUTATE: u32 = 3;
 #[cfg(feature = "contract-test-hooks")]
 const TEST_FAULT_PANIC_BEFORE_PUBLICATION: u32 = 1;
@@ -222,8 +223,11 @@ fn create(
         live: None,
         candidate: None,
         candidate_next_entity_value: None,
+        candidate_mode: None,
         next_entity_value: 1,
         phase: phase_commit::PhaseState::new_boxed()?,
+        gameplay: None,
+        gameplay_candidate: None,
         #[cfg(feature = "contract-test-hooks")]
         next_fault: None,
     };
@@ -476,6 +480,7 @@ fn prepare_scene(
     trigger_test_fault(core, 1)?;
     core.candidate = Some(candidate);
     core.candidate_next_entity_value = Some(next_entity);
+    core.candidate_mode = Some(desc.mode);
     unsafe { ptr::write(out_info, info) };
     Ok(())
 }
@@ -483,6 +488,16 @@ fn prepare_scene(
 fn commit_scene(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32> {
     let (core, _guard) = unsafe { enter_core(core_pointer) }?;
     core.phase.ensure_scene_commit_allowed()?;
+    if core.candidate.is_none() || core.gameplay_candidate.is_none() {
+        return Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE);
+    }
+    if core
+        .gameplay
+        .as_ref()
+        .is_some_and(|state| state.active_step_token.is_some())
+    {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_STEP_BUSY);
+    }
     let candidate = core
         .candidate
         .take()
@@ -492,7 +507,9 @@ fn commit_scene(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32
         .take()
         .expect("candidate entity high-water accompanies candidate");
     core.live = Some(candidate);
+    core.gameplay = core.gameplay_candidate.take();
     core.next_entity_value = next_entity_value;
+    core.candidate_mode = None;
     core.phase.commit_after_scene();
     Ok(())
 }
@@ -501,6 +518,8 @@ fn abort_scene(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32>
     let (core, _guard) = unsafe { enter_core(core_pointer) }?;
     core.candidate = None;
     core.candidate_next_entity_value = None;
+    core.candidate_mode = None;
+    core.gameplay_candidate = None;
     core.phase.abort_with_scene_candidate();
     Ok(())
 }
@@ -1462,6 +1481,747 @@ pub extern "C" fn kadath_runtime_core_query_phase_interface(
     ffi_result(|| phase_commit::query_interface(in_out_interface))
 }
 
+fn valid_output<T>(pointer: *mut T) -> Result<(), u32> {
+    if pointer.is_null() || (pointer as usize) % mem::align_of::<T>() != 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if unsafe { read_struct_size(pointer) }? < mem::size_of::<T>() as u32 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    Ok(())
+}
+
+fn ensure_disjoint(ranges: &[(usize, usize)]) -> Result<(), u32> {
+    for (index, range) in ranges.iter().enumerate() {
+        if ranges[index + 1..]
+            .iter()
+            .any(|other| ranges_overlap(*range, *other))
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+    }
+    Ok(())
+}
+
+fn validate_outcome_buffer(
+    buffer_pointer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
+) -> Result<abi::kadath_runtime_gameplay_outcome_buffer_v1_t, u32> {
+    valid_output(buffer_pointer)?;
+    // Copy caller metadata before validating any potentially overlapping
+    // ranges; do not create an exclusive Rust reference to hostile memory.
+    let buffer = unsafe { ptr::read(buffer_pointer) };
+    if buffer.reserved0 != 0
+        || !reserved_is_zero(&buffer.reserved)
+        || buffer.outcomes.is_null()
+        || buffer.outcome_capacity < 1
+        || buffer.outcome_stride < mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>()
+        || buffer.outcome_stride % mem::align_of::<abi::kadath_runtime_gameplay_outcome_v1_t>() != 0
+        || (buffer.outcomes as usize) % mem::align_of::<abi::kadath_runtime_gameplay_outcome_v1_t>()
+            != 0
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if unsafe { read_struct_size(buffer.outcomes) }?
+        < mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>() as u32
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let buffer_range = strided_range(
+        buffer_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_outcome_buffer_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let outcome_range = strided_range(
+        buffer.outcomes as usize,
+        buffer.outcome_capacity,
+        buffer.outcome_stride,
+        mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    ensure_disjoint(&[buffer_range, outcome_range])?;
+    Ok(buffer)
+}
+
+fn prepare_gameplay_state(
+    core_pointer: *mut abi::kadath_runtime_core_t,
+    desc_pointer: *const abi::kadath_runtime_gameplay_desc_v1_t,
+    out_pointer: *mut abi::kadath_runtime_gameplay_candidate_info_v1_t,
+) -> Result<(), u32> {
+    if desc_pointer.is_null()
+        || (desc_pointer as usize) % mem::align_of::<abi::kadath_runtime_gameplay_desc_v1_t>() != 0
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    valid_output(out_pointer)?;
+    let (core, _guard) = unsafe { enter_core(core_pointer) }?;
+    let desc = unsafe { &*desc_pointer };
+    if desc.struct_size < mem::size_of::<abi::kadath_runtime_gameplay_desc_v1_t>() as u32
+        || desc.reserved0 != 0
+        || !reserved_is_zero(&desc.reserved)
+        || !desc.time_limit_seconds.is_finite()
+        || desc.time_limit_seconds <= 0.0
+        || desc.hazard_count == 0
+        || desc.hazard_count as usize > gameplay::MAX_CONTACTS - 1
+        || desc.hazards.is_null()
+        || desc.hazard_stride < mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
+        || desc.hazard_stride % mem::align_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
+            != 0
+        || (desc.hazards as usize)
+            % mem::align_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
+            != 0
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let desc_range = strided_range(
+        desc_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_desc_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let hazard_range = strided_range(
+        desc.hazards as usize,
+        desc.hazard_count as usize,
+        desc.hazard_stride,
+        mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let output_range = strided_range(
+        out_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_candidate_info_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    ensure_disjoint(&[desc_range, hazard_range, output_range])?;
+    if core.gameplay_candidate.is_some() {
+        return Err(abi::KADATH_ERR_RUNTIME_CANDIDATE_BUSY);
+    }
+    if core.phase.has_candidate() {
+        return Err(abi::KADATH_ERR_RUNTIME_CANDIDATE_BUSY);
+    }
+    let candidate = core
+        .candidate
+        .as_ref()
+        .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
+    let player = read_object_key(&desc.player)?;
+    let goal = read_object_key(&desc.goal)?;
+    let player_record = candidate.visible_exact(player);
+    let goal_record = candidate.visible_exact(goal);
+    if player.kind != abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER
+        || goal.kind != abi::KADATH_RUNTIME_OBJECT_KIND_GOAL
+        || player == goal
+        || player_record
+            .and_then(|record| record.source_index)
+            .is_none()
+        || goal_record.and_then(|record| record.source_index).is_none()
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let mut hazards = Vec::new();
+    hazards
+        .try_reserve_exact(desc.hazard_count as usize)
+        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    let mut previous_source = None;
+    for index in 0..desc.hazard_count as usize {
+        let pointer = unsafe {
+            desc.hazards
+                .cast::<u8>()
+                .add(index * desc.hazard_stride)
+                .cast::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
+        };
+        let hazard = unsafe { &*pointer };
+        if hazard.struct_size
+            < mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>() as u32
+            || hazard.reserved0 != 0
+            || !reserved_is_zero(&hazard.reserved)
+            || !matches!(
+                hazard.movement_mode,
+                abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE
+                    | abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL
+            )
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        let key = read_object_key(&hazard.object_ref)?;
+        let record = candidate
+            .visible_exact(key)
+            .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?;
+        if key.kind != abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD || key == player || key == goal
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        let source = record
+            .source_index
+            .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+        if previous_source.is_some_and(|value| source <= value) {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        previous_source = Some(source);
+        let legacy =
+            hazard.movement_mode == abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
+        if (!legacy
+            && (hazard.patrol_min_y != 0.0
+                || hazard.patrol_max_y != 0.0
+                || hazard.patrol_speed != 0.0))
+            || (legacy
+                && (!hazard.patrol_min_y.is_finite()
+                    || !hazard.patrol_max_y.is_finite()
+                    || !hazard.patrol_speed.is_finite()
+                    || hazard.patrol_min_y >= hazard.patrol_max_y
+                    || hazard.patrol_speed < 0.0))
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        hazards.push(gameplay::Hazard {
+            object: key,
+            source_index: source,
+            movement_mode: hazard.movement_mode,
+            patrol_min_y: hazard.patrol_min_y,
+            patrol_max_y: hazard.patrol_max_y,
+            patrol_speed: hazard.patrol_speed,
+            patrol_direction: 1.0,
+        });
+    }
+    if core.candidate_mode == Some(abi::KADATH_RUNTIME_PREPARE_RESTART)
+        && core
+            .gameplay
+            .as_ref()
+            .is_some_and(|state| state.session.phase == gameplay::Phase::Playing)
+    {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE);
+    }
+    let (next_sequence, next_step_token) = core.gameplay.as_ref().map_or((1, 1), |value| {
+        (value.session.next_outcome_sequence, value.next_step_token)
+    });
+    let state = gameplay::State::new(
+        player,
+        goal,
+        &hazards,
+        desc.time_limit_seconds,
+        next_sequence,
+        next_step_token,
+    );
+    let output = abi::kadath_runtime_gameplay_candidate_info_v1_t {
+        struct_size: mem::size_of::<abi::kadath_runtime_gameplay_candidate_info_v1_t>() as u32,
+        hazard_count: desc.hazard_count,
+        world_epoch: candidate.world_epoch,
+        reserved: [0; 4],
+    };
+    trigger_test_fault(core, TEST_ENTRY_PREPARE)?;
+    core.gameplay_candidate = Some(state);
+    unsafe { ptr::write(out_pointer, output) };
+    Ok(())
+}
+
+fn begin_gameplay_fixed(
+    core_pointer: *mut abi::kadath_runtime_core_t,
+    desc_pointer: *const abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t,
+    buffer_pointer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
+    out_pointer: *mut abi::kadath_runtime_gameplay_step_result_v1_t,
+) -> Result<(), u32> {
+    if desc_pointer.is_null()
+        || (desc_pointer as usize)
+            % mem::align_of::<abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t>()
+            != 0
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    valid_output(out_pointer)?;
+    let buffer = validate_outcome_buffer(buffer_pointer)?;
+    let desc = unsafe { &*desc_pointer };
+    if desc.struct_size
+        < mem::size_of::<abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t>() as u32
+        || desc.reserved0 != 0
+        || desc.reserved1 != 0
+        || !reserved_is_zero(&desc.reserved)
+        || !desc.dt_seconds.is_finite()
+        || desc.dt_seconds < 0.0
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let desc_range = strided_range(
+        desc_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let buffer_range = strided_range(
+        buffer_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_outcome_buffer_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let outcome_range = strided_range(
+        buffer.outcomes as usize,
+        buffer.outcome_capacity,
+        buffer.outcome_stride,
+        mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let result_range = strided_range(
+        out_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_step_result_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    ensure_disjoint(&[desc_range, buffer_range, outcome_range, result_range])?;
+    let (core, _guard) = unsafe { enter_core(core_pointer) }?;
+    if core.candidate.is_some() || core.gameplay_candidate.is_some() {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE);
+    }
+    core.phase.ensure_gameplay_begin_allowed()?;
+    let state = core
+        .gameplay
+        .as_mut()
+        .ok_or(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)?;
+    if state.active_step_token.is_some() {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_STEP_BUSY);
+    }
+    trigger_test_fault(core, TEST_ENTRY_QUERY)?;
+    let state = core
+        .gameplay
+        .as_mut()
+        .expect("Gameplay state was preflighted");
+    let token = state.next_step_token;
+    let next_token = token
+        .checked_add(1)
+        .ok_or(abi::KADATH_ERR_RUNTIME_GAMEPLAY_SEQUENCE_EXHAUSTED)?;
+    let mut session = state.session;
+    let outcome = session
+        .begin_step(desc.dt_seconds, state.player)
+        .map_err(|_| abi::KADATH_ERR_RUNTIME_GAMEPLAY_SEQUENCE_EXHAUSTED)?;
+    let result = gameplay::step_result(session, token, 0, usize::from(outcome.is_some()));
+    if let Some(outcome) = outcome {
+        unsafe { ptr::write(buffer.outcomes, gameplay::outcome_value(outcome)) };
+    }
+    unsafe { ptr::write(out_pointer, result) };
+    state.session = session;
+    state.active_step_token = Some(token);
+    state.active_step_dt = desc.dt_seconds;
+    state.next_step_token = next_token;
+    Ok(())
+}
+
+struct GameplayPositionPlan {
+    updates: [(ObjectKey, [f32; 2]); MAX_OBJECTS],
+    update_count: usize,
+    hazard_directions: [f32; gameplay::MAX_CONTACTS],
+}
+
+fn plan_gameplay_positions(
+    state: &RuntimeState,
+    gameplay: &gameplay::State,
+    dt_seconds: f32,
+    input: [i8; 2],
+) -> Result<GameplayPositionPlan, u32> {
+    let mut updates = [(gameplay.player, [0.0; 2]); MAX_OBJECTS];
+    let mut hazard_directions = [1.0; gameplay::MAX_CONTACTS];
+    let mut count = 0;
+    updates[count] = (
+        gameplay.player,
+        state
+            .planned_step_position(gameplay.player, dt_seconds, input)
+            .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?,
+    );
+    count += 1;
+    for (index, hazard) in gameplay.hazards[..gameplay.hazard_count].iter().enumerate() {
+        let hazard = hazard.as_ref().expect("descriptor hazards are dense");
+        hazard_directions[index] = hazard.patrol_direction;
+        if hazard.movement_mode != abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL
+            || hazard.patrol_speed == 0.0
+            || dt_seconds == 0.0
+        {
+            continue;
+        }
+        let record = state
+            .visible_exact(hazard.object)
+            .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?;
+        let span = f64::from(hazard.patrol_max_y - hazard.patrol_min_y);
+        let period = span * 2.0;
+        let phase = (f64::from(record.sprite.position[1] - hazard.patrol_min_y)
+            + f64::from(hazard.patrol_speed)
+                * f64::from(dt_seconds)
+                * f64::from(hazard.patrol_direction))
+        .rem_euclid(period);
+        let (y, direction) = if phase < span {
+            (f64::from(hazard.patrol_min_y) + phase, 1.0)
+        } else {
+            (f64::from(hazard.patrol_max_y) - (phase - span), -1.0)
+        };
+        let position = state
+            .planned_absolute_position(hazard.object, [record.sprite.position[0], y as f32])
+            .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?;
+        updates[count] = (hazard.object, position);
+        count += 1;
+        hazard_directions[index] = direction;
+    }
+    Ok(GameplayPositionPlan {
+        updates,
+        update_count: count,
+        hazard_directions,
+    })
+}
+
+fn commit_gameplay_fixed(
+    core_pointer: *mut abi::kadath_runtime_core_t,
+    desc_pointer: *const abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t,
+    buffer_pointer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
+    out_pointer: *mut abi::kadath_runtime_gameplay_step_result_v1_t,
+) -> Result<(), u32> {
+    if desc_pointer.is_null()
+        || (desc_pointer as usize)
+            % mem::align_of::<abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t>()
+            != 0
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    valid_output(out_pointer)?;
+    let buffer = validate_outcome_buffer(buffer_pointer)?;
+    let desc = unsafe { &*desc_pointer };
+    if desc.struct_size
+        < mem::size_of::<abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t>() as u32
+        || desc.reserved_input != [0; 2]
+        || desc.reserved0 != 0
+        || desc.reserved1 != 0
+        || !reserved_is_zero(&desc.reserved)
+        || !(-1..=1).contains(&desc.move_x)
+        || !(-1..=1).contains(&desc.move_y)
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let desc_range = strided_range(
+        desc_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let buffer_range = strided_range(
+        buffer_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_outcome_buffer_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let outcome_range = strided_range(
+        buffer.outcomes as usize,
+        buffer.outcome_capacity,
+        buffer.outcome_stride,
+        mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let result_range = strided_range(
+        out_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_step_result_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    ensure_disjoint(&[desc_range, buffer_range, outcome_range, result_range])?;
+    let (core, _guard) = unsafe { enter_core(core_pointer) }?;
+    core.phase.ensure_gameplay_commit_allowed()?;
+    let gameplay = core
+        .gameplay
+        .as_ref()
+        .ok_or(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)?;
+    if gameplay.active_step_token != Some(desc.step_token) {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_STALE_TOKEN);
+    }
+    trigger_test_fault(core, TEST_ENTRY_MUTATE)?;
+    let gameplay = core
+        .gameplay
+        .as_ref()
+        .expect("Gameplay state was preflighted");
+    let state = core
+        .live
+        .as_ref()
+        .ok_or(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)?;
+    let actual_dt = gameplay.active_step_dt;
+    let movement_input = if gameplay.session.accepts_input() {
+        [desc.move_x, desc.move_y]
+    } else {
+        [0, 0]
+    };
+    let position_plan = plan_gameplay_positions(state, gameplay, actual_dt, movement_input)?;
+    let observation = gameplay::active_contacts(
+        state,
+        gameplay,
+        &position_plan.updates[..position_plan.update_count],
+    )?;
+    let mut session = gameplay.session;
+    let outcome = session
+        .observe_contacts(gameplay.player, observation.first_hazard, observation.goal)
+        .map_err(|_| abi::KADATH_ERR_RUNTIME_GAMEPLAY_SEQUENCE_EXHAUSTED)?;
+    let (events, event_count) =
+        gameplay::contact_events(state, gameplay, &observation.contacts, observation.count)?;
+    // Submit through the existing Phase authority before publishing any Gameplay mutation.
+    gameplay::submit_contact_events(core, &events[..event_count])?;
+    core.live
+        .as_mut()
+        .expect("live state was preflighted")
+        .apply_planned_positions(&position_plan.updates[..position_plan.update_count]);
+    let gameplay = core
+        .gameplay
+        .as_mut()
+        .expect("Gameplay state was preflighted");
+    for (index, hazard) in gameplay.hazards[..gameplay.hazard_count]
+        .iter_mut()
+        .enumerate()
+    {
+        hazard
+            .as_mut()
+            .expect("descriptor hazards are dense")
+            .patrol_direction = position_plan.hazard_directions[index];
+    }
+    gameplay.session = session;
+    gameplay.previous_contacts = observation.contacts;
+    gameplay.previous_contact_count = observation.count;
+    gameplay.active_step_token = None;
+    gameplay.active_step_dt = 0.0;
+    let result = gameplay::step_result(
+        gameplay.session,
+        desc.step_token,
+        event_count,
+        usize::from(outcome.is_some()),
+    );
+    if let Some(outcome) = outcome {
+        unsafe { ptr::write(buffer.outcomes, gameplay::outcome_value(outcome)) };
+    }
+    unsafe { ptr::write(out_pointer, result) };
+    Ok(())
+}
+
+fn abort_gameplay_fixed(
+    core_pointer: *mut abi::kadath_runtime_core_t,
+    token: u64,
+) -> Result<(), u32> {
+    let (core, _guard) = unsafe { enter_core(core_pointer) }?;
+    let state = core
+        .gameplay
+        .as_mut()
+        .ok_or(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)?;
+    if state.active_step_token != Some(token) {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_STALE_TOKEN);
+    }
+    state.active_step_token = None;
+    state.active_step_dt = 0.0;
+    Ok(())
+}
+
+fn publish_gameplay_snapshot(
+    core_pointer: *mut abi::kadath_runtime_core_t,
+    buffer_pointer: *mut abi::kadath_runtime_render_buffer_v1_t,
+    out_pointer: *mut abi::kadath_runtime_gameplay_snapshot_v1_t,
+) -> Result<(), u32> {
+    valid_output(buffer_pointer)?;
+    valid_output(out_pointer)?;
+    // Treat the descriptor as bytes copied for this call until its complete
+    // alias/range contract has been established.
+    let buffer = unsafe { ptr::read(buffer_pointer) };
+    if buffer.reserved0 != 0
+        || !reserved_is_zero(&buffer.reserved)
+        || buffer.items.is_null()
+        || buffer.item_capacity == 0
+        || buffer.item_capacity > MAX_OBJECTS
+        || buffer.item_stride < mem::size_of::<abi::kadath_runtime_render_item_v1_t>()
+        || buffer.item_stride % mem::align_of::<abi::kadath_runtime_render_item_v1_t>() != 0
+        || (buffer.items as usize) % mem::align_of::<abi::kadath_runtime_render_item_v1_t>() != 0
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let buffer_range = strided_range(
+        buffer_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_render_buffer_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let item_range = strided_range(
+        buffer.items as usize,
+        buffer.item_capacity,
+        buffer.item_stride,
+        mem::size_of::<abi::kadath_runtime_render_item_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    let snapshot_range = strided_range(
+        out_pointer as usize,
+        1,
+        1,
+        mem::size_of::<abi::kadath_runtime_gameplay_snapshot_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    ensure_disjoint(&[buffer_range, item_range, snapshot_range])?;
+    let (core, _guard) = unsafe { enter_core(core_pointer) }?;
+    if !core.phase.is_fully_idle() {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
+    }
+    let gameplay = core
+        .gameplay
+        .as_ref()
+        .ok_or(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)?;
+    if gameplay.active_step_token.is_some() {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_STEP_BUSY);
+    }
+    if core.live.is_none() {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE);
+    }
+    trigger_test_fault(core, TEST_ENTRY_QUERY)?;
+    let gameplay = core
+        .gameplay
+        .as_ref()
+        .expect("Gameplay state was preflighted");
+    let live = core.live.as_ref().expect("live state was preflighted");
+    let count = live.visible_count(true);
+    if buffer.item_capacity < count {
+        return Err(abi::KADATH_ERR_BUFFER_TOO_SMALL);
+    }
+    for index in 0..count {
+        let pointer = unsafe {
+            buffer
+                .items
+                .cast::<u8>()
+                .add(index * buffer.item_stride)
+                .cast::<abi::kadath_runtime_render_item_v1_t>()
+        };
+        if unsafe { read_struct_size(pointer) }?
+            < mem::size_of::<abi::kadath_runtime_render_item_v1_t>() as u32
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+    }
+    let mut index = 0;
+    live.for_each_active_ordered(|record| {
+        let mut color = record.sprite.color;
+        let key = ObjectKey {
+            object_id: record.object_id,
+            world_epoch: live.world_epoch,
+            logical_generation: record.logical_generation,
+            kind: record.kind,
+        };
+        if key == gameplay.player {
+            color = match gameplay.session.phase {
+                gameplay::Phase::Won => [0.20, 0.95, 0.35, 1.0],
+                gameplay::Phase::Lost => [0.95, 0.20, 0.20, 1.0],
+                gameplay::Phase::Playing => color,
+            };
+        }
+        let item = abi::kadath_runtime_render_item_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_render_item_v1_t>() as u32,
+            reserved0: 0,
+            object_ref: object_ref(record, live.world_epoch),
+            entity_value: record.entity_value,
+            position: record.sprite.position,
+            size: record.sprite.size,
+            final_color: color,
+            texture_id: record.sprite.texture_id,
+            reserved1: 0,
+            reserved: [0; 4],
+        };
+        unsafe {
+            ptr::write(
+                buffer
+                    .items
+                    .cast::<u8>()
+                    .add(index * buffer.item_stride)
+                    .cast(),
+                item,
+            )
+        };
+        index += 1;
+    });
+    let session_result = gameplay::step_result(gameplay.session, 0, 0, 0);
+    let snapshot = abi::kadath_runtime_gameplay_snapshot_v1_t {
+        struct_size: mem::size_of::<abi::kadath_runtime_gameplay_snapshot_v1_t>() as u32,
+        phase: session_result.phase,
+        cause: session_result.cause,
+        accepts_input: u32::from(gameplay.session.accepts_input()),
+        world_epoch: live.world_epoch,
+        last_outcome_sequence: gameplay.session.last_outcome_sequence,
+        time_remaining_seconds: gameplay.session.time_remaining_seconds,
+        reserved0: 0,
+        render_count: count,
+        reserved: [0; 4],
+    };
+    unsafe { ptr::write(out_pointer, snapshot) };
+    Ok(())
+}
+
+extern "C" fn prepare_gameplay_state_entry(
+    core: *mut abi::kadath_runtime_core_t,
+    desc: *const abi::kadath_runtime_gameplay_desc_v1_t,
+    out: *mut abi::kadath_runtime_gameplay_candidate_info_v1_t,
+) -> i32 {
+    ffi_result(|| prepare_gameplay_state(core, desc, out))
+}
+extern "C" fn begin_gameplay_fixed_entry(
+    core: *mut abi::kadath_runtime_core_t,
+    desc: *const abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t,
+    buffer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
+    out: *mut abi::kadath_runtime_gameplay_step_result_v1_t,
+) -> i32 {
+    ffi_result(|| begin_gameplay_fixed(core, desc, buffer, out))
+}
+extern "C" fn commit_gameplay_fixed_entry(
+    core: *mut abi::kadath_runtime_core_t,
+    desc: *const abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t,
+    buffer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
+    out: *mut abi::kadath_runtime_gameplay_step_result_v1_t,
+) -> i32 {
+    ffi_result(|| commit_gameplay_fixed(core, desc, buffer, out))
+}
+extern "C" fn abort_gameplay_fixed_entry(core: *mut abi::kadath_runtime_core_t, token: u64) -> i32 {
+    ffi_result(|| abort_gameplay_fixed(core, token))
+}
+extern "C" fn publish_gameplay_snapshot_entry(
+    core: *mut abi::kadath_runtime_core_t,
+    buffer: *mut abi::kadath_runtime_render_buffer_v1_t,
+    out: *mut abi::kadath_runtime_gameplay_snapshot_v1_t,
+) -> i32 {
+    ffi_result(|| publish_gameplay_snapshot(core, buffer, out))
+}
+
+fn query_gameplay_interface(
+    pointer: *mut abi::kadath_runtime_gameplay_interface_v1_t,
+) -> Result<(), u32> {
+    valid_output(pointer)?;
+    let requested = unsafe { ptr::read(pointer) };
+    if !reserved_is_zero(&requested.reserved) {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if requested.interface_version != abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1 {
+        return Err(abi::KADATH_ERR_NOT_SUPPORTED);
+    }
+    unsafe {
+        ptr::write(
+            pointer,
+            abi::kadath_runtime_gameplay_interface_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_gameplay_interface_v1_t>() as u32,
+                interface_version: abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1,
+                prepare_gameplay_state: Some(prepare_gameplay_state_entry),
+                begin_fixed_step: Some(begin_gameplay_fixed_entry),
+                commit_fixed_step: Some(commit_gameplay_fixed_entry),
+                abort_fixed_step: Some(abort_gameplay_fixed_entry),
+                publish_snapshot: Some(publish_gameplay_snapshot_entry),
+                reserved: [0; 8],
+            },
+        )
+    };
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "C" fn kadath_runtime_core_query_gameplay_interface(
+    pointer: *mut abi::kadath_runtime_gameplay_interface_v1_t,
+) -> i32 {
+    ffi_result(|| query_gameplay_interface(pointer))
+}
+
 #[cfg(feature = "contract-test-hooks")]
 #[repr(C)]
 pub struct TestFaultDesc {
@@ -1529,8 +2289,11 @@ mod tests {
             live: None,
             candidate: None,
             candidate_next_entity_value: None,
+            candidate_mode: None,
             next_entity_value: 1,
             phase: phase_commit::PhaseState::new_boxed().expect("phase arena allocation"),
+            gameplay: None,
+            gameplay_candidate: None,
             #[cfg(feature = "contract-test-hooks")]
             next_fault: None,
         };

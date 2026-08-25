@@ -878,7 +878,7 @@ fn parseArtifactInto(source: []const u8, output: *Scene) !void {
     if (source.len != scene_artifact_header_bytes + @as(usize, payload_bytes)) return error.InvalidSceneArtifact;
     switch (artifact_version) {
         1, 2, 3 => output.* = try parseLegacyArtifact(source, artifact_version, schema_version, payload_bytes),
-        legacy_object_artifact_version => output.* = try parseArtifactV4(source, schema_version),
+        legacy_object_artifact_version => try parseArtifactV4Into(source, schema_version, output),
         behavior_artifact_version => {
             if (schema_version != behavior_schema_version) return error.UnsupportedSceneSchema;
             try parseArtifactBehaviorSceneInto(source, behavior_schema_version, false, output);
@@ -949,14 +949,18 @@ fn parseLegacyArtifact(source: []const u8, artifact_version: u32, schema_version
     return value;
 }
 
-fn parseArtifactV4(source: []const u8, schema_version: u32) !Scene {
+fn parseArtifactV4Into(source: []const u8, schema_version: u32, output: *Scene) !void {
     if (schema_version != legacy_object_schema_version) return error.UnsupportedSceneSchema;
     var reader = ByteReader{ .source = source, .cursor = scene_artifact_header_bytes };
-    const textures = try readTextureSet(&reader);
+    output.* = .{
+        .schemaVersion = legacy_object_schema_version,
+        .textures = try readTextureSet(&reader),
+        .objects = undefined,
+    };
     const object_count = try reader.readU32();
     if (object_count < min_scene_object_count or object_count > max_scene_object_count) return error.InvalidSceneObjectCount;
-    var objects = SceneObjectSet{ .count = @intCast(object_count) };
-    for (objects.mutableSlice()) |*object| {
+    output.objects = .{ .count = @intCast(object_count) };
+    for (output.objects.mutableSlice()) |*object| {
         const entry_bytes = try reader.readU32();
         const entry_source = try reader.readBytes(entry_bytes);
         var entry = ByteReader{ .source = entry_source };
@@ -989,9 +993,7 @@ fn parseArtifactV4(source: []const u8, schema_version: u32) !Scene {
         if (!entry.atEnd()) return error.InvalidSceneObjectPayload;
     }
     if (!reader.atEnd()) return error.InvalidSceneArtifact;
-    const value = Scene{ .schemaVersion = legacy_object_schema_version, .textures = textures, .objects = objects };
-    try validate(&value);
-    return value;
+    try validate(output);
 }
 
 fn parseArtifactBehaviorSceneInto(source: []const u8, schema_version: u32, read_prototypes: bool, output: *Scene) !void {

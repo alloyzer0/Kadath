@@ -1,6 +1,27 @@
 const std = @import("std");
 const runtime_core = @import("runtime_core");
 
+const canonical_sources = [_]runtime_core.SourceDesc{
+    .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
+    .{ .object_id = "hazard", .kind = 4, .sprite = .{ .position = .{ 60, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 0, 0, 1 }, .texture_id = 1 } },
+    .{ .object_id = "goal", .kind = 3, .sprite = .{ .position = .{ 80, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 0, 1 }, .texture_id = 1 } },
+};
+
+fn prepareGameplayCandidate(core: *runtime_core.RuntimeCore) !void {
+    const player = (try core.findById(.candidate, "player")).?.object_ref;
+    const hazard = (try core.findById(.candidate, "hazard")).?.object_ref;
+    const goal = (try core.findById(.candidate, "goal")).?.object_ref;
+    try core.prepareGameplay(3.0, player, goal, &.{.{ .object_ref = hazard }});
+}
+
+fn preparePairedScene(core: *runtime_core.RuntimeCore, mode: runtime_core.PrepareMode) !void {
+    _ = try core.prepare(mode, .{ 0, 0 }, .{ 100, 100 }, &canonical_sources);
+    try prepareGameplayCandidate(core);
+    _ = try core.preparePhaseState(.candidate, &.{});
+    try core.commitPhaseState();
+    try core.commitScene();
+}
+
 const ReplayRng = struct {
     state: u64,
 
@@ -29,15 +50,54 @@ test "Runtime Core Adapter owns and destroys one opaque Core" {
     try std.testing.expect(core.handle == null);
 }
 
+test "Scene publication requires ready Object Gameplay and Phase candidates" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &canonical_sources);
+
+    try std.testing.expectError(error.RuntimeCoreInvalidState, core.commitScene());
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    try std.testing.expectError(error.InvalidGameplayState, core.beginGameplayFixed(0.0, &outcome));
+    try std.testing.expect((try core.findById(.candidate, "player")) != null);
+    try prepareGameplayCandidate(&core);
+    try std.testing.expectError(error.RuntimeCoreInvalidState, core.commitScene());
+    _ = try core.preparePhaseState(.candidate, &.{});
+    try std.testing.expectError(error.RuntimeCoreInvalidState, core.commitScene());
+    try core.commitPhaseState();
+    try core.commitScene();
+    try std.testing.expect((try core.findById(.live, "player")) != null);
+}
+
+test "Restart is terminal-only and preserves Gameplay sequence high-water marks" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    try preparePairedScene(&core, .initial);
+
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    const first = try core.beginGameplayFixed(0.0, &outcome);
+    try core.abortGameplayFixed(first.step_token);
+    _ = try core.prepare(.restart, .{ 0, 0 }, .{ 100, 100 }, &canonical_sources);
+    try std.testing.expectError(error.InvalidGameplayState, prepareGameplayCandidate(&core));
+    try core.abortScene();
+
+    const terminal = try core.beginGameplayFixed(3.0, &outcome);
+    try std.testing.expectEqual(@as(u64, first.step_token + 1), terminal.step_token);
+    try std.testing.expectEqual(@as(u64, 1), outcome.sequence);
+    try core.abortGameplayFixed(terminal.step_token);
+    try preparePairedScene(&core, .restart);
+
+    var render_items: [runtime_core.max_object_count]runtime_core.GameplayRenderItem = undefined;
+    const snapshot = try core.gameplaySnapshot(&render_items);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.last_outcome_sequence);
+    const restarted = try core.beginGameplayFixed(0.0, &outcome);
+    try std.testing.expectEqual(@as(u64, terminal.step_token + 1), restarted.step_token);
+    try core.abortGameplayFixed(restarted.step_token);
+}
+
 test "Runtime Core Adapter drives a fixed phase through the public Phase Interface" {
     var core = try runtime_core.RuntimeCore.init();
     defer core.deinit();
-    const sources = [_]runtime_core.SourceDesc{
-        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
-        .{ .object_id = "goal", .kind = 3, .sprite = .{ .position = .{ 80, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1 } },
-    };
-    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
-    try core.commitScene();
+    try preparePairedScene(&core, .initial);
     const player = (try core.findById(.live, "player")).?.object_ref;
     try core.beginPhase(.fixed, 77);
 
@@ -101,11 +161,7 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
 test "Runtime Core Phase replay preserves FIFO, domain counters, and generation bounds" {
     var core = try runtime_core.RuntimeCore.init();
     defer core.deinit();
-    const sources = [_]runtime_core.SourceDesc{
-        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
-    };
-    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
-    try core.commitScene();
+    try preparePairedScene(&core, .initial);
     const player = (try core.findById(.live, "player")).?.object_ref;
 
     // This is a deterministic replay trace captured under seed 0x50484153.
@@ -179,11 +235,7 @@ test "Runtime Core Phase bounded command replay is reproducible across seeds" {
     for (seeds) |seed| {
         var core = try runtime_core.RuntimeCore.init();
         defer core.deinit();
-        const sources = [_]runtime_core.SourceDesc{
-            .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
-        };
-        _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
-        try core.commitScene();
+        try preparePairedScene(&core, .initial);
         const player = (try core.findById(.live, "player")).?.object_ref;
         const phase_sequence = if (seed == 0) 1 else seed;
         try core.beginPhase(.fixed, phase_sequence);
@@ -246,11 +298,7 @@ test "Runtime Core Phase bounded command replay is reproducible across seeds" {
 test "Runtime Core Phase admission overflow preserves structural state" {
     var core = try runtime_core.RuntimeCore.init();
     defer core.deinit();
-    const sources = [_]runtime_core.SourceDesc{
-        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
-    };
-    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
-    try core.commitScene();
+    try preparePairedScene(&core, .initial);
     const player = (try core.findById(.live, "player")).?.object_ref;
 
     var over_capacity: [runtime_core.max_phase_bindings / 4 + 1]runtime_core.PhaseBinding = undefined;
@@ -325,15 +373,15 @@ test "Runtime Core Phase admission overflow preserves structural state" {
 test "candidate Phase admission stays private until paired Scene commit" {
     var core = try runtime_core.RuntimeCore.init();
     defer core.deinit();
-    const sources = [_]runtime_core.SourceDesc{
-        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
-    };
-    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
-    try core.commitScene();
+    try preparePairedScene(&core, .initial);
     const live_player = (try core.findById(.live, "player")).?.object_ref;
 
-    _ = try core.prepare(.restart, .{ 0, 0 }, .{ 100, 100 }, &sources);
+    var restart_outcome: runtime_core.GameplayOutcome = undefined;
+    const terminal = try core.beginGameplayFixed(3.0, &restart_outcome);
+    try core.abortGameplayFixed(terminal.step_token);
+    _ = try core.prepare(.restart, .{ 0, 0 }, .{ 100, 100 }, &canonical_sources);
     const candidate_player = (try core.findById(.candidate, "player")).?.object_ref;
+    try prepareGameplayCandidate(&core);
     var bindings: [runtime_core.max_phase_bindings / 4]runtime_core.PhaseBinding = undefined;
     for (&bindings) |*binding| {
         binding.* = std.mem.zeroes(runtime_core.PhaseBinding);
@@ -382,11 +430,7 @@ test "candidate Phase admission stays private until paired Scene commit" {
 test "Runtime Core structural replay preserves bounded FIFO and successor generation" {
     var core = try runtime_core.RuntimeCore.init();
     defer core.deinit();
-    const sources = [_]runtime_core.SourceDesc{
-        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
-    };
-    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
-    try core.commitScene();
+    try preparePairedScene(&core, .initial);
     const player = (try core.findById(.live, "player")).?.object_ref;
     const phase_sequence: u64 = 0x5354_5255_4354_5552;
     try core.beginPhase(.fixed, phase_sequence);
@@ -451,4 +495,148 @@ test "Runtime Core structural replay preserves bounded FIFO and successor genera
     try std.testing.expectEqual(@as(u32, 1), taken[0].generation);
     try core.abortPhaseStructural(successor_flush.info.flush_token);
     try core.endPhase(.fixed, phase_sequence);
+}
+
+test "Runtime Core Gameplay owns terminal priority contact events outcome and final tint" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    const sources = [_]runtime_core.SourceDesc{
+        .{ .object_id = "player", .kind = 2, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1, .move_speed = 20 } },
+        .{ .object_id = "hazard", .kind = 4, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 0, 0, 1 }, .texture_id = 1 } },
+        .{ .object_id = "goal", .kind = 3, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 0, 1 }, .texture_id = 1 } },
+    };
+    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &sources);
+    const player = (try core.findById(.candidate, "player")).?.object_ref;
+    const hazard = (try core.findById(.candidate, "hazard")).?.object_ref;
+    const goal = (try core.findById(.candidate, "goal")).?.object_ref;
+    try core.prepareGameplay(3.0, player, goal, &.{.{ .object_ref = hazard }});
+    _ = try core.preparePhaseState(.candidate, &.{});
+    try core.commitPhaseState();
+    try core.commitScene();
+
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    const begin = try core.beginGameplayFixed(0.0, &outcome);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.playing), begin.phase);
+    try std.testing.expectEqual(@as(usize, 0), begin.outcome_count);
+    try core.beginPhase(.fixed, begin.step_token);
+    const committed = try core.commitGameplayFixed(begin.step_token, .{}, &outcome);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), committed.phase);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), committed.cause);
+    try std.testing.expectEqual(@as(usize, 1), committed.outcome_count);
+    try std.testing.expectEqual(@as(usize, 4), committed.submitted_contact_event_count);
+    try std.testing.expectEqual(@as(u64, 1), outcome.sequence);
+    try std.testing.expect(runtime_core.sameObjectRef(hazard, outcome.other));
+
+    var events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
+    for (&events) |*event| {
+        event.* = std.mem.zeroes(runtime_core.PhaseEvent);
+        event.struct_size = @sizeOf(runtime_core.PhaseEvent);
+    }
+    const event_count = try core.drainPhaseEvents(.fixed, begin.step_token, &events);
+    try std.testing.expectEqual(@as(usize, 4), event_count);
+    try std.testing.expectEqualStrings("contact_begin", events[0].name[0..events[0].name_length]);
+    try core.endPhase(.fixed, begin.step_token);
+
+    var render_items: [runtime_core.max_object_count]runtime_core.GameplayRenderItem = undefined;
+    const snapshot = try core.gameplaySnapshot(&render_items);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), snapshot.phase);
+    try std.testing.expectEqual(@as(u32, 0), snapshot.accepts_input);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.last_outcome_sequence);
+    try std.testing.expectEqual([4]f32{ 0.95, 0.20, 0.20, 1.0 }, render_items[0].final_color);
+
+    const terminal_begin = try core.beginGameplayFixed(0.5, &outcome);
+    try std.testing.expectEqual(@as(usize, 0), terminal_begin.outcome_count);
+    try core.abortGameplayFixed(terminal_begin.step_token);
+}
+
+test "Gameplay step token is independent from the active fixed Phase sequence" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    try preparePairedScene(&core, .initial);
+
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    const begin = try core.beginGameplayFixed(0.0, &outcome);
+    const phase_sequence: u64 = 77;
+    try std.testing.expect(begin.step_token != phase_sequence);
+    try core.beginPhase(.fixed, phase_sequence);
+    _ = try core.commitGameplayFixed(begin.step_token, .{}, &outcome);
+    var events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
+    for (&events) |*event| {
+        event.* = std.mem.zeroes(runtime_core.PhaseEvent);
+        event.struct_size = @sizeOf(runtime_core.PhaseEvent);
+    }
+    while (try core.drainPhaseEvents(.fixed, phase_sequence, &events) != 0) {}
+    try core.endPhase(.fixed, phase_sequence);
+}
+
+test "Gameplay Zig Adapter preserves caller outputs when Core rejects a call" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    try preparePairedScene(&core, .initial);
+
+    var outcome = std.mem.zeroes(runtime_core.GameplayOutcome);
+    outcome.sequence = 0x1122_3344_5566_7788;
+    const outcome_before = std.mem.asBytes(&outcome).*;
+    try std.testing.expectError(error.InvalidRuntimeCoreArgument, core.beginGameplayFixed(-1.0, &outcome));
+    try std.testing.expectEqualSlices(u8, &outcome_before, std.mem.asBytes(&outcome));
+
+    var render_items: [1]runtime_core.GameplayRenderItem = undefined;
+    @memset(std.mem.asBytes(&render_items), 0xA5);
+    const render_before = std.mem.asBytes(&render_items).*;
+    try std.testing.expectError(error.RuntimeCoreBufferTooSmall, core.gameplaySnapshot(&render_items));
+    try std.testing.expectEqualSlices(u8, &render_before, std.mem.asBytes(&render_items));
+}
+
+test "Gameplay commit keeps its plan private when the shared Phase queue is full" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    try preparePairedScene(&core, .initial);
+    const player = (try core.findById(.live, "player")).?.object_ref;
+    const hazard = (try core.findById(.live, "hazard")).?.object_ref;
+    const goal = (try core.findById(.live, "goal")).?.object_ref;
+    try core.applyPositions(.live, &.{
+        .{ .object_ref = hazard, .position = .{ 10, 20 } },
+        .{ .object_ref = goal, .position = .{ 10, 20 } },
+    });
+
+    var outcome = std.mem.zeroes(runtime_core.GameplayOutcome);
+    outcome.sequence = 0x8877_6655_4433_2211;
+    const outcome_before = std.mem.asBytes(&outcome).*;
+    const begin = try core.beginGameplayFixed(0.0, &outcome);
+    const phase_sequence: u64 = 900;
+    try core.beginPhase(.fixed, phase_sequence);
+    var ordinary: [runtime_core.max_phase_events - 2]runtime_core.PhaseEvent = undefined;
+    for (&ordinary) |*event| {
+        event.* = std.mem.zeroes(runtime_core.PhaseEvent);
+        event.struct_size = @sizeOf(runtime_core.PhaseEvent);
+        event.domain = @intFromEnum(runtime_core.PhaseDomain.fixed);
+        event.target = player;
+        event.name_length = 4;
+        @memcpy(event.name[0..4], "user");
+    }
+    _ = try core.submitPhaseEvents(&ordinary);
+    try std.testing.expectError(
+        error.RuntimePhaseQueueCapacity,
+        core.commitGameplayFixed(begin.step_token, .{}, &outcome),
+    );
+    try std.testing.expectEqualSlices(u8, &outcome_before, std.mem.asBytes(&outcome));
+    try core.abortGameplayFixed(begin.step_token);
+
+    var drained: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
+    for (&drained) |*event| {
+        event.* = std.mem.zeroes(runtime_core.PhaseEvent);
+        event.struct_size = @sizeOf(runtime_core.PhaseEvent);
+    }
+    try std.testing.expectEqual(ordinary.len, try core.drainPhaseEvents(.fixed, phase_sequence, &drained));
+    try std.testing.expectEqualStrings("user", drained[ordinary.len - 1].name[0..4]);
+    try core.endPhase(.fixed, phase_sequence);
+
+    const retry = try core.beginGameplayFixed(0.0, &outcome);
+    try core.beginPhase(.fixed, phase_sequence + 1);
+    const committed = try core.commitGameplayFixed(retry.step_token, .{}, &outcome);
+    try std.testing.expectEqual(@as(usize, 1), committed.outcome_count);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), committed.cause);
+    try std.testing.expectEqual(@as(u64, 1), outcome.sequence);
+    while (try core.drainPhaseEvents(.fixed, phase_sequence + 1, &drained) != 0) {}
+    try core.endPhase(.fixed, phase_sequence + 1);
 }

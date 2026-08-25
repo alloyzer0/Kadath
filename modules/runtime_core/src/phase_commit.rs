@@ -255,12 +255,44 @@ impl PhaseState {
         {
             return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
         }
-        if self.candidate.is_some_and(|candidate| {
-            candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE && !candidate.ready
+        if !self.candidate.is_some_and(|candidate| {
+            candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE && candidate.ready
         }) {
             return Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE);
         }
         Ok(())
+    }
+
+    pub(crate) fn has_candidate(&self) -> bool {
+        self.candidate.is_some()
+    }
+
+    pub(crate) fn ensure_gameplay_begin_allowed(&self) -> Result<(), u32> {
+        if !self.is_fully_idle() || self.candidate.is_some() {
+            return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_gameplay_commit_allowed(&self) -> Result<(), u32> {
+        if self.candidate.is_some()
+            || self.flush.iter().any(Option::is_some)
+            || self.activation.is_some()
+        {
+            return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
+        }
+        if self.domains[0].phase_sequence.is_none() {
+            return Err(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_fully_idle(&self) -> bool {
+        self.domains
+            .iter()
+            .all(|domain| domain.phase_sequence.is_none())
+            && self.flush.iter().all(Option::is_none)
+            && self.activation.is_none()
     }
 
     pub(crate) fn commit_after_scene(&mut self) {
@@ -277,17 +309,18 @@ impl PhaseState {
         }
         self.flush = [None, None];
         self.activation = None;
-        if self.candidate.is_some_and(|candidate| {
-            candidate.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE && candidate.ready
-        }) {
-            let candidate = self.candidate.take().expect("ready candidate exists");
-            self.active_bindings = candidate.bindings;
-            self.admission_used = self
-                .active_bindings
-                .iter()
-                .map(|binding| binding.behavior_count)
-                .sum();
-        }
+        let candidate = self
+            .candidate
+            .take()
+            .expect("paired ready candidate was preflighted");
+        debug_assert_eq!(candidate.target, abi::KADATH_RUNTIME_TARGET_CANDIDATE);
+        debug_assert!(candidate.ready);
+        self.active_bindings = candidate.bindings;
+        self.admission_used = self
+            .active_bindings
+            .iter()
+            .map(|binding| binding.behavior_count)
+            .sum();
     }
 
     pub(crate) fn abort_with_scene_candidate(&mut self) {
@@ -747,6 +780,9 @@ pub(crate) fn prepare_phase_state(
     }
     if core.phase.candidate.is_some() {
         return Err(abi::KADATH_ERR_RUNTIME_CANDIDATE_BUSY);
+    }
+    if desc.target == abi::KADATH_RUNTIME_TARGET_CANDIDATE && core.gameplay_candidate.is_none() {
+        return Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE);
     }
     let desc_range = strided_range(
         desc_ptr as usize,

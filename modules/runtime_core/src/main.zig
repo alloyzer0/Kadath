@@ -44,6 +44,10 @@ pub const PhaseTransactionInfo = c.kadath_runtime_phase_transaction_info_v1_t;
 pub const PhaseBinding = c.kadath_runtime_phase_binding_desc_v1_t;
 pub const PhaseStatePrepare = c.kadath_runtime_phase_state_prepare_desc_v1_t;
 pub const PhaseStateCandidateInfo = c.kadath_runtime_phase_state_candidate_info_v1_t;
+pub const GameplayOutcome = c.kadath_runtime_gameplay_outcome_v1_t;
+pub const GameplayStepResult = c.kadath_runtime_gameplay_step_result_v1_t;
+pub const GameplayRenderItem = c.kadath_runtime_render_item_v1_t;
+pub const GameplaySnapshot = c.kadath_runtime_gameplay_snapshot_v1_t;
 
 pub const PhaseDomain = enum(u32) {
     fixed = c.KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
@@ -58,12 +62,27 @@ pub const InputSnapshot = struct {
     move_y: i8 = 0,
 };
 
-pub const RenderSprite = extern struct {
-    entity_id: EntityId,
-    position: [2]f32,
-    size: [2]f32,
-    color: [4]f32,
-    texture_id: TextureId,
+pub const RenderSprite = GameplayRenderItem;
+
+pub const GameplayPhase = enum(u32) {
+    playing = c.KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING,
+    won = c.KADATH_RUNTIME_GAMEPLAY_PHASE_WON,
+    lost = c.KADATH_RUNTIME_GAMEPLAY_PHASE_LOST,
+};
+
+pub const GameplayCause = enum(u32) {
+    none = c.KADATH_RUNTIME_GAMEPLAY_CAUSE_NONE,
+    timer = c.KADATH_RUNTIME_GAMEPLAY_CAUSE_TIMER,
+    hazard = c.KADATH_RUNTIME_GAMEPLAY_CAUSE_HAZARD,
+    goal = c.KADATH_RUNTIME_GAMEPLAY_CAUSE_GOAL,
+};
+
+pub const HazardDesc = struct {
+    object_ref: ObjectRef,
+    legacy_patrol: bool = false,
+    patrol_min_y: f32 = 0,
+    patrol_max_y: f32 = 0,
+    patrol_speed: f32 = 0,
 };
 
 pub const SpriteDesc = struct {
@@ -108,6 +127,7 @@ pub const ActivationCommand = union(enum) {
 pub const RuntimeCore = struct {
     interface: c.kadath_runtime_object_authority_interface_t,
     phase_interface: c.kadath_runtime_phase_interface_v1_t,
+    gameplay_interface: c.kadath_runtime_gameplay_interface_v1_t,
     handle: ?*c.kadath_runtime_core_t,
     owns_handle: bool = true,
 
@@ -120,16 +140,20 @@ pub const RuntimeCore = struct {
         phase_interface.struct_size = @sizeOf(c.kadath_runtime_phase_interface_v1_t);
         phase_interface.interface_version = c.KADATH_RUNTIME_PHASE_INTERFACE_V1;
         try check(c.kadath_runtime_core_query_phase_interface(&phase_interface));
+        var gameplay_interface = std.mem.zeroes(c.kadath_runtime_gameplay_interface_v1_t);
+        gameplay_interface.struct_size = @sizeOf(c.kadath_runtime_gameplay_interface_v1_t);
+        gameplay_interface.interface_version = c.KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1;
+        try check(c.kadath_runtime_core_query_gameplay_interface(&gameplay_interface));
         var create_desc = std.mem.zeroes(c.kadath_runtime_core_create_desc_t);
         create_desc.struct_size = @sizeOf(c.kadath_runtime_core_create_desc_t);
         var handle: ?*c.kadath_runtime_core_t = null;
         try check(interface.create.?(&create_desc, &handle));
         if (handle == null) return error.RuntimeCoreCreationFailed;
-        return .{ .interface = interface, .phase_interface = phase_interface, .handle = handle };
+        return .{ .interface = interface, .phase_interface = phase_interface, .gameplay_interface = gameplay_interface, .handle = handle };
     }
 
     pub fn borrow(self: *const RuntimeCore) RuntimeCore {
-        return .{ .interface = self.interface, .phase_interface = self.phase_interface, .handle = self.handle, .owns_handle = false };
+        return .{ .interface = self.interface, .phase_interface = self.phase_interface, .gameplay_interface = self.gameplay_interface, .handle = self.handle, .owns_handle = false };
     }
 
     pub fn takeOwnership(self: *RuntimeCore, previous: *RuntimeCore) void {
@@ -188,6 +212,92 @@ pub const RuntimeCore = struct {
 
     pub fn commitScene(self: *RuntimeCore) !void {
         try check(self.interface.commit_scene.?(self.handle));
+    }
+
+    pub fn prepareGameplay(self: *RuntimeCore, time_limit_seconds: f32, player: ObjectRef, goal: ObjectRef, hazards: []const HazardDesc) !void {
+        if (hazards.len == 0 or hazards.len > max_object_count - 2) return error.InvalidGameplayDescriptor;
+        var c_hazards: [max_object_count - 2]c.kadath_runtime_gameplay_hazard_desc_v1_t = undefined;
+        for (hazards, 0..) |hazard, index| {
+            c_hazards[index] = std.mem.zeroes(c.kadath_runtime_gameplay_hazard_desc_v1_t);
+            c_hazards[index].struct_size = @sizeOf(c.kadath_runtime_gameplay_hazard_desc_v1_t);
+            c_hazards[index].movement_mode = if (hazard.legacy_patrol) c.KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL else c.KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE;
+            c_hazards[index].object_ref = hazard.object_ref;
+            c_hazards[index].patrol_min_y = hazard.patrol_min_y;
+            c_hazards[index].patrol_max_y = hazard.patrol_max_y;
+            c_hazards[index].patrol_speed = hazard.patrol_speed;
+        }
+        var desc = std.mem.zeroes(c.kadath_runtime_gameplay_desc_v1_t);
+        desc.struct_size = @sizeOf(c.kadath_runtime_gameplay_desc_v1_t);
+        desc.time_limit_seconds = time_limit_seconds;
+        desc.hazard_count = @intCast(hazards.len);
+        desc.player = player;
+        desc.goal = goal;
+        desc.hazards = &c_hazards;
+        desc.hazard_stride = @sizeOf(c.kadath_runtime_gameplay_hazard_desc_v1_t);
+        var info = std.mem.zeroes(c.kadath_runtime_gameplay_candidate_info_v1_t);
+        info.struct_size = @sizeOf(c.kadath_runtime_gameplay_candidate_info_v1_t);
+        try check(self.gameplay_interface.prepare_gameplay_state.?(self.handle, &desc, &info));
+    }
+
+    pub fn beginGameplayFixed(self: *RuntimeCore, dt_seconds: f32, outcome: *GameplayOutcome) !GameplayStepResult {
+        var candidate_outcome = std.mem.zeroes(GameplayOutcome);
+        candidate_outcome.struct_size = @sizeOf(GameplayOutcome);
+        var buffer = std.mem.zeroes(c.kadath_runtime_gameplay_outcome_buffer_v1_t);
+        buffer.struct_size = @sizeOf(c.kadath_runtime_gameplay_outcome_buffer_v1_t);
+        buffer.outcomes = &candidate_outcome;
+        buffer.outcome_capacity = 1;
+        buffer.outcome_stride = @sizeOf(GameplayOutcome);
+        var desc = std.mem.zeroes(c.kadath_runtime_gameplay_begin_fixed_desc_v1_t);
+        desc.struct_size = @sizeOf(c.kadath_runtime_gameplay_begin_fixed_desc_v1_t);
+        desc.dt_seconds = dt_seconds;
+        var result = std.mem.zeroes(GameplayStepResult);
+        result.struct_size = @sizeOf(GameplayStepResult);
+        try check(self.gameplay_interface.begin_fixed_step.?(self.handle, &desc, &buffer, &result));
+        if (result.outcome_count == 1) outcome.* = candidate_outcome;
+        return result;
+    }
+
+    pub fn commitGameplayFixed(self: *RuntimeCore, token: u64, input: InputSnapshot, outcome: *GameplayOutcome) !GameplayStepResult {
+        var candidate_outcome = std.mem.zeroes(GameplayOutcome);
+        candidate_outcome.struct_size = @sizeOf(GameplayOutcome);
+        var buffer = std.mem.zeroes(c.kadath_runtime_gameplay_outcome_buffer_v1_t);
+        buffer.struct_size = @sizeOf(c.kadath_runtime_gameplay_outcome_buffer_v1_t);
+        buffer.outcomes = &candidate_outcome;
+        buffer.outcome_capacity = 1;
+        buffer.outcome_stride = @sizeOf(GameplayOutcome);
+        var desc = std.mem.zeroes(c.kadath_runtime_gameplay_commit_fixed_desc_v1_t);
+        desc.struct_size = @sizeOf(c.kadath_runtime_gameplay_commit_fixed_desc_v1_t);
+        desc.step_token = token;
+        desc.move_x = input.move_x;
+        desc.move_y = input.move_y;
+        var result = std.mem.zeroes(GameplayStepResult);
+        result.struct_size = @sizeOf(GameplayStepResult);
+        try check(self.gameplay_interface.commit_fixed_step.?(self.handle, &desc, &buffer, &result));
+        if (result.outcome_count == 1) outcome.* = candidate_outcome;
+        return result;
+    }
+
+    pub fn abortGameplayFixed(self: *RuntimeCore, token: u64) !void {
+        try check(self.gameplay_interface.abort_fixed_step.?(self.handle, token));
+    }
+
+    pub fn gameplaySnapshot(self: *RuntimeCore, output: []GameplayRenderItem) !GameplaySnapshot {
+        if (output.len > max_object_count) return error.RuntimeCoreBufferTooSmall;
+        var candidate_output: [max_object_count]GameplayRenderItem = undefined;
+        for (candidate_output[0..output.len]) |*item| {
+            item.* = std.mem.zeroes(GameplayRenderItem);
+            item.struct_size = @sizeOf(GameplayRenderItem);
+        }
+        var buffer = std.mem.zeroes(c.kadath_runtime_render_buffer_v1_t);
+        buffer.struct_size = @sizeOf(c.kadath_runtime_render_buffer_v1_t);
+        buffer.items = &candidate_output;
+        buffer.item_capacity = output.len;
+        buffer.item_stride = @sizeOf(GameplayRenderItem);
+        var gameplay_snapshot = std.mem.zeroes(GameplaySnapshot);
+        gameplay_snapshot.struct_size = @sizeOf(GameplaySnapshot);
+        try check(self.gameplay_interface.publish_snapshot.?(self.handle, &buffer, &gameplay_snapshot));
+        @memcpy(output, candidate_output[0..output.len]);
+        return gameplay_snapshot;
     }
 
     pub fn abortScene(self: *RuntimeCore) !void {
@@ -588,6 +698,10 @@ fn check(result: i32) !void {
         c.KADATH_ERR_RUNTIME_PHASE_INVALID_COMMIT => error.InvalidRuntimePhaseCommit,
         c.KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED => error.RuntimePhaseActiveRequired,
         c.KADATH_ERR_RUNTIME_PHASE_NOT_DRAINED => error.RuntimePhaseNotDrained,
+        c.KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE => error.InvalidGameplayState,
+        c.KADATH_ERR_RUNTIME_GAMEPLAY_STEP_BUSY => error.GameplayStepBusy,
+        c.KADATH_ERR_RUNTIME_GAMEPLAY_STALE_TOKEN => error.StaleGameplayStepToken,
+        c.KADATH_ERR_RUNTIME_GAMEPLAY_SEQUENCE_EXHAUSTED => error.GameplaySequenceExhausted,
         else => error.RuntimeCoreCallFailed,
     };
 }

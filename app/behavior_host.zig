@@ -67,7 +67,6 @@ pub const Runtime = struct {
     world_epoch: u64 = 1,
     phase_serial: u64 = 1,
     active_phase: ?PhaseSession = null,
-    contact_active: [scene_api.max_scene_object_count]bool = [_]bool{false} ** scene_api.max_scene_object_count,
 
     pub fn deinit(self: *Runtime) void {
         if (self.active) |active| {
@@ -116,17 +115,17 @@ pub const Runtime = struct {
             bindings[binding_count] = binding;
             binding_count += 1;
         }
-        _ = try generation.core.preparePhaseState(generation.target, bindings[0..binding_count]);
+        try generation.preparePhaseState(bindings[0..binding_count]);
     }
 
     pub fn commitPhaseState(self: *Runtime, generation: *scene_generation_api.SceneGeneration) !void {
         _ = self.active orelse return error.BehaviorRuntimeNotLoaded;
-        try generation.core.commitPhaseState();
+        try generation.commitPhaseState();
     }
 
     pub fn abortPhaseState(self: *Runtime, generation: *scene_generation_api.SceneGeneration) void {
         if (!self.isLoaded()) return;
-        generation.core.abortPhaseState() catch |err| {
+        generation.abortPhaseState() catch |err| {
             std.log.err("Runtime Core phase candidate abort failed: {s}", .{@errorName(err)});
         };
     }
@@ -255,24 +254,12 @@ pub const Runtime = struct {
     pub fn finishFixedStep(
         self: *Runtime,
         generation: *scene_generation_api.SceneGeneration,
-        touching: []const bool,
         input: InputSnapshot,
     ) !void {
-        if (touching.len != generation.scene.objects.count) return error.InvalidBehaviorContactSnapshot;
         const session = if (self.active_phase == null)
             try self.beginPhase(generation, .fixed)
         else
             try self.requirePhase(.fixed);
-        const player_index = generation.playerObjectIndex();
-        for (touching, 0..) |is_touching, index| {
-            if (index == player_index or is_touching or !self.contact_active[index]) continue;
-            try self.appendContactEvent(generation, player_index, index, "contact_end");
-        }
-        for (touching, 0..) |is_touching, index| {
-            if (index == player_index or !is_touching or self.contact_active[index]) continue;
-            try self.appendContactEvent(generation, player_index, index, "contact_begin");
-        }
-        @memcpy(self.contact_active[0..touching.len], touching);
         try self.settlePhase(generation, session, input);
         try self.endPhase(generation, session);
     }
@@ -285,36 +272,6 @@ pub const Runtime = struct {
         const session = try self.requirePhase(.frame);
         try self.settlePhase(generation, session, input);
         try self.endPhase(generation, session);
-    }
-
-    fn appendContactEvent(
-        self: *Runtime,
-        generation: *const scene_generation_api.SceneGeneration,
-        player_index: usize,
-        other_index: usize,
-        name: []const u8,
-    ) !void {
-        try self.appendDirectedContact(generation, player_index, other_index, name);
-        try self.appendDirectedContact(generation, other_index, player_index, name);
-    }
-
-    fn appendDirectedContact(
-        self: *Runtime,
-        generation: *const scene_generation_api.SceneGeneration,
-        target_index: usize,
-        other_index: usize,
-        name: []const u8,
-    ) !void {
-        _ = try self.requirePhase(.fixed);
-        var event = std.mem.zeroes(runtime_core.PhaseEvent);
-        event.struct_size = @sizeOf(runtime_core.PhaseEvent);
-        event.domain = @intFromEnum(runtime_core.PhaseDomain.fixed);
-        event.target = generation.runtimeHandleAt(target_index) orelse return error.StaleRuntimeObject;
-        event.has_other = 1;
-        event.other = generation.runtimeHandleAt(other_index) orelse return error.StaleRuntimeObject;
-        event.name_length = @intCast(name.len);
-        @memcpy(event.name[0..name.len], name);
-        _ = try @constCast(generation).core.submitPhaseEvents(&.{event});
     }
 
     fn settlePhase(
