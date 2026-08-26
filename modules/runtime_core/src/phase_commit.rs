@@ -439,7 +439,10 @@ fn valid_phase_output<T>(pointer: *mut T) -> Result<(), u32> {
 }
 
 fn valid_output_array<T>(pointer: *mut T, count: usize) -> Result<(), u32> {
-    if pointer.is_null() || (pointer as usize) % mem::align_of::<T>() != 0 {
+    if pointer.is_null() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if (pointer as usize) % mem::align_of::<T>() != 0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     for index in 0..count {
@@ -2734,6 +2737,45 @@ mod tests {
                 Err(abi::KADATH_ERR_INVALID_ARGUMENT)
             );
         }
+
+        // has_sender > 1 的 guard 必须在 sender 本身合法时仍拒绝，
+        // 这样 OR→AND 变异不会被后续 sender 活性检查掩盖。
+        let mut invalid_sender_flag = event;
+        invalid_sender_flag.has_sender = 2;
+        invalid_sender_flag.sender = object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL);
+        assert_eq!(
+            validate_event(
+                &invalid_sender_flag,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+
+        // 阈值等于最大值时仍然是合法输入（字段/名称/generation 均走边界契约）。
+        let mut max_event = event;
+        max_event.generation = MAX_GENERATION;
+        max_event.name_length = abi::KADATH_RUNTIME_PHASE_MAX_EVENT_NAME_BYTES;
+        max_event.field_count = abi::KADATH_RUNTIME_PHASE_MAX_EVENT_FIELDS;
+        for field in &mut max_event.fields {
+            *field = abi::kadath_runtime_phase_event_field_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_event_field_v1_t>() as u32,
+                value_kind: abi::KADATH_RUNTIME_PHASE_EVENT_VALUE_BOOLEAN,
+                ..unsafe { mem::zeroed() }
+            };
+        }
+        assert_eq!(
+            validate_event(
+                &max_event,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                MAX_GENERATION,
+                true
+            ),
+            Ok(MAX_GENERATION)
+        );
 
         // sender/other 显式存在时需要验证 active object；未声明时则必须是全零 sentinel。
         let mut with_sender = event;
