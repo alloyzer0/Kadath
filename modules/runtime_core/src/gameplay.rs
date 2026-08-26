@@ -654,6 +654,13 @@ mod tests {
         );
         assert_eq!(
             strict_overlap(
+                sprite([0.0, 0.0], [2.0, 2.0]),
+                sprite([0.0, 0.0], [2.0, 0.0])
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            strict_overlap(
                 sprite([f32::MAX, 0.0], [f32::MAX, 2.0]),
                 sprite([0.0, 0.0], [2.0, 2.0])
             ),
