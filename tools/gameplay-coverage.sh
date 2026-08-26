@@ -30,6 +30,8 @@ command -v cargo-llvm-cov >/dev/null 2>&1 || block 'cargo-llvm-cov unavailable'
 command -v llvm-profdata >/dev/null 2>&1 || block 'llvm-profdata unavailable'
 command -v jq >/dev/null 2>&1 || block 'jq unavailable'
 command -v zig >/dev/null 2>&1 || block 'zig unavailable'
+command -v rustup >/dev/null 2>&1 || block 'rustup unavailable for nightly coverage'
+rustup toolchain list | grep -q '^nightly-' || block 'nightly Rust toolchain unavailable'
 
 repository_root=$(git rev-parse --show-toplevel)
 [[ "$(git -C "$repository_root" rev-parse HEAD)" == "$candidate_sha" ]] || block 'checkout does not match candidate SHA'
@@ -37,7 +39,7 @@ repository_root=$(git rev-parse --show-toplevel)
 mkdir -p "$evidence_root"
 
 rust_json="$evidence_root/rust-coverage.json"
-(cd -- "$repository_root" && cargo llvm-cov --package kadath_runtime_core --all-targets \
+(cd -- "$repository_root" && cargo +nightly llvm-cov --package kadath_runtime_core --all-targets \
     --branch --json --output-path "$rust_json") >"$evidence_root/rust-command.log" 2>&1 || block 'Rust coverage command failed'
 
 emit_prefix="$evidence_root/emit"
