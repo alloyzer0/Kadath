@@ -1091,10 +1091,9 @@ fn apply_positions(
     if ranges_overlap(patch_range, item_range) || ranges_overlap(patch_range, result_range) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    let mut parsed = Vec::new();
-    parsed
-        .try_reserve_exact(value.patch_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    // Gameplay 热路径的补丁数量有固定上限，使用栈上固定容量避免每步堆分配。
+    let mut parsed = [(unsafe { mem::zeroed() }, [0.0; 2]); MAX_OBJECTS];
+    let mut parsed_count = 0;
     for index in 0..value.patch_count {
         let offset = index
             .checked_mul(value.patch_stride)
@@ -1116,15 +1115,79 @@ fn apply_positions(
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
         let key = read_object_key(&patch.object_ref)?;
-        if parsed
+        if parsed[..parsed_count]
             .iter()
             .any(|(existing, _): &(ObjectKey, [f32; 2])| *existing == key)
         {
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
-        parsed.push((key, patch.position));
+        parsed[parsed_count] = (key, patch.position);
+        parsed_count += 1;
     }
-    for (key, position) in parsed {
+    for (key, position) in parsed[..parsed_count].iter().copied() {
+        state.set_position(key, position).map_err(authority_error)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "contract-test-hooks"))]
+fn apply_single_position_batch_in_place(
+    state: &mut RuntimeState,
+    value: &abi::kadath_runtime_position_batch_v1_t,
+    item_range: (usize, usize),
+    result_range: (usize, usize),
+) -> Result<(), u32> {
+    // 单一位置批次先完整验证，再一次性发布；跳过整份 RuntimeState 克隆。
+    if value.patches.is_null()
+        || value.patch_count == 0
+        || value.patch_count > MAX_OBJECTS
+        || (value.patches as usize) % mem::align_of::<abi::kadath_runtime_position_patch_v1_t>()
+            != 0
+        || value.patch_stride < mem::size_of::<abi::kadath_runtime_position_patch_v1_t>()
+    {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let patch_range = strided_range(
+        value.patches as usize,
+        value.patch_count,
+        value.patch_stride,
+        mem::size_of::<abi::kadath_runtime_position_patch_v1_t>(),
+    )
+    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
+    if ranges_overlap(patch_range, item_range) || ranges_overlap(patch_range, result_range) {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    let mut parsed = [(unsafe { mem::zeroed() }, [0.0; 2], [0.0; 2]); MAX_OBJECTS];
+    for index in 0..value.patch_count {
+        let patch = unsafe {
+            &*value
+                .patches
+                .cast::<u8>()
+                .add(index * value.patch_stride)
+                .cast::<abi::kadath_runtime_position_patch_v1_t>()
+        };
+        if patch.struct_size < mem::size_of::<abi::kadath_runtime_position_patch_v1_t>() as u32
+            || patch.reserved0 != 0
+            || !reserved_is_zero(&patch.reserved)
+            || !patch.position.iter().all(|position| position.is_finite())
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        let key = read_object_key(&patch.object_ref)?;
+        if parsed[..index]
+            .iter()
+            .any(|(existing, _, _): &(ObjectKey, [f32; 2], [f32; 2])| *existing == key)
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        let old_position = state
+            .visible_exact(key)
+            .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?
+            .sprite
+            .position;
+        parsed[index] = (key, patch.position, old_position);
+    }
+    for (key, position, _) in parsed[..value.patch_count].iter().copied() {
         state.set_position(key, position).map_err(authority_error)?;
     }
     Ok(())
@@ -1202,10 +1265,48 @@ fn mutate(
     {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    let mut borrowed_ranges: Vec<(usize, usize)> = Vec::new();
-    borrowed_ranges
-        .try_reserve_exact(batch.item_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    let live_target = batch.target == abi::KADATH_RUNTIME_TARGET_LIVE;
+    #[cfg(not(feature = "contract-test-hooks"))]
+    if batch.item_count == 1 {
+        let item_pointer = batch.items.cast::<abi::kadath_runtime_mutation_item_v1_t>();
+        let item_size = unsafe { read_struct_size(item_pointer) }?;
+        let result_size = unsafe { read_struct_size(results) }?;
+        if item_size < mem::size_of::<abi::kadath_runtime_mutation_item_v1_t>() as u32
+            || result_size < mem::size_of::<abi::kadath_runtime_mutation_result_t>() as u32
+        {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        let item = unsafe { &*item_pointer };
+        if item.tag == abi::KADATH_RUNTIME_MUTATION_APPLY_POSITIONS {
+            if !reserved_is_zero(&item.reserved) {
+                return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+            }
+            mutation_payload_is_well_formed(item)?;
+            let state = if live_target {
+                core.live
+                    .as_mut()
+                    .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?
+            } else {
+                core.candidate
+                    .as_mut()
+                    .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?
+            };
+            apply_single_position_batch_in_place(
+                state,
+                unsafe { &item.payload.positions },
+                item_range,
+                result_range,
+            )?;
+            let mut result: abi::kadath_runtime_mutation_result_t = unsafe { mem::zeroed() };
+            result.struct_size = mem::size_of::<abi::kadath_runtime_mutation_result_t>() as u32;
+            result.tag = item.tag;
+            unsafe { ptr::write(results, result) };
+            return Ok(());
+        }
+    }
+    // 输入借用范围也受 MAX_OBJECTS 限制，固定数组可保持 mutate 无分配。
+    let mut borrowed_ranges = [(0usize, 0usize); MAX_OBJECTS];
+    let mut borrowed_range_count = 0;
     for index in 0..batch.item_count {
         let item_pointer = unsafe {
             batch
@@ -1253,20 +1354,16 @@ fn mutate(
             if ranges_overlap(patch_range, batch_range)
                 || ranges_overlap(patch_range, item_range)
                 || ranges_overlap(patch_range, result_range)
-                || borrowed_ranges
+                || borrowed_ranges[..borrowed_range_count]
                     .iter()
                     .any(|previous| ranges_overlap(*previous, patch_range))
             {
                 return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
             }
-            borrowed_ranges.push(patch_range);
+            borrowed_ranges[borrowed_range_count] = patch_range;
+            borrowed_range_count += 1;
         }
     }
-    let live_target = match batch.target {
-        abi::KADATH_RUNTIME_TARGET_LIVE => true,
-        abi::KADATH_RUNTIME_TARGET_CANDIDATE => false,
-        _ => return Err(abi::KADATH_ERR_INVALID_ARGUMENT),
-    };
     let mut state = if live_target {
         core.live.as_ref()
     } else {
@@ -1275,14 +1372,11 @@ fn mutate(
     .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?
     .clone();
     let mut next_entity = core.next_entity_value;
-    let mut planned_results = Vec::new();
-    planned_results
-        .try_reserve_exact(batch.item_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
-    let mut lifecycle_refs: Vec<(ObjectKey, u32)> = Vec::new();
-    lifecycle_refs
-        .try_reserve_exact(batch.item_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    // 事务结果和同批次生命周期引用均有固定批次上限，避免在提交循环中分配。
+    let mut planned_results = [unsafe { mem::zeroed() }; MAX_OBJECTS];
+    let mut planned_result_count = 0;
+    let mut lifecycle_refs = [(unsafe { mem::zeroed() }, 0_u32); MAX_OBJECTS];
+    let mut lifecycle_ref_count = 0;
     for index in 0..batch.item_count {
         let item = unsafe {
             &*batch
@@ -1349,7 +1443,7 @@ fn mutate(
                     return Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE);
                 }
                 let key = read_object_key(unsafe { &item.payload.object_ref })?;
-                if let Some((_, previous_tag)) = lifecycle_refs
+                if let Some((_, previous_tag)) = lifecycle_refs[..lifecycle_ref_count]
                     .iter()
                     .rev()
                     .find(|(previous_key, _)| *previous_key == key)
@@ -1361,7 +1455,8 @@ fn mutate(
                         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
                     }
                 }
-                lifecycle_refs.push((key, item.tag));
+                lifecycle_refs[lifecycle_ref_count] = (key, item.tag);
+                lifecycle_ref_count += 1;
                 match item.tag {
                     abi::KADATH_RUNTIME_MUTATION_ACTIVATE_TRANSIENT => {
                         let entity_value = next_entity;
@@ -1390,7 +1485,8 @@ fn mutate(
             }
             _ => return Err(abi::KADATH_ERR_NOT_SUPPORTED),
         }
-        planned_results.push(result);
+        planned_results[planned_result_count] = result;
+        planned_result_count += 1;
     }
     trigger_test_fault(core, 3)?;
     core.next_entity_value = next_entity;
@@ -1399,7 +1495,11 @@ fn mutate(
     } else {
         core.candidate = Some(state);
     }
-    for (index, result) in planned_results.into_iter().enumerate() {
+    for (index, result) in planned_results[..planned_result_count]
+        .iter()
+        .copied()
+        .enumerate()
+    {
         unsafe { ptr::write(results.add(index), result) };
     }
     Ok(())
@@ -1698,7 +1798,13 @@ fn prepare_gameplay_state(
     });
     let state = gameplay::State::new(
         player,
+        player_record
+            .and_then(|record| record.source_index)
+            .expect("validated player source index"),
         goal,
+        goal_record
+            .and_then(|record| record.source_index)
+            .expect("validated goal source index"),
         &hazards,
         desc.time_limit_seconds,
         next_sequence,
@@ -1809,7 +1915,7 @@ fn begin_gameplay_fixed(
 }
 
 struct GameplayPositionPlan {
-    updates: [(ObjectKey, [f32; 2]); MAX_OBJECTS],
+    updates: [(ObjectKey, u8, [f32; 2]); MAX_OBJECTS],
     update_count: usize,
     hazard_directions: [f32; gameplay::MAX_CONTACTS],
 }
@@ -1820,13 +1926,19 @@ fn plan_gameplay_positions(
     dt_seconds: f32,
     input: [i8; 2],
 ) -> Result<GameplayPositionPlan, u32> {
-    let mut updates = [(gameplay.player, [0.0; 2]); MAX_OBJECTS];
+    let mut updates = [(gameplay.player, gameplay.player_source_index, [0.0; 2]); MAX_OBJECTS];
     let mut hazard_directions = [1.0; gameplay::MAX_CONTACTS];
     let mut count = 0;
     updates[count] = (
         gameplay.player,
+        gameplay.player_source_index,
         state
-            .planned_step_position(gameplay.player, dt_seconds, input)
+            .planned_step_position_at_source(
+                gameplay.player_source_index,
+                gameplay.player,
+                dt_seconds,
+                input,
+            )
             .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?,
     );
     count += 1;
@@ -1840,7 +1952,7 @@ fn plan_gameplay_positions(
             continue;
         }
         let record = state
-            .visible_exact(hazard.object)
+            .source_visible_exact(hazard.source_index, hazard.object)
             .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?;
         let span = f64::from(hazard.patrol_max_y - hazard.patrol_min_y);
         let period = span * 2.0;
@@ -1855,9 +1967,13 @@ fn plan_gameplay_positions(
             (f64::from(hazard.patrol_max_y) - (phase - span), -1.0)
         };
         let position = state
-            .planned_absolute_position(hazard.object, [record.sprite.position[0], y as f32])
+            .planned_absolute_position_at_source(
+                hazard.source_index,
+                hazard.object,
+                [record.sprite.position[0], y as f32],
+            )
             .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?;
-        updates[count] = (hazard.object, position);
+        updates[count] = (hazard.object, hazard.source_index, position);
         count += 1;
         hazard_directions[index] = direction;
     }
@@ -1958,10 +2074,20 @@ fn commit_gameplay_fixed(
     let outcome = session
         .observe_contacts(gameplay.player, observation.first_hazard, observation.goal)
         .map_err(|_| abi::KADATH_ERR_RUNTIME_GAMEPLAY_SEQUENCE_EXHAUSTED)?;
-    let (events, event_count) =
-        gameplay::contact_events(state, gameplay, &observation.contacts, observation.count)?;
-    // Submit through the existing Phase authority before publishing any Gameplay mutation.
-    gameplay::submit_contact_events(core, &events[..event_count])?;
+    let (transitions, transition_count) = gameplay::contact_transitions(
+        state,
+        gameplay,
+        &observation.contacts,
+        observation.count,
+        &observation.source_indices,
+        &observation.source_mask,
+    )?;
+    // 先通过 Phase authority 提交，再发布 Gameplay 状态；事件在队列边界直接构造。
+    let event_count = gameplay::submit_contact_transitions(
+        core,
+        gameplay.player,
+        &transitions[..transition_count],
+    )?;
     core.live
         .as_mut()
         .expect("live state was preflighted")
@@ -1981,6 +2107,8 @@ fn commit_gameplay_fixed(
     }
     gameplay.session = session;
     gameplay.previous_contacts = observation.contacts;
+    gameplay.previous_source_indices = observation.source_indices;
+    gameplay.previous_contact_mask = observation.source_mask;
     gameplay.previous_contact_count = observation.count;
     gameplay.active_step_token = None;
     gameplay.active_step_dt = 0.0;
@@ -2098,13 +2226,7 @@ fn publish_gameplay_snapshot(
     let mut index = 0;
     live.for_each_active_ordered(|record| {
         let mut color = record.sprite.color;
-        let key = ObjectKey {
-            object_id: record.object_id,
-            world_epoch: live.world_epoch,
-            logical_generation: record.logical_generation,
-            kind: record.kind,
-        };
-        if key == gameplay.player {
+        if record.source_index == Some(gameplay.player_source_index) {
             color = match gameplay.session.phase {
                 gameplay::Phase::Won => [0.20, 0.95, 0.35, 1.0],
                 gameplay::Phase::Lost => [0.95, 0.20, 0.20, 1.0],

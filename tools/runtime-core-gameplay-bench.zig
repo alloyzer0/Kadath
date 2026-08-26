@@ -143,6 +143,8 @@ pub fn main() !void {
     if (c.kadath_runtime_core_phase_quality_end_allocation_count(&allocations) != c.KADATH_OK) {
         return error.AllocationCounterUnavailable;
     }
+    // Gameplay 热路径在 Core 创建完成后必须只使用固定容量存储。
+    if (allocations != 0) return error.SteadyStateGameplayAllocated;
     std.debug.print(
         "runtime_core_gameplay_bench iterations={d} active_objects={d} transition_pairs={d} directed_events={d} render_items={d} p50_ns={d} p95_ns={d} allocations={d}\n",
         .{

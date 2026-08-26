@@ -301,6 +301,10 @@ impl RuntimeState {
                 visit(record);
             }
         }
+        // 没有 transient 时无需再次扫描全部 slots 寻找 spawn serial。
+        if self.record_count == usize::from(self.authored_source_count) {
+            return;
+        }
         let mut last_serial = 0;
         loop {
             let next = self
@@ -328,6 +332,22 @@ impl RuntimeState {
             .filter_map(|slot| slot.record.as_ref())
             .find(|record| {
                 record.lifecycle != Lifecycle::PendingDestroy
+                    && record.object_id == key.object_id
+                    && record.logical_generation == key.logical_generation
+                    && record.kind == key.kind
+            })
+    }
+
+    pub(crate) fn source_visible_exact(&self, source_index: u8, key: ObjectKey) -> Option<&Record> {
+        if key.world_epoch != self.world_epoch {
+            return None;
+        }
+        self.slots[usize::from(source_index)]
+            .record
+            .as_ref()
+            .filter(|record| {
+                record.lifecycle != Lifecycle::PendingDestroy
+                    && record.source_index == Some(source_index)
                     && record.object_id == key.object_id
                     && record.logical_generation == key.logical_generation
                     && record.kind == key.kind
@@ -375,33 +395,34 @@ impl RuntimeState {
         }
     }
 
-    pub(crate) fn planned_step_position(
+    pub(crate) fn planned_step_position_at_source(
         &self,
+        source_index: u8,
         key: ObjectKey,
         dt_seconds: f32,
         input: [i8; 2],
     ) -> Option<[f32; 2]> {
-        let mut sprite = self.visible_exact(key)?.sprite;
+        let mut sprite = self.source_visible_exact(source_index, key)?.sprite;
         sprite.step_fixed(self.bounds, dt_seconds, input);
         Some(sprite.position)
     }
 
-    pub(crate) fn planned_absolute_position(
+    pub(crate) fn planned_absolute_position_at_source(
         &self,
+        source_index: u8,
         key: ObjectKey,
         position: [f32; 2],
     ) -> Option<[f32; 2]> {
-        let mut sprite = self.visible_exact(key)?.sprite;
+        let mut sprite = self.source_visible_exact(source_index, key)?.sprite;
         sprite.position = position;
         sprite.constrain(self.bounds);
         Some(sprite.position)
     }
 
-    pub(crate) fn apply_planned_positions(&mut self, updates: &[(ObjectKey, [f32; 2])]) {
-        for (key, position) in updates {
-            let index = self
-                .exact_index(*key, false)
-                .expect("planned Gameplay ObjectRef remains live until no-fail publication");
+    pub(crate) fn apply_planned_positions(&mut self, updates: &[(ObjectKey, u8, [f32; 2])]) {
+        for (key, source_index, position) in updates {
+            let index = usize::from(*source_index);
+            debug_assert!(self.source_visible_exact(*source_index, *key).is_some());
             self.slots[index]
                 .record
                 .as_mut()

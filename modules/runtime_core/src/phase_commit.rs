@@ -135,6 +135,8 @@ struct Binding {
 #[derive(Clone, Copy)]
 struct EventEntry {
     item: abi::kadath_runtime_phase_event_v1_t,
+    // Rust Gameplay 自己生成的事件已经在同一提交中验证过对象生命周期。
+    trusted_gameplay: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1084,9 +1086,64 @@ pub(crate) fn submit_events(
             domain_state.event_successor_generation,
             domain_state.event_has_drained,
         )?;
-        domain_state.event_queue.push(EventEntry { item: copied })?;
+        domain_state.event_queue.push(EventEntry {
+            item: copied,
+            trusted_gameplay: false,
+        })?;
     }
     unsafe { ptr::write(out_ptr, result) };
+    Ok(())
+}
+
+/// 将 Rust Gameplay 已生成的接触事件直接写入 Phase 队列。
+///
+/// 该入口不属于 C ABI；调用者只能传入 `contact_events` 构造的固定事件，
+/// 因此跳过面向外部脚本的 ObjectRef/字段重复校验，同时保留队列容量、
+/// Phase 活跃状态、序列号和 generation 的不变量。
+pub(crate) fn submit_trusted_gameplay_events_with(
+    core: &mut RuntimeCore,
+    event_count: usize,
+    mut build_event: impl FnMut(usize) -> abi::kadath_runtime_phase_event_v1_t,
+) -> Result<(), u32> {
+    if event_count == 0 {
+        return Ok(());
+    }
+    if event_count > EVENT_CAPACITY {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+    }
+    let domain = abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    let domain_state = core.phase.domain(domain)?;
+    if domain_state.phase_sequence.is_none() {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED);
+    }
+    if domain_state.event_queue.len() + event_count > EVENT_CAPACITY {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+    }
+    let first_sequence = domain_state.next_event_sequence;
+    let last_sequence = first_sequence
+        .checked_add(event_count as u64)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)?;
+    let generation = PhaseState::normalize_generation(
+        0,
+        domain_state.event_successor_generation,
+        domain_state.event_has_drained,
+    )?;
+    let domain_state = core.phase.domain_mut(domain)?;
+    for index in 0..event_count {
+        let event = build_event(index);
+        if event.domain != domain {
+            return Err(abi::KADATH_ERR_INTERNAL);
+        }
+        let mut copied = event;
+        copied.sequence = first_sequence + index as u64;
+        copied.generation = generation;
+        domain_state.event_queue.push(EventEntry {
+            item: copied,
+            trusted_gameplay: true,
+        })?;
+    }
+    domain_state.next_event_sequence = last_sequence;
     Ok(())
 }
 
@@ -1152,7 +1209,7 @@ pub(crate) fn drain_events(
         .iter()
         .filter(|entry| entry.item.generation == generation)
     {
-        if event_objects_live(&entry.item, state) {
+        if entry.trusted_gameplay || event_objects_live(&entry.item, state) {
             unsafe { ptr::write(output_ptr.add(output_index), entry.item) };
             output_index += 1;
         }
@@ -2056,7 +2113,10 @@ pub(crate) fn commit_activation(
     let world_epoch = state.world_epoch;
     let accepted_event_count = activation.events.len() as u32;
     for event in activation.events.iter().copied() {
-        event_queue.push(EventEntry { item: event })?;
+        event_queue.push(EventEntry {
+            item: event,
+            trusted_gameplay: false,
+        })?;
     }
     let accepted_structural_count = activation.structural.len() as u32;
     for item in activation.structural.iter().copied() {

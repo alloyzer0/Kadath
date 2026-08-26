@@ -1,9 +1,13 @@
 use crate::{abi, object_authority::ObjectKey, phase_commit, world::Sprite, RuntimeCore};
 
 pub(crate) const MAX_CONTACTS: usize = crate::object_authority::MAX_OBJECTS - 1;
+const CONTACT_MASK_WORDS: usize = crate::object_authority::MAX_OBJECTS / 64;
 
 pub(crate) struct ContactObservation {
     pub(crate) contacts: [Option<ObjectKey>; MAX_CONTACTS],
+    // 记录源索引和位图，避免接触差分反复比较完整 ObjectKey。
+    pub(crate) source_indices: [u8; MAX_CONTACTS],
+    pub(crate) source_mask: [u64; CONTACT_MASK_WORDS],
     pub(crate) count: usize,
     pub(crate) first_hazard: Option<ObjectKey>,
     pub(crate) goal: Option<ObjectKey>,
@@ -23,11 +27,15 @@ pub(crate) struct Hazard {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct State {
     pub(crate) player: ObjectKey,
+    pub(crate) player_source_index: u8,
     pub(crate) goal: ObjectKey,
+    pub(crate) goal_source_index: u8,
     pub(crate) hazards: [Option<Hazard>; MAX_CONTACTS],
     pub(crate) hazard_sources: [bool; crate::object_authority::MAX_OBJECTS],
     pub(crate) hazard_count: usize,
     pub(crate) previous_contacts: [Option<ObjectKey>; MAX_CONTACTS],
+    pub(crate) previous_source_indices: [u8; MAX_CONTACTS],
+    pub(crate) previous_contact_mask: [u64; CONTACT_MASK_WORDS],
     pub(crate) previous_contact_count: usize,
     pub(crate) session: Session,
     pub(crate) active_step_token: Option<u64>,
@@ -36,9 +44,13 @@ pub(crate) struct State {
 }
 
 impl State {
+    // 状态字段保持扁平布局，构造参数数量由 Gameplay 固定数据模型决定。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         player: ObjectKey,
+        player_source_index: u8,
         goal: ObjectKey,
+        goal_source_index: u8,
         hazards: &[Hazard],
         time_limit_seconds: f32,
         next_outcome_sequence: u64,
@@ -52,11 +64,15 @@ impl State {
         }
         Self {
             player,
+            player_source_index,
             goal,
+            goal_source_index,
             hazards: storage,
             hazard_sources,
             hazard_count: hazards.len(),
             previous_contacts: [None; MAX_CONTACTS],
+            previous_source_indices: [0; MAX_CONTACTS],
+            previous_contact_mask: [0; CONTACT_MASK_WORDS],
             previous_contact_count: 0,
             session: Session::new(time_limit_seconds, next_outcome_sequence),
             active_step_token: None,
@@ -181,6 +197,7 @@ impl Session {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn strict_overlap(first: Sprite, second: Sprite) -> Result<bool, ()> {
     if !first.is_valid() || !second.is_valid() {
         return Err(());
@@ -206,6 +223,17 @@ pub(crate) fn strict_overlap(first: Sprite, second: Sprite) -> Result<bool, ()> 
         && first_right > second.position[0]
         && first.position[1] < second_bottom
         && first_bottom > second.position[1])
+}
+
+fn strict_overlap_prevalidated(first: Sprite, second: Sprite) -> bool {
+    first.size[0] != 0.0
+        && first.size[1] != 0.0
+        && second.size[0] != 0.0
+        && second.size[1] != 0.0
+        && first.position[0] < second.position[0] + second.size[0]
+        && first.position[0] + first.size[0] > second.position[0]
+        && first.position[1] < second.position[1] + second.size[1]
+        && first.position[1] + first.size[1] > second.position[1]
 }
 
 fn phase_code(value: Phase) -> u32 {
@@ -277,23 +305,24 @@ fn key_ref(key: ObjectKey) -> abi::kadath_runtime_object_ref_v1_t {
 pub(crate) fn active_contacts(
     live: &crate::object_authority::RuntimeState,
     gameplay: &State,
-    position_overrides: &[(ObjectKey, [f32; 2])],
+    position_overrides: &[(ObjectKey, u8, [f32; 2])],
 ) -> Result<ContactObservation, u32> {
     let player = live
-        .visible_exact(gameplay.player)
+        .source_visible_exact(gameplay.player_source_index, gameplay.player)
         .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?;
     let mut player_sprite = player.sprite;
     if let Some(value) = position_overrides
         .iter()
-        .find(|value| value.0 == gameplay.player)
+        .find(|value| value.1 == gameplay.player_source_index)
     {
-        player_sprite.position = value.1;
+        player_sprite.position = value.2;
     }
     let mut contacts = [None; MAX_CONTACTS];
+    let mut source_indices = [0; MAX_CONTACTS];
+    let mut source_mask = [0_u64; CONTACT_MASK_WORDS];
     let mut count = 0;
     let mut first_hazard = None;
     let mut goal_contact = None;
-    let mut invalid_geometry = false;
     live.for_each_active_ordered(|record| {
         let key = ObjectKey {
             object_id: record.object_id,
@@ -308,43 +337,45 @@ pub(crate) fn active_contacts(
             return;
         }
         let mut sprite = record.sprite;
-        if let Some(value) = position_overrides.iter().find(|value| value.0 == key) {
-            sprite.position = value.1;
+        if let Some(value) = position_overrides
+            .iter()
+            .find(|value| record.source_index == Some(value.1))
+        {
+            sprite.position = value.2;
         }
-        match strict_overlap(player_sprite, sprite) {
-            Ok(true) => {
-                contacts[count] = Some(key);
-                count += 1;
-                if is_hazard {
-                    first_hazard.get_or_insert(key);
-                } else {
-                    goal_contact = Some(key);
-                }
+        if strict_overlap_prevalidated(player_sprite, sprite) {
+            contacts[count] = Some(key);
+            let source_index = record
+                .source_index
+                .expect("Gameplay contact candidates must be authored sources");
+            source_indices[count] = source_index;
+            source_mask[usize::from(source_index) / 64] |= 1_u64 << (source_index % 64);
+            count += 1;
+            if is_hazard {
+                first_hazard.get_or_insert(key);
+            } else {
+                goal_contact = Some(key);
             }
-            Ok(false) => {}
-            Err(()) => invalid_geometry = true,
         }
     });
-    if invalid_geometry {
-        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-    }
     Ok(ContactObservation {
         contacts,
+        source_indices,
+        source_mask,
         count,
         first_hazard,
         goal: goal_contact,
     })
 }
 
-fn contains(values: &[Option<ObjectKey>], count: usize, key: ObjectKey) -> bool {
-    values[..count].contains(&Some(key))
-}
-
+#[cfg(test)]
 pub(crate) fn contact_events(
     live: &crate::object_authority::RuntimeState,
     gameplay: &State,
     current: &[Option<ObjectKey>; MAX_CONTACTS],
     current_count: usize,
+    current_source_indices: &[u8; MAX_CONTACTS],
+    current_source_mask: &[u64; CONTACT_MASK_WORDS],
 ) -> Result<
     (
         [abi::kadath_runtime_phase_event_v1_t;
@@ -356,72 +387,179 @@ pub(crate) fn contact_events(
     let mut output =
         [unsafe { std::mem::zeroed() }; abi::KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN as usize];
     let mut count = 0;
-    for name in [b"contact_end".as_slice(), b"contact_begin".as_slice()] {
-        let values = if name == b"contact_end" {
-            &gameplay.previous_contacts
-        } else {
-            current
-        };
-        let value_count = if name == b"contact_end" {
-            gameplay.previous_contact_count
-        } else {
-            current_count
-        };
-        for other in values[..value_count].iter().flatten().copied() {
-            let transitioned = if name == b"contact_end" {
-                !contains(current, current_count, other)
+    let (transitions, transition_count) = contact_transitions(
+        live,
+        gameplay,
+        current,
+        current_count,
+        current_source_indices,
+        current_source_mask,
+    )?;
+    for transition in transitions[..transition_count].iter().copied() {
+        append_contact_transition(
+            &mut output,
+            &mut count,
+            if transition.ended {
+                b"contact_end"
             } else {
-                !contains(
-                    &gameplay.previous_contacts,
-                    gameplay.previous_contact_count,
-                    other,
-                )
-            };
-            if !transitioned {
-                continue;
-            }
-            // A previous pair whose peer has since become stale is forgotten
-            // silently. Phase events may only carry fully live ObjectRefs.
-            if name == b"contact_end" && live.visible_exact(other).is_none() {
-                continue;
-            }
-            if count + 2 > output.len() {
-                return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
-            }
-            for (target, opposite) in [(gameplay.player, other), (other, gameplay.player)] {
-                let mut event: abi::kadath_runtime_phase_event_v1_t = unsafe { std::mem::zeroed() };
-                event.struct_size =
-                    std::mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
-                event.domain = abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
-                event.target = key_ref(target);
-                event.has_other = 1;
-                event.other = key_ref(opposite);
-                event.name_length = name.len() as u32;
-                event.name[..name.len()].copy_from_slice(name);
-                output[count] = event;
-                count += 1;
-            }
-        }
+                b"contact_begin"
+            },
+            gameplay.player,
+            transition.other,
+        )?;
     }
     Ok((output, count))
 }
 
-pub(crate) fn submit_contact_events(
-    core: &mut RuntimeCore,
-    events: &[abi::kadath_runtime_phase_event_v1_t],
-) -> Result<(), u32> {
-    if events.is_empty() {
-        return Ok(());
+#[derive(Clone, Copy)]
+pub(crate) struct ContactTransition {
+    pub(crate) ended: bool,
+    pub(crate) other: ObjectKey,
+}
+
+pub(crate) fn contact_transitions(
+    live: &crate::object_authority::RuntimeState,
+    gameplay: &State,
+    current: &[Option<ObjectKey>; MAX_CONTACTS],
+    current_count: usize,
+    current_source_indices: &[u8; MAX_CONTACTS],
+    current_source_mask: &[u64; CONTACT_MASK_WORDS],
+) -> Result<
+    (
+        [ContactTransition; (abi::KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN as usize) / 2],
+        usize,
+    ),
+    u32,
+> {
+    let mut output = [ContactTransition {
+        ended: false,
+        other: gameplay.player,
+    }; (abi::KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN as usize) / 2];
+    let mut count = 0;
+    for index in 0..gameplay.previous_contact_count {
+        let Some(other) = gameplay.previous_contacts[index] else {
+            continue;
+        };
+        let source_index = gameplay.previous_source_indices[index];
+        if mask_contains(current_source_mask, source_index)
+            || !source_key_is_live(live, other, source_index)
+        {
+            continue;
+        }
+        if count >= output.len() {
+            return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+        }
+        output[count] = ContactTransition { ended: true, other };
+        count += 1;
     }
-    let mut result: abi::kadath_runtime_phase_batch_result_v1_t = unsafe { std::mem::zeroed() };
-    result.struct_size = std::mem::size_of::<abi::kadath_runtime_phase_batch_result_v1_t>() as u32;
-    phase_commit::submit_events(
-        core,
-        events.as_ptr(),
-        events.len(),
-        std::mem::size_of::<abi::kadath_runtime_phase_event_v1_t>(),
-        &mut result,
-    )
+    for index in 0..current_count {
+        let Some(other) = current[index] else {
+            continue;
+        };
+        if mask_contains(
+            &gameplay.previous_contact_mask,
+            current_source_indices[index],
+        ) {
+            continue;
+        }
+        if count >= output.len() {
+            return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+        }
+        output[count] = ContactTransition {
+            ended: false,
+            other,
+        };
+        count += 1;
+    }
+    Ok((output, count))
+}
+
+pub(crate) fn submit_contact_transitions(
+    core: &mut RuntimeCore,
+    player: ObjectKey,
+    transitions: &[ContactTransition],
+) -> Result<usize, u32> {
+    let event_count = transitions
+        .len()
+        .checked_mul(2)
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)?;
+    phase_commit::submit_trusted_gameplay_events_with(core, event_count, |index| {
+        let transition = transitions[index / 2];
+        let name = if transition.ended {
+            b"contact_end".as_slice()
+        } else {
+            b"contact_begin".as_slice()
+        };
+        let (target, opposite) = if index % 2 == 0 {
+            (player, transition.other)
+        } else {
+            (transition.other, player)
+        };
+        let mut event: abi::kadath_runtime_phase_event_v1_t = unsafe { std::mem::zeroed() };
+        event.struct_size = std::mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
+        event.domain = abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+        event.target = key_ref(target);
+        event.has_other = 1;
+        event.other = key_ref(opposite);
+        event.name_length = name.len() as u32;
+        event.name[..name.len()].copy_from_slice(name);
+        event
+    })?;
+    Ok(event_count)
+}
+
+fn mask_contains(mask: &[u64; CONTACT_MASK_WORDS], source_index: u8) -> bool {
+    mask[usize::from(source_index) / 64] & (1_u64 << (source_index % 64)) != 0
+}
+
+fn source_key_is_live(
+    live: &crate::object_authority::RuntimeState,
+    key: ObjectKey,
+    source_index: u8,
+) -> bool {
+    key.world_epoch == live.world_epoch
+        && live.slots[usize::from(source_index)]
+            .record
+            .as_ref()
+            .is_some_and(|record| {
+                record.lifecycle == crate::object_authority::Lifecycle::Active
+                    && record.source_index == Some(source_index)
+                    && ObjectKey {
+                        // authored source 的 slot/ID 在 RuntimeState 生命周期内不可替换，
+                        // 这里只需校验 epoch、generation 与 kind。
+                        object_id: key.object_id,
+                        world_epoch: live.world_epoch,
+                        logical_generation: record.logical_generation,
+                        kind: record.kind,
+                    } == key
+            })
+}
+
+#[cfg(test)]
+fn append_contact_transition(
+    output: &mut [abi::kadath_runtime_phase_event_v1_t;
+             abi::KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN as usize],
+    count: &mut usize,
+    name: &[u8],
+    player: ObjectKey,
+    other: ObjectKey,
+) -> Result<(), u32> {
+    if *count + 2 > output.len() {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+    }
+    for (target, opposite) in [(player, other), (other, player)] {
+        let mut event: abi::kadath_runtime_phase_event_v1_t = unsafe { std::mem::zeroed() };
+        event.struct_size = std::mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
+        event.domain = abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+        event.target = key_ref(target);
+        event.has_other = 1;
+        event.other = key_ref(opposite);
+        event.name_length = name.len() as u32;
+        event.name[..name.len()].copy_from_slice(name);
+        output[*count] = event;
+        *count += 1;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -458,8 +596,12 @@ pub(crate) fn step_plan(
         &next_gameplay,
         &observation.contacts,
         observation.count,
+        &observation.source_indices,
+        &observation.source_mask,
     )?;
     next_gameplay.previous_contacts = observation.contacts;
+    next_gameplay.previous_source_indices = observation.source_indices;
+    next_gameplay.previous_contact_mask = observation.source_mask;
     next_gameplay.previous_contact_count = observation.count;
     Ok((next_live, next_gameplay, events, event_count, outcome))
 }
@@ -608,7 +750,16 @@ mod tests {
             patrol_speed: 0.0,
             patrol_direction: 1.0,
         };
-        let gameplay = State::new(key(b"player", 2), key(b"goal", 3), &[hazard], 3.0, 1, 1);
+        let gameplay = State::new(
+            key(b"player", 2),
+            0,
+            key(b"goal", 3),
+            2,
+            &[hazard],
+            3.0,
+            1,
+            1,
+        );
         let (_, next, events, event_count, outcome) =
             step_plan(&live, &gameplay, 0.0, [0, 0]).unwrap();
         assert_eq!(event_count, 2);
@@ -667,19 +818,31 @@ mod tests {
                 world_epoch: 2,
                 ..key(b"player", 2)
             },
+            0,
             ObjectKey {
                 world_epoch: 2,
                 ..key(b"goal", 3)
             },
+            2,
             &[hazard],
             3.0,
             1,
             1,
         );
         gameplay.previous_contacts[0] = Some(key(b"hazard", 4));
+        gameplay.previous_source_indices[0] = 1;
+        gameplay.previous_contact_mask[0] = 1_u64 << 1;
         gameplay.previous_contact_count = 1;
 
-        let (_, event_count) = contact_events(&live, &gameplay, &[None; MAX_CONTACTS], 0).unwrap();
+        let (_, event_count) = contact_events(
+            &live,
+            &gameplay,
+            &[None; MAX_CONTACTS],
+            0,
+            &[0; MAX_CONTACTS],
+            &[0; CONTACT_MASK_WORDS],
+        )
+        .unwrap();
         assert_eq!(event_count, 0);
     }
 
