@@ -2426,4 +2426,66 @@ mod tests {
         assert!(core.live.is_none());
         assert!(core.candidate.is_none());
     }
+
+    #[test]
+    fn gameplay_outcome_buffer_validation_covers_pointer_stride_capacity_and_reserved_fields() {
+        let mut outcome = abi::kadath_runtime_gameplay_outcome_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        let mut buffer = abi::kadath_runtime_gameplay_outcome_buffer_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_outcome_buffer_v1_t>() as u32,
+            outcomes: &mut outcome,
+            outcome_capacity: 1,
+            outcome_stride: mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>(),
+            ..unsafe { mem::zeroed() }
+        };
+
+        // 有效 caller-owned buffer 必须完整通过；后续每个字段单独覆盖一个 preflight 分支。
+        assert!(validate_outcome_buffer(&mut buffer).is_ok());
+        let valid = buffer;
+        buffer.reserved0 = 1;
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
+        buffer.reserved[0] = 1;
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
+        buffer.outcomes = std::ptr::null_mut();
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
+        buffer.outcome_capacity = 0;
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
+        buffer.outcome_stride = mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>() - 1;
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
+        buffer.outcome_stride = mem::align_of::<abi::kadath_runtime_gameplay_outcome_v1_t>();
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
+        let mut short_outcome = outcome;
+        short_outcome.struct_size = 0;
+        buffer.outcomes = &mut short_outcome;
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+    }
 }
