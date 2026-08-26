@@ -92,23 +92,36 @@ require_anchor() {
     local path=$1 anchor=$2 domain=$3
     grep -Fq "$anchor" "$repository_root/$path" || block "critical decision test missing: $domain"
 }
+require_test_log() {
+    local log=$1 marker=$2 domain=$3
+    [[ -s "$log" ]] || block "critical decision execution log missing: $domain"
+    grep -Fq "$marker" "$log" || block "critical decision not executed: $domain"
+}
 decision_manifest="$evidence_root/critical-decisions.tsv"
 printf 'domain\tfile\tline\tdecision\tcovered\ttotal\n' >"$decision_manifest"
 require_anchor modules/runtime_core/src/gameplay.rs 'timer_then_hazard_then_goal_priority_is_terminal_and_exactly_once' timer_priority
+require_test_log "$evidence_root/rust-command.log" 'timer_then_hazard_then_goal_priority_is_terminal_and_exactly_once ... ok' timer_priority
 printf 'timer_priority\tmodules/runtime_core/src/gameplay.rs\tpriority\ttimer-before-contact\t1\t1\n' >>"$decision_manifest"
 require_anchor modules/runtime_core/src/gameplay.rs 'stale_previous_contact_is_cleared_without_publishing_an_end_event' stale_contact
+require_test_log "$evidence_root/rust-command.log" 'stale_previous_contact_is_cleared_without_publishing_an_end_event ... ok' stale_contact
 printf 'stale_contact\tmodules/runtime_core/src/gameplay.rs\tcontact_transitions\tstale-source-drop\t1\t1\n' >>"$decision_manifest"
 require_anchor modules/runtime_core/tests/runtime_core_contract.zig 'Scene publication requires ready Object Gameplay and Phase candidates' paired_candidate
+require_test_log "$evidence_root/zig-adapter.log" 'Scene publication requires ready Object Gameplay and Phase candidates...OK' paired_candidate
 printf 'paired_candidate\tmodules/runtime_core/tests/runtime_core_contract.zig\tpublication\tpaired-candidate-preflight\t1\t1\n' >>"$decision_manifest"
 require_anchor modules/runtime_core/tests/runtime_core_contract.zig 'Restart is terminal-only and preserves Gameplay sequence high-water marks' restart_high_water
+require_test_log "$evidence_root/zig-adapter.log" 'Restart is terminal-only and preserves Gameplay sequence high-water marks...OK' restart_high_water
 printf 'restart_high_water\tmodules/runtime_core/tests/runtime_core_contract.zig\trestart\tsequence-high-water\t1\t1\n' >>"$decision_manifest"
 require_anchor modules/runtime_core/tests/runtime_core_contract.zig 'Runtime Core Gameplay owns terminal priority contact events outcome and final tint' snapshot_outcome
+require_test_log "$evidence_root/zig-adapter.log" 'Runtime Core Gameplay owns terminal priority contact events outcome and final tint...OK' snapshot_outcome
 printf 'snapshot_outcome\tmodules/runtime_core/tests/runtime_core_contract.zig\tsnapshot\toutcome-tint-coherence\t1\t1\n' >>"$decision_manifest"
 require_anchor modules/runtime_core/tests/public_contract.c 'PHASE3_PUBLIC_GAMEPLAY_PATH=PASS' public_preflight
+require_test_log "$evidence_root/public-c.log" 'PHASE3_PUBLIC_GAMEPLAY_PATH=PASS' public_preflight
 printf 'public_preflight\tmodules/runtime_core/tests/public_contract.c\tpreflight\tpublic-abi-preflight\t1\t1\n' >>"$decision_manifest"
 require_anchor app/behavior_host_contract.zig 'contact events are directed and deliver end before begin' contact_order
+require_test_log "$evidence_root/behavior.log" 'contact events are directed and deliver end before begin...OK' contact_order
 printf 'contact_order\tapp/behavior_host_contract.zig\tcontact-events\tend-before-begin\t1\t1\n' >>"$decision_manifest"
 require_anchor modules/runtime_core/tests/runtime_core_contract.zig 'Runtime Core Phase replay preserves FIFO, domain counters, and generation bounds' phase_capacity
+require_test_log "$evidence_root/zig-adapter.log" 'Runtime Core Phase replay preserves FIFO, domain counters, and generation bounds...OK' phase_capacity
 printf 'phase_capacity\tmodules/runtime_core/tests/runtime_core_contract.zig\tphase-replay\tfifo-generation-bounds\t1\t1\n' >>"$decision_manifest"
 decision_total=$(awk 'NR > 1 { total++ } END { print total+0 }' "$decision_manifest")
 decision_covered=$(awk 'NR > 1 && $5 == $6 { covered++ } END { print covered+0 }' "$decision_manifest")
