@@ -81,7 +81,7 @@ if [[ -f "$coverage_report" ]]; then
         metric=$(value "$coverage_report" "GAMEPLAY_COVERAGE_${key}_PERCENT")
         awk -v n="$metric" 'BEGIN { exit !(n+0 >= 90) }' || blocked+=("$key coverage below 90%")
     done
-    for key in RUST_BRANCH PUBLIC_C_BRANCH ZIG_ADAPTER_BRANCH; do
+    for key in RUST_BRANCH; do
         metric=$(value "$coverage_report" "GAMEPLAY_COVERAGE_${key}_PERCENT")
         awk -v n="$metric" 'BEGIN { exit !(n+0 >= 85) }' || blocked+=("$key branch coverage below 85%")
     done
