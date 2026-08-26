@@ -2672,6 +2672,221 @@ mod tests {
     }
 
     #[test]
+    fn gameplay_prepare_advanced_hazard_and_restart_guards_are_independent() {
+        fn advanced_core(mode: u32) -> Box<RuntimeCore> {
+            let sources = [
+                SourceObject {
+                    object_id: ObjectId::parse(b"player").unwrap(),
+                    kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                    sprite: Sprite {
+                        position: [0.0, 0.0],
+                        size: [2.0, 2.0],
+                        color: [1.0; 4],
+                        texture_id: 1,
+                        move_speed: 1.0,
+                    },
+                },
+                SourceObject {
+                    object_id: ObjectId::parse(b"hazard-1").unwrap(),
+                    kind: abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                    sprite: Sprite {
+                        position: [10.0, 0.0],
+                        size: [2.0, 2.0],
+                        color: [1.0; 4],
+                        texture_id: 1,
+                        move_speed: 0.0,
+                    },
+                },
+                SourceObject {
+                    object_id: ObjectId::parse(b"hazard-2").unwrap(),
+                    kind: abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                    sprite: Sprite {
+                        position: [20.0, 0.0],
+                        size: [2.0, 2.0],
+                        color: [1.0; 4],
+                        texture_id: 1,
+                        move_speed: 0.0,
+                    },
+                },
+                SourceObject {
+                    object_id: ObjectId::parse(b"goal").unwrap(),
+                    kind: abi::KADATH_RUNTIME_OBJECT_KIND_GOAL,
+                    sprite: Sprite {
+                        position: [30.0, 0.0],
+                        size: [2.0, 2.0],
+                        color: [1.0; 4],
+                        texture_id: 1,
+                        move_speed: 0.0,
+                    },
+                },
+            ];
+            let live = RuntimeState::initial(
+                1,
+                1,
+                Bounds::new([-100.0, -100.0], [100.0, 100.0]).unwrap(),
+                &sources,
+                &[1, 2, 3, 4],
+            );
+            Box::new(RuntimeCore {
+                owner_thread: thread::current().id(),
+                in_call: false,
+                live: Some(live.clone()),
+                candidate: Some(live),
+                candidate_next_entity_value: Some(5),
+                candidate_mode: Some(mode),
+                next_entity_value: 5,
+                phase: phase_commit::PhaseState::new_boxed().unwrap(),
+                gameplay: None,
+                gameplay_candidate: None,
+                #[cfg(feature = "contract-test-hooks")]
+                next_fault: None,
+            })
+        }
+
+        fn prepare_desc(
+            hazards: *const abi::kadath_runtime_gameplay_hazard_desc_v1_t,
+            player: abi::kadath_runtime_object_ref_v1_t,
+            goal: abi::kadath_runtime_object_ref_v1_t,
+            hazard_count: u32,
+        ) -> abi::kadath_runtime_gameplay_desc_v1_t {
+            abi::kadath_runtime_gameplay_desc_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_gameplay_desc_v1_t>() as u32,
+                reserved0: 0,
+                time_limit_seconds: 3.0,
+                hazard_count,
+                player,
+                goal,
+                hazards,
+                hazard_stride: mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>(),
+                reserved: [0; 6],
+            }
+        }
+
+        let hazard1 = {
+            let mut value = gameplay_test_hazard();
+            value.object_ref = gameplay_test_object_ref(
+                b"hazard-1",
+                abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                1,
+            );
+            value
+        };
+        let mut hazard2 = hazard1;
+        hazard2.object_ref = gameplay_test_object_ref(
+            b"hazard-2",
+            abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+            1,
+        );
+        let mut hazards = [hazard1, hazard2];
+        let desc = prepare_desc(
+            hazards.as_ptr(),
+            gameplay_test_object_ref(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER, 1),
+            gameplay_test_object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL, 1),
+            2,
+        );
+        let mut output = abi::kadath_runtime_gameplay_candidate_info_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_candidate_info_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        let mut core = advanced_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let pointer = (&mut *core as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        assert_eq!(
+            prepare_gameplay_state_entry(pointer, &desc, &mut output),
+            abi::KADATH_OK as i32
+        );
+        assert_eq!(output.hazard_count, 2);
+
+        // 第二项必须按 index * stride 读取，而不是重复首项或使用除法。
+        assert_eq!(
+            core.gameplay_candidate.as_ref().unwrap().hazards[1]
+                .as_ref()
+                .unwrap()
+                .object,
+            read_object_key(&hazard2.object_ref).unwrap()
+        );
+
+        for mutate in [
+            |value: &mut abi::kadath_runtime_gameplay_hazard_desc_v1_t| {
+                value.movement_mode = abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
+                value.patrol_min_y = f32::NAN;
+                value.patrol_max_y = 2.0;
+                value.patrol_speed = 1.0;
+            },
+            |value: &mut abi::kadath_runtime_gameplay_hazard_desc_v1_t| {
+                value.movement_mode = abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
+                value.patrol_min_y = 0.0;
+                value.patrol_max_y = f32::NAN;
+                value.patrol_speed = 1.0;
+            },
+            |value: &mut abi::kadath_runtime_gameplay_hazard_desc_v1_t| {
+                value.movement_mode = abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
+                value.patrol_min_y = 0.0;
+                value.patrol_max_y = 2.0;
+                value.patrol_speed = -1.0;
+            },
+        ] {
+            hazards[0] = hazard1;
+            mutate(&mut hazards[0]);
+            let mut core = advanced_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+            let pointer = (&mut *core as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+            assert_ne!(
+                prepare_gameplay_state_entry(pointer, &desc, &mut output),
+                abi::KADATH_OK as i32
+            );
+        }
+
+        // 相同 source index 的 hazard 必须被拒绝，避免排序约束被 < 变异放宽。
+        hazards[0] = hazard1;
+        hazards[1] = hazard1;
+        let duplicate_desc = prepare_desc(
+            hazards.as_ptr(),
+            gameplay_test_object_ref(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER, 1),
+            gameplay_test_object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL, 1),
+            2,
+        );
+        let mut duplicate_core = advanced_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let duplicate_pointer =
+            (&mut *duplicate_core as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        assert_ne!(
+            prepare_gameplay_state_entry(duplicate_pointer, &duplicate_desc, &mut output),
+            abi::KADATH_OK as i32
+        );
+
+        // Restart 只有在已有 Playing session 时禁止；两项条件必须可独立区分。
+        let restart_hazards = [hazard1, hazard2];
+        let restart_desc = prepare_desc(
+            restart_hazards.as_ptr(),
+            gameplay_test_object_ref(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER, 1),
+            gameplay_test_object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL, 1),
+            2,
+        );
+        let mut restart_idle = advanced_core(abi::KADATH_RUNTIME_PREPARE_RESTART);
+        let restart_idle_pointer =
+            (&mut *restart_idle as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        assert_eq!(
+            prepare_gameplay_state_entry(restart_idle_pointer, &restart_desc, &mut output),
+            abi::KADATH_OK as i32
+        );
+        let mut restart_playing = advanced_core(abi::KADATH_RUNTIME_PREPARE_RESTART);
+        restart_playing.gameplay = Some(gameplay::State::new(
+            read_object_key(&restart_desc.player).unwrap(),
+            0,
+            read_object_key(&restart_desc.goal).unwrap(),
+            3,
+            &[],
+            3.0,
+            1,
+            1,
+        ));
+        let restart_pointer =
+            (&mut *restart_playing as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        assert_ne!(
+            prepare_gameplay_state_entry(restart_pointer, &restart_desc, &mut output),
+            abi::KADATH_OK as i32
+        );
+    }
+
+    #[test]
     fn gameplay_prepare_preflight_covers_descriptor_and_hazard_validation() {
         let mut hazards = [gameplay_test_hazard(), gameplay_test_hazard()];
         let valid = gameplay_test_desc(hazards.as_ptr());
@@ -3091,6 +3306,25 @@ mod tests {
             phase_result.phase_sequence,
         )
         .unwrap();
+
+        // 用独立堆区覆盖 MAX_OBJECTS 的精确边界，避免范围重叠错误掩盖容量 guard。
+        let template_item = items[0];
+        let mut exact_items = vec![template_item; MAX_OBJECTS].into_boxed_slice();
+        let mut exact_buffer = buffer;
+        exact_buffer.items = exact_items.as_mut_ptr();
+        exact_buffer.item_capacity = MAX_OBJECTS;
+        assert_eq!(
+            publish_gameplay_snapshot(pointer, &mut exact_buffer, &mut snapshot),
+            Ok(())
+        );
+        let mut over_items = vec![template_item; MAX_OBJECTS + 1].into_boxed_slice();
+        let mut over_buffer = exact_buffer;
+        over_buffer.items = over_items.as_mut_ptr();
+        over_buffer.item_capacity = MAX_OBJECTS + 1;
+        assert_eq!(
+            publish_gameplay_snapshot(pointer, &mut over_buffer, &mut snapshot),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
 
         // buffer/output 的 descriptor、reserved、容量、stride、指针对齐和结构体大小
         // 各自独立拒绝；每个失败都发生在写入 caller storage 之前。
