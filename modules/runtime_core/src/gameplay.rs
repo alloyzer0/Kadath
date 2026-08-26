@@ -640,6 +640,20 @@ mod tests {
         );
         assert_eq!(
             strict_overlap(
+                sprite([0.0, 0.0], [2.0, 0.0]),
+                sprite([0.0, 0.0], [2.0, 2.0])
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            strict_overlap(
+                sprite([0.0, 0.0], [2.0, 2.0]),
+                sprite([0.0, 0.0], [0.0, 2.0])
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            strict_overlap(
                 sprite([f32::MAX, 0.0], [f32::MAX, 2.0]),
                 sprite([0.0, 0.0], [2.0, 2.0])
             ),
@@ -857,6 +871,65 @@ mod tests {
         gameplay.previous_contact_mask[0] = 1_u64 << 1;
         gameplay.previous_contact_count = 1;
 
+        // 玩家和候选对象的位置覆盖均需进入几何校验；非有限覆盖必须被拒绝。
+        assert!(matches!(
+            active_contacts(
+                &live,
+                &gameplay,
+                &[
+                    (gameplay.player, 0, [0.0, 0.0]),
+                    (key(b"hazard", 4), 1, [f32::NAN, 0.0]),
+                ],
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+
+        // 当前位图命中时跳过旧接触；旧位图命中时跳过当前接触。
+        let mut current_mask = [0_u64; CONTACT_MASK_WORDS];
+        current_mask[0] = 1_u64 << 1;
+        let mut mask_gameplay = gameplay.clone();
+        mask_gameplay.previous_contacts[0] = Some(ObjectKey {
+            world_epoch: 2,
+            ..key(b"hazard", 4)
+        });
+        mask_gameplay.previous_source_indices[0] = 1;
+        mask_gameplay.previous_contact_count = 1;
+        assert_eq!(
+            contact_transitions(
+                &live,
+                &mask_gameplay,
+                &[None; MAX_CONTACTS],
+                0,
+                &[0; MAX_CONTACTS],
+                &current_mask,
+            )
+            .unwrap()
+            .1,
+            0,
+        );
+        mask_gameplay.previous_contact_count = 0;
+        mask_gameplay.previous_contact_mask = current_mask;
+        let mut current = [None; MAX_CONTACTS];
+        current[0] = Some(ObjectKey {
+            world_epoch: 2,
+            ..key(b"hazard", 4)
+        });
+        let mut current_indices = [0; MAX_CONTACTS];
+        current_indices[0] = 1;
+        assert_eq!(
+            contact_transitions(
+                &live,
+                &mask_gameplay,
+                &current,
+                1,
+                &current_indices,
+                &[0; CONTACT_MASK_WORDS],
+            )
+            .unwrap()
+            .1,
+            0,
+        );
+
         let (_, event_count) = contact_events(
             &live,
             &gameplay,
@@ -887,6 +960,31 @@ mod tests {
             &events[0].name[..events[0].name_length as usize],
             b"contact_end"
         );
+
+        // 超过固定事件槽位时必须返回容量错误，不能写出边界。
+        let mut overflow = [None; MAX_CONTACTS];
+        overflow.fill(Some(ObjectKey {
+            world_epoch: 2,
+            ..key(b"hazard", 4)
+        }));
+        let overflow_indices = [1; MAX_CONTACTS];
+        let overflow_mask = [0_u64; CONTACT_MASK_WORDS];
+        let mut overflow_gameplay = gameplay.clone();
+        overflow_gameplay.previous_contacts = overflow;
+        overflow_gameplay.previous_source_indices = overflow_indices;
+        overflow_gameplay.previous_contact_count = MAX_CONTACTS;
+        overflow_gameplay.previous_contact_mask = overflow_mask;
+        assert!(matches!(
+            contact_transitions(
+                &live,
+                &overflow_gameplay,
+                &overflow,
+                MAX_CONTACTS,
+                &overflow_indices,
+                &overflow_mask,
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+        ));
     }
 
     #[test]
