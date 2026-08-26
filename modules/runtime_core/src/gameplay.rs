@@ -867,6 +867,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(event_count, 0);
+
+        // 同一世界代但本帧离开的接触必须产生双向 end 事件。
+        gameplay.previous_contacts[0] = Some(ObjectKey {
+            world_epoch: 2,
+            ..key(b"hazard", 4)
+        });
+        let (events, event_count) = contact_events(
+            &live,
+            &gameplay,
+            &[None; MAX_CONTACTS],
+            0,
+            &[0; MAX_CONTACTS],
+            &[0; CONTACT_MASK_WORDS],
+        )
+        .unwrap();
+        assert_eq!(event_count, 2);
+        assert_eq!(
+            &events[0].name[..events[0].name_length as usize],
+            b"contact_end"
+        );
     }
 
     #[test]
