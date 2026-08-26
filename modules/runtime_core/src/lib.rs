@@ -2456,6 +2456,13 @@ mod tests {
             Err(abi::KADATH_ERR_INVALID_ARGUMENT)
         ));
         buffer = valid;
+        buffer.reserved0 = 1;
+        buffer.reserved[0] = 1;
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
         buffer.outcomes = std::ptr::null_mut();
         assert!(matches!(
             validate_outcome_buffer(&mut buffer),
