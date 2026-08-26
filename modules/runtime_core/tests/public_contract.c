@@ -1291,7 +1291,10 @@ static int gameplay_contract_path(
 
 static int phase_commit_path(
     kadath_runtime_object_authority_interface_t* object_interface,
-    kadath_runtime_phase_interface_v1_t* phase_interface) {
+    kadath_runtime_phase_interface_v1_t* phase_interface_v1,
+    kadath_runtime_phase_interface_v1_t* phase_interface_v2) {
+    // 后续 Phase 全路径使用 V2；开头的定向检查保留 V1 兼容语义。
+    kadath_runtime_phase_interface_v1_t* phase_interface = phase_interface_v2;
     kadath_runtime_core_t* core = NULL;
     int create_result = create_live_core(object_interface, &core);
     if (create_result != 0) return 100 + create_result;
@@ -1319,7 +1322,7 @@ static int phase_commit_path(
     aliased_begin.desc.struct_size = (uint32_t)sizeof(aliased_begin.desc);
     aliased_begin.desc.domain = KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
     aliased_begin.desc.phase_sequence = 76U;
-    if (phase_interface->begin_phase(core, &aliased_begin.desc, &aliased_begin.result) != KADATH_ERR_INVALID_ARGUMENT ||
+    if (phase_interface_v1->begin_phase(core, &aliased_begin.desc, &aliased_begin.result) != KADATH_ERR_INVALID_ARGUMENT ||
         aliased_begin.desc.phase_sequence != 76U) {
         return 249;
     }
@@ -1328,7 +1331,7 @@ static int phase_commit_path(
     memset(misaligned_begin_storage, 0, sizeof(misaligned_begin_storage));
     uint32_t misaligned_begin_size = (uint32_t)sizeof(kadath_runtime_phase_begin_desc_v1_t);
     memcpy(misaligned_begin_storage + 1U, &misaligned_begin_size, sizeof(misaligned_begin_size));
-    if (phase_interface->begin_phase(
+    if (phase_interface_v1->begin_phase(
             core,
             (const kadath_runtime_phase_begin_desc_v1_t*)(const void*)(misaligned_begin_storage + 1U),
             &begin_result) != KADATH_ERR_INVALID_ARGUMENT ||
@@ -1336,25 +1339,26 @@ static int phase_commit_path(
         return 252;
     }
     begin.phase_sequence = 1U;
-    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
+    if (phase_interface_v1->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
         begin_result.phase_sequence != 1U) {
         return 253;
     }
-    if (phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 1U) != KADATH_OK) {
+    if (phase_interface_v1->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 1U) != KADATH_OK) {
         return 254;
     }
 
-    kadath_runtime_phase_interface_v1_t phase_interface_v2 = query_phase_interface_v2();
-    if (phase_interface_v2.interface_version != KADATH_RUNTIME_PHASE_INTERFACE_V2 ||
-        phase_interface_v2.begin_phase == NULL) {
+    if (phase_interface_v2->interface_version != KADATH_RUNTIME_PHASE_INTERFACE_V2 ||
+        phase_interface_v2->begin_phase == NULL) {
         return 255;
     }
+    memset(&begin_result, 0, sizeof(begin_result));
+    begin_result.struct_size = (uint32_t)sizeof(begin_result);
     begin.phase_sequence = 0U;
-    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_ERR_INVALID_ARGUMENT ||
+    if (phase_interface_v1->begin_phase(core, &begin, &begin_result) != KADATH_ERR_INVALID_ARGUMENT ||
         begin_result.phase_sequence != 0U) {
         return 256;
     }
-    if (phase_interface_v2.begin_phase(core, &begin, &begin_result) != KADATH_OK ||
+    if (phase_interface_v2->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
         begin_result.phase_sequence == 0U) {
         return 257;
     }
@@ -1406,10 +1410,11 @@ static int phase_commit_path(
 
     /* The Phase Interface has one active phase globally, regardless of domain. */
     begin.domain = KADATH_RUNTIME_PHASE_DOMAIN_FRAME;
+    begin.phase_sequence = 2U;
     memset(&begin_result, 0, sizeof(begin_result));
     begin_result.struct_size = (uint32_t)sizeof(begin_result);
     begin_result.phase_sequence = UINT64_MAX;
-    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_ERR_RUNTIME_PHASE_BUSY ||
+    if (phase_interface_v1->begin_phase(core, &begin, &begin_result) != KADATH_ERR_RUNTIME_PHASE_BUSY ||
         begin_result.phase_sequence != UINT64_MAX) return 154;
     if (prepare_candidate_again(object_interface, core, KADATH_RUNTIME_PREPARE_RESTART) != 0 ||
         prepare_gameplay_candidate(object_interface, core) != 0 ||
@@ -1585,6 +1590,7 @@ static int phase_commit_path(
     }
     if (prepare_empty_phase_candidate(core) != 0 ||
         object_interface->commit_scene(core) != KADATH_OK) return 168;
+    begin.phase_sequence = 0U;
     memset(&begin_result, 0, sizeof(begin_result));
     begin_result.struct_size = (uint32_t)sizeof(begin_result);
     if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
@@ -2203,7 +2209,7 @@ int main(void) {
     int gameplay_result = gameplay_contract_path(&interface_value, &phase_interface, &gameplay_interface);
     if (gameplay_result != 0) return gameplay_result;
     puts("PHASE3_PUBLIC_GAMEPLAY_PATH=PASS");
-    int phase_result = phase_commit_path(&interface_value, &phase_interface_v1);
+    int phase_result = phase_commit_path(&interface_value, &phase_interface_v1, &phase_interface);
     if (phase_result != 0) return phase_result;
     puts("PHASE3_PUBLIC_PHASE_COMMIT_PATH=PASS");
     int paired_abort_result = aborted_scene_discards_paired_phase_candidate(
