@@ -85,6 +85,46 @@ snapshot_publication	modules/runtime_core/src/lib.rs	publish_gameplay_snapshot;g
 outcome_sequence	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/lib.rs	outcome_value;step_result;commit_gameplay_fixed
 abi_preflight	modules/runtime_core/src/phase_commit.rs;modules/runtime_core/src/lib.rs	query_interface;query_gameplay_interface;begin_phase_v1;begin_phase_v2;submit_events;validate_event
 EOF
+
+# 将 survivor/unviable 独立落盘，避免只凭总分判断而丢失逐项追踪证据。
+# survivor 一律保守标记为待跟进；unviable 只确认 cargo-mutants 的编译不可行结论，
+# 具体 rustc 诊断通过绑定的 log 路径复核，不能把它们误算成已杀死。
+survivor_audit="$evidence_root/mutation-survivor-audit.tsv"
+jq -r --arg pattern "$critical_pattern" '.outcomes[]
+    | select(.scenario != "Baseline" and .summary == "MissedMutant")
+    | (.scenario.Mutant // {}) as $m
+    | ($m.function.function_name // "unknown") as $fn
+    | (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|mask_contains")) then "contact_differencing"
+       elif ($fn | test("prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|step_plan|step_result")) then "timer_priority"
+       elif ($fn | test("source_key_is_live|validate_outcome_buffer|read_object_key|object_view")) then "epoch_stale"
+       elif ($fn | test("append_contact_transition|valid_output_array|apply_positions|validate_outcome_buffer")) then "capacity"
+       elif ($fn | test("publish_gameplay_snapshot|gameplay_snapshot|snapshot")) then "snapshot_publication"
+       elif ($fn | test("outcome_value|step_result|commit_gameplay_fixed")) then "outcome_sequence"
+       elif ($fn | test("query_interface|query_gameplay_interface|begin_phase|submit_events|validate_")) then "abi_preflight"
+       else "uncategorized" end) as $domain
+    | [$domain, ($m.file // ""), $fn, "SURVIVED", "requires_followup",
+       "完整 cargo test 未杀死；需补充针对性回归或单独记录等价性依据",
+       ($m.name // ""), (.log_path // "")] | @tsv' "$outcomes" \
+    | { printf 'domain\tfile\tfunction\tstatus\taudit\trationale\tmutant\tlog\n'; cat; } >"$survivor_audit"
+
+unviable_audit="$evidence_root/mutation-unviable-audit.tsv"
+jq -r '.outcomes[]
+    | select(.scenario != "Baseline" and .summary == "Unviable")
+    | (.scenario.Mutant // {}) as $m
+    | ($m.function.function_name // "unknown") as $fn
+    | (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|mask_contains")) then "contact_differencing"
+       elif ($fn | test("prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|step_plan|step_result")) then "timer_priority"
+       elif ($fn | test("source_key_is_live|validate_outcome_buffer|read_object_key|object_view")) then "epoch_stale"
+       elif ($fn | test("append_contact_transition|valid_output_array|apply_positions|validate_outcome_buffer")) then "capacity"
+       elif ($fn | test("publish_gameplay_snapshot|gameplay_snapshot|snapshot")) then "snapshot_publication"
+       elif ($fn | test("outcome_value|step_result|commit_gameplay_fixed")) then "outcome_sequence"
+       elif ($fn | test("query_interface|query_gameplay_interface|begin_phase|submit_events|validate_")) then "abi_preflight"
+       else "uncategorized" end) as $domain
+    | [$domain, ($m.file // ""), $fn, "UNVIABLE", "compile_invalid",
+       "cargo-mutants 标记为 Unviable；rustc 编译诊断保存在绑定日志中",
+       ($m.name // ""), (.log_path // "")] | @tsv' "$outcomes" \
+    | { printf 'domain\tfile\tfunction\tstatus\taudit\trationale\tmutant\tlog\n'; cat; } >"$unviable_audit"
+
 report="$evidence_root/mutation.report"
 cat >"$report" <<EOF
 GAMEPLAY_MUTATION_STATUS=$status
@@ -103,6 +143,10 @@ GAMEPLAY_MUTATION_MANIFEST=$manifest
 GAMEPLAY_MUTATION_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')
 GAMEPLAY_MUTATION_CRITICAL_MANIFEST=$critical_manifest
 GAMEPLAY_MUTATION_CRITICAL_MANIFEST_SHA256=$(sha256sum "$critical_manifest" | awk '{print $1}')
+GAMEPLAY_MUTATION_SURVIVOR_AUDIT=$survivor_audit
+GAMEPLAY_MUTATION_SURVIVOR_AUDIT_SHA256=$(sha256sum "$survivor_audit" | awk '{print $1}')
+GAMEPLAY_MUTATION_UNVIABLE_AUDIT=$unviable_audit
+GAMEPLAY_MUTATION_UNVIABLE_AUDIT_SHA256=$(sha256sum "$unviable_audit" | awk '{print $1}')
 GAMEPLAY_MUTATION_BLOCKER=$(IFS=';'; printf '%s' "${blockers[*]-}")
 EOF
 cat "$report"
