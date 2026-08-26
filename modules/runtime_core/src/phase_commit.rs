@@ -2962,6 +2962,18 @@ mod tests {
         begin(&mut core);
         let event = event();
         let mut events = [event; 2];
+        // 两个事件必须有可观察差异，才能捕获第二项地址计算中的乘法变异。
+        let goal_id = ObjectId::parse(b"goal").unwrap();
+        events[1].target = abi::kadath_runtime_object_ref_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_object_ref_v1_t>() as u32,
+            kind: abi::KADATH_RUNTIME_OBJECT_KIND_GOAL,
+            world_epoch: 1,
+            logical_generation: 1,
+            object_id_length: goal_id.len(),
+            reserved0: 0,
+            object_id: goal_id.storage(),
+            reserved: [0; 4],
+        };
         let mut result = batch_result();
         assert_eq!(
             submit_events(
@@ -2983,6 +2995,10 @@ mod tests {
         assert_eq!(domain.event_queue.len(), 2);
         assert_eq!(domain.event_queue[0].item.sequence, 1);
         assert_eq!(domain.event_queue[1].item.sequence, 2);
+        assert_eq!(
+            domain.event_queue[1].item.target.kind,
+            abi::KADATH_RUNTIME_OBJECT_KIND_GOAL
+        );
 
         // 每个指针/长度/步长 guard 都单独命中，确保边界变异不会被短路条件掩盖。
         let mut fresh = test_core();
@@ -3052,6 +3068,16 @@ mod tests {
                 &mut fresh,
                 events.as_ptr(),
                 1,
+                stride - mem::align_of::<abi::kadath_runtime_phase_event_v1_t>(),
+                &mut fresh_result
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            submit_events(
+                &mut fresh,
+                events.as_ptr(),
+                1,
                 stride + 1,
                 &mut fresh_result
             ),
@@ -3106,7 +3132,7 @@ mod tests {
 
         let mut full = test_core();
         begin(&mut full);
-        let full_events = [event; EVENT_CAPACITY];
+        let full_events = vec![event; EVENT_CAPACITY].into_boxed_slice();
         let mut full_result = batch_result();
         submit_events(
             &mut full,
@@ -3121,6 +3147,29 @@ mod tests {
             Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
         );
 
+        // 队列恰好剩余一个槽位时提交两个，覆盖 len + count 的边界。
+        let mut queue_boundary = test_core();
+        begin(&mut queue_boundary);
+        let boundary_events = vec![event; EVENT_CAPACITY].into_boxed_slice();
+        submit_events(
+            &mut queue_boundary,
+            boundary_events.as_ptr(),
+            EVENT_CAPACITY - 1,
+            stride,
+            &mut full_result,
+        )
+        .unwrap();
+        assert_eq!(
+            submit_events(
+                &mut queue_boundary,
+                boundary_events.as_ptr(),
+                2,
+                stride,
+                &mut full_result
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+        );
+
         let mut exhausted = test_core();
         begin(&mut exhausted);
         exhausted
@@ -3130,6 +3179,172 @@ mod tests {
             .next_event_sequence = u64::MAX;
         assert_eq!(
             submit_events(&mut exhausted, &event, 1, stride, &mut fresh_result),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)
+        );
+    }
+
+    #[test]
+    fn begin_phase_v1_v2_cover_preflight_domain_busy_and_sequence_contract() {
+        use crate::{
+            object_authority::{ObjectId, RuntimeState, SourceObject},
+            world::{Bounds, Sprite},
+        };
+
+        fn test_core() -> RuntimeCore {
+            let sources = [SourceObject {
+                object_id: ObjectId::parse(b"player").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                sprite: Sprite {
+                    position: [0.0, 0.0],
+                    size: [2.0, 2.0],
+                    color: [1.0; 4],
+                    texture_id: 1,
+                    move_speed: 0.0,
+                },
+            }];
+            let live = RuntimeState::initial(
+                1,
+                1,
+                Bounds::new([0.0, 0.0], [100.0, 100.0]).unwrap(),
+                &sources,
+                &[1],
+            );
+            RuntimeCore {
+                owner_thread: std::thread::current().id(),
+                in_call: false,
+                live: Some(live),
+                candidate: None,
+                candidate_next_entity_value: None,
+                candidate_mode: None,
+                next_entity_value: 2,
+                phase: PhaseState::new_boxed().unwrap(),
+                gameplay: None,
+                gameplay_candidate: None,
+                #[cfg(feature = "contract-test-hooks")]
+                next_fault: None,
+            }
+        }
+
+        fn desc(domain: u32, sequence: u64) -> abi::kadath_runtime_phase_begin_desc_v1_t {
+            abi::kadath_runtime_phase_begin_desc_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_desc_v1_t>() as u32,
+                domain,
+                phase_sequence: sequence,
+                reserved0: 0,
+                reserved1: 0,
+                reserved: [0; 4],
+            }
+        }
+
+        fn result() -> abi::kadath_runtime_phase_begin_result_v1_t {
+            abi::kadath_runtime_phase_begin_result_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32,
+                ..unsafe { mem::zeroed() }
+            }
+        }
+
+        let mut core = test_core();
+        let valid_v2 = desc(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 0);
+        let mut output = result();
+        begin_phase_v2(&mut core, &valid_v2, &mut output).unwrap();
+        assert_eq!(output.phase_sequence, 1);
+        end_phase(
+            &mut core,
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            output.phase_sequence,
+        )
+        .unwrap();
+
+        let valid_v1 = desc(abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME, 41);
+        output = result();
+        begin_phase_v1(&mut core, &valid_v1, &mut output).unwrap();
+        assert_eq!(output.phase_sequence, 41);
+        end_phase(
+            &mut core,
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME,
+            output.phase_sequence,
+        )
+        .unwrap();
+
+        // desc/out 的空指针、短结构体与 alias 都必须在任何解引用前失败。
+        assert_eq!(
+            begin_phase_v2(&mut core, std::ptr::null(), &mut output),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            begin_phase_v2(&mut core, &valid_v2, std::ptr::null_mut()),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut short_desc = valid_v2;
+        short_desc.struct_size = 0;
+        assert_eq!(
+            begin_phase_v2(&mut core, &short_desc, &mut output),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut short_output = result();
+        short_output.struct_size = 0;
+        assert_eq!(
+            begin_phase_v2(&mut core, &valid_v2, &mut short_output),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let alias_output = (&valid_v2 as *const abi::kadath_runtime_phase_begin_desc_v1_t)
+            .cast_mut()
+            .cast::<abi::kadath_runtime_phase_begin_result_v1_t>();
+        assert_eq!(
+            begin_phase_v2(&mut core, &valid_v2, alias_output),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+
+        let mut invalid = valid_v2;
+        invalid.domain = 99;
+        assert_eq!(
+            begin_phase_v2(&mut core, &invalid, &mut output),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_DOMAIN)
+        );
+        invalid = valid_v2;
+        invalid.phase_sequence = 7;
+        assert_eq!(
+            begin_phase_v2(&mut core, &invalid, &mut output),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut invalid_v1 = valid_v1;
+        invalid_v1.phase_sequence = 0;
+        assert_eq!(
+            begin_phase_v1(&mut core, &invalid_v1, &mut output),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        for mutate in [
+            |value: &mut abi::kadath_runtime_phase_begin_desc_v1_t| value.reserved0 = 1,
+            |value: &mut abi::kadath_runtime_phase_begin_desc_v1_t| value.reserved1 = 1,
+            |value: &mut abi::kadath_runtime_phase_begin_desc_v1_t| value.reserved[0] = 1,
+        ] {
+            let mut invalid = valid_v2;
+            mutate(&mut invalid);
+            assert_eq!(
+                begin_phase_v2(&mut core, &invalid, &mut output),
+                Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+            );
+        }
+
+        let mut no_live = test_core();
+        no_live.live = None;
+        assert_eq!(
+            begin_phase_v2(&mut no_live, &valid_v2, &mut output),
+            Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE)
+        );
+
+        let mut busy = test_core();
+        let mut busy_output = result();
+        begin_phase_v2(&mut busy, &valid_v2, &mut busy_output).unwrap();
+        assert_eq!(
+            begin_phase_v2(&mut busy, &valid_v2, &mut output),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY)
+        );
+
+        let mut exhausted = test_core();
+        exhausted.phase.next_phase_sequence = u64::MAX;
+        assert_eq!(
+            begin_phase_v2(&mut exhausted, &valid_v2, &mut output),
             Err(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)
         );
     }
