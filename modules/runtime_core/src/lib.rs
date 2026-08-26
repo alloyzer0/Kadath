@@ -2516,4 +2516,22 @@ mod tests {
             Err(abi::KADATH_ERR_INVALID_ARGUMENT)
         ));
     }
+
+    #[test]
+    fn gameplay_output_preflight_rejects_null_misaligned_and_short_structs() {
+        let mut value = abi::kadath_runtime_gameplay_step_result_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_step_result_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        assert!(valid_output(&mut value).is_ok());
+        assert!(matches!(
+            valid_output::<abi::kadath_runtime_gameplay_step_result_v1_t>(std::ptr::null_mut()),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        value.struct_size = 0;
+        assert!(matches!(
+            valid_output(&mut value),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+    }
 }
