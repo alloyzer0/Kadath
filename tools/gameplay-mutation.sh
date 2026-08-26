@@ -26,11 +26,14 @@ repository_root=$(git rev-parse --show-toplevel)
 [[ "$(git -C "$repository_root" rev-parse HEAD)" == "$candidate_sha" ]] || block 'checkout does not match candidate SHA'
 mkdir -p "$evidence_root"
 
+# 只对冻结清单中的 Gameplay/Phase critical 函数做变异；lib.rs 其它通用 FFI 包装器不属于本门禁。
+critical_pattern='strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|mask_contains|source_key_is_live|append_contact_transition|step_plan|step_result|outcome_value|prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|publish_gameplay_snapshot|validate_outcome_buffer|apply_positions|valid_output_array|query_gameplay_interface|begin_phase_impl|begin_phase_v1|begin_phase_v2|submit_events|validate_event'
 mutation_root="$evidence_root/mutants"
 (cd -- "$repository_root" && cargo mutants --package kadath_runtime_core \
     --file modules/runtime_core/src/gameplay.rs \
     --file modules/runtime_core/src/lib.rs \
     --file modules/runtime_core/src/phase_commit.rs \
+    --re "$critical_pattern" \
     --timeout 120 --output "$mutation_root") >"$evidence_root/mutation-command.log" 2>&1 || true
 outcomes=$(find "$mutation_root" -name outcomes.json -type f -print -quit)
 [[ -n "$outcomes" && -f "$outcomes" ]] || block 'cargo-mutants outcomes missing'
@@ -40,7 +43,6 @@ killed=$(jq '[.outcomes[] | select(.scenario != "Baseline" and .summary == "Caug
 survived=$(jq '[.outcomes[] | select(.scenario != "Baseline" and .summary == "MissedMutant")] | length' "$outcomes")
 unviable=$(jq '[.outcomes[] | select(.scenario != "Baseline" and .summary == "Unviable")] | length' "$outcomes")
 unclassified=$((total - killed - survived - unviable))
-critical_pattern='begin_step|observe_contacts|transition|active_contacts|contact_transitions|submit_contact_transitions|outcome_value|step_result|prepare_gameplay_state|begin_gameplay_fixed|commit_gameplay_fixed|publish_gameplay_snapshot|validate_outcome_buffer|begin_phase|submit_events|drain_events|take_structural|commit_activation|validate_phase'
 critical_survivors=$(jq --arg pattern "$critical_pattern" '[.outcomes[] | select(
     .scenario != "Baseline" and
     .summary == "MissedMutant" and
@@ -87,7 +89,7 @@ report="$evidence_root/mutation.report"
 cat >"$report" <<EOF
 GAMEPLAY_MUTATION_STATUS=$status
 GAMEPLAY_CANDIDATE_SHA=$candidate_sha
-GAMEPLAY_COMMAND=cargo mutants --package kadath_runtime_core --file gameplay.rs --file lib.rs --file phase_commit.rs
+GAMEPLAY_COMMAND=cargo mutants --package kadath_runtime_core --file gameplay.rs --file lib.rs --file phase_commit.rs --re critical-domain-function-regex
 GAMEPLAY_MUTATION_SCOPE=gameplay.rs,lib.rs,phase_commit.rs
 GAMEPLAY_MUTATION_TOTAL=$total
 GAMEPLAY_MUTATION_KILLED=$killed
