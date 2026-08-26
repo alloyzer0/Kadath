@@ -103,11 +103,22 @@ static kadath_runtime_object_authority_interface_t query_interface(void) {
     return interface_value;
 }
 
-static kadath_runtime_phase_interface_v1_t query_phase_interface(void) {
+static kadath_runtime_phase_interface_v1_t query_phase_interface_v1(void) {
     kadath_runtime_phase_interface_v1_t interface_value;
     memset(&interface_value, 0, sizeof(interface_value));
     interface_value.struct_size = (uint32_t)sizeof(interface_value);
     interface_value.interface_version = KADATH_RUNTIME_PHASE_INTERFACE_V1;
+    if (kadath_runtime_core_query_phase_interface(&interface_value) != KADATH_OK) {
+        memset(&interface_value, 0, sizeof(interface_value));
+    }
+    return interface_value;
+}
+
+static kadath_runtime_phase_interface_v1_t query_phase_interface_v2(void) {
+    kadath_runtime_phase_interface_v1_t interface_value;
+    memset(&interface_value, 0, sizeof(interface_value));
+    interface_value.struct_size = (uint32_t)sizeof(interface_value);
+    interface_value.interface_version = KADATH_RUNTIME_PHASE_INTERFACE_V2;
     if (kadath_runtime_core_query_phase_interface(&interface_value) != KADATH_OK) {
         memset(&interface_value, 0, sizeof(interface_value));
     }
@@ -427,7 +438,7 @@ static int prepare_gameplay_candidate(
 }
 
 static int prepare_empty_phase_candidate(kadath_runtime_core_t* core) {
-    kadath_runtime_phase_interface_v1_t phase_interface = query_phase_interface();
+    kadath_runtime_phase_interface_v1_t phase_interface = query_phase_interface_v2();
     kadath_runtime_phase_state_prepare_desc_v1_t desc;
     kadath_runtime_phase_state_candidate_info_v1_t info;
     memset(&desc, 0, sizeof(desc));
@@ -1325,14 +1336,27 @@ static int phase_commit_path(
         return 252;
     }
     begin.phase_sequence = 1U;
-    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_ERR_INVALID_ARGUMENT ||
-        begin_result.phase_sequence != 0U) {
+    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
+        begin_result.phase_sequence != 1U) {
         return 253;
     }
+    if (phase_interface->end_phase(core, KADATH_RUNTIME_PHASE_DOMAIN_FIXED, 1U) != KADATH_OK) {
+        return 254;
+    }
+
+    kadath_runtime_phase_interface_v1_t phase_interface_v2 = query_phase_interface_v2();
+    if (phase_interface_v2.interface_version != KADATH_RUNTIME_PHASE_INTERFACE_V2 ||
+        phase_interface_v2.begin_phase == NULL) {
+        return 255;
+    }
     begin.phase_sequence = 0U;
-    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_OK ||
+    if (phase_interface->begin_phase(core, &begin, &begin_result) != KADATH_ERR_INVALID_ARGUMENT ||
+        begin_result.phase_sequence != 0U) {
+        return 256;
+    }
+    if (phase_interface_v2.begin_phase(core, &begin, &begin_result) != KADATH_OK ||
         begin_result.phase_sequence == 0U) {
-        return 151;
+        return 257;
     }
     const uint64_t phase_sequence = begin_result.phase_sequence;
 
@@ -2139,7 +2163,8 @@ int main(void) {
         interface_value.mutate == NULL) {
         return 1;
     }
-    kadath_runtime_phase_interface_v1_t phase_interface = query_phase_interface();
+    kadath_runtime_phase_interface_v1_t phase_interface = query_phase_interface_v2();
+    kadath_runtime_phase_interface_v1_t phase_interface_v1 = query_phase_interface_v1();
     if (phase_interface.prepare_phase_state == NULL || phase_interface.begin_phase == NULL ||
         phase_interface.submit_events == NULL || phase_interface.submit_structural == NULL ||
         phase_interface.begin_activation == NULL || phase_interface.end_phase == NULL) {
@@ -2178,7 +2203,7 @@ int main(void) {
     int gameplay_result = gameplay_contract_path(&interface_value, &phase_interface, &gameplay_interface);
     if (gameplay_result != 0) return gameplay_result;
     puts("PHASE3_PUBLIC_GAMEPLAY_PATH=PASS");
-    int phase_result = phase_commit_path(&interface_value, &phase_interface);
+    int phase_result = phase_commit_path(&interface_value, &phase_interface_v1);
     if (phase_result != 0) return phase_result;
     puts("PHASE3_PUBLIC_PHASE_COMMIT_PATH=PASS");
     int paired_abort_result = aborted_scene_discards_paired_phase_candidate(

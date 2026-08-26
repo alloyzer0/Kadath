@@ -139,7 +139,8 @@ pub const RuntimeCore = struct {
         try check(c.kadath_runtime_core_query_object_authority_interface(&interface));
         var phase_interface = std.mem.zeroes(c.kadath_runtime_phase_interface_v1_t);
         phase_interface.struct_size = @sizeOf(c.kadath_runtime_phase_interface_v1_t);
-        phase_interface.interface_version = c.KADATH_RUNTIME_PHASE_INTERFACE_V1;
+        // Gameplay Host 使用 V2：输入 phase sequence 必须为零，由 Rust Core 生成。
+        phase_interface.interface_version = c.KADATH_RUNTIME_PHASE_INTERFACE_V2;
         try check(c.kadath_runtime_core_query_phase_interface(&phase_interface));
         var gameplay_interface = std.mem.zeroes(c.kadath_runtime_gameplay_interface_v1_t);
         gameplay_interface.struct_size = @sizeOf(c.kadath_runtime_gameplay_interface_v1_t);

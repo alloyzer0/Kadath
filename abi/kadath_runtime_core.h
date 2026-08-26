@@ -54,6 +54,7 @@ extern "C" {
 #define KADATH_RUNTIME_MUTATION_FINALIZE_TRANSIENT_DESTROY 8U
 
 #define KADATH_RUNTIME_PHASE_INTERFACE_V1 1U
+#define KADATH_RUNTIME_PHASE_INTERFACE_V2 2U
 #define KADATH_RUNTIME_PHASE_DOMAIN_FIXED 1U
 #define KADATH_RUNTIME_PHASE_DOMAIN_FRAME 2U
 #define KADATH_RUNTIME_PHASE_MAX_GENERATION 8U
@@ -383,7 +384,7 @@ int32_t kadath_runtime_core_query_object_authority_interface(
 typedef struct kadath_runtime_phase_begin_desc_v1_t {
     uint32_t struct_size;
     uint32_t domain;
-    /* 输入保留字段，调用方必须置零；唯一 sequence 由 Rust Core 生成并写入 result。 */
+    /* V1由Host提供非零sequence；V2调用方必须置零，由Rust Core生成并写入result。 */
     uint64_t phase_sequence;
     uint32_t reserved0;
     uint32_t reserved1;

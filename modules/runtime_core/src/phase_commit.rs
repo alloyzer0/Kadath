@@ -919,10 +919,11 @@ pub(crate) fn abort_phase_state(core: &mut RuntimeCore) -> Result<(), u32> {
     Ok(())
 }
 
-pub(crate) fn begin_phase(
+fn begin_phase_impl(
     core: &mut RuntimeCore,
     desc_ptr: *const abi::kadath_runtime_phase_begin_desc_v1_t,
     out_ptr: *mut abi::kadath_runtime_phase_begin_result_v1_t,
+    core_generates_sequence: bool,
 ) -> Result<(), u32> {
     if desc_ptr.is_null() || out_ptr.is_null() {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
@@ -958,7 +959,8 @@ pub(crate) fn begin_phase(
     ) {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_DOMAIN);
     }
-    if desc.phase_sequence != 0
+    if (core_generates_sequence && desc.phase_sequence != 0)
+        || (!core_generates_sequence && desc.phase_sequence == 0)
         || desc.reserved0 != 0
         || desc.reserved1 != 0
         || !reserved_is_zero(&desc.reserved)
@@ -976,8 +978,12 @@ pub(crate) fn begin_phase(
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
     }
-    // phase sequence 始终由 Rust 生成；ABI 输入字段只保留布局且必须为零。
-    let phase_sequence = PhaseState::next_sequence(&mut core.phase.next_phase_sequence)?;
+    // V1保留Host提供的兼容身份；V2才由Rust Core生成唯一sequence。
+    let phase_sequence = if core_generates_sequence {
+        PhaseState::next_sequence(&mut core.phase.next_phase_sequence)?
+    } else {
+        desc.phase_sequence
+    };
     let domain = core.phase.domain_mut(desc.domain)?;
     domain.phase_sequence = Some(phase_sequence);
     domain.event_queue.clear();
@@ -994,6 +1000,22 @@ pub(crate) fn begin_phase(
     };
     unsafe { ptr::write(out_ptr, result) };
     Ok(())
+}
+
+pub(crate) fn begin_phase_v1(
+    core: &mut RuntimeCore,
+    desc_ptr: *const abi::kadath_runtime_phase_begin_desc_v1_t,
+    out_ptr: *mut abi::kadath_runtime_phase_begin_result_v1_t,
+) -> Result<(), u32> {
+    begin_phase_impl(core, desc_ptr, out_ptr, false)
+}
+
+pub(crate) fn begin_phase_v2(
+    core: &mut RuntimeCore,
+    desc_ptr: *const abi::kadath_runtime_phase_begin_desc_v1_t,
+    out_ptr: *mut abi::kadath_runtime_phase_begin_result_v1_t,
+) -> Result<(), u32> {
+    begin_phase_impl(core, desc_ptr, out_ptr, true)
 }
 
 pub(crate) fn submit_events(
@@ -2427,7 +2449,8 @@ macro_rules! phase_entry {
 phase_entry!(prepare_entry, prepare_phase_state, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_state_prepare_desc_v1_t, out: *mut abi::kadath_runtime_phase_state_candidate_info_v1_t));
 phase_entry!(commit_state_entry, commit_phase_state, (core: *mut abi::kadath_runtime_core_t));
 phase_entry!(abort_state_entry, abort_phase_state, (core: *mut abi::kadath_runtime_core_t));
-phase_entry!(begin_phase_entry, begin_phase, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_begin_desc_v1_t, out: *mut abi::kadath_runtime_phase_begin_result_v1_t));
+phase_entry!(begin_phase_v1_entry, begin_phase_v1, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_begin_desc_v1_t, out: *mut abi::kadath_runtime_phase_begin_result_v1_t));
+phase_entry!(begin_phase_v2_entry, begin_phase_v2, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_begin_desc_v1_t, out: *mut abi::kadath_runtime_phase_begin_result_v1_t));
 phase_entry!(submit_events_entry, submit_events, (core: *mut abi::kadath_runtime_core_t, events: *const abi::kadath_runtime_phase_event_v1_t, count: usize, stride: usize, out: *mut abi::kadath_runtime_phase_batch_result_v1_t));
 phase_entry!(drain_events_entry, drain_events, (core: *mut abi::kadath_runtime_core_t, domain: u32, sequence: u64, output: *mut abi::kadath_runtime_phase_event_v1_t, capacity: usize, count: *mut usize));
 phase_entry!(submit_structural_entry, submit_structural, (core: *mut abi::kadath_runtime_core_t, items: *const abi::kadath_runtime_phase_structural_v1_t, count: usize, stride: usize, results: *mut abi::kadath_runtime_phase_request_completion_v1_t, capacity: usize, out: *mut abi::kadath_runtime_phase_batch_result_v1_t));
@@ -2453,19 +2476,32 @@ pub(crate) fn query_interface(
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     let requested = unsafe { ptr::read(in_out) };
-    if requested.interface_version != abi::KADATH_RUNTIME_PHASE_INTERFACE_V1 {
+    if requested.interface_version != abi::KADATH_RUNTIME_PHASE_INTERFACE_V1
+        && requested.interface_version != abi::KADATH_RUNTIME_PHASE_INTERFACE_V2
+    {
         return Err(abi::KADATH_ERR_NOT_SUPPORTED);
     }
     if !reserved_is_zero(&requested.reserved) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
+    let begin_phase: Option<
+        unsafe extern "C" fn(
+            *mut abi::kadath_runtime_core_t,
+            *const abi::kadath_runtime_phase_begin_desc_v1_t,
+            *mut abi::kadath_runtime_phase_begin_result_v1_t,
+        ) -> i32,
+    > = if requested.interface_version == abi::KADATH_RUNTIME_PHASE_INTERFACE_V2 {
+        Some(begin_phase_v2_entry)
+    } else {
+        Some(begin_phase_v1_entry)
+    };
     let value = abi::kadath_runtime_phase_interface_v1_t {
         struct_size: mem::size_of::<abi::kadath_runtime_phase_interface_v1_t>() as u32,
-        interface_version: abi::KADATH_RUNTIME_PHASE_INTERFACE_V1,
+        interface_version: requested.interface_version,
         prepare_phase_state: Some(prepare_entry),
         commit_phase_state: Some(commit_state_entry),
         abort_phase_state: Some(abort_state_entry),
-        begin_phase: Some(begin_phase_entry),
+        begin_phase,
         submit_events: Some(submit_events_entry),
         drain_events: Some(drain_events_entry),
         submit_structural: Some(submit_structural_entry),
