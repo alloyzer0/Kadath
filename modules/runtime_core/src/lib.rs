@@ -1648,28 +1648,42 @@ fn prepare_gameplay_state(
     desc_pointer: *const abi::kadath_runtime_gameplay_desc_v1_t,
     out_pointer: *mut abi::kadath_runtime_gameplay_candidate_info_v1_t,
 ) -> Result<(), u32> {
-    if desc_pointer.is_null()
-        || (desc_pointer as usize) % mem::align_of::<abi::kadath_runtime_gameplay_desc_v1_t>() != 0
-    {
+    // 外部 descriptor 的空指针与对齐分支分开，避免错误指针进入后续解引用。
+    if desc_pointer.is_null() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if (desc_pointer as usize) % mem::align_of::<abi::kadath_runtime_gameplay_desc_v1_t>() != 0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     valid_output(out_pointer)?;
     let (core, _guard) = unsafe { enter_core(core_pointer) }?;
     let desc = unsafe { &*desc_pointer };
-    if desc.struct_size < mem::size_of::<abi::kadath_runtime_gameplay_desc_v1_t>() as u32
-        || desc.reserved0 != 0
-        || !reserved_is_zero(&desc.reserved)
-        || !desc.time_limit_seconds.is_finite()
-        || desc.time_limit_seconds <= 0.0
-        || desc.hazard_count == 0
-        || desc.hazard_count as usize > gameplay::MAX_CONTACTS - 1
-        || desc.hazards.is_null()
-        || desc.hazard_stride < mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
-        || desc.hazard_stride % mem::align_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
-            != 0
-        || (desc.hazards as usize)
-            % mem::align_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
-            != 0
+    if desc.struct_size < mem::size_of::<abi::kadath_runtime_gameplay_desc_v1_t>() as u32 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.reserved0 != 0 || !reserved_is_zero(&desc.reserved) {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if !desc.time_limit_seconds.is_finite() || desc.time_limit_seconds <= 0.0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.hazard_count == 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.hazard_count as usize > gameplay::MAX_CONTACTS - 1 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.hazards.is_null() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.hazard_stride < mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.hazard_stride % mem::align_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>() != 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if (desc.hazards as usize) % mem::align_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
+        != 0
     {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
@@ -1827,10 +1841,13 @@ fn begin_gameplay_fixed(
     buffer_pointer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
     out_pointer: *mut abi::kadath_runtime_gameplay_step_result_v1_t,
 ) -> Result<(), u32> {
-    if desc_pointer.is_null()
-        || (desc_pointer as usize)
-            % mem::align_of::<abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t>()
-            != 0
+    // descriptor 指针先做空值检查，再做对齐检查，避免依赖短路副作用。
+    if desc_pointer.is_null() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if (desc_pointer as usize)
+        % mem::align_of::<abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t>()
+        != 0
     {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
@@ -1839,12 +1856,22 @@ fn begin_gameplay_fixed(
     let desc = unsafe { &*desc_pointer };
     if desc.struct_size
         < mem::size_of::<abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t>() as u32
-        || desc.reserved0 != 0
-        || desc.reserved1 != 0
-        || !reserved_is_zero(&desc.reserved)
-        || !desc.dt_seconds.is_finite()
-        || desc.dt_seconds < 0.0
     {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.reserved0 != 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.reserved1 != 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if !reserved_is_zero(&desc.reserved) {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if !desc.dt_seconds.is_finite() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if desc.dt_seconds < 0.0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     let desc_range = strided_range(
@@ -1989,10 +2016,13 @@ fn commit_gameplay_fixed(
     buffer_pointer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
     out_pointer: *mut abi::kadath_runtime_gameplay_step_result_v1_t,
 ) -> Result<(), u32> {
-    if desc_pointer.is_null()
-        || (desc_pointer as usize)
-            % mem::align_of::<abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t>()
-            != 0
+    // commit descriptor 同样显式区分空指针与对齐错误，保证 ABI guard 可独立审计。
+    if desc_pointer.is_null() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if (desc_pointer as usize)
+        % mem::align_of::<abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t>()
+        != 0
     {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
@@ -2150,15 +2180,29 @@ fn publish_gameplay_snapshot(
     valid_output(out_pointer)?;
     // 完整建立alias/range契约前，只把descriptor视为本次调用复制的字节。
     let buffer = unsafe { ptr::read(buffer_pointer) };
-    if buffer.reserved0 != 0
-        || !reserved_is_zero(&buffer.reserved)
-        || buffer.items.is_null()
-        || buffer.item_capacity == 0
-        || buffer.item_capacity > MAX_OBJECTS
-        || buffer.item_stride < mem::size_of::<abi::kadath_runtime_render_item_v1_t>()
-        || buffer.item_stride % mem::align_of::<abi::kadath_runtime_render_item_v1_t>() != 0
-        || (buffer.items as usize) % mem::align_of::<abi::kadath_runtime_render_item_v1_t>() != 0
-    {
+    // render buffer 的每个 ABI 约束独立拒绝，避免 OR 变异或短路掩盖具体边界。
+    if buffer.reserved0 != 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if !reserved_is_zero(&buffer.reserved) {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if buffer.items.is_null() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if buffer.item_capacity == 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if buffer.item_capacity > MAX_OBJECTS {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if buffer.item_stride < mem::size_of::<abi::kadath_runtime_render_item_v1_t>() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if buffer.item_stride % mem::align_of::<abi::kadath_runtime_render_item_v1_t>() != 0 {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if (buffer.items as usize) % mem::align_of::<abi::kadath_runtime_render_item_v1_t>() != 0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     let buffer_range = strided_range(
