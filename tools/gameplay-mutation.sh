@@ -58,7 +58,7 @@ awk -v score="$score" 'BEGIN { exit !(score+0 >= 80) }' || { status=FAIL; blocke
 [[ "$critical_survivors" -eq 0 ]] || { status=FAIL; blockers+=("critical invariant mutants survived"); }
 
 manifest="$evidence_root/mutation-manifest.tsv"
-printf '%s\n' 'domain\tfile\tfunction\tstatus\tmutant\tlog' >"$manifest"
+printf 'domain\tfile\tfunction\tstatus\tmutant\tlog\n' >"$manifest"
 jq -r '.outcomes[] | select(.scenario != "Baseline") |
     (.scenario.Mutant // {}) as $m |
     ($m.function.function_name // "unknown") as $fn |
