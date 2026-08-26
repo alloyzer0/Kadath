@@ -47,12 +47,15 @@ critical_survivors=$(jq --arg pattern "$critical_pattern" '[.outcomes[] | select
     ((.scenario.Mutant.function.function_name // "") | test($pattern))
 )] | length' "$outcomes")
 [[ "$total" -gt 0 ]] || block 'no mutants generated'
-[[ "$unviable" -eq 0 ]] || block 'unviable mutants require audit'
-[[ "$unclassified" -eq 0 ]] || block 'timeout or unclassified mutants require audit'
 score=$(awk -v killed="$killed" -v total="$total" 'BEGIN { printf "%.2f", killed * 100 / total }')
-awk -v score="$score" 'BEGIN { exit !(score+0 >= 80) }' || block 'mutation score below 80%'
-[[ "$survived" -eq 0 ]] || block 'surviving Gameplay mutants present'
-[[ "$critical_survivors" -eq 0 ]] || block 'critical invariant mutants survived'
+
+status=PASS
+blockers=()
+[[ "$unviable" -eq 0 ]] || { status=FAIL; blockers+=("unviable mutants require audit"); }
+[[ "$unclassified" -eq 0 ]] || { status=FAIL; blockers+=("timeout or unclassified mutants require audit"); }
+awk -v score="$score" 'BEGIN { exit !(score+0 >= 80) }' || { status=FAIL; blockers+=("mutation score below 80%"); }
+[[ "$survived" -eq 0 ]] || { status=FAIL; blockers+=("surviving Gameplay mutants present"); }
+[[ "$critical_survivors" -eq 0 ]] || { status=FAIL; blockers+=("critical invariant mutants survived"); }
 
 manifest="$evidence_root/mutation-manifest.tsv"
 jq -r '.outcomes[] | select(.scenario != "Baseline") |
@@ -60,7 +63,7 @@ jq -r '.outcomes[] | select(.scenario != "Baseline") |
     "$outcomes" >"$manifest"
 report="$evidence_root/mutation.report"
 cat >"$report" <<EOF
-GAMEPLAY_MUTATION_STATUS=PASS
+GAMEPLAY_MUTATION_STATUS=$status
 GAMEPLAY_CANDIDATE_SHA=$candidate_sha
 GAMEPLAY_COMMAND=cargo mutants --package kadath_runtime_core --file gameplay.rs --file lib.rs --file phase_commit.rs
 GAMEPLAY_MUTATION_SCOPE=gameplay.rs,lib.rs,phase_commit.rs
@@ -74,5 +77,6 @@ GAMEPLAY_CRITICAL_SURVIVORS=$critical_survivors
 GAMEPLAY_MUTATION_CRITICAL_DOMAINS=timer_priority,contact_differencing,epoch_stale,capacity,snapshot_publication,outcome_sequence,abi_preflight
 GAMEPLAY_MUTATION_MANIFEST=$manifest
 GAMEPLAY_MUTATION_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')
+GAMEPLAY_MUTATION_BLOCKER=$(IFS=';'; printf '%s' "${blockers[*]-}")
 EOF
 cat "$report"
