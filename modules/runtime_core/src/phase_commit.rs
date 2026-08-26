@@ -2110,7 +2110,12 @@ pub(crate) fn commit_activation(
         core.phase.flush[domain_index] = if entries.iter().all(|entry| entry.completed) {
             None
         } else {
-            Some(Flush { entries, ..flush })
+            Some(Flush {
+                token: flush.token,
+                domain: flush.domain,
+                phase_sequence: flush.phase_sequence,
+                entries,
+            })
         };
         core.phase.activation = None;
         let result = abi::kadath_runtime_phase_activation_result_v1_t {
@@ -2162,7 +2167,12 @@ pub(crate) fn commit_activation(
     let flush = if entries.iter().all(|entry| entry.completed) {
         None
     } else {
-        Some(Flush { entries, ..flush })
+        Some(Flush {
+            token: flush.token,
+            domain: flush.domain,
+            phase_sequence: flush.phase_sequence,
+            entries,
+        })
     };
     core.live = Some(state);
     core.phase.active_bindings = bindings;
@@ -2227,7 +2237,12 @@ pub(crate) fn abort_activation(core: &mut RuntimeCore, transaction_id: u64) -> R
     core.phase.flush[domain_index] = if entries.iter().all(|entry| entry.completed) {
         None
     } else {
-        Some(Flush { entries, ..flush })
+        Some(Flush {
+            token: flush.token,
+            domain: flush.domain,
+            phase_sequence: flush.phase_sequence,
+            entries,
+        })
     };
     core.phase.activation = None;
     Ok(())
@@ -2353,7 +2368,12 @@ pub(crate) fn complete_structural(
     core.phase.flush[flush_index] = if entries.iter().all(|entry| entry.completed) {
         None
     } else {
-        Some(Flush { entries, ..flush })
+        Some(Flush {
+            token: flush.token,
+            domain: flush.domain,
+            phase_sequence: flush.phase_sequence,
+            entries,
+        })
     };
     Ok(())
 }

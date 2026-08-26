@@ -2023,10 +2023,9 @@ fn plan_gameplay_positions(
         // 先计算无符号位移，再按内部不变量 ±1 的方向应用符号，
         // 让速度与 dt 的乘法成为可独立验证的核心算术。
         let displacement = f64::from(hazard.patrol_speed) * f64::from(dt_seconds);
-        let signed_displacement = if hazard.patrol_direction < 0.0 {
-            -displacement
-        } else {
-            displacement
+        let signed_displacement = match hazard.patrol_direction {
+            -1.0 => -displacement,
+            _ => displacement,
         };
         let phase = (f64::from(record.sprite.position[1] - hazard.patrol_min_y)
             + signed_displacement)
@@ -2990,6 +2989,17 @@ mod tests {
             + mem::align_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>();
         let (status, _, _) = run_gameplay_prepare(padded_desc, &mut hazards);
         assert_eq!(status, abi::KADATH_OK as i32);
+
+        // Legacy patrol 允许速度恰为零；该合法边界可区分 <→<= 变异。
+        let mut legacy_zero = gameplay_test_hazard();
+        legacy_zero.movement_mode = abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
+        legacy_zero.patrol_min_y = 0.0;
+        legacy_zero.patrol_max_y = 2.0;
+        legacy_zero.patrol_speed = 0.0;
+        hazards[0] = legacy_zero;
+        let (status, _, _) = run_gameplay_prepare(valid, &mut hazards);
+        assert_eq!(status, abi::KADATH_OK as i32);
+        hazards[0] = gameplay_test_hazard();
 
         // 在容量上界处放入第二项 stale hazard：原始 > guard 必须先返回
         // INVALID_ARGUMENT，而 >→== 或减法变异会继续读取并返回 STALE_OBJECT。
