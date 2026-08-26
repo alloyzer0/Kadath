@@ -2631,4 +2631,506 @@ mod tests {
         assert!(!union_tail_zero(&bytes, 4));
         assert!(!union_tail_zero(&bytes, bytes.len() + 1));
     }
+
+    #[test]
+    fn validate_event_covers_header_object_liveness_and_generation_contract() {
+        use crate::{
+            object_authority::{ObjectId, RuntimeState, SourceObject},
+            world::Bounds,
+        };
+
+        fn object_ref(id: &[u8], kind: u32) -> abi::kadath_runtime_object_ref_v1_t {
+            let object_id = ObjectId::parse(id).unwrap();
+            abi::kadath_runtime_object_ref_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_object_ref_v1_t>() as u32,
+                kind,
+                world_epoch: 1,
+                logical_generation: 1,
+                object_id_length: object_id.len(),
+                reserved0: 0,
+                object_id: object_id.storage(),
+                reserved: [0; 4],
+            }
+        }
+
+        let sources = [
+            SourceObject {
+                object_id: ObjectId::parse(b"player").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                sprite: Sprite {
+                    position: [0.0, 0.0],
+                    size: [2.0, 2.0],
+                    color: [1.0; 4],
+                    texture_id: 1,
+                    move_speed: 0.0,
+                },
+            },
+            SourceObject {
+                object_id: ObjectId::parse(b"goal").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_GOAL,
+                sprite: Sprite {
+                    position: [10.0, 0.0],
+                    size: [2.0, 2.0],
+                    color: [1.0; 4],
+                    texture_id: 1,
+                    move_speed: 0.0,
+                },
+            },
+        ];
+        let state = RuntimeState::initial(
+            1,
+            1,
+            Bounds::new([0.0, 0.0], [100.0, 100.0]).unwrap(),
+            &sources,
+            &[1, 2],
+        );
+        let mut event: abi::kadath_runtime_phase_event_v1_t = unsafe { mem::zeroed() };
+        event.struct_size = mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
+        event.domain = abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+        event.target = object_ref(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER);
+
+        assert_eq!(
+            validate_event(
+                &event,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Ok(0)
+        );
+
+        // header 条件必须逐一拒绝，避免把多个 guard 合并后让 OR→AND 变异逃逸。
+        for mutate in [
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| value.struct_size = 0,
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| value.sequence = 1,
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| {
+                value.domain = abi::KADATH_RUNTIME_PHASE_DOMAIN_FRAME
+            },
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| {
+                value.generation = MAX_GENERATION + 1
+            },
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| {
+                value.field_count = abi::KADATH_RUNTIME_PHASE_MAX_EVENT_FIELDS + 1
+            },
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| value.has_sender = 2,
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| value.has_other = 2,
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| {
+                value.name_length = abi::KADATH_RUNTIME_PHASE_MAX_EVENT_NAME_BYTES + 1
+            },
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| value.name[0] = 1,
+            |value: &mut abi::kadath_runtime_phase_event_v1_t| value.reserved[0] = 1,
+        ] {
+            let mut invalid = event;
+            mutate(&mut invalid);
+            assert_eq!(
+                validate_event(
+                    &invalid,
+                    &state,
+                    abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                    0,
+                    false
+                ),
+                Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+            );
+        }
+
+        // sender/other 显式存在时需要验证 active object；未声明时则必须是全零 sentinel。
+        let mut with_sender = event;
+        with_sender.has_sender = 1;
+        with_sender.sender = object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL);
+        assert_eq!(
+            validate_event(
+                &with_sender,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Ok(0)
+        );
+        let mut sender_mismatch = event;
+        sender_mismatch.sender = object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL);
+        assert_eq!(
+            validate_event(
+                &sender_mismatch,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut stale_sender = with_sender;
+        stale_sender.sender.world_epoch = 2;
+        assert_eq!(
+            validate_event(
+                &stale_sender,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)
+        );
+        let mut with_other = event;
+        with_other.has_other = 1;
+        with_other.other = object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL);
+        assert_eq!(
+            validate_event(
+                &with_other,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Ok(0)
+        );
+        let mut other_mismatch = event;
+        other_mismatch.other = object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL);
+        assert_eq!(
+            validate_event(
+                &other_mismatch,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut stale_other = with_other;
+        stale_other.other.world_epoch = 2;
+        assert_eq!(
+            validate_event(
+                &stale_other,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)
+        );
+
+        let mut stale_target = event;
+        stale_target.target.world_epoch = 2;
+        assert_eq!(
+            validate_event(
+                &stale_target,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_STALE_REQUEST)
+        );
+        let mut invalid_generation = event;
+        invalid_generation.generation = 1;
+        assert_eq!(
+            validate_event(
+                &invalid_generation,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_REQUEST)
+        );
+        invalid_generation.generation = 0;
+        assert_eq!(
+            validate_event(
+                &invalid_generation,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                4,
+                true
+            ),
+            Ok(4)
+        );
+        invalid_generation.generation = MAX_GENERATION + 1;
+        assert_eq!(
+            validate_event(
+                &invalid_generation,
+                &state,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                0,
+                false
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+    }
+
+    #[test]
+    fn submit_events_covers_pointer_queue_sequence_and_generation_contract() {
+        use crate::{
+            object_authority::{ObjectId, RuntimeState, SourceObject},
+            world::{Bounds, Sprite},
+        };
+
+        fn test_core() -> RuntimeCore {
+            let sources = [
+                SourceObject {
+                    object_id: ObjectId::parse(b"player").unwrap(),
+                    kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                    sprite: Sprite {
+                        position: [0.0, 0.0],
+                        size: [2.0, 2.0],
+                        color: [1.0; 4],
+                        texture_id: 1,
+                        move_speed: 0.0,
+                    },
+                },
+                SourceObject {
+                    object_id: ObjectId::parse(b"goal").unwrap(),
+                    kind: abi::KADATH_RUNTIME_OBJECT_KIND_GOAL,
+                    sprite: Sprite {
+                        position: [10.0, 0.0],
+                        size: [2.0, 2.0],
+                        color: [1.0; 4],
+                        texture_id: 1,
+                        move_speed: 0.0,
+                    },
+                },
+            ];
+            let live = RuntimeState::initial(
+                1,
+                1,
+                Bounds::new([0.0, 0.0], [100.0, 100.0]).unwrap(),
+                &sources,
+                &[1, 2],
+            );
+            RuntimeCore {
+                owner_thread: std::thread::current().id(),
+                in_call: false,
+                live: Some(live),
+                candidate: None,
+                candidate_next_entity_value: None,
+                candidate_mode: None,
+                next_entity_value: 3,
+                phase: PhaseState::new_boxed().unwrap(),
+                gameplay: None,
+                gameplay_candidate: None,
+                #[cfg(feature = "contract-test-hooks")]
+                next_fault: None,
+            }
+        }
+
+        fn event() -> abi::kadath_runtime_phase_event_v1_t {
+            let object_id = ObjectId::parse(b"player").unwrap();
+            abi::kadath_runtime_phase_event_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32,
+                domain: abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                target: abi::kadath_runtime_object_ref_v1_t {
+                    struct_size: mem::size_of::<abi::kadath_runtime_object_ref_v1_t>() as u32,
+                    kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                    world_epoch: 1,
+                    logical_generation: 1,
+                    object_id_length: object_id.len(),
+                    reserved0: 0,
+                    object_id: object_id.storage(),
+                    reserved: [0; 4],
+                },
+                ..unsafe { mem::zeroed() }
+            }
+        }
+
+        fn begin(core: &mut RuntimeCore) -> u64 {
+            let desc = abi::kadath_runtime_phase_begin_desc_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_desc_v1_t>() as u32,
+                domain: abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                phase_sequence: 0,
+                reserved0: 0,
+                reserved1: 0,
+                reserved: [0; 4],
+            };
+            let mut result = abi::kadath_runtime_phase_begin_result_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32,
+                ..unsafe { mem::zeroed() }
+            };
+            begin_phase_v2(core, &desc, &mut result).unwrap();
+            result.phase_sequence
+        }
+
+        fn batch_result() -> abi::kadath_runtime_phase_batch_result_v1_t {
+            abi::kadath_runtime_phase_batch_result_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_batch_result_v1_t>() as u32,
+                ..unsafe { mem::zeroed() }
+            }
+        }
+
+        let stride = mem::size_of::<abi::kadath_runtime_phase_event_v1_t>();
+        let mut core = test_core();
+        begin(&mut core);
+        let event = event();
+        let mut events = [event; 2];
+        let mut result = batch_result();
+        assert_eq!(
+            submit_events(
+                &mut core,
+                events.as_ptr(),
+                events.len(),
+                stride,
+                &mut result
+            ),
+            Ok(())
+        );
+        assert_eq!(result.accepted_count, 2);
+        assert_eq!((result.first_sequence, result.last_sequence), (1, 2));
+        let domain = core
+            .phase
+            .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+            .unwrap();
+        assert_eq!(domain.next_event_sequence, 3);
+        assert_eq!(domain.event_queue.len(), 2);
+        assert_eq!(domain.event_queue[0].item.sequence, 1);
+        assert_eq!(domain.event_queue[1].item.sequence, 2);
+
+        // 每个指针/长度/步长 guard 都单独命中，确保边界变异不会被短路条件掩盖。
+        let mut fresh = test_core();
+        let mut fresh_result = batch_result();
+        assert_eq!(
+            submit_events(&mut fresh, std::ptr::null(), 1, stride, &mut fresh_result),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            submit_events(&mut fresh, events.as_ptr(), 0, stride, &mut fresh_result),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            submit_events(
+                &mut fresh,
+                events.as_ptr(),
+                EVENT_CAPACITY + 1,
+                stride,
+                &mut fresh_result
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            submit_events(&mut fresh, events.as_ptr(), 1, stride, std::ptr::null_mut()),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut short_result = batch_result();
+        short_result.struct_size = 0;
+        assert_eq!(
+            submit_events(&mut fresh, events.as_ptr(), 1, stride, &mut short_result),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut misaligned_result_storage = [0_u8; 256];
+        let misaligned_result = unsafe {
+            misaligned_result_storage
+                .as_mut_ptr()
+                .add(1)
+                .cast::<abi::kadath_runtime_phase_batch_result_v1_t>()
+        };
+        assert_eq!(
+            submit_events(&mut fresh, events.as_ptr(), 1, stride, misaligned_result),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut misaligned_events_storage = [0_u8; 512];
+        let misaligned_events = unsafe {
+            misaligned_events_storage
+                .as_mut_ptr()
+                .add(1)
+                .cast::<abi::kadath_runtime_phase_event_v1_t>()
+        };
+        assert_eq!(
+            submit_events(&mut fresh, misaligned_events, 1, stride, &mut fresh_result),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            submit_events(
+                &mut fresh,
+                events.as_ptr(),
+                1,
+                stride - 1,
+                &mut fresh_result
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            submit_events(
+                &mut fresh,
+                events.as_ptr(),
+                1,
+                stride + 1,
+                &mut fresh_result
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let overflow_start =
+            usize::MAX - (mem::align_of::<abi::kadath_runtime_phase_event_v1_t>() - 1);
+        assert_eq!(
+            submit_events(
+                &mut fresh,
+                overflow_start as *const abi::kadath_runtime_phase_event_v1_t,
+                2,
+                stride,
+                &mut fresh_result
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let overlap_result = events
+            .as_mut_ptr()
+            .cast::<abi::kadath_runtime_phase_batch_result_v1_t>();
+        assert_eq!(
+            submit_events(&mut fresh, events.as_ptr(), 1, stride, overlap_result),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+
+        // Phase 必须先激活；合法事件随后还要经过 object/generation 校验。
+        assert_eq!(
+            submit_events(&mut fresh, events.as_ptr(), 1, stride, &mut fresh_result),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED)
+        );
+        begin(&mut fresh);
+        let mut invalid_generation = event;
+        invalid_generation.generation = 1;
+        assert_eq!(
+            submit_events(
+                &mut fresh,
+                &invalid_generation,
+                1,
+                stride,
+                &mut fresh_result
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_REQUEST)
+        );
+
+        let mut no_live = test_core();
+        begin(&mut no_live);
+        no_live.live = None;
+        assert_eq!(
+            submit_events(&mut no_live, &event, 1, stride, &mut fresh_result),
+            Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE)
+        );
+
+        let mut full = test_core();
+        begin(&mut full);
+        let full_events = [event; EVENT_CAPACITY];
+        let mut full_result = batch_result();
+        submit_events(
+            &mut full,
+            full_events.as_ptr(),
+            full_events.len(),
+            stride,
+            &mut full_result,
+        )
+        .unwrap();
+        assert_eq!(
+            submit_events(&mut full, &event, 1, stride, &mut full_result),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+        );
+
+        let mut exhausted = test_core();
+        begin(&mut exhausted);
+        exhausted
+            .phase
+            .domain_mut(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+            .unwrap()
+            .next_event_sequence = u64::MAX;
+        assert_eq!(
+            submit_events(&mut exhausted, &event, 1, stride, &mut fresh_result),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)
+        );
+    }
 }
