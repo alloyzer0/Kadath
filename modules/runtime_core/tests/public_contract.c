@@ -2171,6 +2171,14 @@ int main(void) {
     }
     kadath_runtime_phase_interface_v1_t phase_interface = query_phase_interface_v2();
     kadath_runtime_phase_interface_v1_t phase_interface_v1 = query_phase_interface_v1();
+    // 未知 Phase ABI 版本必须 fail-closed，且不得覆写调用方缓冲区。
+    kadath_runtime_phase_interface_v1_t wrong_phase_version = phase_interface;
+    wrong_phase_version.interface_version = UINT32_MAX;
+    kadath_runtime_phase_interface_v1_t wrong_phase_sentinel = wrong_phase_version;
+    if (kadath_runtime_core_query_phase_interface(&wrong_phase_version) != KADATH_ERR_NOT_SUPPORTED ||
+        memcmp(&wrong_phase_version, &wrong_phase_sentinel, sizeof(wrong_phase_version)) != 0) {
+        return 4;
+    }
     if (phase_interface.prepare_phase_state == NULL || phase_interface.begin_phase == NULL ||
         phase_interface.submit_events == NULL || phase_interface.submit_structural == NULL ||
         phase_interface.begin_activation == NULL || phase_interface.end_phase == NULL) {
