@@ -764,6 +764,16 @@ mod tests {
             ),
             Err(())
         );
+        let mut invalid = sprite([0.0, 0.0], [2.0, 2.0]);
+        invalid.texture_id = 0;
+        assert_eq!(
+            strict_overlap(invalid, sprite([0.0, 0.0], [2.0, 2.0])),
+            Err(())
+        );
+        assert_eq!(
+            strict_overlap(sprite([0.0, 0.0], [2.0, 2.0]), invalid),
+            Err(())
+        );
     }
 
     #[test]
@@ -1247,11 +1257,11 @@ mod tests {
                     (case.priority == 3 || case.priority == 4).then_some(goal),
                 )
                 .unwrap();
+            let actual = timer.or(contact);
             assert_eq!(
-                timer.or(contact).map(|outcome| outcome.cause),
+                actual.map(|outcome| outcome.cause),
                 seed_priority_outcome(case)
             );
-            let actual = timer.or(contact);
             let replay_hazard = actual.is_some().then_some(hazard_keys[0]);
             let replay_goal = actual.is_some().then_some(goal);
             assert_eq!(

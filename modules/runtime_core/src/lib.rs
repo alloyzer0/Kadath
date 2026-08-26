@@ -2487,6 +2487,14 @@ mod tests {
             Err(abi::KADATH_ERR_INVALID_ARGUMENT)
         ));
         buffer = valid;
+        // stride 足够大但不自然对齐时，必须由独立 alignment 分支拒绝，
+        // 不能让 OR→AND 变异被前面的长度校验掩盖。
+        buffer.outcome_stride = mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>() + 1;
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
         let mut misaligned_storage = [0_u8; 256];
         let alignment = mem::align_of::<abi::kadath_runtime_gameplay_outcome_v1_t>();
         assert!(
@@ -2533,5 +2541,279 @@ mod tests {
             valid_output(&mut value),
             Err(abi::KADATH_ERR_INVALID_ARGUMENT)
         ));
+    }
+
+    fn gameplay_test_object_ref(
+        id: &[u8],
+        kind: u32,
+        epoch: u64,
+    ) -> abi::kadath_runtime_object_ref_v1_t {
+        let object_id = ObjectId::parse(id).expect("test object id is valid");
+        abi::kadath_runtime_object_ref_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_object_ref_v1_t>() as u32,
+            kind,
+            world_epoch: epoch,
+            logical_generation: 1,
+            object_id_length: object_id.len(),
+            reserved0: 0,
+            object_id: object_id.storage(),
+            reserved: [0; 4],
+        }
+    }
+
+    fn gameplay_test_core(mode: u32) -> Box<RuntimeCore> {
+        let sources = [
+            SourceObject {
+                object_id: ObjectId::parse(b"player").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                sprite: Sprite {
+                    position: [0.0, 0.0],
+                    size: [2.0, 2.0],
+                    color: [1.0; 4],
+                    texture_id: 1,
+                    move_speed: 1.0,
+                },
+            },
+            SourceObject {
+                object_id: ObjectId::parse(b"goal").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_GOAL,
+                sprite: Sprite {
+                    position: [10.0, 0.0],
+                    size: [2.0, 2.0],
+                    color: [1.0; 4],
+                    texture_id: 1,
+                    move_speed: 0.0,
+                },
+            },
+            SourceObject {
+                object_id: ObjectId::parse(b"hazard").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                sprite: Sprite {
+                    position: [20.0, 0.0],
+                    size: [2.0, 2.0],
+                    color: [1.0; 4],
+                    texture_id: 1,
+                    move_speed: 0.0,
+                },
+            },
+        ];
+        let live = RuntimeState::initial(
+            1,
+            1,
+            Bounds::new([0.0, 0.0], [100.0, 100.0]).unwrap(),
+            &sources,
+            &[1, 2, 3],
+        );
+        Box::new(RuntimeCore {
+            owner_thread: thread::current().id(),
+            in_call: false,
+            live: Some(live.clone()),
+            candidate: Some(live),
+            candidate_next_entity_value: Some(4),
+            candidate_mode: Some(mode),
+            next_entity_value: 4,
+            phase: phase_commit::PhaseState::new_boxed().expect("phase arena allocation"),
+            gameplay: None,
+            gameplay_candidate: None,
+            #[cfg(feature = "contract-test-hooks")]
+            next_fault: None,
+        })
+    }
+
+    fn gameplay_test_hazard() -> abi::kadath_runtime_gameplay_hazard_desc_v1_t {
+        abi::kadath_runtime_gameplay_hazard_desc_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>() as u32,
+            movement_mode: abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE,
+            object_ref: gameplay_test_object_ref(
+                b"hazard",
+                abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                1,
+            ),
+            patrol_min_y: 0.0,
+            patrol_max_y: 0.0,
+            patrol_speed: 0.0,
+            reserved0: 0,
+            reserved: [0; 4],
+        }
+    }
+
+    fn gameplay_test_desc(
+        hazards: *const abi::kadath_runtime_gameplay_hazard_desc_v1_t,
+    ) -> abi::kadath_runtime_gameplay_desc_v1_t {
+        abi::kadath_runtime_gameplay_desc_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_desc_v1_t>() as u32,
+            reserved0: 0,
+            time_limit_seconds: 3.0,
+            hazard_count: 1,
+            player: gameplay_test_object_ref(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER, 1),
+            goal: gameplay_test_object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL, 1),
+            hazards,
+            hazard_stride: mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>(),
+            reserved: [0; 6],
+        }
+    }
+
+    fn run_gameplay_prepare(
+        desc: abi::kadath_runtime_gameplay_desc_v1_t,
+        _hazards: &mut [abi::kadath_runtime_gameplay_hazard_desc_v1_t; 2],
+    ) -> (
+        i32,
+        Box<RuntimeCore>,
+        abi::kadath_runtime_gameplay_candidate_info_v1_t,
+    ) {
+        let mut output = abi::kadath_runtime_gameplay_candidate_info_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_candidate_info_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        let mut core = gameplay_test_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let pointer = (&mut *core as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        let status = prepare_gameplay_state_entry(pointer, &desc, &mut output);
+        (status, core, output)
+    }
+
+    #[test]
+    fn gameplay_prepare_preflight_covers_descriptor_and_hazard_validation() {
+        let mut hazards = [gameplay_test_hazard(), gameplay_test_hazard()];
+        let valid = gameplay_test_desc(hazards.as_ptr());
+        let (status, core, output) = run_gameplay_prepare(valid, &mut hazards);
+        assert_eq!(status, abi::KADATH_OK as i32);
+        assert_eq!(output.hazard_count, 1);
+        assert_eq!(output.world_epoch, 1);
+        assert!(core.gameplay_candidate.is_some());
+
+        let invalid = [
+            {
+                let mut value = valid;
+                value.struct_size = 0;
+                value
+            },
+            {
+                let mut value = valid;
+                value.reserved0 = 1;
+                value
+            },
+            {
+                let mut value = valid;
+                value.reserved[0] = 1;
+                value
+            },
+            {
+                let mut value = valid;
+                value.time_limit_seconds = f32::NAN;
+                value
+            },
+            {
+                let mut value = valid;
+                value.time_limit_seconds = 0.0;
+                value
+            },
+            {
+                let mut value = valid;
+                value.hazard_count = 0;
+                value
+            },
+            {
+                let mut value = valid;
+                value.hazard_count = (gameplay::MAX_CONTACTS - 1 + 1) as u32;
+                value
+            },
+            {
+                let mut value = valid;
+                value.hazards = std::ptr::null();
+                value
+            },
+            {
+                let mut value = valid;
+                value.hazard_stride =
+                    mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>() - 1;
+                value
+            },
+            {
+                let mut value = valid;
+                value.hazard_stride =
+                    mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>() + 1;
+                value
+            },
+            {
+                let mut value = valid;
+                value.player.kind = abi::KADATH_RUNTIME_OBJECT_KIND_GOAL;
+                value
+            },
+            {
+                let mut value = valid;
+                value.goal.kind = abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER;
+                value
+            },
+            {
+                let mut value = valid;
+                value.goal = value.player;
+                value
+            },
+        ];
+        for (index, desc) in invalid.into_iter().enumerate() {
+            let (status, core, _) = run_gameplay_prepare(desc, &mut hazards);
+            assert_ne!(status, abi::KADATH_OK as i32, "descriptor case {index}");
+            assert!(core.gameplay_candidate.is_none());
+        }
+
+        let hazard_invalid = [
+            {
+                let mut value = hazards[0];
+                value.struct_size = 0;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.reserved0 = 1;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.reserved[0] = 1;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.movement_mode = 99;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.object_ref.world_epoch = 2;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.object_ref.kind = abi::KADATH_RUNTIME_OBJECT_KIND_GOAL;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.patrol_min_y = 1.0;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.movement_mode = abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
+                value.patrol_min_y = 2.0;
+                value.patrol_max_y = 1.0;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.movement_mode = abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
+                value.patrol_min_y = 0.0;
+                value.patrol_max_y = 2.0;
+                value.patrol_speed = f32::NAN;
+                value
+            },
+        ];
+        for (index, hazard) in hazard_invalid.into_iter().enumerate() {
+            hazards[0] = hazard;
+            let (status, core, _) = run_gameplay_prepare(valid, &mut hazards);
+            assert_ne!(status, abi::KADATH_OK as i32, "hazard case {index}");
+            assert!(core.gameplay_candidate.is_none());
+            hazards[0] = gameplay_test_hazard();
+        }
     }
 }
