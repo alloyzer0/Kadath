@@ -40,10 +40,6 @@ pub const Runtime = struct {
         return error.UnsupportedBehaviorRuntime;
     }
 
-    pub fn worldEpoch(_: *const Runtime) u64 {
-        return 1;
-    }
-
     pub fn onStart(_: *Runtime, _: *const scene_generation_api.SceneGeneration) !TranslationBatch {
         return error.UnsupportedBehaviorRuntime;
     }
@@ -66,9 +62,5 @@ pub const Runtime = struct {
 };
 
 pub fn loadWithIdentity(_: std.Io, _: std.mem.Allocator, _: []const u8, _: *const scene_api.Scene) !LoadedRuntime {
-    return error.UnsupportedBehaviorRuntime;
-}
-
-pub fn loadWithIdentityAtEpoch(_: std.Io, _: std.mem.Allocator, _: []const u8, _: *const scene_api.Scene, _: u64) !LoadedRuntime {
     return error.UnsupportedBehaviorRuntime;
 }

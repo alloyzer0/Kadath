@@ -31,6 +31,7 @@ pub const invalid_texture: TextureId = 0;
 
 pub const ObjectRef = c.kadath_runtime_object_ref_v1_t;
 pub const ObjectView = c.kadath_runtime_object_view_v1_t;
+pub const StateInfo = c.kadath_runtime_state_info_v1_t;
 pub const PhaseEvent = c.kadath_runtime_phase_event_v1_t;
 pub const PhasePositionPatch = c.kadath_runtime_position_patch_v1_t;
 pub const PhaseStructural = c.kadath_runtime_phase_structural_v1_t;
@@ -419,6 +420,19 @@ pub const RuntimeCore = struct {
         const result = try self.queryOne(target, &item);
         if (result.payload.snapshot.object_count > output.len) return error.RuntimeCoreInvalidOutput;
         return output[0..result.payload.snapshot.object_count];
+    }
+
+    /// Rust Core 是 world epoch 的唯一 authority；Zig 只读取这个窄状态查询结果。
+    pub fn stateInfo(self: *const RuntimeCore, target: Target) !StateInfo {
+        var item = std.mem.zeroes(c.kadath_runtime_query_item_v1_t);
+        item.struct_size = @sizeOf(c.kadath_runtime_query_item_v1_t);
+        item.tag = c.KADATH_RUNTIME_QUERY_STATE_INFO;
+        const result = try self.queryOne(target, &item);
+        return result.payload.state_info;
+    }
+
+    pub fn worldEpoch(self: *const RuntimeCore, target: Target) !u64 {
+        return (try self.stateInfo(target)).world_epoch;
     }
 
     pub fn findById(self: *const RuntimeCore, target: Target, object_id: []const u8) !?ObjectView {

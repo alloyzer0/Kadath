@@ -9,8 +9,6 @@ const runtime_core = @import("runtime_core");
 
 pub const InputSnapshot = behavior_runtime.InputSnapshot;
 
-const max_exact_luau_world_epoch: u64 = 9_007_199_254_740_991;
-
 const StructuralOrigin = struct {
     object_id: scene_api.ObjectId = .{},
     script_id: u32 = 0,
@@ -64,7 +62,6 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     package: ?*behavior_runtime.Package = null,
     active: ?*behavior_runtime.ActiveSet = null,
-    world_epoch: u64 = 1,
     phase_serial: u64 = 1,
     active_phase: ?PhaseSession = null,
 
@@ -86,17 +83,12 @@ pub const Runtime = struct {
 
     pub fn cloneForRestart(self: *const Runtime, allocator: std.mem.Allocator, scene: *const scene_api.Scene) !Runtime {
         const package = self.package orelse return error.BehaviorRuntimeNotLoaded;
-        return initArtifactAtEpoch(allocator, package.bytes, scene, self.world_epoch);
+        return initArtifact(allocator, package.bytes, scene);
     }
 
     pub fn cloneForSceneReload(self: *const Runtime, allocator: std.mem.Allocator, scene: *const scene_api.Scene) !Runtime {
         const package = self.package orelse return error.BehaviorRuntimeNotLoaded;
-        const next_world_epoch = std.math.add(u64, self.world_epoch, 1) catch return error.BehaviorWorldEpochExhausted;
-        return initArtifactAtEpoch(allocator, package.bytes, scene, next_world_epoch);
-    }
-
-    pub fn worldEpoch(self: *const Runtime) u64 {
-        return self.world_epoch;
+        return initArtifact(allocator, package.bytes, scene);
     }
 
     pub fn preparePhaseState(self: *Runtime, generation: *scene_generation_api.SceneGeneration) !void {
@@ -161,7 +153,7 @@ pub const Runtime = struct {
         var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
         const ordered = try mutable_generation.activeHandles(&handles);
         var initial_positions: [runtime_core.max_object_count][2]f32 = undefined;
-        var context = try OverlayHostContext.init(mutable_generation, self.world_epoch);
+        var context = try OverlayHostContext.init(mutable_generation, try mutable_generation.worldEpoch());
         for (ordered, 0..) |handle, index| {
             const object_index = mutable_generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
             initial_positions[index] = context.positions[object_index];
@@ -225,7 +217,7 @@ pub const Runtime = struct {
         _ = try self.beginPhase(generation, .fixed);
         var context = DirectHostContext{
             .generation = generation,
-            .world_epoch = self.world_epoch,
+            .world_epoch = try generation.worldEpoch(),
             .domain = .fixed,
         };
         var host = directNativeHost(&context);
@@ -243,7 +235,7 @@ pub const Runtime = struct {
         _ = try self.beginPhase(generation, .frame);
         var context = DirectHostContext{
             .generation = generation,
-            .world_epoch = self.world_epoch,
+            .world_epoch = try generation.worldEpoch(),
             .domain = .frame,
         };
         var host = directNativeHost(&context);
@@ -317,7 +309,7 @@ pub const Runtime = struct {
                 }
                 var context = DirectHostContext{
                     .generation = generation,
-                    .world_epoch = self.world_epoch,
+                    .world_epoch = try generation.worldEpoch(),
                     .domain = session.domain,
                 };
                 var host = directNativeHost(&context);
@@ -395,7 +387,7 @@ pub const Runtime = struct {
                         if (maybe_record == null) {
                             var context = ActivationHostContext.init(
                                 generation,
-                                self.world_epoch,
+                                try generation.worldEpoch(),
                                 transaction.transaction_id,
                                 session.domain,
                                 runtime_core.max_phase_bindings,
@@ -461,7 +453,7 @@ pub const Runtime = struct {
                         defer self.allocator.destroy(activation_context);
                         activation_context.* = ActivationHostContext.init(
                             generation,
-                            self.world_epoch,
+                            try generation.worldEpoch(),
                             transaction.transaction_id,
                             session.domain,
                             runtime_core.max_phase_bindings,
@@ -1264,38 +1256,18 @@ pub fn loadWithIdentity(
     path: []const u8,
     scene: *const scene_api.Scene,
 ) !LoadedRuntime {
-    return loadWithIdentityAtEpoch(io, allocator, path, scene, 1);
-}
-
-pub fn loadWithIdentityAtEpoch(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    scene: *const scene_api.Scene,
-    world_epoch: u64,
-) !LoadedRuntime {
     const contents = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(artifact.max_artifact_bytes));
     defer allocator.free(contents);
     return .{
-        .value = try initArtifactAtEpoch(allocator, contents, scene, world_epoch),
+        .value = try initArtifact(allocator, contents, scene),
         .identity = try content_identity.ContentIdentity.fromBytes(.artifact, contents),
         .artifact_version = artifact.artifact_version,
     };
 }
 
 pub fn initArtifact(allocator: std.mem.Allocator, bytes: []const u8, scene: *const scene_api.Scene) !Runtime {
-    return initArtifactAtEpoch(allocator, bytes, scene, 1);
-}
-
-pub fn initArtifactAtEpoch(
-    allocator: std.mem.Allocator,
-    bytes: []const u8,
-    scene: *const scene_api.Scene,
-    world_epoch: u64,
-) !Runtime {
     if (scene.schemaVersion != scene_api.behavior_schema_version and
         scene.schemaVersion != scene_api.current_schema_version) return error.UnsupportedBehaviorSceneSchema;
-    if (world_epoch == 0 or world_epoch > max_exact_luau_world_epoch) return error.InvalidBehaviorWorldEpoch;
     var diagnostic = behavior_runtime.Diagnostic{};
     const package = try allocator.create(behavior_runtime.Package);
     errdefer allocator.destroy(package);
@@ -1324,7 +1296,6 @@ pub fn initArtifactAtEpoch(
         .allocator = allocator,
         .package = package,
         .active = active,
-        .world_epoch = world_epoch,
     };
 }
 

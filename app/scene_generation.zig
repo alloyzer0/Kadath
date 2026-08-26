@@ -157,6 +157,11 @@ pub const SceneGeneration = struct {
         return .{ .sprites = output[0..snapshot.render_count], .snapshot = snapshot };
     }
 
+    /// Runtime identity 由 Rust Core 统一产生；SceneGeneration 只提供只读 Adapter。
+    pub fn worldEpoch(self: *const SceneGeneration) !u64 {
+        return self.core.worldEpoch(self.target);
+    }
+
     pub fn reserveTransient(self: *SceneGeneration, prototype_id: []const u8, position: [2]f32) !ReservedSpawn {
         const prototype_index = self.scene.prototypes.indexOfId(prototype_id) orelse return error.UnknownSpawnPrototype;
         const prototype = &self.scene.prototypes.entries[prototype_index];

@@ -25,8 +25,6 @@ const SpriteInstance = @import("renderer2d").SpriteInstance;
 
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
-const max_exact_luau_world_epoch: u64 = 9_007_199_254_740_991;
-
 fn validateSceneTextureBindings(registry: *const runtime_texture_registry.RuntimeTextureRegistry, scene: *const scene_api.Scene) !void {
     for (scene.objects.slice()) |object| _ = try registry.resolve(object.sprite.textureId);
     for (scene.prototypes.slice()) |prototype| _ = try registry.resolve(prototype.sprite.textureId);
@@ -72,7 +70,6 @@ pub const Host = struct {
     script_enabled: bool,
     script_tick: u64,
     behavior_runtime: behavior_host.Runtime,
-    world_epoch: u64,
     platform: Platform,
     rhi: Rhi,
     renderer2d: Renderer2D,
@@ -173,7 +170,6 @@ pub const Host = struct {
             .script_enabled = script_program.hasInstructions(),
             .script_tick = 0,
             .behavior_runtime = behavior_candidate orelse .{},
-            .world_epoch = if (behavior_candidate) |runtime| runtime.worldEpoch() else 1,
             .platform = platform,
             .rhi = backend,
             .renderer2d = renderer2d,
@@ -442,12 +438,11 @@ pub const Host = struct {
             return error.MissingScriptPath;
         };
         if (usesBehaviorRuntime(&self.scene)) {
-            var candidate = (try behavior_host.loadWithIdentityAtEpoch(
+            var candidate = (try behavior_host.loadWithIdentity(
                 self.io,
                 std.heap.page_allocator,
                 path,
                 &self.scene,
-                self.world_epoch,
             )).value;
             errdefer candidate.deinit();
             const batch = try candidate.onStart(&self.generation);
@@ -489,10 +484,6 @@ pub const Host = struct {
             return error.MissingScenePath;
         };
         const candidate = try scene_api.load(self.io, std.heap.page_allocator, path);
-        const candidate_world_epoch = if (self.world_epoch >= max_exact_luau_world_epoch)
-            return error.BehaviorWorldEpochExhausted
-        else
-            self.world_epoch + 1;
         var prepared_textures = try runtime_texture_registry.prepareScene(self.io, std.heap.page_allocator, &candidate);
         defer prepared_textures.deinit();
         var candidate_registry = try runtime_texture_registry.RuntimeTextureRegistry.initPrepared(
@@ -515,12 +506,11 @@ pub const Host = struct {
                 candidate_behavior = try self.behavior_runtime.cloneForSceneReload(std.heap.page_allocator, &candidate);
             } else if (sceneHasBehaviors(&candidate)) {
                 const script_path = self.script_path orelse return error.MissingScriptPath;
-                candidate_behavior = (try behavior_host.loadWithIdentityAtEpoch(
+                candidate_behavior = (try behavior_host.loadWithIdentity(
                     self.io,
                     std.heap.page_allocator,
                     script_path,
                     &candidate,
-                    candidate_world_epoch,
                 )).value;
             }
             if (candidate_behavior.isLoaded()) {
@@ -551,7 +541,6 @@ pub const Host = struct {
         self.script_program = candidate_program;
         self.script_enabled = candidate_script_enabled;
         self.script_tick = 0;
-        self.world_epoch = candidate_world_epoch;
         self.scene = candidate;
         self.accumulator_seconds = 0.0;
         self.render_count = 0;

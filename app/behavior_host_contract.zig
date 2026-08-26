@@ -564,10 +564,9 @@ test "Behavior Host applies on_start and fixed commands in Scene order" {
 
     var restart_runtime = try runtime.cloneForRestart(std.testing.allocator, &scene);
     defer restart_runtime.deinit();
-    try std.testing.expectEqual(runtime.worldEpoch(), restart_runtime.worldEpoch());
     var reloaded_scene_runtime = try runtime.cloneForSceneReload(std.testing.allocator, &scene);
     defer reloaded_scene_runtime.deinit();
-    try std.testing.expectEqual(runtime.worldEpoch() + 1, reloaded_scene_runtime.worldEpoch());
+    try std.testing.expectEqual(@as(u64, 1), try generation.worldEpoch());
 
     const start = try runtime.onStart(&generation);
     try std.testing.expectEqual(@as(usize, 3), start.object_count);
@@ -1043,7 +1042,7 @@ test "stale queued target is dropped without disabling its producer" {
     var previous_generation = fixture.generation;
     fixture.generation = replacement;
     previous_generation.deinit();
-    fixture.runtime.world_epoch += 1;
+    try std.testing.expectEqual(@as(u64, 2), try fixture.generation.worldEpoch());
     try std.testing.expect(fixture.runtime.active.?.bindingEnabled(1));
 }
 
@@ -1106,7 +1105,7 @@ test "saved ObjectRef follows restart replacement and rejects a new world epoch"
     var previous_generation = fixture.generation;
     fixture.generation = replacement;
     previous_generation.deinit();
-    fixture.runtime.world_epoch += 1;
+    try std.testing.expectEqual(@as(u64, 2), try fixture.generation.worldEpoch());
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 1), (try fixture.generation.objectPosition(2))[0], 0.0001);
     try std.testing.expect(!fixture.runtime.active.?.bindingEnabled(1));
