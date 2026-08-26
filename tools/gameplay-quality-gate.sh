@@ -77,7 +77,7 @@ if [[ -f "$coverage_report" ]]; then
     candidate_report_bound "$coverage_report" || blocked+=("coverage report SHA mismatch")
     [[ -n "$(value "$coverage_report" GAMEPLAY_COMMAND)" ]] || blocked+=("coverage command provenance missing")
     [[ "$(value "$coverage_report" GAMEPLAY_COVERAGE_STATUS)" == PASS ]] || blocked+=("coverage status is not PASS")
-    for key in RUST_LINE PUBLIC_C_LINE ZIG_ADAPTER_LINE; do
+    for key in RUST_LINE PUBLIC_C_LINE ZIG_ADAPTER_LINE BEHAVIOR_LINE; do
         metric=$(value "$coverage_report" "GAMEPLAY_COVERAGE_${key}_PERCENT")
         awk -v n="$metric" 'BEGIN { exit !(n+0 >= 90) }' || blocked+=("$key coverage below 90%")
     done
