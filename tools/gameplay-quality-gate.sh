@@ -105,6 +105,7 @@ if [[ -f "$mutation_report" ]]; then
     [[ "$(value "$mutation_report" GAMEPLAY_CRITICAL_SURVIVORS)" == 0 ]] || blocked+=("critical invariant mutant survived")
     [[ "$(value "$mutation_report" GAMEPLAY_MUTATION_CRITICAL_DOMAINS)" == timer_priority,contact_differencing,epoch_stale,capacity,snapshot_publication,outcome_sequence,abi_preflight ]] || blocked+=("critical mutation domain manifest missing")
     verify_bound_file "$mutation_report" GAMEPLAY_MUTATION_MANIFEST GAMEPLAY_MUTATION_MANIFEST_SHA256 || blocked+=("mutation manifest hash mismatch")
+    verify_bound_file "$mutation_report" GAMEPLAY_MUTATION_CRITICAL_MANIFEST GAMEPLAY_MUTATION_CRITICAL_MANIFEST_SHA256 || blocked+=("critical mutation domain manifest hash mismatch")
 fi
 
 check_benchmark() {

@@ -58,9 +58,31 @@ awk -v score="$score" 'BEGIN { exit !(score+0 >= 80) }' || { status=FAIL; blocke
 [[ "$critical_survivors" -eq 0 ]] || { status=FAIL; blockers+=("critical invariant mutants survived"); }
 
 manifest="$evidence_root/mutation-manifest.tsv"
+printf '%s\n' 'domain\tfile\tfunction\tstatus\tmutant\tlog' >"$manifest"
 jq -r '.outcomes[] | select(.scenario != "Baseline") |
-    [.summary, (.scenario.Mutant.name // .scenario), (.log_path // "")] | @tsv' \
+    (.scenario.Mutant // {}) as $m |
+    ($m.function.function_name // "unknown") as $fn |
+    (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|mask_contains")) then "contact_differencing"
+     elif ($fn | test("prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|step_plan|step_result")) then "timer_priority"
+     elif ($fn | test("source_key_is_live|validate_outcome_buffer|read_object_key|object_view")) then "epoch_stale"
+     elif ($fn | test("append_contact_transition|valid_output_array|apply_positions|validate_outcome_buffer")) then "capacity"
+     elif ($fn | test("publish_gameplay_snapshot|gameplay_snapshot|snapshot")) then "snapshot_publication"
+     elif ($fn | test("outcome_value|step_result|commit_gameplay_fixed")) then "outcome_sequence"
+     elif ($fn | test("query_interface|query_gameplay_interface|begin_phase|submit_events|validate_")) then "abi_preflight"
+     else "uncategorized" end) as $domain |
+    [$domain, ($m.file // ""), $fn, (.summary // ""), ($m.name // ""), (.log_path // "")] | @tsv' \
     "$outcomes" >"$manifest"
+critical_manifest="$evidence_root/mutation-critical-domains.tsv"
+cat >"$critical_manifest" <<'EOF'
+domain	files	functions
+timer_priority	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/lib.rs	step_plan;step_result;prepare_gameplay_state;begin_gameplay_fixed;plan_gameplay_positions;commit_gameplay_fixed
+contact_differencing	modules/runtime_core/src/gameplay.rs	strict_overlap;active_contacts;contact_events;contact_transitions;submit_contact_transitions;mask_contains
+epoch_stale	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/lib.rs	source_key_is_live;validate_outcome_buffer;read_object_key;object_view
+capacity	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/lib.rs	append_contact_transition;valid_output_array;apply_positions
+snapshot_publication	modules/runtime_core/src/lib.rs	publish_gameplay_snapshot;gameplay_snapshot
+outcome_sequence	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/lib.rs	outcome_value;step_result;commit_gameplay_fixed
+abi_preflight	modules/runtime_core/src/phase_commit.rs;modules/runtime_core/src/lib.rs	query_interface;query_gameplay_interface;begin_phase_v1;begin_phase_v2;submit_events;validate_event
+EOF
 report="$evidence_root/mutation.report"
 cat >"$report" <<EOF
 GAMEPLAY_MUTATION_STATUS=$status
@@ -77,6 +99,8 @@ GAMEPLAY_CRITICAL_SURVIVORS=$critical_survivors
 GAMEPLAY_MUTATION_CRITICAL_DOMAINS=timer_priority,contact_differencing,epoch_stale,capacity,snapshot_publication,outcome_sequence,abi_preflight
 GAMEPLAY_MUTATION_MANIFEST=$manifest
 GAMEPLAY_MUTATION_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')
+GAMEPLAY_MUTATION_CRITICAL_MANIFEST=$critical_manifest
+GAMEPLAY_MUTATION_CRITICAL_MANIFEST_SHA256=$(sha256sum "$critical_manifest" | awk '{print $1}')
 GAMEPLAY_MUTATION_BLOCKER=$(IFS=';'; printf '%s' "${blockers[*]-}")
 EOF
 cat "$report"
