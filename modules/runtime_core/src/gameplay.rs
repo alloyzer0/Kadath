@@ -697,6 +697,44 @@ mod tests {
     }
 
     #[test]
+    fn gameplay_abi_values_cover_all_terminal_codes_and_invalid_steps() {
+        let player = key(b"player", 2);
+        let mut session = Session::new(3.0, 11);
+
+        // 非有限和负时间步必须拒绝，且不能改变仍在进行中的会话。
+        let before = session;
+        assert_eq!(session.begin_step(f32::NAN, player), Err(()));
+        assert_eq!(session.begin_step(-0.01, player), Err(()));
+        assert_eq!(session, before);
+
+        let playing = step_result(session, 7, 0, 0);
+        assert_eq!(playing.phase, abi::KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING);
+        assert_eq!(playing.cause, abi::KADATH_RUNTIME_GAMEPLAY_CAUSE_NONE);
+        assert_eq!(playing.accepts_input, 1);
+
+        let won = session
+            .transition(Phase::Won, Cause::Goal, player, None)
+            .unwrap();
+        let won_value = outcome_value(won);
+        assert_eq!(won_value.phase, abi::KADATH_RUNTIME_GAMEPLAY_PHASE_WON);
+        assert_eq!(won_value.cause, abi::KADATH_RUNTIME_GAMEPLAY_CAUSE_GOAL);
+        assert_eq!(won_value.has_other, 0);
+        assert_eq!(step_result(session, 8, 2, 1).accepts_input, 0);
+
+        let lost = Outcome {
+            sequence: 12,
+            phase: Phase::Lost,
+            cause: Cause::Hazard,
+            player,
+            other: Some(key(b"hazard", 4)),
+        };
+        let lost_value = outcome_value(lost);
+        assert_eq!(lost_value.phase, abi::KADATH_RUNTIME_GAMEPLAY_PHASE_LOST);
+        assert_eq!(lost_value.cause, abi::KADATH_RUNTIME_GAMEPLAY_CAUSE_HAZARD);
+        assert_eq!(lost_value.has_other, 1);
+    }
+
+    #[test]
     fn step_plan_keeps_previous_ledger_and_orders_all_ends_before_begins() {
         use crate::{
             object_authority::{RuntimeState, SourceObject},
