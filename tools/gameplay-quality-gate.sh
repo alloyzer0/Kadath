@@ -5,12 +5,13 @@ usage() {
     cat <<'EOF'
 Usage: gameplay-quality-gate.sh --candidate-sha SHA --oracle-sha SHA --candidate-benchmark PATH
   --candidate-report PATH --oracle-benchmark PATH --oracle-report PATH
-  --coverage-report PATH --mutation-report PATH
+  --coverage-report PATH --mutation-report PATH --seed-report PATH
 EOF
 }
 
 candidate_sha= oracle_sha= candidate_benchmark= candidate_report=
 oracle_benchmark= oracle_report= coverage_report= mutation_report=
+seed_report=
 while (($#)); do
     case "$1" in
         --candidate-sha) candidate_sha=${2-}; shift 2 ;;
@@ -21,6 +22,7 @@ while (($#)); do
         --oracle-report) oracle_report=${2-}; shift 2 ;;
         --coverage-report) coverage_report=${2-}; shift 2 ;;
         --mutation-report) mutation_report=${2-}; shift 2 ;;
+        --seed-report) seed_report=${2-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -48,6 +50,7 @@ require_file() {
 
 require_file "$coverage_report" "coverage report"
 require_file "$mutation_report" "mutation report"
+require_file "$seed_report" "seed matrix report"
 require_file "$candidate_report" "candidate performance report"
 require_file "$oracle_report" "oracle performance report"
 [[ -x "$candidate_benchmark" ]] || blocked+=("candidate benchmark missing")
@@ -106,6 +109,18 @@ if [[ -f "$mutation_report" ]]; then
     [[ "$(value "$mutation_report" GAMEPLAY_MUTATION_CRITICAL_DOMAINS)" == timer_priority,contact_differencing,epoch_stale,capacity,snapshot_publication,outcome_sequence,abi_preflight ]] || blocked+=("critical mutation domain manifest missing")
     verify_bound_file "$mutation_report" GAMEPLAY_MUTATION_MANIFEST GAMEPLAY_MUTATION_MANIFEST_SHA256 || blocked+=("mutation manifest hash mismatch")
     verify_bound_file "$mutation_report" GAMEPLAY_MUTATION_CRITICAL_MANIFEST GAMEPLAY_MUTATION_CRITICAL_MANIFEST_SHA256 || blocked+=("critical mutation domain manifest hash mismatch")
+fi
+
+if [[ -f "$seed_report" ]]; then
+    candidate_report_bound "$seed_report" || blocked+=("seed matrix report SHA mismatch")
+    [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_STATUS)" == PASS ]] || blocked+=("seed matrix status is not PASS")
+    [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_TOTAL)" == 10000 ]] || blocked+=("seed matrix total is not 10000")
+    [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_UNIQUE_COMBINATIONS)" == 5760 ]] || blocked+=("seed matrix combination coverage is incomplete")
+    [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_DIMENSION_ROWS)" == 26 ]] || blocked+=("seed matrix dimension manifest is incomplete")
+    [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_COMBINATION_ROWS)" == 5760 ]] || blocked+=("seed matrix combination manifest is incomplete")
+    [[ -n "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_COMMAND)" ]] || blocked+=("seed matrix command provenance missing")
+    verify_bound_file "$seed_report" GAMEPLAY_SEED_MATRIX_MANIFEST GAMEPLAY_SEED_MATRIX_MANIFEST_SHA256 || blocked+=("seed matrix manifest hash mismatch")
+    verify_bound_file "$seed_report" GAMEPLAY_SEED_MATRIX_COMMAND_LOG GAMEPLAY_SEED_MATRIX_COMMAND_LOG_SHA256 || blocked+=("seed matrix command log hash mismatch")
 fi
 
 check_benchmark() {

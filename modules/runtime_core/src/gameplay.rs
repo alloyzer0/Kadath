@@ -615,6 +615,104 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct SeedCase {
+        contact_index: usize,
+        stale_epoch: bool,
+        pending_lifecycle: usize,
+        restart: bool,
+        scene_reload: bool,
+        capacity_boundary: usize,
+        alias: bool,
+        snapshot_coherence: bool,
+        priority: usize,
+    }
+
+    const SEED_CASE_COUNT: usize = 4 * 2 * 3 * 2 * 2 * 3 * 2 * 2 * 5;
+
+    // 固定的 64 位混合函数只用于把超过笛卡尔覆盖区间的 seed 映射回组合空间。
+    fn seed_hash(mut value: u64) -> u64 {
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn seed_case(seed: u64) -> SeedCase {
+        // 前 5,760 个 seed 使用互质仿射置换，保证每个正交组合至少一次；
+        // 其余 seed 使用同一固定 hash，继续提供稳定的随机化分布。
+        let rank = if seed <= SEED_CASE_COUNT as u64 {
+            ((seed - 1) * 7_919 + 104_729) % SEED_CASE_COUNT as u64
+        } else {
+            seed_hash(seed) % SEED_CASE_COUNT as u64
+        } as usize;
+        let mut rest = rank;
+        let priority = rest % 5;
+        rest /= 5;
+        let snapshot_coherence = rest % 2 == 1;
+        rest /= 2;
+        let alias = rest % 2 == 1;
+        rest /= 2;
+        let capacity_boundary = rest % 3;
+        rest /= 3;
+        let scene_reload = rest % 2 == 1;
+        rest /= 2;
+        let restart = rest % 2 == 1;
+        rest /= 2;
+        let pending_lifecycle = rest % 3;
+        rest /= 3;
+        let stale_epoch = rest % 2 == 1;
+        rest /= 2;
+        let contact_index = rest % 4;
+        SeedCase {
+            contact_index,
+            stale_epoch,
+            pending_lifecycle,
+            restart,
+            scene_reload,
+            capacity_boundary,
+            alias,
+            snapshot_coherence,
+            priority,
+        }
+    }
+
+    fn seed_contact_count(case: SeedCase) -> usize {
+        [0, 1, 2, 32][case.contact_index]
+    }
+
+    fn seed_priority_outcome(case: SeedCase) -> Option<Cause> {
+        match case.priority {
+            0 => None,
+            1 => Some(Cause::Timer),
+            2 | 4 => Some(Cause::Hazard),
+            3 => Some(Cause::Goal),
+            _ => unreachable!("priority matrix is bounded"),
+        }
+    }
+
+    fn matrix_sources() -> Vec<crate::object_authority::SourceObject> {
+        let mut sources = Vec::with_capacity(34);
+        sources.push(crate::object_authority::SourceObject {
+            object_id: ObjectId::parse(b"player").unwrap(),
+            kind: 2,
+            sprite: sprite([0.0, 0.0], [2.0, 2.0]),
+        });
+        for index in 0..32 {
+            let object_id = ObjectId::parse(format!("hazard-{index}").as_bytes()).unwrap();
+            sources.push(crate::object_authority::SourceObject {
+                object_id,
+                kind: 4,
+                sprite: sprite([10.0 + index as f32, 0.0], [2.0, 2.0]),
+            });
+        }
+        sources.push(crate::object_authority::SourceObject {
+            object_id: ObjectId::parse(b"goal").unwrap(),
+            kind: 3,
+            sprite: sprite([100.0, 0.0], [2.0, 2.0]),
+        });
+        sources
+    }
+
     #[test]
     fn strict_aabb_excludes_edges_zero_area_and_invalid_overflow() {
         assert_eq!(
@@ -1051,6 +1149,269 @@ mod tests {
             let edge = sprite([offset + 2.0, 0.0], [2.0, 2.0]);
             assert_eq!(strict_overlap(first, overlap), Ok(true), "seed={seed}");
             assert_eq!(strict_overlap(first, edge), Ok(false), "seed={seed}");
+        }
+    }
+
+    #[test]
+    fn deterministic_seed_matrix_covers_revision2_dimensions() {
+        use crate::{
+            object_authority::{DestroyDisposition, RuntimeState},
+            world::Bounds,
+        };
+        use std::{collections::BTreeMap, fmt::Write as _};
+
+        let sources = matrix_sources();
+        let bounds = Bounds::new([0.0, 0.0], [256.0, 256.0]).unwrap();
+        let entity_values: Vec<u64> = (1..=sources.len() as u64).collect();
+        let live = RuntimeState::initial(1, 1, bounds, &sources, &entity_values);
+        let player = ObjectKey {
+            object_id: sources[0].object_id,
+            world_epoch: 1,
+            logical_generation: 1,
+            kind: sources[0].kind,
+        };
+        let goal = ObjectKey {
+            object_id: sources[33].object_id,
+            world_epoch: 1,
+            logical_generation: 1,
+            kind: sources[33].kind,
+        };
+        let hazards: Vec<Hazard> = sources[1..33]
+            .iter()
+            .enumerate()
+            .map(|(index, source)| Hazard {
+                object: ObjectKey {
+                    object_id: source.object_id,
+                    world_epoch: 1,
+                    logical_generation: 1,
+                    kind: source.kind,
+                },
+                source_index: (index + 1) as u8,
+                movement_mode: 0,
+                patrol_min_y: 0.0,
+                patrol_max_y: 0.0,
+                patrol_speed: 0.0,
+                patrol_direction: 1.0,
+            })
+            .collect();
+        let base_gameplay = State::new(player, 0, goal, 33, &hazards, 3.0, 1, 1);
+        let hazard_keys: Vec<ObjectKey> = hazards.iter().map(|hazard| hazard.object).collect();
+
+        let mut combinations = BTreeMap::<String, usize>::new();
+        let mut dimension_counts = [
+            vec![0_usize; 4],
+            vec![0_usize; 2],
+            vec![0_usize; 3],
+            vec![0_usize; 2],
+            vec![0_usize; 2],
+            vec![0_usize; 3],
+            vec![0_usize; 2],
+            vec![0_usize; 2],
+            vec![0_usize; 5],
+        ];
+
+        for seed in 1_u64..=10_000 {
+            let case = seed_case(seed);
+            let contact_count = seed_contact_count(case);
+            let combo = format!(
+                "contact_count={contact_count};stale_epoch={};pending_lifecycle={};restart={};scene_reload={};capacity_boundary={};alias={};snapshot_coherence={};priority={}",
+                u8::from(case.stale_epoch),
+                case.pending_lifecycle,
+                u8::from(case.restart),
+                u8::from(case.scene_reload),
+                case.capacity_boundary,
+                u8::from(case.alias),
+                u8::from(case.snapshot_coherence),
+                case.priority
+            );
+            *combinations.entry(combo).or_default() += 1;
+            dimension_counts[0][case.contact_index] += 1;
+            dimension_counts[1][usize::from(case.stale_epoch)] += 1;
+            dimension_counts[2][case.pending_lifecycle] += 1;
+            dimension_counts[3][usize::from(case.restart)] += 1;
+            dimension_counts[4][usize::from(case.scene_reload)] += 1;
+            dimension_counts[5][case.capacity_boundary] += 1;
+            dimension_counts[6][usize::from(case.alias)] += 1;
+            dimension_counts[7][usize::from(case.snapshot_coherence)] += 1;
+            dimension_counts[8][case.priority] += 1;
+
+            // 每个 seed 都重放 terminal priority；Hazard+Goal 仍严格由 Hazard 获胜。
+            let mut session = Session::new(3.0, seed);
+            let timer = session
+                .begin_step(if case.priority == 1 { 3.0 } else { 0.5 }, player)
+                .unwrap();
+            let contact = session
+                .observe_contacts(
+                    player,
+                    (case.priority == 2 || case.priority == 4).then_some(hazard_keys[0]),
+                    (case.priority == 3 || case.priority == 4).then_some(goal),
+                )
+                .unwrap();
+            assert_eq!(
+                timer.or(contact).map(|outcome| outcome.cause),
+                seed_priority_outcome(case)
+            );
+            let actual = timer.or(contact);
+            let replay_hazard = actual.is_some().then_some(hazard_keys[0]);
+            let replay_goal = actual.is_some().then_some(goal);
+            assert_eq!(
+                session.observe_contacts(player, replay_hazard, replay_goal),
+                Ok(None),
+                "seed={seed}: terminal outcome replayed"
+            );
+
+            // 0/1/2/32 contact 与 exact/overflow capacity 共用同一 bounded transition seam。
+            let mut current = [None; MAX_CONTACTS];
+            let mut current_indices = [0_u8; MAX_CONTACTS];
+            let mut current_mask = [0_u64; CONTACT_MASK_WORDS];
+            let requested_count = match case.capacity_boundary {
+                0 => contact_count.min(1),
+                1 => 32,
+                2 => 33,
+                _ => unreachable!("capacity matrix is bounded"),
+            };
+            for index in 0..requested_count {
+                current[index] = Some(hazard_keys[index % hazard_keys.len()]);
+                current_indices[index] = ((index % 32) + 1) as u8;
+                current_mask[index / 64] |= 1_u64 << (index % 64);
+            }
+            let mut transition_gameplay = base_gameplay.clone();
+            if case.stale_epoch {
+                transition_gameplay.previous_contacts[0] = Some(ObjectKey {
+                    world_epoch: 2,
+                    ..hazard_keys[0]
+                });
+                transition_gameplay.previous_source_indices[0] = 1;
+                transition_gameplay.previous_contact_count = 1;
+            }
+            let transitions = contact_transitions(
+                &live,
+                &transition_gameplay,
+                &current,
+                requested_count,
+                &current_indices,
+                &current_mask,
+            );
+            if case.capacity_boundary == 2 {
+                assert!(
+                    matches!(
+                        transitions,
+                        Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+                    ),
+                    "seed={seed}: overflow must fail closed"
+                );
+            } else {
+                let (_, count) = transitions.expect("bounded contact matrix must succeed");
+                assert_eq!(count, requested_count, "seed={seed}: contact count drifted");
+            }
+
+            // pending spawn/destroy 必须从 active publication 中消失，且不得进入 source contact。
+            if case.pending_lifecycle != 0 {
+                let mut lifecycle = live.clone();
+                let slot = lifecycle
+                    .reserve_transient(7, 1, sprite([0.0, 0.0], [2.0, 2.0]))
+                    .unwrap()
+                    .clone();
+                let transient_key = ObjectKey {
+                    object_id: slot.object_id,
+                    world_epoch: lifecycle.world_epoch,
+                    logical_generation: slot.logical_generation,
+                    kind: slot.kind,
+                };
+                if case.pending_lifecycle == 2 {
+                    lifecycle.activate(transient_key, 10_000).unwrap();
+                    assert_eq!(
+                        lifecycle.request_destroy(transient_key),
+                        Ok(DestroyDisposition::AwaitingFinalize)
+                    );
+                }
+                assert_eq!(lifecycle.visible_count(true), sources.len());
+                if case.pending_lifecycle == 1 {
+                    // PendingSpawn 可被生命周期查询看到，但不会进入 active publication。
+                    assert!(lifecycle.visible_exact(transient_key).is_some());
+                } else {
+                    assert!(lifecycle.visible_exact(transient_key).is_none());
+                }
+            }
+
+            // restart 保持 epoch/sequence，reload 递增 epoch 并使旧 ObjectRef stale。
+            if case.restart {
+                let restarted = live
+                    .restart(bounds, &sources, &entity_values)
+                    .expect("restart source identity must remain stable");
+                assert_eq!(restarted.world_epoch, live.world_epoch);
+                assert_eq!(restarted.record_count(), sources.len());
+                let reset = State::new(player, 0, goal, 33, &hazards, 3.0, seed + 1, 1);
+                assert_eq!(reset.session.phase, Phase::Playing);
+                assert_eq!(reset.session.next_outcome_sequence, seed + 1);
+            }
+            if case.scene_reload {
+                let reloaded = RuntimeState::initial(2, 1, bounds, &sources, &entity_values);
+                assert_eq!(reloaded.world_epoch, 2);
+                assert!(reloaded.visible_exact(player).is_none());
+                let reloaded_player = ObjectKey {
+                    world_epoch: 2,
+                    ..player
+                };
+                assert!(reloaded.visible_exact(reloaded_player).is_some());
+            }
+
+            if case.alias {
+                assert!(crate::ensure_disjoint(&[(0, 8), (8, 16)]).is_ok());
+                assert_eq!(
+                    crate::ensure_disjoint(&[(0, 8), (4, 12)]),
+                    Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+                );
+            }
+            if case.snapshot_coherence {
+                let snapshot = step_result(session, seed, 0, 0);
+                assert_eq!(snapshot.phase, phase_code(session.phase), "seed={seed}");
+                assert_eq!(snapshot.cause, cause_code(session.cause), "seed={seed}");
+                assert_eq!(snapshot.accepts_input, u32::from(session.accepts_input()));
+            }
+        }
+
+        assert_eq!(combinations.len(), SEED_CASE_COUNT);
+        assert!(combinations.values().all(|count| *count >= 1));
+        assert!(dimension_counts
+            .iter()
+            .all(|counts| counts.iter().all(|count| *count > 0)));
+
+        if let Ok(path) = std::env::var("GAMEPLAY_SEED_MATRIX_MANIFEST") {
+            let mut manifest = String::from("kind\tkey\tcount\tminimum\n");
+            writeln!(manifest, "meta\ttotal_seeds\t10000\t10000").unwrap();
+            writeln!(
+                manifest,
+                "meta\tunique_combinations\t{}\t{}",
+                combinations.len(),
+                SEED_CASE_COUNT
+            )
+            .unwrap();
+            let dimensions = [
+                ("contact_count", ["0", "1", "2", "32"].as_slice()),
+                ("stale_epoch", ["0", "1"].as_slice()),
+                ("pending_lifecycle", ["0", "1", "2"].as_slice()),
+                ("restart", ["0", "1"].as_slice()),
+                ("scene_reload", ["0", "1"].as_slice()),
+                ("capacity_boundary", ["0", "1", "2"].as_slice()),
+                ("alias", ["0", "1"].as_slice()),
+                ("snapshot_coherence", ["0", "1"].as_slice()),
+                ("priority", ["0", "1", "2", "3", "4"].as_slice()),
+            ];
+            for (dimension_index, (name, values)) in dimensions.iter().enumerate() {
+                for (value_index, value) in values.iter().enumerate() {
+                    writeln!(
+                        manifest,
+                        "dimension\t{name}={value}\t{}\t1",
+                        dimension_counts[dimension_index][value_index]
+                    )
+                    .unwrap();
+                }
+            }
+            for (combination, count) in combinations {
+                writeln!(manifest, "combination\t{combination}\t{count}\t1").unwrap();
+            }
+            std::fs::write(path, manifest).expect("seed matrix manifest must be writable");
         }
     }
 }
