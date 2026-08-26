@@ -43,7 +43,6 @@ pub const SceneGeneration = struct {
     goal_index: u8,
     hazards: [scene_api.max_scene_object_count]HazardSource = [_]HazardSource{.{}} ** scene_api.max_scene_object_count,
     hazard_count: u8 = 0,
-    goal_position: [2]f32,
     phase_candidate_ready: bool = false,
 
     pub fn prepare(value: *const scene_api.Scene, extent: PlatformExtent) !SceneGeneration {
@@ -69,7 +68,6 @@ pub const SceneGeneration = struct {
         if (self.target != .candidate) return error.RuntimeCoreInvalidState;
         // Complete every fallible projection query while both candidates remain private.
         // After commitScene, ownership transfer and the target flip are no-fail operations.
-        try self.refreshRuntimeMetadata();
         try self.ensurePairedPhaseCandidate();
         try self.core.commitScene();
         self.phase_candidate_ready = false;
@@ -105,7 +103,6 @@ pub const SceneGeneration = struct {
         try self.ensurePairedPhaseCandidate();
         try self.core.commitScene();
         self.phase_candidate_ready = false;
-        self.goal_position = self.scene.goal().sprite.position;
     }
 
     pub fn beginGameplayFixed(self: *SceneGeneration, dt_seconds: f32, outcome: *runtime_core.GameplayOutcome) !runtime_core.GameplayStepResult {
@@ -135,21 +132,19 @@ pub const SceneGeneration = struct {
             count += 1;
         }
         if (count != 0) try self.core.applyPositions(self.target, patches[0..count]);
-        try self.refreshRuntimeMetadata();
     }
 
     pub fn setGoalPosition(self: *SceneGeneration, position: [2]f32) !void {
         const goal = self.scene.goal();
         const clamped = clampPosition(position, goal.sprite.size, self.extent);
         try self.setObjectPosition(self.goal_index, clamped);
-        self.goal_position = clamped;
     }
 
     pub fn setExtent(self: *SceneGeneration, extent: PlatformExtent) !void {
         if (extent.width == 0 or extent.height == 0) return;
         try self.core.setBounds(self.target, .{ 0, 0 }, boundsMax(extent));
         self.extent = extent;
-        try self.setGoalPosition(self.goal_position);
+        try self.setGoalPosition(self.goalPosition());
     }
 
     pub fn extractSprites(self: *SceneGeneration, output: []runtime_core.RenderSprite) !struct { sprites: []runtime_core.RenderSprite, snapshot: runtime_core.GameplaySnapshot } {
@@ -200,6 +195,11 @@ pub const SceneGeneration = struct {
 
     pub fn runtimeObject(self: *const SceneGeneration, handle: RuntimeHandle) ?RuntimeRecord {
         const view = (self.core.resolve(self.target, handle) catch return null) orelse return null;
+        return self.runtimeRecordFromView(view);
+    }
+
+    /// 供同一批次的 Adapter 复用已取出的 Rust view，避免逐对象再次跨 ABI 查询。
+    pub fn runtimeRecordFromView(self: *const SceneGeneration, view: runtime_core.ObjectView) ?RuntimeRecord {
         var value = record(view) catch return null;
         value.behavior_count = if (value.source_index) |index|
             self.scene.objects.entries[index].behaviors.count
@@ -237,12 +237,20 @@ pub const SceneGeneration = struct {
         return output[0..active.len];
     }
 
+    pub fn activeViews(self: *const SceneGeneration, output: []runtime_core.ObjectView) ![]runtime_core.ObjectView {
+        return self.core.snapshot(self.target, true, output);
+    }
+
     pub fn visibleHandles(self: *const SceneGeneration, output: []RuntimeHandle) ![]RuntimeHandle {
         var views: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
         const visible = try self.core.snapshot(self.target, false, &views);
         if (output.len < visible.len) return error.RuntimeObjectBufferTooSmall;
         for (visible, 0..) |view, index| output[index] = view.object_ref;
         return output[0..visible.len];
+    }
+
+    pub fn visibleViews(self: *const SceneGeneration, output: []runtime_core.ObjectView) ![]runtime_core.ObjectView {
+        return self.core.snapshot(self.target, false, output);
     }
 
     pub fn activeCount(self: *const SceneGeneration) usize {
@@ -293,7 +301,6 @@ pub const SceneGeneration = struct {
     pub fn setObjectPosition(self: *SceneGeneration, object_index: usize, position: [2]f32) !void {
         const handle = self.runtimeHandleAt(object_index) orelse return error.UnknownSceneObject;
         try self.core.applyPositions(self.target, &.{.{ .object_ref = handle, .position = position }});
-        if (object_index == self.goal_index) self.goal_position = (try self.core.resolve(self.target, handle)).?.position;
     }
 
     pub fn applyObjectPositionsAtomically(self: *SceneGeneration, updates: []const ObjectPositionUpdate) !void {
@@ -306,7 +313,6 @@ pub const SceneGeneration = struct {
             };
         }
         try self.core.applyPositions(self.target, patches[0..updates.len]);
-        try self.refreshRuntimeMetadata();
     }
 
     pub fn commitActivation(
@@ -324,11 +330,9 @@ pub const SceneGeneration = struct {
             };
         }
         try self.core.commitActivation(patches[0..updates.len], commands, dispositions);
-        try self.refreshRuntimeMetadata();
     }
 
     pub fn refreshPhaseProjection(self: *SceneGeneration) !void {
-        try self.refreshRuntimeMetadata();
     }
 
     pub fn preparePhaseState(self: *SceneGeneration, bindings: []const runtime_core.PhaseBinding) !void {
@@ -351,17 +355,12 @@ pub const SceneGeneration = struct {
     }
 
     pub fn goalPosition(self: *const SceneGeneration) [2]f32 {
-        return self.goal_position;
+        return self.objectPosition(self.goal_index) catch self.scene.goal().sprite.position;
     }
 
     pub fn primaryHazardY(self: *const SceneGeneration) f32 {
         if (self.hazard_count == 0) return 0;
         return (self.objectPosition(self.hazards[0].object_index) catch return 0)[1];
-    }
-
-    fn refreshRuntimeMetadata(self: *SceneGeneration) !void {
-        const goal_handle = self.runtimeHandleAt(self.goal_index) orelse return error.UnknownSceneObject;
-        self.goal_position = (try self.core.resolve(self.target, goal_handle) orelse return error.UnknownSceneObject).position;
     }
 
     fn prepareGameplay(self: *SceneGeneration) !void {
@@ -430,7 +429,6 @@ fn prepareWithCore(
         .goal_index = goal_index orelse return error.SceneGenerationMissingGoal,
         .hazards = hazards,
         .hazard_count = hazard_count,
-        .goal_position = value.goal().sprite.position,
         .phase_candidate_ready = false,
     };
     try generation.prepareGameplay();

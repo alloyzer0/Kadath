@@ -150,19 +150,16 @@ pub const Runtime = struct {
         const active = self.active orelse return error.BehaviorRuntimeNotLoaded;
         const mutable_generation: *scene_generation_api.SceneGeneration = @constCast(generation);
         try self.prepareTransientBindings(mutable_generation);
-        var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
-        const ordered = try mutable_generation.activeHandles(&handles);
+        var ordered_storage: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
+        const ordered = try mutable_generation.activeViews(&ordered_storage);
         var initial_positions: [runtime_core.max_object_count][2]f32 = undefined;
         var context = try OverlayHostContext.init(mutable_generation, try mutable_generation.worldEpoch());
-        for (ordered, 0..) |handle, index| {
-            const object_index = mutable_generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
-            initial_positions[index] = context.positions[object_index];
-        }
+        for (ordered, 0..) |view, index| initial_positions[index] = view.position;
         var host = overlayNativeHost(&context);
         try active.runStartV4(&host);
         var batch = TranslationBatch{ .object_count = ordered.len };
-        for (ordered, 0..) |handle, index| {
-            const object_index = mutable_generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
+        for (ordered, 0..) |view, index| {
+            const object_index = context.indexOfRef(view.object_ref) orelse return error.StaleRuntimeObject;
             const position = initial_positions[index];
             batch.deltas[index] = .{
                 context.positions[object_index][0] - position[0],
@@ -177,9 +174,9 @@ pub const Runtime = struct {
     fn prepareTransientBindings(self: *Runtime, generation: *scene_generation_api.SceneGeneration) !void {
         const package = self.package orelse return error.BehaviorRuntimeNotLoaded;
         var diagnostic = behavior_runtime.Diagnostic{};
-        var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
-        for (try generation.activeHandles(&handles)) |handle| {
-            const record = generation.runtimeObject(handle) orelse continue;
+        var views: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
+        for (try generation.activeViews(&views)) |view| {
+            const record = generation.runtimeRecordFromView(view) orelse continue;
             if (record.source_index != null or record.behavior_count == 0 or self.active.?.containsObject(record.object_id.slice())) continue;
             const prototype_index = record.prototype_index orelse return error.InvalidRuntimeObjectActivation;
             const prototype = &generation.scene.prototypes.entries[prototype_index];
@@ -552,6 +549,8 @@ fn phaseOperationName(operation: u32) []const u8 {
 const OverlayHostContext = struct {
     generation: *scene_generation_api.SceneGeneration,
     world_epoch: u64,
+    handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined,
+    handle_count: usize = 0,
     positions: [runtime_core.max_object_count][2]f32 = [_][2]f32{.{ 0, 0 }} ** runtime_core.max_object_count,
     present: [runtime_core.max_object_count]bool = [_]bool{false} ** runtime_core.max_object_count,
     events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined,
@@ -559,13 +558,29 @@ const OverlayHostContext = struct {
 
     fn init(generation: *scene_generation_api.SceneGeneration, world_epoch: u64) !OverlayHostContext {
         var context = OverlayHostContext{ .generation = generation, .world_epoch = world_epoch };
-        var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
-        for (try generation.activeHandles(&handles)) |handle| {
-            const index = generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
-            context.present[index] = true;
-            context.positions[index] = try generation.objectPosition(index);
+        var views: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
+        for (try generation.visibleViews(&views), 0..) |view, index| {
+            context.handles[index] = view.object_ref;
+            context.positions[index] = view.position;
+            context.present[index] = view.lifecycle == 2;
+            context.handle_count += 1;
         }
         return context;
+    }
+
+    fn indexOfRef(self: *const OverlayHostContext, object_ref: runtime_core.ObjectRef) ?usize {
+        for (self.handles[0..self.handle_count], 0..) |handle, index| {
+            if (runtime_core.sameObjectRef(handle, object_ref)) return index;
+        }
+        return null;
+    }
+
+    fn indexOfNative(self: *const OverlayHostContext, object: ?*const behavior_runtime.NativeObjectHandle) ?usize {
+        const value = object orelse return null;
+        for (self.handles[0..self.handle_count], 0..) |handle, index| {
+            if (nativeMatchesObjectRef(value, handle)) return index;
+        }
+        return null;
     }
 };
 
@@ -603,13 +618,13 @@ const ActivationHostContext = struct {
             .domain = domain,
             .active_binding_capacity = active_binding_capacity,
         };
-        var handles: [runtime_core.max_object_count]scene_generation_api.RuntimeHandle = undefined;
-        for (try generation.visibleHandles(&handles)) |handle| {
+        var views: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
+        for (try generation.visibleViews(&views)) |view| {
             const index = context.handle_count;
-            context.handles[index] = handle;
+            context.handles[index] = view.object_ref;
+            // Activation transaction 也需要访问 pending 对象；Core 仍负责最终生命周期裁决。
             context.present[index] = true;
-            const object_index = generation.objectIndexForRef(handle) orelse return error.StaleRuntimeObject;
-            context.positions[index] = try generation.objectPosition(object_index);
+            context.positions[index] = view.position;
             context.handle_count += 1;
         }
         return context;
@@ -893,10 +908,12 @@ fn overlayResolveObject(
 ) callconv(.c) c_int {
     const context: *OverlayHostContext = @ptrCast(@alignCast(userdata orelse return 0));
     if (object_id == null or object_id_length == 0 or object_id_length > behavior_runtime.max_object_id_bytes) return 0;
-    const handle = context.generation.runtimeHandle(object_id[0..object_id_length]) orelse return 0;
-    const object_index = context.generation.objectIndexForRef(handle) orelse return 0;
+    const handle = for (context.handles[0..context.handle_count]) |candidate| {
+        if (std.mem.eql(u8, runtime_core.objectIdSlice(&candidate), object_id[0..object_id_length])) break candidate;
+    } else return 0;
+    const object_index = context.indexOfRef(handle) orelse return 0;
     if (!context.present[object_index]) return 0;
-    return fillRuntimeObjectHandle(context.generation, handle, context.world_epoch, out_object);
+    return fillNativeObjectHandle(handle, out_object);
 }
 
 fn overlayGetObjectPosition(
@@ -987,7 +1004,7 @@ fn validateOverlayObjectHandle(
     context: *OverlayHostContext,
     object: ?*const behavior_runtime.NativeObjectHandle,
 ) ?usize {
-    const slot = validateRuntimeObjectHandle(context.generation, context.world_epoch, object) orelse return null;
+    const slot = context.indexOfNative(object) orelse return null;
     if (!context.present[slot]) return null;
     return slot;
 }
