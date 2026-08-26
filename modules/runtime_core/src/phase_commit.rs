@@ -928,7 +928,11 @@ fn begin_phase_impl(
     out_ptr: *mut abi::kadath_runtime_phase_begin_result_v1_t,
     core_generates_sequence: bool,
 ) -> Result<(), u32> {
-    if desc_ptr.is_null() || out_ptr.is_null() {
+    // 两个外部指针分别校验，保证单侧为空时不会落入后续结构体读取。
+    if desc_ptr.is_null() {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if out_ptr.is_null() {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     let desc_size = unsafe { read_struct_size(desc_ptr) }?;
@@ -3223,6 +3227,149 @@ mod tests {
             submit_events(&mut exhausted, &event, 1, stride, &mut fresh_result),
             Err(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)
         );
+    }
+
+    #[test]
+    fn submit_events_arithmetic_boundaries_have_observable_side_effects() {
+        use crate::{
+            object_authority::{ObjectId, RuntimeState, SourceObject},
+            world::{Bounds, Sprite},
+        };
+
+        fn test_core() -> RuntimeCore {
+            let sources = [SourceObject {
+                object_id: ObjectId::parse(b"player").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                sprite: Sprite {
+                    position: [0.0, 0.0],
+                    size: [2.0, 2.0],
+                    color: [1.0; 4],
+                    texture_id: 1,
+                    move_speed: 0.0,
+                },
+            }];
+            let live = RuntimeState::initial(
+                1,
+                1,
+                Bounds::new([0.0, 0.0], [100.0, 100.0]).unwrap(),
+                &sources,
+                &[1],
+            );
+            RuntimeCore {
+                owner_thread: std::thread::current().id(),
+                in_call: false,
+                live: Some(live),
+                candidate: None,
+                candidate_next_entity_value: None,
+                candidate_mode: None,
+                next_entity_value: 2,
+                phase: PhaseState::new_boxed().unwrap(),
+                gameplay: None,
+                gameplay_candidate: None,
+                #[cfg(feature = "contract-test-hooks")]
+                next_fault: None,
+            }
+        }
+
+        fn event() -> abi::kadath_runtime_phase_event_v1_t {
+            let object_id = ObjectId::parse(b"player").unwrap();
+            abi::kadath_runtime_phase_event_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32,
+                domain: abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                target: abi::kadath_runtime_object_ref_v1_t {
+                    struct_size: mem::size_of::<abi::kadath_runtime_object_ref_v1_t>() as u32,
+                    kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                    world_epoch: 1,
+                    logical_generation: 1,
+                    object_id_length: object_id.len(),
+                    reserved0: 0,
+                    object_id: object_id.storage(),
+                    reserved: [0; 4],
+                },
+                ..unsafe { mem::zeroed() }
+            }
+        }
+
+        fn begin(core: &mut RuntimeCore) {
+            let desc = abi::kadath_runtime_phase_begin_desc_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_desc_v1_t>() as u32,
+                domain: abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                phase_sequence: 0,
+                reserved0: 0,
+                reserved1: 0,
+                reserved: [0; 4],
+            };
+            let mut result = abi::kadath_runtime_phase_begin_result_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32,
+                ..unsafe { mem::zeroed() }
+            };
+            begin_phase_v2(core, &desc, &mut result).unwrap();
+        }
+
+        fn result() -> abi::kadath_runtime_phase_batch_result_v1_t {
+            abi::kadath_runtime_phase_batch_result_v1_t {
+                struct_size: mem::size_of::<abi::kadath_runtime_phase_batch_result_v1_t>() as u32,
+                ..unsafe { mem::zeroed() }
+            }
+        }
+
+        let stride = mem::size_of::<abi::kadath_runtime_phase_event_v1_t>();
+        {
+            // item_count=64 且队列已有 1 个元素时，原始 len + count 会拒绝，
+            // +→* 变异若放行将部分写入，故同时断言队列和 sequence 保持不变。
+            let mut core = test_core();
+            begin(&mut core);
+            let one = [event()];
+            let mut output = result();
+            submit_events(&mut core, one.as_ptr(), 1, stride, &mut output).unwrap();
+            let batch = vec![event(); EVENT_CAPACITY].into_boxed_slice();
+            assert_eq!(
+                submit_events(
+                    &mut core,
+                    batch.as_ptr(),
+                    EVENT_CAPACITY,
+                    stride,
+                    &mut output,
+                ),
+                Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+            );
+            let domain = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap();
+            assert_eq!(domain.event_queue.len(), 1);
+            assert_eq!(domain.next_event_sequence, 2);
+        }
+
+        {
+            // 第一项合法、第二项 generation 非法，确保 index * stride 的
+            // *→/ 变异不会把第二项再次读取为第一项。
+            let mut core = test_core();
+            begin(&mut core);
+            let first = event();
+            let mut second = first;
+            second.generation = 1;
+            let events = [first, second];
+            let mut output = result();
+            assert_eq!(
+                submit_events(
+                    &mut core,
+                    events.as_ptr(),
+                    events.len(),
+                    stride,
+                    &mut output
+                ),
+                Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_REQUEST)
+            );
+            assert_eq!(
+                core.phase
+                    .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                    .unwrap()
+                    .event_queue
+                    .len(),
+                0
+            );
+        }
     }
 
     #[test]

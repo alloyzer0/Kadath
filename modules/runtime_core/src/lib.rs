@@ -1115,6 +1115,11 @@ fn apply_positions(
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
         let key = read_object_key(&patch.object_ref)?;
+        // 先确认每个 key 仍由 Object Authority 持有，避免容量边界批次
+        // 为了得到专用 stale 错误而读取未提供的后续内存。
+        if state.visible_exact(key).is_none() {
+            return Err(abi::KADATH_ERR_RUNTIME_STALE_OBJECT);
+        }
         if parsed[..parsed_count]
             .iter()
             .any(|(existing, _): &(ObjectKey, [f32; 2])| *existing == key)
@@ -1723,14 +1728,23 @@ fn prepare_gameplay_state(
     let goal = read_object_key(&desc.goal)?;
     let player_record = candidate.visible_exact(player);
     let goal_record = candidate.visible_exact(goal);
-    if player.kind != abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER
-        || goal.kind != abi::KADATH_RUNTIME_OBJECT_KIND_GOAL
-        || player == goal
-        || player_record
-            .and_then(|record| record.source_index)
-            .is_none()
-        || goal_record.and_then(|record| record.source_index).is_none()
+    // 玩家、目标及其 source index 各自拒绝，避免 OR→AND 变异把坏引用拼成合法状态。
+    if player.kind != abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if goal.kind != abi::KADATH_RUNTIME_OBJECT_KIND_GOAL {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if player == goal {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if player_record
+        .and_then(|record| record.source_index)
+        .is_none()
     {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
+    if goal_record.and_then(|record| record.source_index).is_none() {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     let mut hazards = Vec::new();
@@ -1748,22 +1762,33 @@ fn prepare_gameplay_state(
         let hazard = unsafe { &*pointer };
         if hazard.struct_size
             < mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>() as u32
-            || hazard.reserved0 != 0
-            || !reserved_is_zero(&hazard.reserved)
-            || !matches!(
-                hazard.movement_mode,
-                abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE
-                    | abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL
-            )
         {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if hazard.reserved0 != 0 {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if !reserved_is_zero(&hazard.reserved) {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if !matches!(
+            hazard.movement_mode,
+            abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE
+                | abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL
+        ) {
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
         let key = read_object_key(&hazard.object_ref)?;
         let record = candidate
             .visible_exact(key)
             .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?;
-        if key.kind != abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD || key == player || key == goal
-        {
+        if key.kind != abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if key == player {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if key == goal {
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
         let source = record
@@ -1775,17 +1800,28 @@ fn prepare_gameplay_state(
         previous_source = Some(source);
         let legacy =
             hazard.movement_mode == abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
-        if (!legacy
-            && (hazard.patrol_min_y != 0.0
-                || hazard.patrol_max_y != 0.0
-                || hazard.patrol_speed != 0.0))
-            || (legacy
-                && (!hazard.patrol_min_y.is_finite()
-                    || !hazard.patrol_max_y.is_finite()
-                    || !hazard.patrol_speed.is_finite()
-                    || hazard.patrol_min_y >= hazard.patrol_max_y
-                    || hazard.patrol_speed < 0.0))
-        {
+        if !legacy && hazard.patrol_min_y != 0.0 {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if !legacy && hazard.patrol_max_y != 0.0 {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if !legacy && hazard.patrol_speed != 0.0 {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if legacy && !hazard.patrol_min_y.is_finite() {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if legacy && !hazard.patrol_max_y.is_finite() {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if legacy && !hazard.patrol_speed.is_finite() {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if legacy && hazard.patrol_min_y >= hazard.patrol_max_y {
+            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        }
+        if legacy && hazard.patrol_speed < 0.0 {
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
         hazards.push(gameplay::Hazard {
@@ -1982,11 +2018,17 @@ fn plan_gameplay_positions(
             .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?;
         let span = f64::from(hazard.patrol_max_y - hazard.patrol_min_y);
         let period = span * 2.0;
+        // 先计算无符号位移，再按内部不变量 ±1 的方向应用符号，
+        // 让速度与 dt 的乘法成为可独立验证的核心算术。
+        let displacement = f64::from(hazard.patrol_speed) * f64::from(dt_seconds);
+        let signed_displacement = if hazard.patrol_direction < 0.0 {
+            -displacement
+        } else {
+            displacement
+        };
         let phase = (f64::from(record.sprite.position[1] - hazard.patrol_min_y)
-            + f64::from(hazard.patrol_speed)
-                * f64::from(dt_seconds)
-                * f64::from(hazard.patrol_direction))
-        .rem_euclid(period);
+            + signed_displacement)
+            .rem_euclid(period);
         let (y, direction) = if phase < span {
             (f64::from(hazard.patrol_min_y) + phase, 1.0)
         } else {
@@ -2940,6 +2982,31 @@ mod tests {
         assert_eq!(output.world_epoch, 1);
         assert!(core.gameplay_candidate.is_some());
 
+        // 对齐但带尾部 padding 的 stride 仍然合法；可区分 <→> 变异。
+        let mut padded_desc = valid;
+        padded_desc.hazard_stride = mem::size_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>()
+            + mem::align_of::<abi::kadath_runtime_gameplay_hazard_desc_v1_t>();
+        let (status, _, _) = run_gameplay_prepare(padded_desc, &mut hazards);
+        assert_eq!(status, abi::KADATH_OK as i32);
+
+        // 在容量上界处放入第二项 stale hazard：原始 > guard 必须先返回
+        // INVALID_ARGUMENT，而 >→== 或减法变异会继续读取并返回 STALE_OBJECT。
+        let mut many_hazards = vec![gameplay_test_hazard(); gameplay::MAX_CONTACTS];
+        many_hazards[1].object_ref.world_epoch = 2;
+        let mut max_desc = valid;
+        max_desc.hazards = many_hazards.as_ptr();
+        max_desc.hazard_count = gameplay::MAX_CONTACTS as u32;
+        let mut max_output = abi::kadath_runtime_gameplay_candidate_info_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_candidate_info_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        let mut max_core = gameplay_test_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let max_pointer = (&mut *max_core as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        assert_eq!(
+            prepare_gameplay_state_entry(max_pointer, &max_desc, &mut max_output),
+            abi::KADATH_ERR_INVALID_ARGUMENT as i32
+        );
+
         let invalid = [
             {
                 let mut value = valid;
@@ -3124,6 +3191,19 @@ mod tests {
         assert_eq!(plan.updates[1].2, [20.0, 2.0]);
         assert_eq!(plan.hazard_directions[0], 1.0);
 
+        // 非零 patrol_min_y 与非单位 dt 同时覆盖 span、period、相位偏移
+        // 以及速度×dt 的算术；期望到达上界并反向移动。
+        let offset_patrol = gameplay::Hazard {
+            patrol_min_y: 3.0,
+            patrol_max_y: 13.0,
+            patrol_speed: 2.0,
+            ..patrol
+        };
+        let offset_gameplay = gameplay::State::new(player, 0, goal, 1, &[offset_patrol], 3.0, 1, 1);
+        let offset_plan = plan_gameplay_positions(state, &offset_gameplay, 8.0, [0, 0]).unwrap();
+        assert_eq!(offset_plan.updates[1].2, [20.0, 10.0]);
+        assert_eq!(offset_plan.hazard_directions[0], -1.0);
+
         // 三个 continue 条件各自独立验证，避免 OR→AND 变异漏过。
         for (movement_mode, patrol_speed, dt_seconds) in [
             (abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE, 2.0, 1.0),
@@ -3202,6 +3282,24 @@ mod tests {
         invalid = base;
         invalid.patch_stride = mem::size_of::<abi::kadath_runtime_position_patch_v1_t>() + 1;
         assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+        invalid = base;
+        invalid.patch_stride = mem::size_of::<abi::kadath_runtime_position_patch_v1_t>()
+            + mem::align_of::<abi::kadath_runtime_position_patch_v1_t>();
+        assert_eq!(
+            apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range),
+            Ok(())
+        );
+
+        // MAX_OBJECTS 本身是合法容量；首项 stale 让原始路径返回专用错误，
+        // 可区分 >→== 与 >→>= 变异，而无需解引用其余未使用槽位。
+        invalid = base;
+        invalid.patch_count = MAX_OBJECTS;
+        patches[0].object_ref.world_epoch = 2;
+        assert_eq!(
+            apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range),
+            Err(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)
+        );
+        patches[0].object_ref = player;
         invalid = base;
         invalid.patch_count = MAX_OBJECTS;
         invalid.patch_stride = usize::MAX - (alignment - 1);
@@ -3359,6 +3457,35 @@ mod tests {
         exact_buffer.item_capacity = MAX_OBJECTS;
         assert_eq!(
             publish_gameplay_snapshot(pointer, &mut exact_buffer, &mut snapshot),
+            Ok(())
+        );
+        let mut padded_buffer = exact_buffer;
+        padded_buffer.item_stride =
+            render_size + mem::align_of::<abi::kadath_runtime_render_item_v1_t>();
+        let item_alignment = mem::align_of::<abi::kadath_runtime_render_item_v1_t>();
+        let mut padded_storage =
+            vec![
+                0_u8;
+                padded_buffer.item_stride * (MAX_OBJECTS - 1) + render_size + item_alignment
+            ]
+            .into_boxed_slice();
+        let aligned_items = ((padded_storage.as_mut_ptr() as usize + item_alignment - 1)
+            & !(item_alignment - 1))
+            as *mut abi::kadath_runtime_render_item_v1_t;
+        for index in 0..3 {
+            unsafe {
+                ptr::write(
+                    aligned_items
+                        .cast::<u8>()
+                        .add(index * padded_buffer.item_stride)
+                        .cast::<abi::kadath_runtime_render_item_v1_t>(),
+                    template_item,
+                );
+            }
+        }
+        padded_buffer.items = aligned_items;
+        assert_eq!(
+            publish_gameplay_snapshot(pointer, &mut padded_buffer, &mut snapshot),
             Ok(())
         );
         let mut over_items = vec![template_item; MAX_OBJECTS + 1].into_boxed_slice();
