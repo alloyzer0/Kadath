@@ -202,11 +202,17 @@ pub(crate) fn strict_overlap(first: Sprite, second: Sprite) -> Result<bool, ()> 
     if !first.is_valid() || !second.is_valid() {
         return Err(());
     }
-    if first.size[0] == 0.0
-        || first.size[1] == 0.0
-        || second.size[0] == 0.0
-        || second.size[1] == 0.0
-    {
+    // 四个零面积分支显式拆开：即使另一轴有值，零宽/零高也不是可碰撞区域。
+    if first.size[0] == 0.0 {
+        return Ok(false);
+    }
+    if first.size[1] == 0.0 {
+        return Ok(false);
+    }
+    if second.size[0] == 0.0 {
+        return Ok(false);
+    }
+    if second.size[1] == 0.0 {
         return Ok(false);
     }
     let first_right = first.position[0] + first.size[0];
@@ -827,6 +833,201 @@ mod tests {
             ),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn active_contacts_covers_high_source_mask_words_and_player_override() {
+        use crate::{
+            object_authority::{RuntimeState, SourceObject},
+            world::Bounds,
+        };
+
+        let mut sources = Vec::with_capacity(72);
+        sources.push(SourceObject {
+            object_id: ObjectId::parse(b"player").unwrap(),
+            kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+            sprite: sprite([0.0, 0.0], [2.0, 2.0]),
+        });
+        for source_index in 1..=70 {
+            sources.push(SourceObject {
+                object_id: ObjectId::parse(format!("hazard-{source_index}").as_bytes()).unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                sprite: sprite([0.5, 0.0], [2.0, 2.0]),
+            });
+        }
+        sources.push(SourceObject {
+            object_id: ObjectId::parse(b"goal").unwrap(),
+            kind: abi::KADATH_RUNTIME_OBJECT_KIND_GOAL,
+            sprite: sprite([20.0, 20.0], [2.0, 2.0]),
+        });
+        let entity_values: Vec<u64> = (1..=sources.len() as u64).collect();
+        let live = RuntimeState::initial(
+            1,
+            1,
+            Bounds::new([-100.0, -100.0], [100.0, 100.0]).unwrap(),
+            &sources,
+            &entity_values,
+        );
+        let player = key(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER);
+        let goal = key(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL);
+        let hazards: Vec<Hazard> = (1..=70)
+            .map(|source_index| Hazard {
+                object: key(
+                    format!("hazard-{source_index}").as_bytes(),
+                    abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                ),
+                source_index,
+                movement_mode: abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE,
+                patrol_min_y: 0.0,
+                patrol_max_y: 0.0,
+                patrol_speed: 0.0,
+                patrol_direction: 1.0,
+            })
+            .collect();
+        let gameplay = State::new(player, 0, goal, 71, &hazards, 3.0, 1, 1);
+
+        let observation = active_contacts(&live, &gameplay, &[]).unwrap();
+        assert_eq!(observation.count, 70);
+        assert_eq!(observation.source_indices[0], 1);
+        assert_eq!(observation.source_indices[69], 70);
+        assert_ne!(observation.source_mask[0] & (1_u64 << 1), 0);
+        assert_ne!(observation.source_mask[1] & (1_u64 << (70 % 64)), 0);
+
+        // 玩家 override 必须独立查找；移动到远处后不能继续报告 hazard 接触。
+        let moved = active_contacts(&live, &gameplay, &[(player, 0, [50.0, 50.0])]).unwrap();
+        assert_eq!(moved.count, 0);
+    }
+
+    #[test]
+    fn submit_contact_transitions_preserves_pair_order_and_direction() {
+        use crate::{
+            object_authority::{RuntimeState, SourceObject},
+            phase_commit,
+            world::Bounds,
+            RuntimeCore,
+        };
+
+        let sources = [
+            SourceObject {
+                object_id: ObjectId::parse(b"player").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+                sprite: sprite([0.0, 0.0], [2.0, 2.0]),
+            },
+            SourceObject {
+                object_id: ObjectId::parse(b"hazard-1").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                sprite: sprite([10.0, 0.0], [2.0, 2.0]),
+            },
+            SourceObject {
+                object_id: ObjectId::parse(b"hazard-2").unwrap(),
+                kind: abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+                sprite: sprite([20.0, 0.0], [2.0, 2.0]),
+            },
+        ];
+        let live = RuntimeState::initial(
+            1,
+            1,
+            Bounds::new([-10.0, -10.0], [100.0, 100.0]).unwrap(),
+            &sources,
+            &[1, 2, 3],
+        );
+        let mut core = RuntimeCore {
+            owner_thread: std::thread::current().id(),
+            in_call: false,
+            live: Some(live),
+            candidate: None,
+            candidate_next_entity_value: None,
+            candidate_mode: None,
+            next_entity_value: 4,
+            phase: phase_commit::PhaseState::new_boxed().unwrap(),
+            gameplay: None,
+            gameplay_candidate: None,
+            #[cfg(feature = "contract-test-hooks")]
+            next_fault: None,
+        };
+        let begin_desc = abi::kadath_runtime_phase_begin_desc_v1_t {
+            struct_size: std::mem::size_of::<abi::kadath_runtime_phase_begin_desc_v1_t>() as u32,
+            domain: abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            phase_sequence: 0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved: [0; 4],
+        };
+        let mut begin_result = abi::kadath_runtime_phase_begin_result_v1_t {
+            struct_size: std::mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        phase_commit::begin_phase_v2(&mut core, &begin_desc, &mut begin_result).unwrap();
+
+        let player = key(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER);
+        let first = key(b"hazard-1", abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD);
+        let second = key(b"hazard-2", abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD);
+        let transitions = [
+            ContactTransition {
+                ended: true,
+                other: first,
+            },
+            ContactTransition {
+                ended: false,
+                other: second,
+            },
+        ];
+        assert_eq!(
+            submit_contact_transitions(&mut core, player, &transitions),
+            Ok(4)
+        );
+
+        let event_size = std::mem::size_of::<abi::kadath_runtime_phase_event_v1_t>();
+        let mut short_output: [abi::kadath_runtime_phase_event_v1_t; 4] =
+            [unsafe { std::mem::zeroed() }; 4];
+        for event in &mut short_output {
+            event.struct_size = event_size as u32;
+        }
+        short_output[1].struct_size = (event_size - 1) as u32;
+        let mut short_count = 0;
+        assert_eq!(
+            phase_commit::drain_events(
+                &mut core,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                begin_result.phase_sequence,
+                short_output.as_mut_ptr(),
+                short_output.len(),
+                &mut short_count,
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut output: [abi::kadath_runtime_phase_event_v1_t; 4] =
+            [unsafe { std::mem::zeroed() }; 4];
+        for event in &mut output {
+            event.struct_size = event_size as u32;
+        }
+        let mut output_count = 0;
+        phase_commit::drain_events(
+            &mut core,
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            begin_result.phase_sequence,
+            output.as_mut_ptr(),
+            output.len(),
+            &mut output_count,
+        )
+        .unwrap();
+        assert_eq!(output_count, 4);
+        assert_eq!(
+            &output[0].name[..output[0].name_length as usize],
+            b"contact_end"
+        );
+        assert_eq!(
+            &output[2].name[..output[2].name_length as usize],
+            b"contact_begin"
+        );
+        assert_eq!(crate::read_object_key(&output[0].target), Ok(player));
+        assert_eq!(crate::read_object_key(&output[1].target), Ok(first));
+        assert_eq!(crate::read_object_key(&output[2].target), Ok(player));
+        assert_eq!(crate::read_object_key(&output[3].target), Ok(second));
+        assert_eq!(crate::read_object_key(&output[0].other), Ok(first));
+        assert_eq!(crate::read_object_key(&output[1].other), Ok(player));
+        assert_eq!(crate::read_object_key(&output[2].other), Ok(second));
+        assert_eq!(crate::read_object_key(&output[3].other), Ok(player));
     }
 
     #[test]
