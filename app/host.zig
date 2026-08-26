@@ -634,9 +634,13 @@ pub const Host = struct {
                     .move_x = @intCast(routed_input.behaviors.move_x),
                     .move_y = @intCast(routed_input.behaviors.move_y),
                 });
+                if (self.behavior_runtime.isLoaded()) {
+                    // collision 前先发布 callback 已提交的 structural 可见性；
+                    // contact/普通事件仍在 Gameplay commit 后统一 drain。
+                    try self.behavior_runtime.settleFixedStructuralBeforeGameplay(&self.generation);
+                }
             } else {
-                // Legacy fixed scripts have no input parameter, but their
-                // direct mutation commands still run after terminal state.
+                // Legacy fixed 脚本没有 input 参数，但终态后仍执行 direct mutation。
                 self.runScriptFixed(@floatCast(fixed_dt_seconds));
             }
             if (!usesBehaviorRuntime(&self.scene) or !self.behavior_runtime.isLoaded()) {

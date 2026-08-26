@@ -135,8 +135,6 @@ struct Binding {
 #[derive(Clone, Copy)]
 struct EventEntry {
     item: abi::kadath_runtime_phase_event_v1_t,
-    // Rust Gameplay 自己生成的事件已经在同一提交中验证过对象生命周期。
-    trusted_gameplay: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -960,7 +958,11 @@ pub(crate) fn begin_phase(
     ) {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_DOMAIN);
     }
-    if desc.reserved0 != 0 || desc.reserved1 != 0 || !reserved_is_zero(&desc.reserved) {
+    if desc.phase_sequence != 0
+        || desc.reserved0 != 0
+        || desc.reserved1 != 0
+        || !reserved_is_zero(&desc.reserved)
+    {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     if core.live.is_none() {
@@ -974,13 +976,8 @@ pub(crate) fn begin_phase(
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
     }
-    // 生产 Adapter 传入 0 时由 Rust 生成唯一 phase sequence；非零值保留给
-    // 兼容性/契约测试调用，避免把旧的外部测试 seam 与生产 authority 混在一起。
-    let phase_sequence = if desc.phase_sequence == 0 {
-        PhaseState::next_sequence(&mut core.phase.next_phase_sequence)?
-    } else {
-        desc.phase_sequence
-    };
+    // phase sequence 始终由 Rust 生成；ABI 输入字段只保留布局且必须为零。
+    let phase_sequence = PhaseState::next_sequence(&mut core.phase.next_phase_sequence)?;
     let domain = core.phase.domain_mut(desc.domain)?;
     domain.phase_sequence = Some(phase_sequence);
     domain.event_queue.clear();
@@ -1091,10 +1088,7 @@ pub(crate) fn submit_events(
             domain_state.event_successor_generation,
             domain_state.event_has_drained,
         )?;
-        domain_state.event_queue.push(EventEntry {
-            item: copied,
-            trusted_gameplay: false,
-        })?;
+        domain_state.event_queue.push(EventEntry { item: copied })?;
     }
     unsafe { ptr::write(out_ptr, result) };
     Ok(())
@@ -1143,10 +1137,7 @@ pub(crate) fn submit_trusted_gameplay_events_with(
         let mut copied = event;
         copied.sequence = first_sequence + index as u64;
         copied.generation = generation;
-        domain_state.event_queue.push(EventEntry {
-            item: copied,
-            trusted_gameplay: true,
-        })?;
+        domain_state.event_queue.push(EventEntry { item: copied })?;
     }
     domain_state.next_event_sequence = last_sequence;
     Ok(())
@@ -1214,7 +1205,9 @@ pub(crate) fn drain_events(
         .iter()
         .filter(|entry| entry.item.generation == generation)
     {
-        if entry.trusted_gameplay || event_objects_live(&entry.item, state) {
+        // Gameplay 事件只跳过提交时的外部 ABI 重复校验；投递时仍重新解析
+        // target/sender/other，防止 structural settle 后把幽灵引用交给 Zig。
+        if event_objects_live(&entry.item, state) {
             unsafe { ptr::write(output_ptr.add(output_index), entry.item) };
             output_index += 1;
         }
@@ -2118,10 +2111,7 @@ pub(crate) fn commit_activation(
     let world_epoch = state.world_epoch;
     let accepted_event_count = activation.events.len() as u32;
     for event in activation.events.iter().copied() {
-        event_queue.push(EventEntry {
-            item: event,
-            trusted_gameplay: false,
-        })?;
+        event_queue.push(EventEntry { item: event })?;
     }
     let accepted_structural_count = activation.structural.len() as u32;
     for item in activation.structural.iter().copied() {

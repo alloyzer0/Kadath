@@ -52,7 +52,11 @@ pub const Runtime = struct {
         return error.UnsupportedBehaviorRuntime;
     }
 
-    pub fn finishFixedStep(_: *Runtime, _: *scene_generation_api.SceneGeneration, _: []const bool, _: InputSnapshot) !void {
+    pub fn finishFixedStep(_: *Runtime, _: *scene_generation_api.SceneGeneration, _: InputSnapshot) !void {
+        return error.UnsupportedBehaviorRuntime;
+    }
+
+    pub fn settleFixedStructuralBeforeGameplay(_: *Runtime, _: *scene_generation_api.SceneGeneration) !void {
         return error.UnsupportedBehaviorRuntime;
     }
 

@@ -250,6 +250,16 @@ pub const Runtime = struct {
         try self.endPhase(generation, session);
     }
 
+    /// fixed_update 回调结束后先结算 structural visibility；普通事件和
+    /// Gameplay contact 仍留到 commit 之后按 Phase 顺序统一投递。
+    pub fn settleFixedStructuralBeforeGameplay(
+        self: *Runtime,
+        generation: *scene_generation_api.SceneGeneration,
+    ) !void {
+        const session = try self.requirePhase(.fixed);
+        while (try self.flushStructural(generation, session)) {}
+    }
+
     pub fn finishFrame(
         self: *Runtime,
         generation: *scene_generation_api.SceneGeneration,

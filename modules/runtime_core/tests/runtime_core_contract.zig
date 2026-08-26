@@ -99,7 +99,7 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     defer core.deinit();
     try preparePairedScene(&core, .initial);
     const player = (try core.findById(.live, "player")).?.object_ref;
-    try core.beginPhase(.fixed, 77);
+    const phase_sequence = try core.beginPhaseOwned(.fixed);
 
     var event = std.mem.zeroes(runtime_core.PhaseEvent);
     event.struct_size = @sizeOf(runtime_core.PhaseEvent);
@@ -109,7 +109,7 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     @memcpy(event.name[0..5], "hello");
     _ = try core.submitPhaseEvents(&[_]runtime_core.PhaseEvent{event});
     var drained: [1]runtime_core.PhaseEvent = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try core.drainPhaseEvents(.fixed, 77, &drained));
+    try std.testing.expectEqual(@as(usize, 1), try core.drainPhaseEvents(.fixed, phase_sequence, &drained));
 
     var structural = std.mem.zeroes(runtime_core.PhaseStructural);
     structural.struct_size = @sizeOf(runtime_core.PhaseStructural);
@@ -129,7 +129,7 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     var completions = [_]runtime_core.PhaseCompletion{completion};
     _ = try core.submitPhaseStructural(&structural_items, &completions);
     var taken: [1]runtime_core.PhaseStructural = undefined;
-    const flush = try core.takePhaseStructural(.fixed, 77, &taken);
+    const flush = try core.takePhaseStructural(.fixed, phase_sequence, &taken);
     const transaction = try core.beginPhaseActivation(flush.info.flush_token, taken[0].sequence);
     var activation = std.mem.zeroes(runtime_core.PhaseActivationBatch);
     var activation_results = [_]runtime_core.PhaseActivationStructuralResult{std.mem.zeroes(runtime_core.PhaseActivationStructuralResult)};
@@ -147,7 +147,7 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     const activated = try core.commitPhaseActivation(transaction.transaction_id);
     try std.testing.expectEqual(@as(u32, 2), activated.root_object.lifecycle);
     var nested_taken: [1]runtime_core.PhaseStructural = undefined;
-    const nested_flush = try core.takePhaseStructural(.fixed, 77, &nested_taken);
+    const nested_flush = try core.takePhaseStructural(.fixed, phase_sequence, &nested_taken);
     const nested_transaction = try core.beginPhaseActivation(nested_flush.info.flush_token, nested_taken[0].sequence);
     var nested_activation = std.mem.zeroes(runtime_core.PhaseActivationBatch);
     nested_activation.struct_size = @sizeOf(runtime_core.PhaseActivationBatch);
@@ -155,7 +155,7 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     nested_activation.active_binding_capacity = runtime_core.max_phase_bindings;
     try core.submitPhaseActivation(nested_transaction.transaction_id, &nested_activation, &[_]runtime_core.PhaseActivationStructuralResult{});
     _ = try core.commitPhaseActivation(nested_transaction.transaction_id);
-    try core.endPhase(.fixed, 77);
+    try core.endPhase(.fixed, phase_sequence);
 }
 
 test "Rust Core owns generated phase sequence high-water" {
@@ -177,10 +177,10 @@ test "Runtime Core Phase replay preserves FIFO, domain counters, and generation 
     try preparePairedScene(&core, .initial);
     const player = (try core.findById(.live, "player")).?.object_ref;
 
-    // This is a deterministic replay trace captured under seed 0x50484153.
+    // 固定seed 0x50484153的确定性重放轨迹。
     const seed: u32 = 0x5048_4153;
     try std.testing.expectEqual(@as(u32, 0x5048_4153), seed);
-    try core.beginPhase(.fixed, seed);
+    const first_phase_sequence = try core.beginPhaseOwned(.fixed);
 
     var drained: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
     var bounded_batch: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
@@ -194,15 +194,15 @@ test "Runtime Core Phase replay preserves FIFO, domain counters, and generation 
         error.RuntimePhaseQueueCapacity,
         core.submitPhaseEvents(&[_]runtime_core.PhaseEvent{seededPhaseEvent(player, 1, 0, runtime_core.max_phase_events)}),
     );
-    const bounded_count = try core.drainPhaseEvents(.fixed, seed, drained[0..]);
+    const bounded_count = try core.drainPhaseEvents(.fixed, first_phase_sequence, drained[0..]);
     try std.testing.expectEqual(runtime_core.max_phase_events, bounded_count);
     for (drained[0..bounded_count], 0..) |event, index| {
         try std.testing.expectEqual(@as(u64, @intCast(index + 1)), event.sequence);
         try std.testing.expectEqual(@as(u32, 0), event.generation);
     }
-    try core.endPhase(.fixed, seed);
+    try core.endPhase(.fixed, first_phase_sequence);
 
-    try core.beginPhase(.fixed, seed + 1);
+    const successor_phase_sequence = try core.beginPhaseOwned(.fixed);
     var expected_sequence: u64 = runtime_core.max_phase_events + 1;
     const generation_steps: u32 = runtime_core.max_phase_generation + 1;
     var command: u32 = 0;
@@ -211,30 +211,29 @@ test "Runtime Core Phase replay preserves FIFO, domain counters, and generation 
         const generation_batch = try core.submitPhaseEvents(&[_]runtime_core.PhaseEvent{event});
         try std.testing.expectEqual(expected_sequence, generation_batch.first_sequence);
         try std.testing.expectEqual(expected_sequence, generation_batch.last_sequence);
-        const count = try core.drainPhaseEvents(.fixed, seed + 1, drained[0..]);
+        const count = try core.drainPhaseEvents(.fixed, successor_phase_sequence, drained[0..]);
         try std.testing.expectEqual(@as(usize, 1), count);
         try std.testing.expectEqual(expected_sequence, drained[0].sequence);
         try std.testing.expectEqual(command, drained[0].generation);
         expected_sequence += 1;
     }
 
-    // The ninth successor is generation 8; the next request is exhausted and
-    // must leave the phase state unchanged.
+    // 第九个successor对应generation 8；再提交必须耗尽且保持Phase状态不变。
     try std.testing.expectError(
         error.RuntimePhaseGenerationExhausted,
         core.submitPhaseEvents(&[_]runtime_core.PhaseEvent{seededPhaseEvent(player, 1, 0, 9)}),
     );
-    try std.testing.expectEqual(@as(usize, 0), try core.drainPhaseEvents(.fixed, seed + 1, drained[0..]));
-    try core.endPhase(.fixed, seed + 1);
+    try std.testing.expectEqual(@as(usize, 0), try core.drainPhaseEvents(.fixed, successor_phase_sequence, drained[0..]));
+    try core.endPhase(.fixed, successor_phase_sequence);
 
-    // Fixed and frame domains keep independent sequence counters.
-    try core.beginPhase(.frame, seed + 2);
+    // Fixed与frame domain各自维护独立的event sequence counter。
+    const frame_phase_sequence = try core.beginPhaseOwned(.frame);
     const frame_event = seededPhaseEvent(player, 2, 0, 10);
     const frame_batch = try core.submitPhaseEvents(&[_]runtime_core.PhaseEvent{frame_event});
     try std.testing.expectEqual(@as(u64, 1), frame_batch.first_sequence);
-    try std.testing.expectEqual(@as(usize, 1), try core.drainPhaseEvents(.frame, seed + 2, drained[0..]));
+    try std.testing.expectEqual(@as(usize, 1), try core.drainPhaseEvents(.frame, frame_phase_sequence, drained[0..]));
     try std.testing.expectEqual(@as(u64, 1), drained[0].sequence);
-    try core.endPhase(.frame, seed + 2);
+    try core.endPhase(.frame, frame_phase_sequence);
 }
 
 test "Runtime Core Phase bounded command replay is reproducible across seeds" {
@@ -250,8 +249,7 @@ test "Runtime Core Phase bounded command replay is reproducible across seeds" {
         defer core.deinit();
         try preparePairedScene(&core, .initial);
         const player = (try core.findById(.live, "player")).?.object_ref;
-        const phase_sequence = if (seed == 0) 1 else seed;
-        try core.beginPhase(.fixed, phase_sequence);
+        const phase_sequence = try core.beginPhaseOwned(.fixed);
 
         var rng = ReplayRng{ .state = seed };
         var drained: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
@@ -337,8 +335,7 @@ test "Runtime Core Phase admission overflow preserves structural state" {
     try std.testing.expectEqual(@as(u32, runtime_core.max_phase_bindings / 4), candidate.binding_count);
     try core.commitPhaseState();
 
-    const phase_sequence: u64 = 0x4144_4d49_5353_494f;
-    try core.beginPhase(.fixed, phase_sequence);
+    const phase_sequence = try core.beginPhaseOwned(.fixed);
     var structural = std.mem.zeroes(runtime_core.PhaseStructural);
     structural.struct_size = @sizeOf(runtime_core.PhaseStructural);
     structural.operation = runtime_core.phase_operation_reserve_transient;
@@ -365,22 +362,21 @@ test "Runtime Core Phase admission overflow preserves structural state" {
     try std.testing.expectEqual(@as(usize, 0), flush.count);
     try core.endPhase(.fixed, phase_sequence);
 
-    // A 255-binding state plus one accepted structural reservation must admit
-    // the exact 256th binding; only the 257th is overflow.
+    // 255个binding加一个structural reservation必须恰好接纳第256个；第257个才溢出。
     bindings[bindings.len - 1].behavior_count = 3;
     const exact_candidate = try core.preparePhaseState(.live, bindings[0..]);
     try std.testing.expectEqual(@as(u32, runtime_core.max_phase_bindings / 4), exact_candidate.binding_count);
     try core.commitPhaseState();
-    try core.beginPhase(.fixed, phase_sequence + 1);
+    const exact_phase_sequence = try core.beginPhaseOwned(.fixed);
     completion = std.mem.zeroes(runtime_core.PhaseCompletion);
     completion.struct_size = @sizeOf(runtime_core.PhaseCompletion);
     completions[0] = completion;
     const exact_batch = try core.submitPhaseStructural(structural_items[0..], completions[0..]);
     try std.testing.expectEqual(@as(usize, 1), exact_batch.accepted_count);
-    const exact_flush = try core.takePhaseStructural(.fixed, phase_sequence + 1, taken[0..]);
+    const exact_flush = try core.takePhaseStructural(.fixed, exact_phase_sequence, taken[0..]);
     try std.testing.expectEqual(@as(usize, 1), exact_flush.count);
     try core.abortPhaseStructural(exact_flush.info.flush_token);
-    try core.endPhase(.fixed, phase_sequence + 1);
+    try core.endPhase(.fixed, exact_phase_sequence);
 }
 
 test "candidate Phase admission stays private until paired Scene commit" {
@@ -421,23 +417,23 @@ test "candidate Phase admission stays private until paired Scene commit" {
     var requests = [_]runtime_core.PhaseStructural{request};
     var completions = [_]runtime_core.PhaseCompletion{completion};
 
-    try core.beginPhase(.fixed, 0x5041_4952_4c49_5645);
+    const live_phase_sequence = try core.beginPhaseOwned(.fixed);
     _ = try core.submitPhaseStructural(requests[0..], completions[0..]);
     var taken: [1]runtime_core.PhaseStructural = undefined;
-    const flush = try core.takePhaseStructural(.fixed, 0x5041_4952_4c49_5645, taken[0..]);
+    const flush = try core.takePhaseStructural(.fixed, live_phase_sequence, taken[0..]);
     try core.abortPhaseStructural(flush.info.flush_token);
-    try core.endPhase(.fixed, 0x5041_4952_4c49_5645);
+    try core.endPhase(.fixed, live_phase_sequence);
 
     try core.commitScene();
     requests[0].origin = candidate_player;
     completions[0] = std.mem.zeroes(runtime_core.PhaseCompletion);
     completions[0].struct_size = @sizeOf(runtime_core.PhaseCompletion);
-    try core.beginPhase(.fixed, 0x5041_4952_4e45_5753);
+    const candidate_phase_sequence = try core.beginPhaseOwned(.fixed);
     try std.testing.expectError(
         error.RuntimePhaseAdmissionCapacity,
         core.submitPhaseStructural(requests[0..], completions[0..]),
     );
-    try core.endPhase(.fixed, 0x5041_4952_4e45_5753);
+    try core.endPhase(.fixed, candidate_phase_sequence);
 }
 
 test "Runtime Core structural replay preserves bounded FIFO and successor generation" {
@@ -445,8 +441,7 @@ test "Runtime Core structural replay preserves bounded FIFO and successor genera
     defer core.deinit();
     try preparePairedScene(&core, .initial);
     const player = (try core.findById(.live, "player")).?.object_ref;
-    const phase_sequence: u64 = 0x5354_5255_4354_5552;
-    try core.beginPhase(.fixed, phase_sequence);
+    const phase_sequence = try core.beginPhaseOwned(.fixed);
 
     var structural_items: [runtime_core.max_phase_structural]runtime_core.PhaseStructural = undefined;
     var completions: [runtime_core.max_phase_structural]runtime_core.PhaseCompletion = undefined;
@@ -531,7 +526,7 @@ test "Runtime Core Gameplay owns terminal priority contact events outcome and fi
     const begin = try core.beginGameplayFixed(0.0, &outcome);
     try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.playing), begin.phase);
     try std.testing.expectEqual(@as(usize, 0), begin.outcome_count);
-    try core.beginPhase(.fixed, begin.step_token);
+    const phase_sequence = try core.beginPhaseOwned(.fixed);
     const committed = try core.commitGameplayFixed(begin.step_token, .{}, &outcome);
     try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), committed.phase);
     try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), committed.cause);
@@ -545,10 +540,10 @@ test "Runtime Core Gameplay owns terminal priority contact events outcome and fi
         event.* = std.mem.zeroes(runtime_core.PhaseEvent);
         event.struct_size = @sizeOf(runtime_core.PhaseEvent);
     }
-    const event_count = try core.drainPhaseEvents(.fixed, begin.step_token, &events);
+    const event_count = try core.drainPhaseEvents(.fixed, phase_sequence, &events);
     try std.testing.expectEqual(@as(usize, 4), event_count);
     try std.testing.expectEqualStrings("contact_begin", events[0].name[0..events[0].name_length]);
-    try core.endPhase(.fixed, begin.step_token);
+    try core.endPhase(.fixed, phase_sequence);
 
     var render_items: [runtime_core.max_object_count]runtime_core.GameplayRenderItem = undefined;
     const snapshot = try core.gameplaySnapshot(&render_items);
@@ -562,16 +557,17 @@ test "Runtime Core Gameplay owns terminal priority contact events outcome and fi
     try core.abortGameplayFixed(terminal_begin.step_token);
 }
 
-test "Gameplay step token is independent from the active fixed Phase sequence" {
+test "Gameplay step token and fixed Phase sequence are separately Core-owned" {
     var core = try runtime_core.RuntimeCore.init();
     defer core.deinit();
     try preparePairedScene(&core, .initial);
 
     var outcome: runtime_core.GameplayOutcome = undefined;
     const begin = try core.beginGameplayFixed(0.0, &outcome);
-    const phase_sequence: u64 = 77;
-    try std.testing.expect(begin.step_token != phase_sequence);
-    try core.beginPhase(.fixed, phase_sequence);
+    const phase_sequence = try core.beginPhaseOwned(.fixed);
+    // 两个令牌属于独立命名空间；数值允许相同，但都必须由Core生成且非零。
+    try std.testing.expect(begin.step_token != 0);
+    try std.testing.expect(phase_sequence != 0);
     _ = try core.commitGameplayFixed(begin.step_token, .{}, &outcome);
     var events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
     for (&events) |*event| {
@@ -616,8 +612,7 @@ test "Gameplay commit keeps its plan private when the shared Phase queue is full
     outcome.sequence = 0x8877_6655_4433_2211;
     const outcome_before = std.mem.asBytes(&outcome).*;
     const begin = try core.beginGameplayFixed(0.0, &outcome);
-    const phase_sequence: u64 = 900;
-    try core.beginPhase(.fixed, phase_sequence);
+    const phase_sequence = try core.beginPhaseOwned(.fixed);
     var ordinary: [runtime_core.max_phase_events - 2]runtime_core.PhaseEvent = undefined;
     for (&ordinary) |*event| {
         event.* = std.mem.zeroes(runtime_core.PhaseEvent);
@@ -645,11 +640,11 @@ test "Gameplay commit keeps its plan private when the shared Phase queue is full
     try core.endPhase(.fixed, phase_sequence);
 
     const retry = try core.beginGameplayFixed(0.0, &outcome);
-    try core.beginPhase(.fixed, phase_sequence + 1);
+    const retry_phase_sequence = try core.beginPhaseOwned(.fixed);
     const committed = try core.commitGameplayFixed(retry.step_token, .{}, &outcome);
     try std.testing.expectEqual(@as(usize, 1), committed.outcome_count);
     try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), committed.cause);
     try std.testing.expectEqual(@as(u64, 1), outcome.sequence);
-    while (try core.drainPhaseEvents(.fixed, phase_sequence + 1, &drained) != 0) {}
-    try core.endPhase(.fixed, phase_sequence + 1);
+    while (try core.drainPhaseEvents(.fixed, retry_phase_sequence, &drained) != 0) {}
+    try core.endPhase(.fixed, retry_phase_sequence);
 }

@@ -85,8 +85,7 @@ fn runDomain(
         return error.AllocationCounterUnavailable;
     }
     for (samples, 0..) |*sample, index| {
-        const phase_sequence = @as(u64, @intCast(index)) + 1;
-        try core.beginPhase(domain, phase_sequence);
+        const phase_sequence = try core.beginPhaseOwned(domain);
         const start = monotonicNs();
         _ = try core.submitPhaseEvents(events[0..]);
         _ = try core.submitPhaseStructural(structural[0..], completions[0..]);

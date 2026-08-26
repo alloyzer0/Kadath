@@ -1607,8 +1607,7 @@ fn validate_outcome_buffer(
     buffer_pointer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
 ) -> Result<abi::kadath_runtime_gameplay_outcome_buffer_v1_t, u32> {
     valid_output(buffer_pointer)?;
-    // Copy caller metadata before validating any potentially overlapping
-    // ranges; do not create an exclusive Rust reference to hostile memory.
+    // 验证潜在重叠范围前先复制caller metadata，避免对不可信内存建立独占Rust引用。
     let buffer = unsafe { ptr::read(buffer_pointer) };
     if buffer.reserved0 != 0
         || !reserved_is_zero(&buffer.reserved)
@@ -2149,8 +2148,7 @@ fn publish_gameplay_snapshot(
 ) -> Result<(), u32> {
     valid_output(buffer_pointer)?;
     valid_output(out_pointer)?;
-    // Treat the descriptor as bytes copied for this call until its complete
-    // alias/range contract has been established.
+    // 完整建立alias/range契约前，只把descriptor视为本次调用复制的字节。
     let buffer = unsafe { ptr::read(buffer_pointer) };
     if buffer.reserved0 != 0
         || !reserved_is_zero(&buffer.reserved)

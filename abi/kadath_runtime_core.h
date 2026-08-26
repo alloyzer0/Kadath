@@ -383,6 +383,7 @@ int32_t kadath_runtime_core_query_object_authority_interface(
 typedef struct kadath_runtime_phase_begin_desc_v1_t {
     uint32_t struct_size;
     uint32_t domain;
+    /* 输入保留字段，调用方必须置零；唯一 sequence 由 Rust Core 生成并写入 result。 */
     uint64_t phase_sequence;
     uint32_t reserved0;
     uint32_t reserved1;
@@ -560,10 +561,9 @@ typedef struct kadath_runtime_phase_activation_result_v1_t {
 struct kadath_runtime_phase_interface_v1_t {
     uint32_t struct_size;
     uint32_t interface_version;
-    /* Every pointer/count/stride argument below is caller-owned and borrowed only for the call.
-     * The Core retains POD values and opaque numeric tokens, never a caller pointer. All entry
-     * points are owner-thread-only and non-reentrant; output slots are caller-owned and are
-     * published only after complete preflight succeeds. */
+    /* 下列 pointer/count/stride 均由调用方持有且只借用一次调用；Core 仅保留 POD
+     * 值与不透明数字 token，不保留调用方指针。Single-thread: owner thread。
+     * Reentrant: no。完整 preflight 成功后才发布 caller-owned output。 */
     int32_t (*prepare_phase_state)(
         kadath_runtime_core_t* core,
         const kadath_runtime_phase_state_prepare_desc_v1_t* desc,
@@ -754,38 +754,35 @@ struct kadath_runtime_render_item_v1_t {
 typedef struct kadath_runtime_gameplay_interface_v1_t {
     uint32_t struct_size;
     uint32_t interface_version;
-    /* Mode D opaque Core; Mode A caller-owned input/output descriptors. All
-     * pointed-to ranges are borrowed for this call only. Single-owner-thread,
-     * non-reentrant. Success publishes only a
-     * private Gameplay candidate; failure leaves candidate/output unchanged. */
+    /* Mode D opaque Core；Mode A caller-owned input/output descriptor。所有指向范围
+     * 只在本次调用借用。Single-thread: owner thread。Reentrant: no。
+     * 成功仅发布 private Gameplay candidate；失败保持 candidate/output 不变。 */
     int32_t (*prepare_gameplay_state)(
         kadath_runtime_core_t* core,
         const kadath_runtime_gameplay_desc_v1_t* desc,
         kadath_runtime_gameplay_candidate_info_v1_t* out_info);
-    /* Mode D opaque Core; Mode A caller-owned begin descriptor, capacity-1
-     * outcome buffer, and result. Single-owner-thread, non-reentrant. Success opens exactly one step;
-     * failure publishes neither step state nor output/outcome bytes. */
+    /* Mode D opaque Core；Mode A caller-owned begin descriptor、capacity-1 outcome
+     * buffer 与 result。Single-thread: owner thread。Reentrant: no。
+     * 成功只打开一个 step；失败不发布 step state 或 output/outcome bytes。 */
     int32_t (*begin_fixed_step)(
         kadath_runtime_core_t* core,
         const kadath_runtime_gameplay_begin_fixed_desc_v1_t* desc,
         kadath_runtime_gameplay_outcome_buffer_v1_t* outcome_buffer,
         kadath_runtime_gameplay_step_result_v1_t* out_result);
-    /* Mode D opaque Core; Mode A caller-owned commit descriptor, capacity-1
-     * outcome buffer, and result. Single-owner-thread, non-reentrant. Success atomically publishes the
-     * fixed Gameplay/Object result after Phase event admission; failure leaves
-     * authoritative state and caller outputs unchanged. */
+    /* Mode D opaque Core；Mode A caller-owned commit descriptor、capacity-1 outcome
+     * buffer 与 result。Single-thread: owner thread。Reentrant: no。Phase event admission
+     * 后原子发布 fixed Gameplay/Object result；失败保持权威状态与 caller output 不变。 */
     int32_t (*commit_fixed_step)(
         kadath_runtime_core_t* core,
         const kadath_runtime_gameplay_commit_fixed_desc_v1_t* desc,
         kadath_runtime_gameplay_outcome_buffer_v1_t* outcome_buffer,
         kadath_runtime_gameplay_step_result_v1_t* out_result);
-    /* Mode D opaque Core plus scalar token; no caller allocation. Single-owner-
-     * thread and non-reentrant. Success closes the matching open step. */
+    /* Mode D opaque Core 与 scalar token；无 caller allocation。
+     * Single-thread: owner thread。Reentrant: no。成功关闭匹配的 open step。 */
     int32_t (*abort_fixed_step)(kadath_runtime_core_t* core, uint64_t step_token);
-    /* Mode D opaque Core; Mode A caller-owned bounded render storage and
-     * snapshot output, borrowed only for this call. Single-owner-thread,
-     * non-reentrant. Success publishes one
-     * coherent idle-boundary snapshot; failure writes neither range. */
+    /* Mode D opaque Core；Mode A caller-owned bounded render storage 与 snapshot
+     * output，只借用本次调用。Single-thread: owner thread。Reentrant: no。
+     * 成功发布 coherent idle-boundary snapshot；失败不写入任一范围。 */
     int32_t (*publish_snapshot)(
         kadath_runtime_core_t* core,
         kadath_runtime_render_buffer_v1_t* render_buffer,
@@ -793,8 +790,8 @@ typedef struct kadath_runtime_gameplay_interface_v1_t {
     uint64_t reserved[8];
 } kadath_runtime_gameplay_interface_v1_t;
 
-// Mode A caller-owned in/out descriptor, borrowed only for this call.
-// No opaque Core is supplied; this query is thread-safe and reentrant.
+// Mode A caller-owned in/out descriptor，只借用本次调用。
+// 不传入opaque Core；该query thread-safe且reentrant。
 int32_t kadath_runtime_core_query_gameplay_interface(
     kadath_runtime_gameplay_interface_v1_t* in_out_interface);
 

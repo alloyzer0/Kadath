@@ -225,17 +225,6 @@ pub(crate) fn strict_overlap(first: Sprite, second: Sprite) -> Result<bool, ()> 
         && first_bottom > second.position[1])
 }
 
-fn strict_overlap_prevalidated(first: Sprite, second: Sprite) -> bool {
-    first.size[0] != 0.0
-        && first.size[1] != 0.0
-        && second.size[0] != 0.0
-        && second.size[1] != 0.0
-        && first.position[0] < second.position[0] + second.size[0]
-        && first.position[0] + first.size[0] > second.position[0]
-        && first.position[1] < second.position[1] + second.size[1]
-        && first.position[1] + first.size[1] > second.position[1]
-}
-
 fn phase_code(value: Phase) -> u32 {
     match value {
         Phase::Playing => abi::KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING,
@@ -323,7 +312,11 @@ pub(crate) fn active_contacts(
     let mut count = 0;
     let mut first_hazard = None;
     let mut goal_contact = None;
+    let mut geometry_error = false;
     live.for_each_active_ordered(|record| {
+        if geometry_error {
+            return;
+        }
         let key = ObjectKey {
             object_id: record.object_id,
             world_epoch: live.world_epoch,
@@ -343,21 +336,28 @@ pub(crate) fn active_contacts(
         {
             sprite.position = value.2;
         }
-        if strict_overlap_prevalidated(player_sprite, sprite) {
-            contacts[count] = Some(key);
-            let source_index = record
-                .source_index
-                .expect("Gameplay contact candidates must be authored sources");
-            source_indices[count] = source_index;
-            source_mask[usize::from(source_index) / 64] |= 1_u64 << (source_index % 64);
-            count += 1;
-            if is_hazard {
-                first_hazard.get_or_insert(key);
-            } else {
-                goal_contact = Some(key);
+        match strict_overlap(player_sprite, sprite) {
+            Ok(true) => {
+                contacts[count] = Some(key);
+                let source_index = record
+                    .source_index
+                    .expect("Gameplay contact candidates must be authored sources");
+                source_indices[count] = source_index;
+                source_mask[usize::from(source_index) / 64] |= 1_u64 << (source_index % 64);
+                count += 1;
+                if is_hazard {
+                    first_hazard.get_or_insert(key);
+                } else {
+                    goal_contact = Some(key);
+                }
             }
+            Ok(false) => {}
+            Err(()) => geometry_error = true,
         }
     });
+    if geometry_error {
+        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+    }
     Ok(ContactObservation {
         contacts,
         source_indices,

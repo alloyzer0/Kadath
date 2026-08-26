@@ -31,20 +31,23 @@ mutation_root="$evidence_root/mutants"
     --file modules/runtime_core/src/gameplay.rs \
     --file modules/runtime_core/src/lib.rs \
     --timeout 120 --output "$mutation_root") >"$evidence_root/mutation-command.log" 2>&1 || true
-outcomes="$mutation_root/outcomes.json"
-[[ -f "$outcomes" ]] || block 'cargo-mutants outcomes missing'
+outcomes=$(find "$mutation_root" -name outcomes.json -type f -print -quit)
+[[ -n "$outcomes" && -f "$outcomes" ]] || block 'cargo-mutants outcomes missing'
 
 total=$(jq '[.outcomes[] | select(.scenario != "Baseline")] | length' "$outcomes")
 killed=$(jq '[.outcomes[] | select(.scenario != "Baseline" and .summary == "CaughtMutant")] | length' "$outcomes")
 survived=$(jq '[.outcomes[] | select(.scenario != "Baseline" and .summary == "MissedMutant")] | length' "$outcomes")
 unviable=$(jq '[.outcomes[] | select(.scenario != "Baseline" and .summary == "Unviable")] | length' "$outcomes")
 unclassified=$((total - killed - survived - unviable))
+critical_pattern='begin_step|observe_contacts|transition|active_contacts|contact_transitions|submit_contact_transitions|outcome_value|step_result|prepare_gameplay_state|begin_gameplay_fixed|commit_gameplay_fixed|publish_gameplay_snapshot|validate_outcome_buffer'
+critical_survivors=$(jq --arg pattern "$critical_pattern" '[.outcomes[] | select(.scenario != "Baseline" and .summary == "MissedMutant" and (.scenario | test($pattern)))] | length' "$outcomes")
 [[ "$total" -gt 0 ]] || block 'no mutants generated'
 [[ "$unviable" -eq 0 ]] || block 'unviable mutants require audit'
 [[ "$unclassified" -eq 0 ]] || block 'timeout or unclassified mutants require audit'
 score=$(awk -v killed="$killed" -v total="$total" 'BEGIN { printf "%.2f", killed * 100 / total }')
 awk -v score="$score" 'BEGIN { exit !(score+0 >= 80) }' || block 'mutation score below 80%'
 [[ "$survived" -eq 0 ]] || block 'surviving Gameplay mutants present'
+[[ "$critical_survivors" -eq 0 ]] || block 'critical invariant mutants survived'
 
 manifest="$evidence_root/mutation-manifest.tsv"
 jq -r '.outcomes[] | select(.scenario != "Baseline") | [.summary, .scenario, (.log_path // "")] | @tsv' \
@@ -60,7 +63,7 @@ GAMEPLAY_MUTATION_SURVIVED=$survived
 GAMEPLAY_MUTATION_UNVIABLE=$unviable
 GAMEPLAY_MUTATION_UNCLASSIFIED=$unclassified
 GAMEPLAY_MUTATION_SCORE_PERCENT=$score
-GAMEPLAY_CRITICAL_SURVIVORS=0
+GAMEPLAY_CRITICAL_SURVIVORS=$critical_survivors
 GAMEPLAY_MUTATION_CRITICAL_DOMAINS=timer_priority,contact_differencing,epoch_stale,capacity,snapshot_publication,outcome_sequence,abi_preflight
 GAMEPLAY_MUTATION_MANIFEST=$manifest
 GAMEPLAY_MUTATION_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')

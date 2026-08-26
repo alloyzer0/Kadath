@@ -121,7 +121,8 @@ test "unsupported Behavior Host stub mirrors the Host v4 scheduling surface" {
     try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.onStart(&generation));
     try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.runFixed(&generation, 1.0 / 60.0, .{}));
     try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.runUpdate(&generation, 0.25, .{}));
-    try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.finishFixedStep(&generation, &.{}, .{}));
+    try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.settleFixedStructuralBeforeGameplay(&generation));
+    try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.finishFixedStep(&generation, .{}));
     try std.testing.expectError(error.UnsupportedBehaviorRuntime, runtime.finishFrame(&generation, .{}));
 }
 
@@ -817,8 +818,7 @@ test "contact events are directed and deliver end before begin" {
     try std.testing.expectApproxEqAbs(@as(f32, 2), (try fixture.generation.objectPosition(1))[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 2), (try fixture.generation.objectPosition(2))[0], 0.0001);
 
-    // Frame phases have their own caller sequence. Interleaving one must not
-    // make the next Gameplay step token ineligible for the fixed Phase.
+    // Frame phase 使用独立的Core sequence；穿插执行不得影响下一Gameplay step token。
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
     try fixture.runtime.finishFrame(&fixture.generation, .{});
 

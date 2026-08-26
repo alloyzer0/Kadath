@@ -126,8 +126,7 @@ pub fn main() !void {
     var render_items: [runtime_core.max_object_count]runtime_core.GameplayRenderItem = undefined;
     initializeEventOutput(&events);
 
-    // Seed the ledger with 32 contacts so every measured step publishes the
-    // maximum successful Phase contact batch: 32 pairs * 2 directed events.
+    // 预置32个接触，使每次测量都发布最大成功批次：32 pair * 2 directed event。
     try runStep(&fixture, near_position, &outcome, &events, &render_items);
 
     if (c.kadath_runtime_core_phase_quality_begin_allocation_count() != c.KADATH_OK) {
