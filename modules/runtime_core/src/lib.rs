@@ -3063,6 +3063,35 @@ mod tests {
             assert_eq!(items[0].final_color, expected_color);
         }
 
+        // 通过公开 wrapper 覆盖成功码与 Phase busy 错误码，避免只测试内部实现。
+        assert_eq!(
+            publish_gameplay_snapshot_entry(pointer, &mut buffer, &mut snapshot),
+            abi::KADATH_OK as i32
+        );
+        let phase_desc = abi::kadath_runtime_phase_begin_desc_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_desc_v1_t>() as u32,
+            domain: abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            phase_sequence: 0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved: [0; 4],
+        };
+        let mut phase_result = abi::kadath_runtime_phase_begin_result_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        phase_commit::begin_phase_v2(&mut core, &phase_desc, &mut phase_result).unwrap();
+        assert_eq!(
+            publish_gameplay_snapshot_entry(pointer, &mut buffer, &mut snapshot),
+            abi::KADATH_ERR_RUNTIME_PHASE_BUSY as i32
+        );
+        phase_commit::end_phase(
+            &mut core,
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            phase_result.phase_sequence,
+        )
+        .unwrap();
+
         // buffer/output 的 descriptor、reserved、容量、stride、指针对齐和结构体大小
         // 各自独立拒绝；每个失败都发生在写入 caller storage 之前。
         let valid_buffer = buffer;
@@ -3097,6 +3126,12 @@ mod tests {
         buffer = valid_buffer;
         buffer.item_capacity = 2;
         assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        // 第一个输出项合法、第二个项短结构体，确保逐项 read_struct_size 分支实际执行。
+        buffer = valid_buffer;
+        items[0].struct_size = render_size as u32;
+        items[1].struct_size = (render_size - 1) as u32;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        items[1].struct_size = render_size as u32;
         items[0].struct_size = 0;
         assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
         assert_eq!(items[0].struct_size, 0);
@@ -3373,5 +3408,104 @@ mod tests {
             phase_result.phase_sequence,
         )
         .unwrap();
+
+        // wrapper 的成功与 active-phase 前置错误必须都经过 ffi_result 转换。
+        assert_eq!(
+            commit_gameplay_fixed_entry(
+                pointer,
+                &commit_desc,
+                &mut outcome_buffer,
+                &mut commit_result
+            ),
+            abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED as i32
+        );
+        assert_eq!(
+            begin_gameplay_fixed_entry(
+                pointer,
+                &begin_desc,
+                &mut outcome_buffer,
+                &mut begin_result
+            ),
+            abi::KADATH_OK as i32
+        );
+        let wrapper_token = begin_result.step_token;
+        assert_eq!(
+            begin_gameplay_fixed_entry(
+                pointer,
+                &begin_desc,
+                &mut outcome_buffer,
+                &mut begin_result
+            ),
+            abi::KADATH_ERR_RUNTIME_GAMEPLAY_STEP_BUSY as i32
+        );
+        abort_gameplay_fixed(pointer, wrapper_token).unwrap();
+        begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result).unwrap();
+        let wrapper_commit_token = begin_result.step_token;
+        phase_desc.phase_sequence = 0;
+        phase_commit::begin_phase_v2(&mut core, &phase_desc, &mut phase_result).unwrap();
+        commit_desc.step_token = wrapper_commit_token;
+        assert_eq!(
+            commit_gameplay_fixed_entry(
+                pointer,
+                &commit_desc,
+                &mut outcome_buffer,
+                &mut commit_result
+            ),
+            abi::KADATH_OK as i32
+        );
+        phase_commit::end_phase(
+            &mut core,
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            phase_result.phase_sequence,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gameplay_interface_query_covers_version_reservation_and_exported_callbacks() {
+        let mut interface = abi::kadath_runtime_gameplay_interface_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_interface_v1_t>() as u32,
+            interface_version: abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1,
+            ..unsafe { mem::zeroed() }
+        };
+        assert_eq!(query_gameplay_interface(&mut interface), Ok(()));
+        assert!(interface.prepare_gameplay_state.is_some());
+        assert!(interface.begin_fixed_step.is_some());
+        assert!(interface.commit_fixed_step.is_some());
+        assert!(interface.abort_fixed_step.is_some());
+        assert!(interface.publish_snapshot.is_some());
+
+        assert_eq!(
+            query_gameplay_interface(std::ptr::null_mut()),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut short = interface;
+        short.struct_size = 0;
+        assert_eq!(
+            query_gameplay_interface(&mut short),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut reserved = interface;
+        reserved.reserved[0] = 1;
+        assert_eq!(
+            query_gameplay_interface(&mut reserved),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let mut unsupported = interface;
+        unsupported.interface_version = 99;
+        assert_eq!(
+            query_gameplay_interface(&mut unsupported),
+            Err(abi::KADATH_ERR_NOT_SUPPORTED)
+        );
+
+        // 直接覆盖 C ABI wrapper 的成功与错误返回，防止 wrapper 常量变异伪造状态码。
+        assert_eq!(
+            kadath_runtime_core_query_gameplay_interface(&mut interface),
+            abi::KADATH_OK as i32
+        );
+        assert_eq!(
+            kadath_runtime_core_query_gameplay_interface(&mut unsupported),
+            abi::KADATH_ERR_NOT_SUPPORTED as i32
+        );
     }
 }
