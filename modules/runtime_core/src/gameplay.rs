@@ -774,6 +774,59 @@ mod tests {
             strict_overlap(sprite([0.0, 0.0], [2.0, 2.0]), invalid),
             Err(())
         );
+
+        // 每个零尺寸分支都要独立命中；对方矩形保持几何重叠，避免
+        // OR→AND 变异被“最终没有重叠”这一巧合掩盖。
+        for (first, second) in [
+            (
+                sprite([0.0, 0.0], [0.0, 2.0]),
+                sprite([-1.0, -1.0], [2.0, 2.0]),
+            ),
+            (
+                sprite([0.0, 0.0], [2.0, 0.0]),
+                sprite([-1.0, -1.0], [2.0, 2.0]),
+            ),
+            (
+                sprite([0.0, 0.0], [2.0, 2.0]),
+                sprite([-1.0, -1.0], [0.0, 2.0]),
+            ),
+            (
+                sprite([0.0, 0.0], [2.0, 2.0]),
+                sprite([-1.0, -1.0], [2.0, 0.0]),
+            ),
+        ] {
+            assert_eq!(strict_overlap(first, second), Ok(false));
+        }
+
+        // 非对称尺寸同时验证 second_right 的加法以及四个严格边界。
+        assert_eq!(
+            strict_overlap(
+                sprite([2.0, 0.0], [2.0, 2.0]),
+                sprite([3.0, 0.0], [0.5, 2.0])
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            strict_overlap(
+                sprite([2.0, 0.0], [2.0, 2.0]),
+                sprite([1.0, 0.0], [1.0, 2.0])
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            strict_overlap(
+                sprite([0.0, 2.0], [2.0, 2.0]),
+                sprite([0.0, 1.0], [2.0, 1.0])
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            strict_overlap(
+                sprite([0.0, 0.0], [2.0, 2.0]),
+                sprite([0.0, 2.0], [2.0, 2.0])
+            ),
+            Ok(false)
+        );
     }
 
     #[test]

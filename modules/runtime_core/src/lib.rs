@@ -2816,4 +2816,76 @@ mod tests {
             hazards[0] = gameplay_test_hazard();
         }
     }
+
+    #[test]
+    fn gameplay_position_plan_covers_player_and_legacy_patrol_paths() {
+        let core = gameplay_test_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let state = core.live.as_ref().expect("test live state");
+        let player = ObjectKey {
+            object_id: ObjectId::parse(b"player").unwrap(),
+            world_epoch: 1,
+            logical_generation: 1,
+            kind: abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+        };
+        let goal = ObjectKey {
+            object_id: ObjectId::parse(b"goal").unwrap(),
+            world_epoch: 1,
+            logical_generation: 1,
+            kind: abi::KADATH_RUNTIME_OBJECT_KIND_GOAL,
+        };
+        let hazard_key = ObjectKey {
+            object_id: ObjectId::parse(b"hazard").unwrap(),
+            world_epoch: 1,
+            logical_generation: 1,
+            kind: abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+        };
+        let patrol = gameplay::Hazard {
+            object: hazard_key,
+            source_index: 2,
+            movement_mode: abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL,
+            patrol_min_y: 0.0,
+            patrol_max_y: 10.0,
+            patrol_speed: 2.0,
+            patrol_direction: 1.0,
+        };
+        let gameplay = gameplay::State::new(player, 0, goal, 1, &[patrol], 3.0, 1, 1);
+
+        // 玩家位移与巡逻 hazard 同时规划；dt=5 将 phase 推到 span 边界，
+        // 独立命中正向和反向 patrol 分支以及两个 update_count 增量。
+        let plan = plan_gameplay_positions(state, &gameplay, 5.0, [1, 0]).unwrap();
+        assert_eq!(plan.update_count, 2);
+        assert_eq!(plan.updates[0].0, player);
+        assert_eq!(plan.updates[0].2, [5.0, 0.0]);
+        assert_eq!(plan.updates[1].0, hazard_key);
+        assert_eq!(plan.updates[1].2, [20.0, 10.0]);
+        assert_eq!(plan.hazard_directions[0], -1.0);
+
+        // phase 位于 span 内时必须沿正方向前进，覆盖加法和 rem_euclid 输入。
+        let plan = plan_gameplay_positions(state, &gameplay, 1.0, [0, 0]).unwrap();
+        assert_eq!(plan.updates[1].2, [20.0, 2.0]);
+        assert_eq!(plan.hazard_directions[0], 1.0);
+
+        // 三个 continue 条件各自独立验证，避免 OR→AND 变异漏过。
+        for (movement_mode, patrol_speed, dt_seconds) in [
+            (abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE, 2.0, 1.0),
+            (
+                abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL,
+                0.0,
+                1.0,
+            ),
+            (
+                abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL,
+                2.0,
+                0.0,
+            ),
+        ] {
+            let mut hazard = patrol;
+            hazard.movement_mode = movement_mode;
+            hazard.patrol_speed = patrol_speed;
+            let gameplay = gameplay::State::new(player, 0, goal, 1, &[hazard], 3.0, 1, 1);
+            let plan = plan_gameplay_positions(state, &gameplay, dt_seconds, [0, 0]).unwrap();
+            assert_eq!(plan.update_count, 1);
+            assert_eq!(plan.hazard_directions[0], 1.0);
+        }
+    }
 }
