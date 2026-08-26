@@ -1675,7 +1675,7 @@ fn prepare_gameplay_state(
     if desc.hazard_count == 0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    if desc.hazard_count as usize > gameplay::MAX_CONTACTS - 1 {
+    if desc.hazard_count as usize >= gameplay::MAX_CONTACTS {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     if desc.hazards.is_null() {
@@ -1809,20 +1809,22 @@ fn prepare_gameplay_state(
         if !legacy && hazard.patrol_speed != 0.0 {
             return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
         }
-        if legacy && !hazard.patrol_min_y.is_finite() {
-            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-        }
-        if legacy && !hazard.patrol_max_y.is_finite() {
-            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-        }
-        if legacy && !hazard.patrol_speed.is_finite() {
-            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-        }
-        if legacy && hazard.patrol_min_y >= hazard.patrol_max_y {
-            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-        }
-        if legacy && hazard.patrol_speed < 0.0 {
-            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+        if legacy {
+            if !hazard.patrol_min_y.is_finite() {
+                return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+            }
+            if !hazard.patrol_max_y.is_finite() {
+                return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+            }
+            if !hazard.patrol_speed.is_finite() {
+                return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+            }
+            if hazard.patrol_min_y >= hazard.patrol_max_y {
+                return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+            }
+            if hazard.patrol_speed < 0.0 {
+                return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
+            }
         }
         hazards.push(gameplay::Hazard {
             object: key,
@@ -3006,6 +3008,18 @@ mod tests {
             prepare_gameplay_state_entry(max_pointer, &max_desc, &mut max_output),
             abi::KADATH_ERR_INVALID_ARGUMENT as i32
         );
+        let mut over_hazards = vec![gameplay_test_hazard(); gameplay::MAX_CONTACTS + 1];
+        over_hazards[1].object_ref.world_epoch = 2;
+        let mut over_desc = max_desc;
+        over_desc.hazards = over_hazards.as_ptr();
+        over_desc.hazard_count = gameplay::MAX_CONTACTS as u32 + 1;
+        let mut over_core = gameplay_test_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let over_pointer =
+            (&mut *over_core as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        assert_eq!(
+            prepare_gameplay_state_entry(over_pointer, &over_desc, &mut max_output),
+            abi::KADATH_ERR_INVALID_ARGUMENT as i32
+        );
 
         let invalid = [
             {
@@ -3120,6 +3134,16 @@ mod tests {
             },
             {
                 let mut value = hazards[0];
+                value.patrol_max_y = 1.0;
+                value
+            },
+            {
+                let mut value = hazards[0];
+                value.patrol_speed = 1.0;
+                value
+            },
+            {
+                let mut value = hazards[0];
                 value.movement_mode = abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_LEGACY_PATROL;
                 value.patrol_min_y = 2.0;
                 value.patrol_max_y = 1.0;
@@ -3203,6 +3227,15 @@ mod tests {
         let offset_plan = plan_gameplay_positions(state, &offset_gameplay, 8.0, [0, 0]).unwrap();
         assert_eq!(offset_plan.updates[1].2, [20.0, 10.0]);
         assert_eq!(offset_plan.hazard_directions[0], -1.0);
+        let reverse_patrol = gameplay::Hazard {
+            patrol_direction: -1.0,
+            ..offset_patrol
+        };
+        let reverse_gameplay =
+            gameplay::State::new(player, 0, goal, 1, &[reverse_patrol], 3.0, 1, 1);
+        let reverse_plan = plan_gameplay_positions(state, &reverse_gameplay, 8.0, [0, 0]).unwrap();
+        assert_eq!(reverse_plan.updates[1].2, [20.0, 4.0]);
+        assert_eq!(reverse_plan.hazard_directions[0], 1.0);
 
         // 三个 continue 条件各自独立验证，避免 OR→AND 变异漏过。
         for (movement_mode, patrol_speed, dt_seconds) in [
@@ -3635,6 +3668,7 @@ mod tests {
             ),
             Err(abi::KADATH_ERR_INVALID_ARGUMENT)
         );
+        let valid_begin_desc = begin_desc;
         for mutate in [
             |value: &mut abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t| value.struct_size = 0,
             |value: &mut abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t| value.reserved0 = 1,
@@ -3647,10 +3681,7 @@ mod tests {
                 value.dt_seconds = -0.01
             },
         ] {
-            begin_desc = abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t {
-                struct_size: begin_size as u32,
-                ..begin_desc
-            };
+            begin_desc = valid_begin_desc;
             mutate(&mut begin_desc);
             assert_eq!(
                 begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
