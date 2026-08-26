@@ -3115,4 +3115,263 @@ mod tests {
         snapshot.struct_size = 0;
         assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
     }
+
+    #[test]
+    fn gameplay_begin_and_commit_entries_validate_descriptors_and_tokens() {
+        let mut core = gameplay_test_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let player = read_object_key(&gameplay_test_object_ref(
+            b"player",
+            abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER,
+            1,
+        ))
+        .unwrap();
+        let goal = read_object_key(&gameplay_test_object_ref(
+            b"goal",
+            abi::KADATH_RUNTIME_OBJECT_KIND_GOAL,
+            1,
+        ))
+        .unwrap();
+        // 直接准备一个无 hazard 的 Gameplay state，使 begin/commit 可以独立验证
+        // descriptor、step token 与 Phase 活跃边界，不依赖外层 Zig 编排。
+        core.candidate = None;
+        core.candidate_next_entity_value = None;
+        core.candidate_mode = None;
+        core.gameplay = Some(gameplay::State::new(player, 0, goal, 1, &[], 3.0, 1, 1));
+        let pointer = (&mut *core as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        let begin_size = mem::size_of::<abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t>();
+        let mut begin_desc = abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t {
+            struct_size: begin_size as u32,
+            dt_seconds: 0.0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved: [0; 4],
+        };
+        let mut outcome = abi::kadath_runtime_gameplay_outcome_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        let mut outcome_buffer = abi::kadath_runtime_gameplay_outcome_buffer_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_outcome_buffer_v1_t>() as u32,
+            reserved0: 0,
+            outcomes: &mut outcome,
+            outcome_capacity: 1,
+            outcome_stride: mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>(),
+            reserved: [0; 4],
+        };
+        let mut begin_result = abi::kadath_runtime_gameplay_step_result_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_step_result_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+
+        // begin 的 null/alignment/size/reserved/finite/range 分支逐一验证。
+        assert_eq!(
+            begin_gameplay_fixed(
+                pointer,
+                std::ptr::null(),
+                &mut outcome_buffer,
+                &mut begin_result
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            begin_gameplay_fixed(
+                pointer,
+                &begin_desc,
+                &mut outcome_buffer,
+                std::ptr::null_mut()
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        let alignment = mem::align_of::<abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t>();
+        let mut misaligned = [0_u8; 128];
+        let misaligned_address =
+            ((misaligned.as_mut_ptr() as usize + alignment - 1) & !(alignment - 1)) + 1;
+        assert_eq!(
+            begin_gameplay_fixed(
+                pointer,
+                misaligned_address as *const _,
+                &mut outcome_buffer,
+                &mut begin_result
+            ),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        );
+        for mutate in [
+            |value: &mut abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t| value.struct_size = 0,
+            |value: &mut abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t| value.reserved0 = 1,
+            |value: &mut abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t| value.reserved1 = 1,
+            |value: &mut abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t| value.reserved[0] = 1,
+            |value: &mut abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t| {
+                value.dt_seconds = f32::NAN
+            },
+            |value: &mut abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t| {
+                value.dt_seconds = -0.01
+            },
+        ] {
+            begin_desc = abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t {
+                struct_size: begin_size as u32,
+                ..begin_desc
+            };
+            mutate(&mut begin_desc);
+            assert_eq!(
+                begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
+                Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+            );
+        }
+        begin_desc = abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t {
+            struct_size: begin_size as u32,
+            dt_seconds: 0.0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved: [0; 4],
+        };
+
+        // candidate/gameplay candidate、无Gameplay状态和Phase busy 都必须阻止 begin。
+        let live_candidate = core.live.clone();
+        core.candidate = live_candidate;
+        assert!(matches!(
+            begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
+            Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)
+        ));
+        core.candidate = None;
+        core.gameplay_candidate = Some(core.gameplay.as_ref().unwrap().clone());
+        assert!(matches!(
+            begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
+            Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)
+        ));
+        core.gameplay_candidate = None;
+        let saved_gameplay = core.gameplay.take().unwrap();
+        assert!(matches!(
+            begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
+            Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)
+        ));
+        core.gameplay = Some(saved_gameplay);
+
+        let mut phase_desc = abi::kadath_runtime_phase_begin_desc_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_desc_v1_t>() as u32,
+            domain: abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            phase_sequence: 0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved: [0; 4],
+        };
+        let mut phase_result = abi::kadath_runtime_phase_begin_result_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        phase_commit::begin_phase_v2(&mut core, &phase_desc, &mut phase_result).unwrap();
+        assert_eq!(
+            begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
+            Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY)
+        );
+        phase_commit::end_phase(
+            &mut core,
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            phase_result.phase_sequence,
+        )
+        .unwrap();
+
+        // 合法 begin 必须打开且只打开一个 step；重复 begin 命中 STEP_BUSY，
+        // abort 后再进入 commit，验证 Rust 生成的 step token 贯穿整条路径。
+        assert_eq!(
+            begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
+            Ok(())
+        );
+        let token = begin_result.step_token;
+        assert_ne!(token, 0);
+        assert_eq!(
+            begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
+            Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_STEP_BUSY)
+        );
+        abort_gameplay_fixed(pointer.cast(), token).unwrap();
+
+        // commit 前重新 begin，并打开固定 Phase；先验证 stale token，再验证合法提交。
+        begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result).unwrap();
+        let token = begin_result.step_token;
+        phase_desc.phase_sequence = 0;
+        phase_commit::begin_phase_v2(&mut core, &phase_desc, &mut phase_result).unwrap();
+        let commit_size = mem::size_of::<abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t>();
+        let mut commit_desc = abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t {
+            struct_size: commit_size as u32,
+            move_x: 0,
+            move_y: 0,
+            reserved_input: [0; 2],
+            reserved0: 0,
+            reserved1: 0,
+            step_token: token + 1,
+            reserved: [0; 4],
+        };
+        let mut commit_result = abi::kadath_runtime_gameplay_step_result_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_step_result_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        assert_eq!(
+            commit_gameplay_fixed(
+                pointer,
+                &commit_desc,
+                &mut outcome_buffer,
+                &mut commit_result
+            ),
+            Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_STALE_TOKEN)
+        );
+        for mutate in [
+            |value: &mut abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t| value.struct_size = 0,
+            |value: &mut abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t| {
+                value.reserved_input = [1, 0]
+            },
+            |value: &mut abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t| value.reserved0 = 1,
+            |value: &mut abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t| value.reserved1 = 1,
+            |value: &mut abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t| value.reserved[0] = 1,
+            |value: &mut abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t| value.move_x = 2,
+            |value: &mut abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t| value.move_y = -2,
+        ] {
+            commit_desc = abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t {
+                struct_size: commit_size as u32,
+                move_x: 0,
+                move_y: 0,
+                reserved_input: [0; 2],
+                reserved0: 0,
+                reserved1: 0,
+                step_token: token,
+                reserved: [0; 4],
+            };
+            mutate(&mut commit_desc);
+            assert_eq!(
+                commit_gameplay_fixed(
+                    pointer,
+                    &commit_desc,
+                    &mut outcome_buffer,
+                    &mut commit_result
+                ),
+                Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+            );
+        }
+        commit_desc = abi::kadath_runtime_gameplay_commit_fixed_desc_v1_t {
+            struct_size: commit_size as u32,
+            move_x: 0,
+            move_y: 0,
+            reserved_input: [0; 2],
+            reserved0: 0,
+            reserved1: 0,
+            step_token: token,
+            reserved: [0; 4],
+        };
+        assert_eq!(
+            commit_gameplay_fixed(
+                pointer,
+                &commit_desc,
+                &mut outcome_buffer,
+                &mut commit_result
+            ),
+            Ok(())
+        );
+        assert_eq!(commit_result.step_token, token);
+        assert_eq!(commit_result.submitted_contact_event_count, 0);
+        assert_eq!(commit_result.outcome_count, 0);
+        phase_commit::end_phase(
+            &mut core,
+            abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+            phase_result.phase_sequence,
+        )
+        .unwrap();
+    }
 }
