@@ -2489,6 +2489,10 @@ mod tests {
         buffer = valid;
         let mut misaligned_storage = [0_u8; 256];
         let alignment = mem::align_of::<abi::kadath_runtime_gameplay_outcome_v1_t>();
+        assert!(
+            alignment > 1,
+            "ABI outcome alignment must expose an alignment preflight branch"
+        );
         let misaligned_address =
             ((misaligned_storage.as_mut_ptr() as usize + alignment - 1) & !(alignment - 1)) + 1;
         // 先写入合法 struct_size，避免对齐 mutant 被后续读取失败掩盖。
