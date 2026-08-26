@@ -120,6 +120,7 @@ check_benchmark() {
     actual=$(sha256sum "$executable" | awk '{print $1}')
     expected=$(value "$report" "GAMEPLAY_${prefix}_BENCHMARK_SHA256")
     [[ "$actual" == "$expected" ]] || blocked+=("$prefix benchmark hash mismatch")
+    verify_bound_file "$report" GAMEPLAY_PERF_MANIFEST GAMEPLAY_PERF_MANIFEST_SHA256 || blocked+=("$prefix performance manifest hash mismatch")
 }
 check_benchmark "$candidate_benchmark" "$candidate_report" CANDIDATE
 check_benchmark "$oracle_benchmark" "$oracle_report" ORACLE
