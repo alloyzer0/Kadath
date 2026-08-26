@@ -2491,6 +2491,13 @@ mod tests {
         let alignment = mem::align_of::<abi::kadath_runtime_gameplay_outcome_v1_t>();
         let misaligned_address =
             ((misaligned_storage.as_mut_ptr() as usize + alignment - 1) & !(alignment - 1)) + 1;
+        // 先写入合法 struct_size，避免对齐 mutant 被后续读取失败掩盖。
+        unsafe {
+            std::ptr::write_unaligned(
+                misaligned_address as *mut u32,
+                mem::size_of::<abi::kadath_runtime_gameplay_outcome_v1_t>() as u32,
+            );
+        }
         buffer.outcomes = misaligned_address as *mut abi::kadath_runtime_gameplay_outcome_v1_t;
         assert!(matches!(
             validate_outcome_buffer(&mut buffer),
