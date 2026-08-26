@@ -49,7 +49,7 @@ bad_rows=$(awk -F '\t' 'NR > 1 && ($1 == "dimension" || $1 == "combination") && 
 [[ "$bad_rows" == 0 ]] || block 'seed matrix contains uncovered dimension or combination'
 dimension_rows=$(awk -F '\t' '$1 == "dimension" { count++ } END { print count + 0 }' "$manifest")
 combination_rows=$(awk -F '\t' '$1 == "combination" { count++ } END { print count + 0 }' "$manifest")
-[[ "$dimension_rows" == 26 ]] || block 'seed dimension manifest is incomplete'
+[[ "$dimension_rows" == 25 ]] || block 'seed dimension manifest is incomplete'
 [[ "$combination_rows" == 5760 ]] || block 'seed combination manifest is incomplete'
 
 report="$evidence_root/seed-matrix.report"

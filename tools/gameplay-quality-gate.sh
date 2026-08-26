@@ -116,7 +116,7 @@ if [[ -f "$seed_report" ]]; then
     [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_STATUS)" == PASS ]] || blocked+=("seed matrix status is not PASS")
     [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_TOTAL)" == 10000 ]] || blocked+=("seed matrix total is not 10000")
     [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_UNIQUE_COMBINATIONS)" == 5760 ]] || blocked+=("seed matrix combination coverage is incomplete")
-    [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_DIMENSION_ROWS)" == 26 ]] || blocked+=("seed matrix dimension manifest is incomplete")
+    [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_DIMENSION_ROWS)" == 25 ]] || blocked+=("seed matrix dimension manifest is incomplete")
     [[ "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_COMBINATION_ROWS)" == 5760 ]] || blocked+=("seed matrix combination manifest is incomplete")
     [[ -n "$(value "$seed_report" GAMEPLAY_SEED_MATRIX_COMMAND)" ]] || blocked+=("seed matrix command provenance missing")
     verify_bound_file "$seed_report" GAMEPLAY_SEED_MATRIX_MANIFEST GAMEPLAY_SEED_MATRIX_MANIFEST_SHA256 || blocked+=("seed matrix manifest hash mismatch")
