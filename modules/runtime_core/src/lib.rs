@@ -2487,6 +2487,16 @@ mod tests {
             Err(abi::KADATH_ERR_INVALID_ARGUMENT)
         ));
         buffer = valid;
+        let mut misaligned_storage = [0_u8; 256];
+        let alignment = mem::align_of::<abi::kadath_runtime_gameplay_outcome_v1_t>();
+        let misaligned_address =
+            ((misaligned_storage.as_mut_ptr() as usize + alignment - 1) & !(alignment - 1)) + 1;
+        buffer.outcomes = misaligned_address as *mut abi::kadath_runtime_gameplay_outcome_v1_t;
+        assert!(matches!(
+            validate_outcome_buffer(&mut buffer),
+            Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+        ));
+        buffer = valid;
         let mut short_outcome = outcome;
         short_outcome.struct_size = 0;
         buffer.outcomes = &mut short_outcome;
