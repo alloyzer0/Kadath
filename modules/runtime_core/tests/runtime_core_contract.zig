@@ -158,6 +158,19 @@ test "Runtime Core Adapter drives a fixed phase through the public Phase Interfa
     try core.endPhase(.fixed, 77);
 }
 
+test "Rust Core owns generated phase sequence high-water" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    try preparePairedScene(&core, .initial);
+
+    const first = try core.beginPhaseOwned(.frame);
+    try std.testing.expect(first != 0);
+    try core.endPhase(.frame, first);
+    const second = try core.beginPhaseOwned(.frame);
+    try std.testing.expectEqual(first + 1, second);
+    try core.endPhase(.frame, second);
+}
+
 test "Runtime Core Phase replay preserves FIFO, domain counters, and generation bounds" {
     var core = try runtime_core.RuntimeCore.init();
     defer core.deinit();

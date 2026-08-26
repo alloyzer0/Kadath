@@ -102,14 +102,14 @@ fn runStep(
         .position = player_position,
     }});
     const begin = try fixture.core.beginGameplayFixed(0.0, outcome);
-    try fixture.core.beginPhase(.fixed, begin.step_token);
+    const phase_sequence = try fixture.core.beginPhaseOwned(.fixed);
     const committed = try fixture.core.commitGameplayFixed(begin.step_token, .{}, outcome);
     if (committed.submitted_contact_event_count != runtime_core.max_phase_events) {
         return error.InvalidMaximumContactOutput;
     }
-    const drained = try fixture.core.drainPhaseEvents(.fixed, begin.step_token, events);
+    const drained = try fixture.core.drainPhaseEvents(.fixed, phase_sequence, events);
     if (drained != runtime_core.max_phase_events) return error.InvalidMaximumContactOutput;
-    try fixture.core.endPhase(.fixed, begin.step_token);
+    try fixture.core.endPhase(.fixed, phase_sequence);
     const snapshot = try fixture.core.gameplaySnapshot(render_items);
     if (snapshot.render_count != runtime_core.max_object_count) return error.InvalidRenderCount;
     std.mem.doNotOptimizeAway(events);

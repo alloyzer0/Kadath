@@ -332,9 +332,6 @@ pub const SceneGeneration = struct {
         try self.core.commitActivation(patches[0..updates.len], commands, dispositions);
     }
 
-    pub fn refreshPhaseProjection(self: *SceneGeneration) !void {
-    }
-
     pub fn preparePhaseState(self: *SceneGeneration, bindings: []const runtime_core.PhaseBinding) !void {
         _ = try self.core.preparePhaseState(self.target, bindings);
     }
@@ -504,15 +501,15 @@ fn clampPosition(position: [2]f32, size: [2]f32, extent: PlatformExtent) [2]f32 
 fn testGameplayStep(generation: *SceneGeneration, dt_seconds: f32, input: runtime_core.InputSnapshot) !struct { result: runtime_core.GameplayStepResult, outcome: runtime_core.GameplayOutcome } {
     var outcome: runtime_core.GameplayOutcome = undefined;
     const begin = try generation.beginGameplayFixed(dt_seconds, &outcome);
-    try generation.core.beginPhase(.fixed, begin.step_token);
+    const phase_sequence = try generation.core.beginPhaseOwned(.fixed);
     const result = try generation.commitGameplayFixed(begin.step_token, input, &outcome);
     var events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
     for (&events) |*event| {
         event.* = std.mem.zeroes(runtime_core.PhaseEvent);
         event.struct_size = @sizeOf(runtime_core.PhaseEvent);
     }
-    _ = try generation.core.drainPhaseEvents(.fixed, begin.step_token, &events);
-    try generation.core.endPhase(.fixed, begin.step_token);
+    _ = try generation.core.drainPhaseEvents(.fixed, phase_sequence, &events);
+    try generation.core.endPhase(.fixed, phase_sequence);
     return .{ .result = result, .outcome = outcome };
 }
 

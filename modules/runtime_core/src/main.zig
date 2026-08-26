@@ -329,6 +329,15 @@ pub const RuntimeCore = struct {
 
     pub fn beginPhase(self: *RuntimeCore, domain: PhaseDomain, phase_sequence: u64) !void {
         if (phase_sequence == 0) return error.InvalidRuntimePhaseSequence;
+        _ = try self.beginPhaseWithSequence(domain, phase_sequence);
+    }
+
+    /// 生产 Host 只声明 phase domain；sequence 由 Rust Core 生成并返回。
+    pub fn beginPhaseOwned(self: *RuntimeCore, domain: PhaseDomain) !u64 {
+        return self.beginPhaseWithSequence(domain, 0);
+    }
+
+    fn beginPhaseWithSequence(self: *RuntimeCore, domain: PhaseDomain, phase_sequence: u64) !u64 {
         var desc = std.mem.zeroes(c.kadath_runtime_phase_begin_desc_v1_t);
         desc.struct_size = @sizeOf(c.kadath_runtime_phase_begin_desc_v1_t);
         desc.domain = @intFromEnum(domain);
@@ -336,6 +345,7 @@ pub const RuntimeCore = struct {
         var result = std.mem.zeroes(c.kadath_runtime_phase_begin_result_v1_t);
         result.struct_size = @sizeOf(c.kadath_runtime_phase_begin_result_v1_t);
         try check(self.phase_interface.begin_phase.?(self.handle, &desc, &result));
+        return result.phase_sequence;
     }
 
     pub fn submitPhaseEvents(self: *RuntimeCore, events: []const PhaseEvent) !PhaseBatchResult {

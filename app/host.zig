@@ -620,6 +620,7 @@ pub const Host = struct {
             var outcome: runtime_core.GameplayOutcome = undefined;
             const begin = try self.generation.beginGameplayFixed(@floatCast(fixed_dt_seconds), &outcome);
             var gameplay_committed = false;
+            var legacy_phase_sequence: u64 = 0;
             errdefer if (!gameplay_committed) self.generation.core.abortGameplayFixed(begin.step_token) catch {};
             accepts_input = begin.accepts_input != 0;
             if (begin.outcome_count == 1) self.consumeGameplayOutcome(outcome);
@@ -639,7 +640,7 @@ pub const Host = struct {
                 self.runScriptFixed(@floatCast(fixed_dt_seconds));
             }
             if (!usesBehaviorRuntime(&self.scene) or !self.behavior_runtime.isLoaded()) {
-                try self.generation.core.beginPhase(.fixed, begin.step_token);
+                legacy_phase_sequence = try self.generation.core.beginPhaseOwned(.fixed);
             }
             const committed = self.generation.commitGameplayFixed(begin.step_token, .{
                 .move_x = routed_input.world.move_x,
@@ -665,8 +666,9 @@ pub const Host = struct {
                     event.* = std.mem.zeroes(runtime_core.PhaseEvent);
                     event.struct_size = @sizeOf(runtime_core.PhaseEvent);
                 }
-                while (try self.generation.core.drainPhaseEvents(.fixed, begin.step_token, &drained) != 0) {}
-                try self.generation.core.endPhase(.fixed, begin.step_token);
+                // Legacy path 也让 Rust 生成 phase sequence；Gameplay step token 只负责 Gameplay。
+                while (try self.generation.core.drainPhaseEvents(.fixed, legacy_phase_sequence, &drained) != 0) {}
+                try self.generation.core.endPhase(.fixed, legacy_phase_sequence);
             }
             self.accumulator_seconds -= fixed_dt_seconds;
         }

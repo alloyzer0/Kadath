@@ -62,7 +62,6 @@ pub const Runtime = struct {
     allocator: std.mem.Allocator = std.heap.page_allocator,
     package: ?*behavior_runtime.Package = null,
     active: ?*behavior_runtime.ActiveSet = null,
-    phase_serial: u64 = 1,
     active_phase: ?PhaseSession = null,
 
     pub fn deinit(self: *Runtime) void {
@@ -123,14 +122,12 @@ pub const Runtime = struct {
     }
 
     fn beginPhase(self: *Runtime, generation: *scene_generation_api.SceneGeneration, domain: runtime_core.PhaseDomain) !PhaseSession {
-        if (self.active_phase != null or self.phase_serial == 0 or self.phase_serial == std.math.maxInt(u64)) {
+        if (self.active_phase != null) {
             return error.RuntimePhaseBusy;
         }
         try self.preparePhaseState(generation);
         try self.commitPhaseState(generation);
-        const session = PhaseSession{ .domain = domain, .sequence = self.phase_serial };
-        try generation.core.beginPhase(domain, session.sequence);
-        self.phase_serial += 1;
+        const session = PhaseSession{ .domain = domain, .sequence = try generation.core.beginPhaseOwned(domain) };
         self.active_phase = session;
         return session;
     }
@@ -514,7 +511,6 @@ pub const Runtime = struct {
                 }
             }
         }
-        if (did_work) try generation.refreshPhaseProjection();
         return did_work;
     }
 };

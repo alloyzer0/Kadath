@@ -218,6 +218,7 @@ pub(crate) struct PhaseState {
     active_bindings: BoundedVec<Binding, { MAX_BINDINGS as usize }>,
     admission_used: u32,
     domains: [DomainState; 2],
+    next_phase_sequence: u64,
     next_flush_token: u64,
     next_transaction_id: u64,
     flush: [Option<Flush>; 2],
@@ -239,6 +240,7 @@ impl PhaseState {
             ptr::addr_of_mut!((*pointer).admission_used).write(0);
             ptr::addr_of_mut!((*pointer).domains[0]).write(DomainState::new());
             ptr::addr_of_mut!((*pointer).domains[1]).write(DomainState::new());
+            ptr::addr_of_mut!((*pointer).next_phase_sequence).write(1);
             ptr::addr_of_mut!((*pointer).next_flush_token).write(1);
             ptr::addr_of_mut!((*pointer).next_transaction_id).write(1);
             ptr::addr_of_mut!((*pointer).flush).write([None, None]);
@@ -958,11 +960,7 @@ pub(crate) fn begin_phase(
     ) {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_INVALID_DOMAIN);
     }
-    if desc.phase_sequence == 0
-        || desc.reserved0 != 0
-        || desc.reserved1 != 0
-        || !reserved_is_zero(&desc.reserved)
-    {
+    if desc.reserved0 != 0 || desc.reserved1 != 0 || !reserved_is_zero(&desc.reserved) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     if core.live.is_none() {
@@ -976,8 +974,15 @@ pub(crate) fn begin_phase(
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_BUSY);
     }
+    // 生产 Adapter 传入 0 时由 Rust 生成唯一 phase sequence；非零值保留给
+    // 兼容性/契约测试调用，避免把旧的外部测试 seam 与生产 authority 混在一起。
+    let phase_sequence = if desc.phase_sequence == 0 {
+        PhaseState::next_sequence(&mut core.phase.next_phase_sequence)?
+    } else {
+        desc.phase_sequence
+    };
     let domain = core.phase.domain_mut(desc.domain)?;
-    domain.phase_sequence = Some(desc.phase_sequence);
+    domain.phase_sequence = Some(phase_sequence);
     domain.event_queue.clear();
     domain.structural_queue.clear();
     domain.event_successor_generation = 0;
@@ -987,7 +992,7 @@ pub(crate) fn begin_phase(
     let result = abi::kadath_runtime_phase_begin_result_v1_t {
         struct_size: mem::size_of::<abi::kadath_runtime_phase_begin_result_v1_t>() as u32,
         domain: desc.domain,
-        phase_sequence: desc.phase_sequence,
+        phase_sequence,
         reserved: [0; 4],
     };
     unsafe { ptr::write(out_ptr, result) };
