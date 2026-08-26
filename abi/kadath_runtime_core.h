@@ -791,7 +791,7 @@ typedef struct kadath_runtime_gameplay_interface_v1_t {
 } kadath_runtime_gameplay_interface_v1_t;
 
 // Mode A caller-owned in/out descriptor，只借用本次调用。
-// 不传入opaque Core；该query thread-safe且reentrant。
+// 不传入opaque Core。Thread-safe. Reentrant: yes.
 int32_t kadath_runtime_core_query_gameplay_interface(
     kadath_runtime_gameplay_interface_v1_t* in_out_interface);
 

@@ -517,22 +517,7 @@ fn source_key_is_live(
     key: ObjectKey,
     source_index: u8,
 ) -> bool {
-    key.world_epoch == live.world_epoch
-        && live.slots[usize::from(source_index)]
-            .record
-            .as_ref()
-            .is_some_and(|record| {
-                record.lifecycle == crate::object_authority::Lifecycle::Active
-                    && record.source_index == Some(source_index)
-                    && ObjectKey {
-                        // authored source 的 slot/ID 在 RuntimeState 生命周期内不可替换，
-                        // 这里只需校验 epoch、generation 与 kind。
-                        object_id: key.object_id,
-                        world_epoch: live.world_epoch,
-                        logical_generation: record.logical_generation,
-                        kind: record.kind,
-                    } == key
-            })
+    live.source_active_exact(source_index, key).is_some()
 }
 
 #[cfg(test)]

@@ -240,7 +240,7 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 - 同一实现 candidate 必须删除 Zig persistent phase queue/admission/sequence/generation writer；callback-local staging 可保留。Scene/KSCN/KSCP、Luau Host v4、Editor/Preview/Package wire、collision/gameplay migration、final render snapshot 和 Scheduler 不在本增量内。
 - 该 clarification 对应 Outer contract discovery `P1-Rust-Runtime-Core-Phase-Commit-01`，Inner baseline `444dc5b`；Linux 证据仍不代理 Windows/NTFS/HWND/Vulkan acceptance。
 
-### 6.4 2026-08-25 Gameplay implementation clarification
+### 6.4 2026-08-25 Gameplay 实现澄清
 
 `P1-Rust-Runtime-Core-Gameplay-01` 在 Object Authority 与 Phase Commit 已交付的同一 opaque Core 上完成最后一个 authority cluster；本节记录 implementation candidate 的目标态，在合并前不反写 `## 2 CURRENT`：
 

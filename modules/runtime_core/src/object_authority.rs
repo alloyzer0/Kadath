@@ -354,6 +354,13 @@ impl RuntimeState {
             })
     }
 
+    pub(crate) fn source_active_exact(&self, source_index: u8, key: ObjectKey) -> Option<&Record> {
+        // Gameplay 只能询问精确 authored source 是否仍为 active；generation、
+        // lifecycle 与 stale 裁决继续封装在 Object Authority 内。
+        self.source_visible_exact(source_index, key)
+            .filter(|record| record.lifecycle == Lifecycle::Active)
+    }
+
     pub(crate) fn visible_by_id(&self, object_id: ObjectId) -> Option<&Record> {
         self.slots
             .iter()
