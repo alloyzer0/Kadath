@@ -40,7 +40,11 @@ survived=$(jq '[.outcomes[] | select(.scenario != "Baseline" and .summary == "Mi
 unviable=$(jq '[.outcomes[] | select(.scenario != "Baseline" and .summary == "Unviable")] | length' "$outcomes")
 unclassified=$((total - killed - survived - unviable))
 critical_pattern='begin_step|observe_contacts|transition|active_contacts|contact_transitions|submit_contact_transitions|outcome_value|step_result|prepare_gameplay_state|begin_gameplay_fixed|commit_gameplay_fixed|publish_gameplay_snapshot|validate_outcome_buffer'
-critical_survivors=$(jq --arg pattern "$critical_pattern" '[.outcomes[] | select(.scenario != "Baseline" and .summary == "MissedMutant" and (.scenario | test($pattern)))] | length' "$outcomes")
+critical_survivors=$(jq --arg pattern "$critical_pattern" '[.outcomes[] | select(
+    .scenario != "Baseline" and
+    .summary == "MissedMutant" and
+    ((.scenario.Mutant.function.function_name // "") | test($pattern))
+)] | length' "$outcomes")
 [[ "$total" -gt 0 ]] || block 'no mutants generated'
 [[ "$unviable" -eq 0 ]] || block 'unviable mutants require audit'
 [[ "$unclassified" -eq 0 ]] || block 'timeout or unclassified mutants require audit'
@@ -50,7 +54,8 @@ awk -v score="$score" 'BEGIN { exit !(score+0 >= 80) }' || block 'mutation score
 [[ "$critical_survivors" -eq 0 ]] || block 'critical invariant mutants survived'
 
 manifest="$evidence_root/mutation-manifest.tsv"
-jq -r '.outcomes[] | select(.scenario != "Baseline") | [.summary, .scenario, (.log_path // "")] | @tsv' \
+jq -r '.outcomes[] | select(.scenario != "Baseline") |
+    [.summary, (.scenario.Mutant.name // .scenario), (.log_path // "")] | @tsv' \
     "$outcomes" >"$manifest"
 report="$evidence_root/mutation.report"
 cat >"$report" <<EOF
