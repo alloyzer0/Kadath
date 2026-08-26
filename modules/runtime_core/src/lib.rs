@@ -2888,4 +2888,231 @@ mod tests {
             assert_eq!(plan.hazard_directions[0], 1.0);
         }
     }
+
+    #[test]
+    fn gameplay_apply_positions_validates_batch_and_publishes_clamped_updates() {
+        let core = gameplay_test_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let initial = core.live.as_ref().expect("test live state").clone();
+        let player = gameplay_test_object_ref(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER, 1);
+        let mut patches = [abi::kadath_runtime_position_patch_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_position_patch_v1_t>() as u32,
+            reserved0: 0,
+            object_ref: player,
+            position: [200.0, 200.0],
+            reserved: [0; 4],
+        }];
+        let base = abi::kadath_runtime_position_batch_v1_t {
+            patches: patches.as_ptr(),
+            patch_count: 1,
+            patch_stride: mem::size_of::<abi::kadath_runtime_position_patch_v1_t>(),
+        };
+        let empty_range = (0, 0);
+
+        // 合法批次必须一次性验证后发布，并由 Object Authority 做 bounds clamp。
+        let mut state = initial.clone();
+        assert_eq!(
+            apply_positions(&mut state, &base, empty_range, empty_range),
+            Ok(())
+        );
+        let player_key = read_object_key(&player).unwrap();
+        assert_eq!(
+            state.visible_exact(player_key).unwrap().sprite.position,
+            [98.0, 98.0]
+        );
+
+        // 顶层 batch preflight 的每个条件都独立命中，避免 OR→AND 变异漏过。
+        let mut invalid = base;
+        invalid.patches = std::ptr::null();
+        assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+        invalid = base;
+        invalid.patch_count = 0;
+        assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+        invalid = base;
+        invalid.patch_count = MAX_OBJECTS + 1;
+        assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+        let alignment = mem::align_of::<abi::kadath_runtime_position_patch_v1_t>();
+        let mut misaligned = [0_u8; 256];
+        let misaligned_address =
+            ((misaligned.as_mut_ptr() as usize + alignment - 1) & !(alignment - 1)) + 1;
+        invalid = base;
+        invalid.patches = misaligned_address as *const _;
+        assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+        invalid = base;
+        invalid.patch_stride = mem::size_of::<abi::kadath_runtime_position_patch_v1_t>() - 1;
+        assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+        invalid = base;
+        invalid.patch_stride = mem::size_of::<abi::kadath_runtime_position_patch_v1_t>() + 1;
+        assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+        invalid = base;
+        invalid.patch_count = MAX_OBJECTS;
+        invalid.patch_stride = usize::MAX - (alignment - 1);
+        assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+
+        let patch_range = (
+            patches.as_ptr() as usize,
+            patches.as_ptr() as usize + mem::size_of::<abi::kadath_runtime_position_patch_v1_t>(),
+        );
+        assert!(apply_positions(&mut initial.clone(), &base, patch_range, empty_range).is_err());
+        assert!(apply_positions(&mut initial.clone(), &base, empty_range, patch_range).is_err());
+
+        // patch 级别的 struct/reserved/finite/key/duplicate 校验也必须拒绝且不改状态。
+        patches[0].struct_size = 0;
+        assert!(apply_positions(&mut initial.clone(), &base, empty_range, empty_range).is_err());
+        patches[0].struct_size = mem::size_of::<abi::kadath_runtime_position_patch_v1_t>() as u32;
+        patches[0].reserved0 = 1;
+        assert!(apply_positions(&mut initial.clone(), &base, empty_range, empty_range).is_err());
+        patches[0].reserved0 = 0;
+        patches[0].reserved[0] = 1;
+        assert!(apply_positions(&mut initial.clone(), &base, empty_range, empty_range).is_err());
+        patches[0].reserved[0] = 0;
+        patches[0].position = [f32::NAN, 0.0];
+        assert!(apply_positions(&mut initial.clone(), &base, empty_range, empty_range).is_err());
+        patches[0].position = [200.0, 200.0];
+        patches[0].object_ref.world_epoch = 2;
+        assert!(apply_positions(&mut initial.clone(), &base, empty_range, empty_range).is_err());
+        patches[0].object_ref = player;
+
+        let duplicate = [patches[0], patches[0]];
+        let duplicate_batch = abi::kadath_runtime_position_batch_v1_t {
+            patches: duplicate.as_ptr(),
+            patch_count: 2,
+            patch_stride: mem::size_of::<abi::kadath_runtime_position_patch_v1_t>(),
+        };
+        assert!(apply_positions(
+            &mut initial.clone(),
+            &duplicate_batch,
+            empty_range,
+            empty_range
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gameplay_snapshot_validates_caller_buffer_and_publishes_terminal_tint() {
+        let mut core = gameplay_test_core(abi::KADATH_RUNTIME_PREPARE_INITIAL);
+        let player = gameplay_test_object_ref(b"player", abi::KADATH_RUNTIME_OBJECT_KIND_PLAYER, 1);
+        let goal = gameplay_test_object_ref(b"goal", abi::KADATH_RUNTIME_OBJECT_KIND_GOAL, 1);
+        let player_key = read_object_key(&player).unwrap();
+        let goal_key = read_object_key(&goal).unwrap();
+        let hazard_key = ObjectKey {
+            object_id: ObjectId::parse(b"hazard").unwrap(),
+            world_epoch: 1,
+            logical_generation: 1,
+            kind: abi::KADATH_RUNTIME_OBJECT_KIND_PATROL_HAZARD,
+        };
+        let hazard = gameplay::Hazard {
+            object: hazard_key,
+            source_index: 2,
+            movement_mode: abi::KADATH_RUNTIME_GAMEPLAY_HAZARD_MOVEMENT_NONE,
+            patrol_min_y: 0.0,
+            patrol_max_y: 0.0,
+            patrol_speed: 0.0,
+            patrol_direction: 1.0,
+        };
+        core.gameplay = Some(gameplay::State::new(
+            player_key,
+            0,
+            goal_key,
+            1,
+            &[hazard],
+            3.0,
+            1,
+            1,
+        ));
+        let pointer = (&mut *core as *mut RuntimeCore).cast::<abi::kadath_runtime_core_t>();
+        let render_size = mem::size_of::<abi::kadath_runtime_render_item_v1_t>();
+        let mut items = [abi::kadath_runtime_render_item_v1_t {
+            struct_size: render_size as u32,
+            ..unsafe { mem::zeroed() }
+        }; 3];
+        let mut buffer = abi::kadath_runtime_render_buffer_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_render_buffer_v1_t>() as u32,
+            reserved0: 0,
+            items: items.as_mut_ptr(),
+            item_capacity: items.len(),
+            item_stride: render_size,
+            reserved: [0; 4],
+        };
+        let mut snapshot = abi::kadath_runtime_gameplay_snapshot_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_snapshot_v1_t>() as u32,
+            ..unsafe { mem::zeroed() }
+        };
+
+        // Playing/Won/Lost 三态都必须写出稳定的 phase、cause、input 与玩家颜色。
+        for (phase, expected_color) in [
+            (gameplay::Phase::Playing, [1.0, 1.0, 1.0, 1.0]),
+            (gameplay::Phase::Won, [0.20, 0.95, 0.35, 1.0]),
+            (gameplay::Phase::Lost, [0.95, 0.20, 0.20, 1.0]),
+        ] {
+            let state = core.gameplay.as_mut().unwrap();
+            state.session.phase = phase;
+            state.session.cause = match phase {
+                gameplay::Phase::Playing => gameplay::Cause::None,
+                gameplay::Phase::Won => gameplay::Cause::Goal,
+                gameplay::Phase::Lost => gameplay::Cause::Hazard,
+            };
+            assert_eq!(
+                publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot),
+                Ok(())
+            );
+            assert_eq!(snapshot.render_count, 3);
+            assert_eq!(
+                snapshot.accepts_input,
+                u32::from(phase == gameplay::Phase::Playing)
+            );
+            assert_eq!(items[0].final_color, expected_color);
+        }
+
+        // buffer/output 的 descriptor、reserved、容量、stride、指针对齐和结构体大小
+        // 各自独立拒绝；每个失败都发生在写入 caller storage 之前。
+        let valid_buffer = buffer;
+        let valid_snapshot = snapshot;
+        buffer.reserved0 = 1;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.reserved[0] = 1;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.items = std::ptr::null_mut();
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.item_capacity = 0;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.item_capacity = MAX_OBJECTS + 1;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.item_stride = render_size - 1;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.item_stride = render_size + 1;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        let alignment = mem::align_of::<abi::kadath_runtime_render_item_v1_t>();
+        let mut misaligned = [0_u8; 256];
+        let misaligned_address =
+            ((misaligned.as_mut_ptr() as usize + alignment - 1) & !(alignment - 1)) + 1;
+        buffer = valid_buffer;
+        buffer.items = misaligned_address as *mut _;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.item_capacity = 2;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        items[0].struct_size = 0;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        assert_eq!(items[0].struct_size, 0);
+
+        buffer = valid_buffer;
+        buffer.items = (&mut buffer as *mut abi::kadath_runtime_render_buffer_v1_t).cast();
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.items = (&mut snapshot as *mut abi::kadath_runtime_gameplay_snapshot_v1_t).cast();
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        buffer.struct_size = 0;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+        buffer = valid_buffer;
+        snapshot = valid_snapshot;
+        snapshot.struct_size = 0;
+        assert!(publish_gameplay_snapshot(pointer, &mut buffer, &mut snapshot).is_err());
+    }
 }
