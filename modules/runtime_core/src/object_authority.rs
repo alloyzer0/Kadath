@@ -10,6 +10,15 @@ pub(crate) struct ObjectId {
     len: u8,
 }
 
+impl Default for ObjectId {
+    fn default() -> Self {
+        Self {
+            bytes: [0; 64],
+            len: 0,
+        }
+    }
+}
+
 impl ObjectId {
     pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
         if bytes.is_empty()
@@ -94,7 +103,7 @@ pub(crate) struct SourceObject {
     pub(crate) sprite: Sprite,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ObjectKey {
     pub(crate) object_id: ObjectId,
     pub(crate) world_epoch: u64,

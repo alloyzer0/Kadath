@@ -1675,7 +1675,7 @@ fn prepare_gameplay_state(
     if desc.hazard_count == 0 {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    if desc.hazard_count as usize >= gameplay::MAX_CONTACTS {
+    if (desc.hazard_count as usize) >= gameplay::MAX_CONTACTS {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
     if desc.hazards.is_null() {
@@ -1982,6 +1982,16 @@ struct GameplayPositionPlan {
     updates: [(ObjectKey, u8, [f32; 2]); MAX_OBJECTS],
     update_count: usize,
     hazard_directions: [f32; gameplay::MAX_CONTACTS],
+}
+
+impl Default for GameplayPositionPlan {
+    fn default() -> Self {
+        Self {
+            updates: [(ObjectKey::default(), 0, [0.0; 2]); MAX_OBJECTS],
+            update_count: 0,
+            hazard_directions: [0.0; gameplay::MAX_CONTACTS],
+        }
+    }
 }
 
 fn plan_gameplay_positions(

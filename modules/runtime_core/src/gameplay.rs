@@ -1,6 +1,9 @@
 use crate::{abi, object_authority::ObjectKey, phase_commit, world::Sprite, RuntimeCore};
 
 pub(crate) const MAX_CONTACTS: usize = crate::object_authority::MAX_OBJECTS - 1;
+// 接触差分最多为单域事件容量的一半，避免重复书写数组长度表达式。
+pub(crate) const MAX_CONTACT_TRANSITIONS: usize =
+    abi::KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN as usize / 2;
 const CONTACT_MASK_WORDS: usize = crate::object_authority::MAX_OBJECTS / 64;
 
 pub(crate) struct ContactObservation {
@@ -11,6 +14,19 @@ pub(crate) struct ContactObservation {
     pub(crate) count: usize,
     pub(crate) first_hazard: Option<ObjectKey>,
     pub(crate) goal: Option<ObjectKey>,
+}
+
+impl Default for ContactObservation {
+    fn default() -> Self {
+        Self {
+            contacts: [None; MAX_CONTACTS],
+            source_indices: [0; MAX_CONTACTS],
+            source_mask: [0; CONTACT_MASK_WORDS],
+            count: 0,
+            first_hazard: None,
+            goal: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -417,7 +433,7 @@ pub(crate) fn contact_events(
     Ok((output, count))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ContactTransition {
     pub(crate) ended: bool,
     pub(crate) other: ObjectKey,
@@ -430,17 +446,11 @@ pub(crate) fn contact_transitions(
     current_count: usize,
     current_source_indices: &[u8; MAX_CONTACTS],
     current_source_mask: &[u64; CONTACT_MASK_WORDS],
-) -> Result<
-    (
-        [ContactTransition; (abi::KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN as usize) / 2],
-        usize,
-    ),
-    u32,
-> {
+) -> Result<([ContactTransition; MAX_CONTACT_TRANSITIONS], usize), u32> {
     let mut output = [ContactTransition {
         ended: false,
         other: gameplay.player,
-    }; (abi::KADATH_RUNTIME_PHASE_MAX_EVENTS_PER_DOMAIN as usize) / 2];
+    }; MAX_CONTACT_TRANSITIONS];
     let mut count = 0;
     for index in 0..gameplay.previous_contact_count {
         let Some(other) = gameplay.previous_contacts[index] else {
