@@ -295,8 +295,9 @@ pub const Runtime = struct {
         var did_work = false;
         while (true) {
             var drained: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
-            // Rust Core 会完整写入返回 count 范围；预清零 64 个大型事件既不参与
-            // ABI preflight，也不会被空队列读取，避免在每次 Phase settle 制造固定成本。
+            // Rust ABI 会先读取每项 struct_size，再完整写入返回 count 范围。
+            // 这里只初始化必需表头，避免重新引入 64 个大型事件的整块预清零。
+            initializePhaseEventHeaders(&drained);
             const count = try generation.core.drainPhaseEvents(session.domain, session.sequence, &drained);
             if (count == 0) break;
             did_work = true;
@@ -1342,4 +1343,23 @@ fn logFailures(active: *const behavior_runtime.ActiveSet) void {
 
 fn logDiagnostic(prefix: []const u8, err: anyerror, diagnostic: []const u8) void {
     std.log.err("{s}: error={s}, diagnostic={s}", .{ prefix, @errorName(err), diagnostic });
+}
+
+fn initializePhaseEventHeaders(events: []runtime_core.PhaseEvent) void {
+    for (events) |*event| {
+        event.struct_size = @sizeOf(runtime_core.PhaseEvent);
+    }
+}
+
+test "phase drain output initializes ABI headers without clearing payloads" {
+    var drained: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
+    @memset(std.mem.asBytes(&drained), 0xa5);
+
+    initializePhaseEventHeaders(&drained);
+
+    for (drained) |event| {
+        try std.testing.expectEqual(@as(u32, @sizeOf(runtime_core.PhaseEvent)), event.struct_size);
+        // 只允许写 ABI 必需的表头；大 payload 仍由 Rust 在返回 count 范围内覆盖。
+        try std.testing.expectEqual(@as(u8, 0xa5), event.name[0]);
+    }
 }

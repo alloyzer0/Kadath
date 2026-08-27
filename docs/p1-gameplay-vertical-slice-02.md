@@ -65,9 +65,9 @@ Hash 只作为“同一 transcript 完全一致”的证据，不代替字段级
 - WSL2 Linux：p50 约 2.35 ms，p95 约 2.50 ms，p99 约 2.85 ms；
 - 每个完整冷生命周期记录 909 次 Rust 分配。该数字包含三次候选世界/VM 生命周期，不是 steady-state 零分配指标。
 
-`gprofng` 对 4096 次 workload 的 profile 将 `Runtime.settlePhase` 识别为唯一可归因热点：每次 drain 前清零 64 个大型 `PhaseEvent` 占据明显 CPU 样本，而 Rust Core 的公开输出契约会完整写入返回的 `count` 范围。仓库其他调用点也直接使用未初始化输出缓冲。
+`gprofng` 对 4096 次 workload 的 profile 将 `Runtime.settlePhase` 识别为唯一可归因热点：每次 drain 前清零 64 个大型 `PhaseEvent` 占据明显 CPU 样本。Rust Core 的公开输出契约要求调用方先提供每项 `struct_size`，通过 ABI preflight 后会完整写入返回的 `count` 范围，因此无须预清零其余 payload。
 
-因此只移除了这一处无效预清零。优化后：
+因此只移除了这一处无效的 payload 预清零；每个输出项仍显式初始化 ABI preflight 必需的 `struct_size`，Rust 只在校验表头后覆盖返回 `count` 范围。优化后：
 
 - Linux p50 约 2.15 ms，p95 约 2.47 ms；
 - profile 总 CPU 样本约从 0.099 s 降至 0.090 s；
