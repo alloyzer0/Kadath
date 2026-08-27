@@ -365,25 +365,51 @@ public sealed class WorkspaceAuthoringModel
         ValidateTextureId(textureSet, patch.SceneHazardTextureId, "scene.hazard.textureId");
         var workspaceTextures = textureSet.Select(value => new WorkspaceSceneTexture(value.TextureId, value.Artifact)).ToArray();
         var currentObjects = current.Scene.Objects ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene object set is missing from the snapshot.");
+        var currentPrototypes = current.Scene.Prototypes ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene Prototype set is missing from the snapshot.");
+        var targetSchema = TargetSceneSchema(current.Scene.SchemaVersion);
         WorkspaceSceneObject[]? normalizedObjects = null;
         if (patch.SceneObjects is not null)
         {
-            try { normalizedObjects = WorkspaceSceneDocumentCodec.NormalizeDefinitions(patch.SceneObjects, workspaceTextures, TargetSceneSchema(current.Scene.SchemaVersion), gameplay); }
+            try { normalizedObjects = WorkspaceSceneDocumentCodec.NormalizeDefinitions(patch.SceneObjects, workspaceTextures, targetSchema, gameplay); }
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
         }
-        else if (sceneTextures.ResolvedTextures is not null)
+        WorkspaceScenePrototype[]? normalizedPrototypes = null;
+        if (patch.ScenePrototypes is not null)
+        {
+            if (current.Scene.SchemaVersion is not (WorkspaceSceneDocumentCodec.PrototypeSchemaVersion or WorkspaceSceneDocumentCodec.CurrentSchemaVersion))
+                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "scene.prototypes can only be authored for Scene v6 or v7.");
+            try
+            {
+                normalizedPrototypes = WorkspaceSceneDocumentCodec.NormalizePrototypeDefinitions(patch.ScenePrototypes);
+            }
+            catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
+        }
+        if (sceneTextures.ResolvedTextures is not null || patch.SceneObjects is not null || patch.ScenePrototypes is not null
+            || gameplayProfileChanged || gameplayTimeLimitChanged)
         {
             try
             {
-                _ = WorkspaceSceneDocumentCodec.NormalizeDefinitions(
-                    currentObjects.Select(ToDefinition).ToArray(), workspaceTextures, TargetSceneSchema(current.Scene.SchemaVersion), gameplay);
+                var candidateObjects = normalizedObjects ?? WorkspaceSceneDocumentCodec.NormalizeDefinitions(
+                    currentObjects.Select(ToDefinition).ToArray(), workspaceTextures, targetSchema, gameplay);
+                var candidatePrototypes = normalizedPrototypes ?? WorkspaceSceneDocumentCodec.NormalizePrototypeDefinitions(
+                    currentPrototypes.Select(ToDefinition).ToArray());
+                // 关键提交前校验：跨 texture/object/prototype/gameplay 的约束只在完整 candidate 上裁决一次。
+                WorkspaceSceneDocumentCodec.ValidateNormalized(
+                    workspaceTextures,
+                    candidateObjects,
+                    candidatePrototypes,
+                    targetSchema,
+                    gameplay);
             }
-            catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
+            catch (WorkspaceProjectValidationException exception)
+            {
+                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception);
+            }
         }
         var provided = patch.SceneGoalPosition is not null || patch.ScriptGoalPosition is not null || patch.ScriptGoalVelocity is not null
             || patch.ScenePlayerTextureId is not null || patch.SceneGoalTextureId is not null || patch.SceneHazardTextureId is not null
             || patch.SceneTextures is not null || patch.SceneObjects is not null || patch.SceneGameplayProfile is not null
-            || patch.SceneGameplayTimeLimitSeconds is not null;
+            || patch.SceneGameplayTimeLimitSeconds is not null || patch.ScenePrototypes is not null;
         if (!provided) throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "At least one authoring field is required.");
 
         var sceneGoal = Changed(patch.SceneGoalPosition, current.Scene.GoalPosition) ? patch.SceneGoalPosition : null;
@@ -393,21 +419,27 @@ public sealed class WorkspaceAuthoringModel
         var goalTexture = patch.SceneGoalTextureId is not null && patch.SceneGoalTextureId != current.Scene.GoalTextureId ? patch.SceneGoalTextureId : null;
         var hazardTexture = patch.SceneHazardTextureId is not null && patch.SceneHazardTextureId != current.Scene.HazardTextureId ? patch.SceneHazardTextureId : null;
         var objectDefinitions = normalizedObjects is not null
-            && (current.Scene.SchemaVersion != WorkspaceSceneDocumentCodec.CurrentSchemaVersion || !ObjectsEqual(currentObjects, normalizedObjects))
+            // 只有旧 v3 需要以完整对象 patch 显式升级到 v4；v4-v7 的等价集合必须保持 no-op。
+            && (current.Scene.SchemaVersion < WorkspaceSceneDocumentCodec.LegacySchemaVersion
+                || !ObjectsEqual(currentObjects, normalizedObjects))
             ? normalizedObjects.Select(value => value.ToDefinition()).ToArray()
+            : null;
+        var prototypeDefinitions = normalizedPrototypes is not null && !PrototypesEqual(currentPrototypes, normalizedPrototypes)
+            ? normalizedPrototypes.Select(value => value.ToDefinition()).ToArray()
             : null;
         var normalized = new AuthoringPatch(sceneGoal, scriptGoal, velocity, playerTexture, goalTexture, hazardTexture,
             sceneTextures.RequestedTextures, objectDefinitions, gameplayProfileChanged ? gameplay.Profile : null,
-            gameplayTimeLimitChanged ? gameplay.TimeLimitSeconds : null);
+            gameplayTimeLimitChanged ? gameplay.TimeLimitSeconds : null, prototypeDefinitions);
         var fields = ChangedFields(normalized);
-        if (fields.Length == 0) return new NormalizedPatch(normalized, [], false, false, null, null, null);
+        if (fields.Length == 0) return new NormalizedPatch(normalized, [], false, false, null, null, null, null);
         return new NormalizedPatch(normalized, fields,
             sceneGoal is not null || playerTexture is not null || goalTexture is not null || hazardTexture is not null
                 || sceneTextures.ResolvedTextures is not null || objectDefinitions is not null || gameplayProfileChanged
-                || gameplayTimeLimitChanged,
+                || gameplayTimeLimitChanged || prototypeDefinitions is not null,
             scriptGoal is not null || velocity is not null,
             sceneTextures.ResolvedTextures,
             objectDefinitions is null ? null : normalizedObjects,
+            prototypeDefinitions is null ? null : normalizedPrototypes,
             gameplayProfileChanged || gameplayTimeLimitChanged ? gameplay : null);
     }
 
@@ -420,6 +452,7 @@ public sealed class WorkspaceAuthoringModel
             ? current.Textures
             : normalized.ResolvedSceneTextures.Select(value => new WorkspaceSceneTexture(value.TextureId, value.Artifact)).ToArray();
         var objects = normalized.ResolvedSceneObjects ?? ApplyFixedObjectPatch(current.Objects, normalized.Patch);
+        var prototypes = normalized.ResolvedScenePrototypes ?? current.Prototypes;
         if (current.SourceSchemaVersion is WorkspaceSceneDocumentCodec.LegacySchemaVersion
             or WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
             or WorkspaceSceneDocumentCodec.PrototypeSchemaVersion
@@ -433,9 +466,9 @@ public sealed class WorkspaceAuthoringModel
                     WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV7(
                         textures,
                         objects,
-                        current.Prototypes,
+                        prototypes,
                         normalized.ResolvedSceneGameplay ?? current.Gameplay),
-                    WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV6(textures, objects, current.Prototypes),
+                    WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV6(textures, objects, prototypes),
                     WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV5(textures, objects),
                     _ => WorkspaceSceneDocumentCodec.SerializeV4(textures, objects)
                 };
@@ -503,6 +536,17 @@ public sealed class WorkspaceAuthoringModel
             && pair.First.PatrolSpeed == pair.Second.PatrolSpeed
             && BehaviorsEqual(pair.First.Behaviors, pair.Second.Behaviors));
 
+    private static bool PrototypesEqual(
+        IReadOnlyList<ProjectModelScenePrototype> current,
+        IReadOnlyList<WorkspaceScenePrototype> requested) =>
+        current.Count == requested.Count && current.Zip(requested).All(pair =>
+            pair.First.PrototypeId == pair.Second.PrototypeId
+            && pair.First.Kind == pair.Second.Kind
+            && pair.First.Size.SequenceEqual(pair.Second.Size)
+            && pair.First.Color.SequenceEqual(pair.Second.Color)
+            && pair.First.TextureId == pair.Second.TextureId
+            && BehaviorsEqual(pair.First.Behaviors, pair.Second.Behaviors));
+
     private static bool BehaviorsEqual(
         IReadOnlyList<ProjectModelSceneBehaviorBinding>? current,
         IReadOnlyList<WorkspaceSceneBehaviorBinding>? requested)
@@ -522,13 +566,19 @@ public sealed class WorkspaceAuthoringModel
         NormalizedPatch normalized,
         CancellationToken cancellationToken)
     {
-        if (normalized.ResolvedSceneObjects is not { } requested) return;
+        if (normalized.ResolvedSceneObjects is null && normalized.ResolvedScenePrototypes is null) return;
         var currentObjects = current.Scene.Objects
             ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene object set is missing from the snapshot.");
+        var currentPrototypes = current.Scene.Prototypes
+            ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene Prototype set is missing from the snapshot.");
         if (current.Scene.SchemaVersion is not (WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
             or WorkspaceSceneDocumentCodec.PrototypeSchemaVersion
             or WorkspaceSceneDocumentCodec.CurrentSchemaVersion)) return;
-        if (!BehaviorCollectionsChanged(currentObjects, requested)) return;
+        var objectBehaviorsChanged = normalized.ResolvedSceneObjects is { } requestedObjects
+            && BehaviorCollectionsChanged(currentObjects, requestedObjects);
+        var prototypeBehaviorsChanged = normalized.ResolvedScenePrototypes is { } requestedPrototypes
+            && PrototypeBehaviorCollectionsChanged(currentPrototypes, requestedPrototypes);
+        if (!objectBehaviorsChanged && !prototypeBehaviorsChanged) return;
 
         WorkspaceBehaviorContractObservation observation;
         try { observation = WorkspaceBehaviorContractModel.Read(project, cancellationToken); }
@@ -543,23 +593,41 @@ public sealed class WorkspaceAuthoringModel
             throw Failure(WorkspaceAuthoringFailureKind.RevisionConflict, "Behavior contract no longer matches the current authoring revision.");
 
         var entries = observation.Catalog.Entries.ToDictionary(entry => entry.ScriptId);
-        foreach (var sceneObject in requested)
+        if (objectBehaviorsChanged)
         {
-            foreach (var binding in sceneObject.Behaviors ?? [])
+            foreach (var sceneObject in normalized.ResolvedSceneObjects!)
             {
-                if (!entries.TryGetValue(binding.ScriptId, out var entry))
+                ValidateBehaviorBindings($"Scene.objects[{sceneObject.ObjectId}]", sceneObject.Behaviors ?? [], entries);
+            }
+        }
+        if (prototypeBehaviorsChanged)
+        {
+            foreach (var prototype in normalized.ResolvedScenePrototypes!)
+            {
+                ValidateBehaviorBindings($"Scene.prototypes[{prototype.PrototypeId}]", prototype.Behaviors, entries);
+            }
+        }
+    }
+
+    private static void ValidateBehaviorBindings(
+        string owner,
+        IReadOnlyList<WorkspaceSceneBehaviorBinding> bindings,
+        IReadOnlyDictionary<uint, WorkspaceBehaviorContractEntry> entries)
+    {
+        foreach (var binding in bindings)
+        {
+            if (!entries.TryGetValue(binding.ScriptId, out var entry))
+                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch,
+                    $"{owner}.behaviors references unknown scriptId {binding.ScriptId}.");
+            var schemas = entry.Parameters.ToDictionary(parameter => parameter.Name, StringComparer.Ordinal);
+            foreach (var parameter in binding.Parameters)
+            {
+                if (!schemas.TryGetValue(parameter.Name, out var schema))
                     throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch,
-                        $"Scene.objects[{sceneObject.ObjectId}].behaviors references unknown scriptId {binding.ScriptId}.");
-                var schemas = entry.Parameters.ToDictionary(parameter => parameter.Name, StringComparer.Ordinal);
-                foreach (var parameter in binding.Parameters)
-                {
-                    if (!schemas.TryGetValue(parameter.Name, out var schema))
-                        throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch,
-                            $"Scene.objects[{sceneObject.ObjectId}].behaviors[{binding.ScriptId}] contains unknown parameter {parameter.Name}.");
-                    if (parameter.Value < schema.Minimum || parameter.Value > schema.Maximum)
-                        throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch,
-                            $"Scene.objects[{sceneObject.ObjectId}].behaviors[{binding.ScriptId}].parameters.{parameter.Name} is outside [{schema.Minimum}, {schema.Maximum}].");
-                }
+                        $"{owner}.behaviors[{binding.ScriptId}] contains unknown parameter {parameter.Name}.");
+                if (parameter.Value < schema.Minimum || parameter.Value > schema.Maximum)
+                    throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch,
+                        $"{owner}.behaviors[{binding.ScriptId}].parameters.{parameter.Name} is outside [{schema.Minimum}, {schema.Maximum}].");
             }
         }
     }
@@ -582,6 +650,24 @@ public sealed class WorkspaceAuthoringModel
         return requested.Any(value => !currentIds.Contains(value.ObjectId) && (value.Behaviors?.Length ?? 0) != 0);
     }
 
+    private static bool PrototypeBehaviorCollectionsChanged(
+        IReadOnlyList<ProjectModelScenePrototype> current,
+        IReadOnlyList<WorkspaceScenePrototype> requested)
+    {
+        var requestedById = requested.ToDictionary(value => value.PrototypeId, StringComparer.Ordinal);
+        foreach (var currentPrototype in current)
+        {
+            if (!requestedById.TryGetValue(currentPrototype.PrototypeId, out var requestedPrototype))
+            {
+                if ((currentPrototype.Behaviors?.Count ?? 0) != 0) return true;
+                continue;
+            }
+            if (!BehaviorsEqual(currentPrototype.Behaviors, requestedPrototype.Behaviors)) return true;
+        }
+        var currentIds = current.Select(value => value.PrototypeId).ToHashSet(StringComparer.Ordinal);
+        return requested.Any(value => !currentIds.Contains(value.PrototypeId) && value.Behaviors.Length != 0);
+    }
+
     private static SceneObjectDefinition ToDefinition(ProjectModelSceneObject value) => new(
         value.ObjectId,
         value.Kind,
@@ -596,6 +682,19 @@ public sealed class WorkspaceAuthoringModel
         value.Behaviors?.Select(binding => new SceneBehaviorBindingDefinition(
             binding.ScriptId,
             binding.Parameters?.ToDictionary(parameter => parameter.Name, parameter => parameter.Value, StringComparer.Ordinal))).ToArray());
+
+    private static ScenePrototypeDefinition ToDefinition(ProjectModelScenePrototype value) => new(
+        value.PrototypeId,
+        value.Kind,
+        value.Size,
+        value.Color,
+        value.TextureId,
+        value.Behaviors?.Select(binding => new SceneBehaviorBindingDefinition(
+            binding.ScriptId,
+            binding.Parameters?.ToDictionary(
+                parameter => parameter.Name,
+                parameter => parameter.Value,
+                StringComparer.Ordinal))).ToArray());
 
     private static int TargetSceneSchema(int sourceSchemaVersion) =>
         sourceSchemaVersion switch
@@ -676,6 +775,7 @@ public sealed class WorkspaceAuthoringModel
         if (patch.SceneHazardTextureId is not null) fields.Add("scene.hazard.textureId");
         if (patch.SceneTextures is not null) fields.Add("scene.textures");
         if (patch.SceneObjects is not null) fields.Add("scene.objects");
+        if (patch.ScenePrototypes is not null) fields.Add("scene.prototypes");
         if (patch.SceneGameplayProfile is not null) fields.Add("scene.gameplay.profile");
         if (patch.SceneGameplayTimeLimitSeconds is not null) fields.Add("scene.gameplay.timeLimitSeconds");
         return fields.ToArray();
@@ -753,6 +853,7 @@ public sealed class WorkspaceAuthoringModel
         bool ScriptChanged,
         ProjectModelTexture[]? ResolvedSceneTextures,
         WorkspaceSceneObject[]? ResolvedSceneObjects,
+        WorkspaceScenePrototype[]? ResolvedScenePrototypes,
         WorkspaceSceneGameplay? ResolvedSceneGameplay);
     private sealed record SceneTextureNormalization(ProjectModelTexture[]? ResolvedTextures, SceneTextureAssignment[]? RequestedTextures);
     private sealed record TransactionEntry(string TargetPath, string StagedPath, string RecoveryPath, byte[] Intended);

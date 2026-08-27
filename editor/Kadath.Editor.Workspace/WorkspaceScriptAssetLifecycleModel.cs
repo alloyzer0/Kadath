@@ -359,13 +359,19 @@ public sealed class WorkspaceScriptAssetLifecycleModel
             ?? throw Failure(WorkspaceScriptAssetLifecycleFailureKind.NotFound, $"Script Asset {scriptId} does not exist.");
         if (current.Dependencies.Count == 1)
             throw Failure(WorkspaceScriptAssetLifecycleFailureKind.LastDependency, "The last Script Asset cannot be deleted from Script schema v2.");
-        var references = projection.Project.Scene.Objects?
+        var objectReferences = projection.Project.Scene.Objects?
             .Where(value => value.Behaviors?.Any(binding => binding.ScriptId == scriptId) == true)
-            .Select(value => value.ObjectId)
-            .Take(4)
+            .Select(value => $"object:{value.ObjectId}")
             .ToArray() ?? [];
+        var prototypeReferences = projection.Project.Scene.Prototypes?
+            .Where(value => value.Behaviors?.Any(binding => binding.ScriptId == scriptId) == true)
+            .Select(value => $"prototype:{value.PrototypeId}")
+            .ToArray() ?? [];
+        // Prototype Binding 与 Object Binding 同为 Scene source 的强引用；删除资产前必须统一裁决。
+        var references = objectReferences.Concat(prototypeReferences).Take(4).ToArray();
         if (references.Length != 0)
-            throw Failure(WorkspaceScriptAssetLifecycleFailureKind.InUse, $"Script Asset {scriptId} is referenced by Scene Object: {string.Join(", ", references)}.");
+            throw Failure(WorkspaceScriptAssetLifecycleFailureKind.InUse,
+                $"Script Asset {scriptId} is referenced by Scene authoring: {string.Join(", ", references)}.");
 
         var manifest = WorkspaceScriptSourceModel.EncodeBehaviorManifest(
             current.Dependencies.Where(value => value.ScriptId != scriptId).Select(value => (value.ScriptId, value.SourceName)));

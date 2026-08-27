@@ -286,6 +286,102 @@
                 </StackPanel>
               </Border>
 
+              <Border IsVisible="{Binding SupportsScenePrototypeAuthoring}" Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="6">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock FontWeight="SemiBold" Text="Spawn Prototypes" />
+                    <TextBlock Grid.Column="1" FontSize="11" Foreground="#AEBAC8" Text="{Binding ScenePrototypeCountStatus}" />
+                  </Grid>
+                  <TextBlock FontSize="11" Foreground="#AEBAC8" Text="生成蓝图不进入 Scene Hierarchy；列表顺序即 Source Prototype Order。" TextWrapping="Wrap" />
+                  <ComboBox ItemsSource="{Binding ScenePrototypeDrafts}" SelectedItem="{Binding SelectedScenePrototype}">
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate>
+                        <TextBlock Text="{Binding DisplayName}" />
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
+                  <StackPanel Orientation="Horizontal" Spacing="5">
+                    <Button Command="{Binding AddScenePrototypeCommand}" Content="+ Sprite Prototype" />
+                    <Button Command="{Binding DeleteScenePrototypeCommand}" Content="删除" />
+                    <Button Command="{Binding MoveScenePrototypeUpCommand}" Content="上移" />
+                    <Button Command="{Binding MoveScenePrototypeDownCommand}" Content="下移" />
+                  </StackPanel>
+
+                  <Border IsVisible="{Binding HasSelectedScenePrototype}" Padding="7" Background="#1C222A" CornerRadius="4">
+                    <StackPanel Spacing="5">
+                      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                        <TextBlock VerticalAlignment="Center" Text="PrototypeId" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedScenePrototype.PrototypeId}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                        <TextBlock VerticalAlignment="Center" Text="Kind" />
+                        <TextBlock Grid.Column="1" VerticalAlignment="Center" Foreground="#9FE3B1" Text="{Binding SelectedScenePrototype.Kind}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*" ColumnSpacing="4">
+                        <TextBlock VerticalAlignment="Center" Text="Size X" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedScenePrototype.SizeX}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Y" />
+                        <TextBox Grid.Column="3" Text="{Binding SelectedScenePrototype.SizeY}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*,Auto,*,Auto,*" ColumnSpacing="3">
+                        <TextBlock VerticalAlignment="Center" Text="R" />
+                        <TextBox Grid.Column="1" Text="{Binding SelectedScenePrototype.ColorR}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="G" />
+                        <TextBox Grid.Column="3" Text="{Binding SelectedScenePrototype.ColorG}" />
+                        <TextBlock Grid.Column="4" VerticalAlignment="Center" Text="B" />
+                        <TextBox Grid.Column="5" Text="{Binding SelectedScenePrototype.ColorB}" />
+                        <TextBlock Grid.Column="6" VerticalAlignment="Center" Text="A" />
+                        <TextBox Grid.Column="7" Text="{Binding SelectedScenePrototype.ColorA}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                        <TextBlock VerticalAlignment="Center" Text="TextureId" />
+                        <ComboBox Grid.Column="1" ItemsSource="{Binding SelectedScenePrototype.TextureIds}" SelectedItem="{Binding SelectedScenePrototype.TextureIdText}" />
+                      </Grid>
+                      <Border Padding="7" Background="#252D37" CornerRadius="4">
+                        <StackPanel Spacing="5">
+                          <TextBlock FontWeight="SemiBold" Text="行为脚本绑定" />
+                          <TextBlock FontSize="11" Foreground="#AEBAC8" Text="{Binding BehaviorContractStatus}" TextWrapping="Wrap" />
+                          <Grid ColumnDefinitions="*,Auto" ColumnSpacing="5">
+                            <ComboBox ItemsSource="{Binding AvailableBehaviorContracts}" SelectedItem="{Binding SelectedBehaviorContract}">
+                              <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                  <TextBlock Text="{Binding SourcePath}" />
+                                </DataTemplate>
+                              </ComboBox.ItemTemplate>
+                            </ComboBox>
+                            <Button Grid.Column="1" Command="{Binding AddBehaviorBindingCommand}" Content="添加绑定" />
+                          </Grid>
+                          <ListBox MaxHeight="110" ItemsSource="{Binding SelectedScenePrototype.Behaviors}" SelectedItem="{Binding SelectedBehaviorBinding}">
+                            <ListBox.ItemTemplate>
+                              <DataTemplate>
+                                <TextBlock Text="{Binding DisplayName}" />
+                              </DataTemplate>
+                            </ListBox.ItemTemplate>
+                          </ListBox>
+                          <StackPanel Orientation="Horizontal" Spacing="5">
+                            <Button Command="{Binding RemoveBehaviorBindingCommand}" Content="移除" />
+                            <Button Command="{Binding MoveBehaviorBindingUpCommand}" Content="上移" />
+                            <Button Command="{Binding MoveBehaviorBindingDownCommand}" Content="下移" />
+                          </StackPanel>
+                          <TextBlock IsVisible="{Binding HasSelectedBehaviorBinding}" FontSize="11" Foreground="#9FE3B1" Text="{Binding SelectedBehaviorBinding.Status}" />
+                          <ItemsControl IsEnabled="{Binding IsBehaviorContractReady}" ItemsSource="{Binding SelectedBehaviorBinding.Parameters}">
+                            <ItemsControl.ItemTemplate>
+                              <DataTemplate>
+                                <Grid ColumnDefinitions="110,*" RowDefinitions="Auto,Auto" ColumnSpacing="5" Margin="0,0,0,4">
+                                  <TextBlock VerticalAlignment="Center" Text="{Binding Name}" />
+                                  <TextBox Grid.Column="1" PlaceholderText="留空使用默认值" Text="{Binding ValueText}" />
+                                  <TextBlock Grid.Row="1" Grid.ColumnSpan="2" FontSize="10" Foreground="#8F9CAB" Text="{Binding Details}" TextWrapping="Wrap" />
+                                </Grid>
+                              </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                          </ItemsControl>
+                        </StackPanel>
+                      </Border>
+                    </StackPanel>
+                  </Border>
+                </StackPanel>
+              </Border>
+
               <Border Padding="8" Background="#252D37" CornerRadius="4">
                 <StackPanel Spacing="4">
                   <TextBlock FontWeight="SemiBold" Text="Scene texture set" />
