@@ -20,6 +20,11 @@ pub fn route(scene: *const scene_api.Scene, input: AxisInput) RoutedInput {
     };
 }
 
+pub fn routeGameplay(scene: *const scene_api.Scene, input: AxisInput, accepts_input: bool) RoutedInput {
+    // Gameplay 终态先统一抑制输入，再执行 Native/Behavior ownership 分流；Host 与证据 workload 共用此规则。
+    return route(scene, if (accepts_input) input else .{});
+}
+
 test "Scene v4 keeps Player movement in Native World" {
     const input = AxisInput{ .move_x = 1, .move_y = -1 };
     const routed = route(&scene_api.default_scene, input);
@@ -45,4 +50,15 @@ test "Behavior Scene with any Player binding moves ownership to Behavior Binding
     const routed = route(&scene, input);
     try @import("std").testing.expectEqual(AxisInput{}, routed.world);
     try @import("std").testing.expectEqual(input, routed.behaviors);
+}
+
+test "terminal Gameplay state suppresses both movement ownership outputs" {
+    var scene = scene_api.default_scene;
+    scene.schemaVersion = scene_api.current_schema_version;
+    const player = &scene.objects.entries[scene.objects.indexOfKind(.player).?];
+    player.behaviors.count = 1;
+    player.behaviors.entries[0].scriptId = 999;
+    const routed = routeGameplay(&scene, .{ .move_x = 1, .move_y = -1 }, false);
+    try @import("std").testing.expectEqual(AxisInput{}, routed.world);
+    try @import("std").testing.expectEqual(AxisInput{}, routed.behaviors);
 }

@@ -624,11 +624,11 @@ pub const Host = struct {
             errdefer if (!gameplay_committed) self.generation.core.abortGameplayFixed(begin.step_token) catch {};
             accepts_input = begin.accepts_input != 0;
             if (begin.outcome_count == 1) self.consumeGameplayOutcome(outcome);
-            const step_input = if (begin.accepts_input != 0) input else InputSnapshot{};
-            const routed_input = player_movement_ownership.route(&self.scene, .{
-                .move_x = step_input.move_x,
-                .move_y = step_input.move_y,
-            });
+            const routed_input = player_movement_ownership.routeGameplay(
+                &self.scene,
+                .{ .move_x = input.move_x, .move_y = input.move_y },
+                begin.accepts_input != 0,
+            );
             if (usesBehaviorRuntime(&self.scene)) {
                 try self.runBehaviorFixed(@floatCast(fixed_dt_seconds), .{
                     .move_x = @intCast(routed_input.behaviors.move_x),

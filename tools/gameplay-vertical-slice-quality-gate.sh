@@ -58,6 +58,10 @@ if [[ -f "$report" ]]; then
     p99=$(value "$report" GAMEPLAY_VERTICAL_SLICE_P99_NS)
     allocations_total=$(value "$report" GAMEPLAY_VERTICAL_SLICE_RUST_ALLOCATIONS_TOTAL)
     allocations_max=$(value "$report" GAMEPLAY_VERTICAL_SLICE_RUST_ALLOCATIONS_MAX)
+    steady_samples=$(value "$report" GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_SAMPLES)
+    steady_allocations_total=$(value "$report" GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOCATIONS_TOTAL)
+    steady_allocations_max=$(value "$report" GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOCATIONS_MAX)
+    steady_allowed_max=$(value "$report" GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOWED_MAX)
     digest=$(value "$report" GAMEPLAY_VERTICAL_SLICE_REPLAY_DIGEST)
     rss=$(value "$report" GAMEPLAY_VERTICAL_SLICE_PEAK_RSS_KB)
     [[ "$p50" =~ ^[1-9][0-9]*$ && "$p95" =~ ^[1-9][0-9]*$ && "$p99" =~ ^[1-9][0-9]*$ ]] || \
@@ -68,6 +72,13 @@ if [[ -f "$report" ]]; then
     fi
     [[ "$allocations_total" =~ ^[0-9]+$ && "$allocations_max" =~ ^[0-9]+$ ]] || \
         blocked+=("Vertical Slice cold-path allocation payload invalid")
+    if [[ ! "$steady_samples" =~ ^[0-9]+$ || ! "$steady_allocations_total" =~ ^[0-9]+$ ||
+          ! "$steady_allocations_max" =~ ^[0-9]+$ || "$steady_samples" != 256 || "$steady_allowed_max" != 96 ]]; then
+        blocked+=("steady fixed-step allocation gate failed")
+    elif (( steady_allocations_max > steady_allowed_max ||
+            steady_allocations_total > steady_samples * steady_allowed_max )); then
+        blocked+=("steady fixed-step allocation gate failed")
+    fi
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || blocked+=("Vertical Slice replay digest invalid")
     [[ "$rss" =~ ^[1-9][0-9]*$ && "$(value "$report" GAMEPLAY_VERTICAL_SLICE_RSS_POLICY)" == diagnostic_only ]] || \
         blocked+=("Vertical Slice RSS diagnostic payload invalid")
@@ -95,9 +106,14 @@ if [[ -f "$report" ]]; then
     [[ "$raw_metric" == *"vertical_slice_samples=64"* && "$raw_metric" == *"p50_ns=$p50"* &&
        "$raw_metric" == *"p95_ns=$p95"* && "$raw_metric" == *"p99_ns=$p99"* &&
        "$raw_metric" == *"rust_allocations_total=$allocations_total"* &&
-       "$raw_metric" == *"rust_allocations_max=$allocations_max"* && "$raw_metric" == *"digest=$digest"* ]] || \
+       "$raw_metric" == *"rust_allocations_max=$allocations_max"* &&
+       "$raw_metric" == *"rust_steady_fixed_samples=$steady_samples"* &&
+       "$raw_metric" == *"rust_steady_fixed_allocations_total=$steady_allocations_total"* &&
+       "$raw_metric" == *"rust_steady_fixed_allocations_max=$steady_allocations_max"* &&
+       "$raw_metric" == *"digest=$digest"* ]] || \
         blocked+=("Vertical Slice report metrics do not match raw output")
-    [[ "$raw_contract" == *"objects=5 fixed_steps=7 outcomes=3"* && "$raw_contract" == *"status=PASS"* ]] || \
+    [[ "$raw_contract" == *"objects=5 fixed_steps=7 outcomes=3 steady_fixed_samples=256 steady_fixed_max_allocations=96"* &&
+       "$raw_contract" == *"status=PASS"* ]] || \
         blocked+=("Vertical Slice raw contract evidence missing")
     time_file=$(value "$report" GAMEPLAY_VERTICAL_SLICE_TIME)
     raw_rss=$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes):[[:space:]]*//p' "$time_file" 2>/dev/null | tail -n 1)

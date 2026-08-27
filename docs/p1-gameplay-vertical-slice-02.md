@@ -1,6 +1,6 @@
 # P1 Gameplay Vertical Slice 02 验收约定
 
-状态：执行中
+状态：实现与验收约定已冻结
 日期：2026-08-27
 
 ## 目标
@@ -40,12 +40,18 @@ Hash 只作为“同一 transcript 完全一致”的证据，不代替字段级
 3. Hazard、Contact 顺序、Outcome 不重放、Restart、Reload、Goal 的字段断言全部通过；
 4. benchmark 报告同一 workload 的 p50/p95/p99、steady-state 分配计数与证据文件 SHA-256。
 
+字段级测试不得只复核 phase/outcome：必须同时断言三个初始 step 的 token 连续性、begin/commit token 一致、time remaining、定向 contact event count、outcome count，以及最终五个 `RenderSprite` 的 Rust 顺序。Player sprite 还要逐字段断言 ObjectRef、entity、position、size、terminal tint 和 texture。
+
+终态输入抑制必须调用 Host 生产路径共用的 `player_movement_ownership.routeGameplay`，并断言请求的非零 Y 输入没有改变 Player Y；测试或 benchmark 不得各自复制一份抑制规则。
+
 ## 性能与优化边界
 
 - 先采集未优化基线，再 profile。
 - 只允许优化一个由 profile 证明的热点；若没有明显热点，则记录“不做推测性优化”。
 - RSS 只记录为诊断数据，不设 `256 KiB` 一类不符合完整引擎进程的门槛。
 - gate 关注正确性、确定性、尾延迟、steady-state 分配增长、证据可追溯性与跨平台 smoke。
+- 同场景 active fixed-step 单独采样 256 次，Session 构造与 `on_start` 排除在计数窗口外。当前 Behavior-enabled 路径实测每步 66 次 Rust 分配；门禁固定为每步最多 96 次，并校验总数不超过 `samples × 96`。该上限不可由报告自行放宽。
+- 上述计数与 direct Runtime Core 稳态门禁分开：后者连续 120 万 fixed-step 必须保持 Rust 分配为 0、RSS 增长不超过 64 KiB。两者分别回答“真实 Behavior 步进的稳定分配率”和“Core 是否持续增长”。
 
 ## 2026-08-27 实测与 profile 决策
 

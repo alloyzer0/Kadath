@@ -5,6 +5,7 @@ const builder = @import("behavior_package_builder");
 const gameplay_replay = @import("gameplay_replay");
 const gameplay_vertical_slice_fixture = @import("gameplay_vertical_slice_fixture");
 const manifest = @import("behavior_manifest");
+const player_movement_ownership = @import("player_movement_ownership.zig");
 const scene_api = @import("scene.zig");
 const scene_generation_api = @import("scene_generation.zig");
 const runtime_core = @import("runtime_core");
@@ -1120,18 +1121,26 @@ const vertical_slice_player_source = gameplay_vertical_slice_fixture.player_sour
 const vertical_slice_no_op_source = gameplay_vertical_slice_fixture.no_op_source;
 const vertical_slice_scene = gameplay_vertical_slice_fixture.initial_scene;
 const vertical_slice_reload_scene = gameplay_vertical_slice_fixture.reload_scene;
+const vertical_slice_object_count = 5;
 
 const InitialVerticalEvidence = struct {
     digest: gameplay_replay.Digest,
     first_outcome: runtime_core.GameplayOutcome,
     final_snapshot: runtime_core.GameplaySnapshot,
+    player_entity: runtime_core.EntityId,
     player_position: [2]f32,
     probe_position: [2]f32,
+    position_before_terminal_input: [2]f32,
+    steps: [3]VerticalStepEvidence,
+    final_render_sprites: [vertical_slice_object_count]runtime_core.RenderSprite,
 };
 
 const VerticalStepEvidence = struct {
+    begin: runtime_core.GameplayStepResult,
+    commit: runtime_core.GameplayStepResult,
     outcome: ?runtime_core.GameplayOutcome,
     snapshot: runtime_core.GameplaySnapshot,
+    render_sprites: [vertical_slice_object_count]runtime_core.RenderSprite,
 };
 
 fn runVerticalFixedStep(
@@ -1147,20 +1156,40 @@ fn runVerticalFixedStep(
         recorder.recordOutcome(&outcome);
         published_outcome = outcome;
     }
-    const routed = if (begin.accepts_input != 0) requested else behavior_host.InputSnapshot{};
-    try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, routed);
+    const routed = player_movement_ownership.routeGameplay(
+        fixture.generation.scene,
+        .{ .move_x = @intCast(requested.move_x), .move_y = @intCast(requested.move_y) },
+        begin.accepts_input != 0,
+    );
+    const behavior_input = behavior_host.InputSnapshot{
+        .move_x = routed.behaviors.move_x,
+        .move_y = routed.behaviors.move_y,
+    };
+    try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, behavior_input);
     try fixture.runtime.settleFixedStructuralBeforeGameplay(&fixture.generation);
-    const committed = try fixture.generation.commitGameplayFixed(begin.step_token, .{}, &outcome);
+    const committed = try fixture.generation.commitGameplayFixed(begin.step_token, .{
+        .move_x = routed.world.move_x,
+        .move_y = routed.world.move_y,
+    }, &outcome);
     recorder.recordStep(.commit, &committed);
     if (committed.outcome_count == 1) {
         recorder.recordOutcome(&outcome);
         published_outcome = outcome;
     }
-    try fixture.runtime.finishFixedStep(&fixture.generation, routed);
+    try fixture.runtime.finishFixedStep(&fixture.generation, behavior_input);
     var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
     const publication = try fixture.generation.extractSprites(&render_items);
+    if (publication.sprites.len != vertical_slice_object_count) return error.InvalidVerticalRenderCount;
+    var render_sprites: [vertical_slice_object_count]runtime_core.RenderSprite = undefined;
+    @memcpy(render_sprites[0..], publication.sprites);
     recorder.recordSnapshot(&publication.snapshot, publication.sprites);
-    return .{ .outcome = published_outcome, .snapshot = publication.snapshot };
+    return .{
+        .begin = begin,
+        .commit = committed,
+        .outcome = published_outcome,
+        .snapshot = publication.snapshot,
+        .render_sprites = render_sprites,
+    };
 }
 
 fn startVerticalRuntime(fixture: *RuntimeFixture) !void {
@@ -1251,26 +1280,34 @@ fn runInitialVerticalSlice(first_move_y: i8) !InitialVerticalEvidence {
     recorder.recordSnapshot(&publication.snapshot, publication.sprites);
 
     var first_outcome: ?runtime_core.GameplayOutcome = null;
+    const player_index = fixture.generation.objectIndex("player") orelse return error.MissingVerticalPlayer;
+    var position_before_terminal_input: [2]f32 = undefined;
+    var steps: [3]VerticalStepEvidence = undefined;
     const requested_inputs = [_]behavior_host.InputSnapshot{
         .{ .move_y = first_move_y },
         .{},
         // 终态后的这个输入必须由 Host 路由规则抑制，Behavior 只收到零输入。
         .{ .move_y = 1 },
     };
-    for (requested_inputs) |requested| {
+    for (requested_inputs, 0..) |requested, index| {
+        if (index == 2) position_before_terminal_input = try fixture.generation.objectPosition(player_index);
         const step = try runVerticalFixedStep(&fixture, requested, &recorder);
+        steps[index] = step;
         if (first_outcome == null) first_outcome = step.outcome;
         publication.snapshot = step.snapshot;
     }
 
-    const player_index = fixture.generation.objectIndex("player") orelse return error.MissingVerticalPlayer;
     const probe_index = fixture.generation.objectIndex("phase-probe") orelse return error.MissingVerticalProbe;
     return .{
         .digest = recorder.finish(),
         .first_outcome = first_outcome orelse return error.MissingVerticalOutcome,
         .final_snapshot = publication.snapshot,
+        .player_entity = fixture.generation.playerEntity(),
         .player_position = try fixture.generation.objectPosition(player_index),
         .probe_position = try fixture.generation.objectPosition(probe_index),
+        .position_before_terminal_input = position_before_terminal_input,
+        .steps = steps,
+        .final_render_sprites = steps[2].render_sprites,
     };
 }
 
@@ -1359,6 +1396,50 @@ test "Vertical Slice replay is deterministic through Behavior fixed Contact Phas
     try std.testing.expectEqual(@as(u32, 0), first.final_snapshot.accepts_input);
     try std.testing.expectEqual(@as(u64, 1), first.final_snapshot.last_outcome_sequence);
     try std.testing.expectEqual(@as(f32, 30), first.player_position[0]);
+    try std.testing.expectEqual(@as(f32, 10), first.position_before_terminal_input[1]);
+    try std.testing.expectEqual(first.position_before_terminal_input[1], first.player_position[1]);
+
+    try std.testing.expectEqual(@as(u64, 1), first.steps[0].begin.step_token);
+    try std.testing.expectEqual(first.steps[0].begin.step_token, first.steps[0].commit.step_token);
+    try std.testing.expectEqual(@as(u64, 2), first.steps[1].begin.step_token);
+    try std.testing.expectEqual(first.steps[1].begin.step_token, first.steps[1].commit.step_token);
+    try std.testing.expectEqual(@as(u64, 3), first.steps[2].begin.step_token);
+    try std.testing.expectEqual(first.steps[2].begin.step_token, first.steps[2].commit.step_token);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.playing), first.steps[0].begin.phase);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.playing), first.steps[1].begin.phase);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), first.steps[1].commit.phase);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), first.steps[1].commit.cause);
+    try std.testing.expectEqual(@as(u32, 0), first.steps[1].commit.accepts_input);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), first.steps[2].begin.phase);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), first.steps[2].begin.cause);
+    try std.testing.expect(first.steps[1].begin.time_remaining_seconds < first.steps[0].begin.time_remaining_seconds);
+    try std.testing.expectEqual(first.steps[0].begin.time_remaining_seconds, first.steps[0].commit.time_remaining_seconds);
+    try std.testing.expectEqual(first.steps[1].begin.time_remaining_seconds, first.steps[1].commit.time_remaining_seconds);
+    try std.testing.expectEqual(first.steps[1].commit.time_remaining_seconds, first.steps[2].begin.time_remaining_seconds);
+    try std.testing.expectEqual(@as(u64, 0), first.steps[0].commit.submitted_contact_event_count);
+    // Rust 对每个 contact transition 发布 source/other 两个定向事件。
+    try std.testing.expectEqual(@as(u64, 2), first.steps[1].commit.submitted_contact_event_count);
+    try std.testing.expectEqual(@as(u64, 4), first.steps[2].commit.submitted_contact_event_count);
+    try std.testing.expectEqual(@as(u64, 1), first.steps[1].commit.outcome_count);
+    try std.testing.expectEqual(@as(u64, 0), first.steps[2].commit.outcome_count);
+    try std.testing.expectEqual(@as(u32, 0), first.steps[2].begin.accepts_input);
+    for (first.steps) |step| {
+        try std.testing.expectEqual(@as(u64, 0), step.begin.submitted_contact_event_count);
+        try std.testing.expectEqual(@as(u64, 0), step.begin.outcome_count);
+    }
+
+    const expected_render_order = [_][]const u8{ "goal", "hazard-a", "player", "hazard-b", "phase-probe" };
+    try std.testing.expectEqual(expected_render_order.len, first.final_render_sprites.len);
+    for (first.final_render_sprites, expected_render_order) |sprite, expected_id| {
+        try std.testing.expectEqualStrings(expected_id, runtime_core.objectIdSlice(&sprite.object_ref));
+    }
+    const player_sprite = first.final_render_sprites[2];
+    try std.testing.expectEqual(first.first_outcome.player, player_sprite.object_ref);
+    try std.testing.expectEqual(first.player_entity, player_sprite.entity_value);
+    try std.testing.expectEqual([2]f32{ 30, 10 }, player_sprite.position);
+    try std.testing.expectEqual([2]f32{ 2, 2 }, player_sprite.size);
+    try std.testing.expectEqual([4]f32{ 0.95, 0.20, 0.20, 1.0 }, player_sprite.final_color);
+    try std.testing.expectEqual(@as(u32, 1), player_sprite.texture_id);
     // 2=begin(A)，随后 1=end(A)、2=begin(B)，证明跨接触切换的 Phase 投递顺序为 212。
     try std.testing.expectEqual(@as(f32, 212), first.probe_position[0]);
 }

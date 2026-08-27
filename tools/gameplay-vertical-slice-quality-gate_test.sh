@@ -21,8 +21,8 @@ done
 chmod +x "$scratch/benchmark"
 digest=fa77c837f249f9dfe9cdf85d597d7a06d34b3c45ceccfe9e5209e46c0947aaaf
 cat >"$scratch/run.stdout" <<EOF
-vertical_slice_samples=64 p50_ns=2000000 p95_ns=3000000 p99_ns=4000000 rust_allocations_total=58176 rust_allocations_max=909 digest=$digest
-vertical_slice_contract objects=5 fixed_steps=7 outcomes=3 initial_epoch=1 restart_epoch=1 reload_epoch=2 contact_order=212 status=PASS
+vertical_slice_samples=64 p50_ns=2000000 p95_ns=3000000 p99_ns=4000000 rust_allocations_total=58176 rust_allocations_max=909 rust_steady_fixed_samples=256 rust_steady_fixed_allocations_total=16896 rust_steady_fixed_allocations_max=66 digest=$digest
+vertical_slice_contract objects=5 fixed_steps=7 outcomes=3 steady_fixed_samples=256 steady_fixed_max_allocations=96 initial_epoch=1 restart_epoch=1 reload_epoch=2 contact_order=212 status=PASS
 EOF
 printf '%s\n' 'Maximum resident set size (kbytes): 24576' >"$scratch/run.time"
 
@@ -43,6 +43,10 @@ GAMEPLAY_VERTICAL_SLICE_MAX_P95_NS=50000000
 GAMEPLAY_VERTICAL_SLICE_MAX_P99_NS=100000000
 GAMEPLAY_VERTICAL_SLICE_RUST_ALLOCATIONS_TOTAL=58176
 GAMEPLAY_VERTICAL_SLICE_RUST_ALLOCATIONS_MAX=909
+GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_SAMPLES=256
+GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOCATIONS_TOTAL=16896
+GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOCATIONS_MAX=66
+GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOWED_MAX=96
 GAMEPLAY_VERTICAL_SLICE_REPLAY_DIGEST=$digest
 GAMEPLAY_VERTICAL_SLICE_PEAK_RSS_KB=24576
 GAMEPLAY_VERTICAL_SLICE_RSS_POLICY=diagnostic_only
@@ -74,6 +78,25 @@ EOF
 } >"$report"
 
 (cd "$git_repo" && bash "$repository_root/tools/gameplay-vertical-slice-quality-gate.sh" --candidate-sha "$candidate_sha" --report "$report") | grep -q VERTICAL_SLICE_GATE_PASS
+
+# 即使攻击者重新绑定 payload，稳态 fixed-step 出现分配也必须阻断。
+steady_bad_payload="$scratch/steady-bad.payload"
+steady_bad_report="$scratch/steady-bad.report"
+sed 's/GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOCATIONS_MAX=66/GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOCATIONS_MAX=97/' \
+    "$payload" >"$steady_bad_payload"
+{
+    cat "$steady_bad_payload"
+    printf 'GAMEPLAY_REPORT_PAYLOAD=%s\nREPORT_PAYLOAD_SHA256=%s\n' \
+        "$steady_bad_payload" "$(hash "$steady_bad_payload")"
+} >"$steady_bad_report"
+set +e
+steady_bad_output=$(cd "$git_repo" && bash "$repository_root/tools/gameplay-vertical-slice-quality-gate.sh" \
+    --candidate-sha "$candidate_sha" --report "$steady_bad_report" 2>&1)
+steady_bad_status=$?
+set -e
+[[ "$steady_bad_status" == 2 ]]
+grep -q 'steady fixed-step allocation gate failed' <<<"$steady_bad_output"
+
 printf '%s\n' 'tampered' >>"$scratch/run.stdout"
 set +e
 tampered_output=$(cd "$git_repo" && bash "$repository_root/tools/gameplay-vertical-slice-quality-gate.sh" --candidate-sha "$candidate_sha" --report "$report" 2>&1)

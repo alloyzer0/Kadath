@@ -1,6 +1,7 @@
 const std = @import("std");
 const behavior_host = @import("../app/behavior_host.zig");
 const gameplay_replay = @import("../app/gameplay_replay.zig");
+const player_movement_ownership = @import("../app/player_movement_ownership.zig");
 const scene_api = @import("../app/scene.zig");
 const scene_generation_api = @import("../app/scene_generation.zig");
 const runtime_core = @import("runtime_core");
@@ -10,6 +11,8 @@ const c = @cImport({
 });
 
 const default_sample_count: usize = 64;
+const steady_fixed_sample_count: usize = 256;
+const steady_fixed_max_allocations: u64 = 96;
 const max_input_bytes: usize = 4 * 1024 * 1024;
 
 const Session = struct {
@@ -119,16 +122,27 @@ fn runFixed(
         recorder.recordOutcome(&outcome);
         published = outcome;
     }
-    const routed = if (begin.accepts_input != 0) requested else behavior_host.InputSnapshot{};
-    try session.runtime.runFixed(&session.generation, 1.0 / 60.0, routed);
+    const routed = player_movement_ownership.routeGameplay(
+        session.generation.scene,
+        .{ .move_x = @intCast(requested.move_x), .move_y = @intCast(requested.move_y) },
+        begin.accepts_input != 0,
+    );
+    const behavior_input = behavior_host.InputSnapshot{
+        .move_x = routed.behaviors.move_x,
+        .move_y = routed.behaviors.move_y,
+    };
+    try session.runtime.runFixed(&session.generation, 1.0 / 60.0, behavior_input);
     try session.runtime.settleFixedStructuralBeforeGameplay(&session.generation);
-    const committed = try session.generation.commitGameplayFixed(begin.step_token, .{}, &outcome);
+    const committed = try session.generation.commitGameplayFixed(begin.step_token, .{
+        .move_x = routed.world.move_x,
+        .move_y = routed.world.move_y,
+    }, &outcome);
     recorder.recordStep(.commit, &committed);
     if (committed.outcome_count == 1) {
         recorder.recordOutcome(&outcome);
         published = outcome;
     }
-    try session.runtime.finishFixedStep(&session.generation, routed);
+    try session.runtime.finishFixedStep(&session.generation, behavior_input);
     return .{ .outcome = published, .snapshot = try recordSnapshot(session, recorder) };
 }
 
@@ -224,6 +238,46 @@ fn validateEvidence(evidence: *const WorkloadEvidence) !void {
     }
 }
 
+const SteadyFixedAllocationEvidence = struct {
+    total: u64,
+    max: u64,
+};
+
+fn measureSteadyFixedAllocations(
+    allocator: std.mem.Allocator,
+    artifact_bytes: []const u8,
+    initial_source: []const u8,
+) !SteadyFixedAllocationEvidence {
+    var total: u64 = 0;
+    var max: u64 = 0;
+    for (0..steady_fixed_sample_count) |_| {
+        var session = try Session.init(allocator, artifact_bytes, initial_source);
+        defer session.deinit();
+        try session.start();
+        var recorder = gameplay_replay.Recorder.init();
+
+        // Session 构造与 on_start 属于冷路径；计数窗口只覆盖同一场景的活跃 fixed-step。
+        if (c.kadath_runtime_core_phase_quality_begin_allocation_count() != c.KADATH_OK) {
+            return error.AllocationCounterUnavailable;
+        }
+        const step = runFixed(&session, .{}, &recorder) catch |err| {
+            var ignored: u64 = 0;
+            _ = c.kadath_runtime_core_phase_quality_end_allocation_count(&ignored);
+            return err;
+        };
+        var allocations: u64 = 0;
+        if (c.kadath_runtime_core_phase_quality_end_allocation_count(&allocations) != c.KADATH_OK) {
+            return error.AllocationCounterUnavailable;
+        }
+        if (step.outcome != null or step.snapshot.phase != @intFromEnum(runtime_core.GameplayPhase.playing)) {
+            return error.SteadyFixedStepLeftPlayingPhase;
+        }
+        total += allocations;
+        max = @max(max, allocations);
+    }
+    return .{ .total = total, .max = max };
+}
+
 fn percentile(sorted: []const u64, numerator: usize, denominator: usize) u64 {
     const rank = (sorted.len * numerator + denominator - 1) / denominator;
     return sorted[if (rank == 0) 0 else rank - 1];
@@ -251,6 +305,11 @@ pub fn main(init: std.process.Init) !void {
     const warmup = try runWorkload(init.gpa, artifact_bytes, initial_source, reload_source);
     try validateEvidence(&warmup);
     const expected_digest = warmup.digest;
+    const steady_fixed_allocations = try measureSteadyFixedAllocations(
+        init.gpa,
+        artifact_bytes,
+        initial_source,
+    );
     const samples = try init.gpa.alloc(u64, sample_count);
     defer init.gpa.free(samples);
     var total_allocations: u64 = 0;
@@ -280,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
     try stdout.print(
-        "vertical_slice_samples={d} p50_ns={d} p95_ns={d} p99_ns={d} rust_allocations_total={d} rust_allocations_max={d} digest={s}\n",
+        "vertical_slice_samples={d} p50_ns={d} p95_ns={d} p99_ns={d} rust_allocations_total={d} rust_allocations_max={d} rust_steady_fixed_samples={d} rust_steady_fixed_allocations_total={d} rust_steady_fixed_allocations_max={d} digest={s}\n",
         .{
             sample_count,
             percentile(samples, 50, 100),
@@ -288,12 +347,15 @@ pub fn main(init: std.process.Init) !void {
             percentile(samples, 99, 100),
             total_allocations,
             max_allocations,
+            steady_fixed_sample_count,
+            steady_fixed_allocations.total,
+            steady_fixed_allocations.max,
             &digest_hex,
         },
     );
     try stdout.print(
-        "vertical_slice_contract objects=5 fixed_steps=7 outcomes=3 initial_epoch=1 restart_epoch=1 reload_epoch=2 contact_order=212 status=PASS\n",
-        .{},
+        "vertical_slice_contract objects=5 fixed_steps=7 outcomes=3 steady_fixed_samples=256 steady_fixed_max_allocations={d} initial_epoch=1 restart_epoch=1 reload_epoch=2 contact_order=212 status=PASS\n",
+        .{steady_fixed_max_allocations},
     );
     try stdout.flush();
 }

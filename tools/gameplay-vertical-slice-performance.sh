@@ -9,6 +9,7 @@ candidate_sha=""
 evidence_root=""
 max_p95_ns=50000000
 max_p99_ns=100000000
+steady_fixed_max_allocations=96
 while (($#)); do
     case "$1" in
         --candidate-sha) candidate_sha=${2-}; shift 2 ;;
@@ -76,15 +77,24 @@ p95_ns=$(sed -n 's/.*p95_ns=\([0-9][0-9]*\).*/\1/p' <<<"$metric_line")
 p99_ns=$(sed -n 's/.*p99_ns=\([0-9][0-9]*\).*/\1/p' <<<"$metric_line")
 allocations_total=$(sed -n 's/.*rust_allocations_total=\([0-9][0-9]*\).*/\1/p' <<<"$metric_line")
 allocations_max=$(sed -n 's/.*rust_allocations_max=\([0-9][0-9]*\).*/\1/p' <<<"$metric_line")
+steady_samples=$(sed -n 's/.*rust_steady_fixed_samples=\([0-9][0-9]*\).*/\1/p' <<<"$metric_line")
+steady_allocations_total=$(sed -n 's/.*rust_steady_fixed_allocations_total=\([0-9][0-9]*\).*/\1/p' <<<"$metric_line")
+steady_allocations_max=$(sed -n 's/.*rust_steady_fixed_allocations_max=\([0-9][0-9]*\).*/\1/p' <<<"$metric_line")
 digest=$(sed -n 's/.*digest=\([0-9a-f][0-9a-f]*\).*/\1/p' <<<"$metric_line")
 peak_rss_kb=$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes):[[:space:]]*//p' "$time_file" | tail -n 1)
 
 status=PASS
 [[ "$run_status" == 0 && "$contract_line" == *"status=PASS"* ]] || status=BLOCKED
 [[ "$samples" == 64 ]] || status=BLOCKED
-for value in "$p50_ns" "$p95_ns" "$p99_ns" "$allocations_total" "$allocations_max" "$peak_rss_kb"; do
+for value in "$p50_ns" "$p95_ns" "$p99_ns" "$allocations_total" "$allocations_max" \
+    "$steady_samples" "$steady_allocations_total" "$steady_allocations_max" "$peak_rss_kb"; do
     [[ "$value" =~ ^[0-9]+$ ]] || status=BLOCKED
 done
+if [[ "$steady_samples" =~ ^[0-9]+$ && "$steady_allocations_total" =~ ^[0-9]+$ &&
+      "$steady_allocations_max" =~ ^[0-9]+$ ]]; then
+    (( steady_samples == 256 && steady_allocations_max <= steady_fixed_max_allocations &&
+       steady_allocations_total <= steady_samples * steady_fixed_max_allocations )) || status=BLOCKED
+fi
 [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || status=BLOCKED
 if [[ "$p50_ns" =~ ^[0-9]+$ && "$p95_ns" =~ ^[0-9]+$ && "$p99_ns" =~ ^[0-9]+$ ]]; then
     (( p50_ns <= p95_ns && p95_ns <= p99_ns )) || status=BLOCKED
@@ -109,6 +119,10 @@ GAMEPLAY_VERTICAL_SLICE_MAX_P95_NS=$max_p95_ns
 GAMEPLAY_VERTICAL_SLICE_MAX_P99_NS=$max_p99_ns
 GAMEPLAY_VERTICAL_SLICE_RUST_ALLOCATIONS_TOTAL=${allocations_total:-0}
 GAMEPLAY_VERTICAL_SLICE_RUST_ALLOCATIONS_MAX=${allocations_max:-0}
+GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_SAMPLES=${steady_samples:-0}
+GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOCATIONS_TOTAL=${steady_allocations_total:-0}
+GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOCATIONS_MAX=${steady_allocations_max:-0}
+GAMEPLAY_VERTICAL_SLICE_RUST_STEADY_FIXED_ALLOWED_MAX=$steady_fixed_max_allocations
 GAMEPLAY_VERTICAL_SLICE_REPLAY_DIGEST=${digest:-missing}
 GAMEPLAY_VERTICAL_SLICE_PEAK_RSS_KB=${peak_rss_kb:-0}
 GAMEPLAY_VERTICAL_SLICE_RSS_POLICY=diagnostic_only
