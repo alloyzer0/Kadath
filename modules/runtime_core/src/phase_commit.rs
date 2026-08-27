@@ -3391,6 +3391,74 @@ mod tests {
                 0
             );
         }
+
+        {
+            // trusted Gameplay 批次也必须覆盖容量边界、队列预检与连续 sequence；
+            // 这些断言专门防止“先写半批、再报错”或算术变异造成的静默漂移。
+            let mut core = test_core();
+            begin(&mut core);
+            assert_eq!(
+                submit_trusted_gameplay_events_with(&mut core, EVENT_CAPACITY, |_| event()),
+                Ok(())
+            );
+            let domain = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap();
+            assert_eq!(domain.event_queue.len(), EVENT_CAPACITY);
+            assert_eq!(domain.next_event_sequence, EVENT_CAPACITY as u64 + 1);
+        }
+
+        {
+            let mut core = test_core();
+            begin(&mut core);
+            assert_eq!(
+                submit_trusted_gameplay_events_with(&mut core, EVENT_CAPACITY + 1, |_| event()),
+                Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+            );
+            let domain = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap();
+            assert_eq!(domain.event_queue.len(), 0);
+            assert_eq!(domain.next_event_sequence, 1);
+        }
+
+        {
+            let mut core = test_core();
+            begin(&mut core);
+            assert_eq!(
+                submit_trusted_gameplay_events_with(&mut core, 1, |_| event()),
+                Ok(())
+            );
+            assert_eq!(
+                submit_trusted_gameplay_events_with(&mut core, EVENT_CAPACITY, |_| event()),
+                Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)
+            );
+            let domain = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap();
+            assert_eq!(domain.event_queue.len(), 1);
+            assert_eq!(domain.event_queue.as_slice()[0].item.sequence, 1);
+            assert_eq!(domain.next_event_sequence, 2);
+        }
+
+        {
+            let mut core = test_core();
+            begin(&mut core);
+            assert_eq!(
+                submit_trusted_gameplay_events_with(&mut core, 2, |_| event()),
+                Ok(())
+            );
+            let domain = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap();
+            assert_eq!(domain.event_queue.as_slice()[0].item.sequence, 1);
+            assert_eq!(domain.event_queue.as_slice()[1].item.sequence, 2);
+            assert_eq!(domain.next_event_sequence, 3);
+        }
     }
 
     #[test]
