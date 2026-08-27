@@ -204,6 +204,8 @@ pub fn build(b: *std.Build) void {
     const quality_emit_dir = gameplay_quality_emit_dir orelse phase_quality_emit_dir;
     var linux_platform_contract_binary: ?std.Build.LazyPath = null;
     var linux_window_verifier_binary: ?std.Build.LazyPath = null;
+    var linux_window_verifier_executable: ?*std.Build.Step.Compile = null;
+    var linux_window_verifier_step: ?*std.Build.Step = null;
     const mingw_gcc_runtime_dir: ?[]const u8 = if (target.result.os.tag == .windows)
         b.option([]const u8, "mingw-gcc-runtime-dir", "Directory containing libgcc_eh.a for Rust panic unwinding") orelse
             "C:\\ProgramTools\\mingw64\\lib\\gcc\\x86_64-w64-mingw32\\14.2.0"
@@ -1247,6 +1249,7 @@ pub fn build(b: *std.Build) void {
             .name = "verify-linux-window",
             .root_module = linux_verifier_mod,
         });
+        linux_window_verifier_executable = linux_verifier;
         linux_window_verifier_binary = linux_verifier.getEmittedBin();
         const linux_verifier_test_mod = b.createModule(.{
             .root_source_file = b.path("tools/verify-linux-window.zig"),
@@ -1266,9 +1269,10 @@ pub fn build(b: *std.Build) void {
         linux_verifier_run.addFileArg(platform_contract_tests.getEmittedBin());
         linux_verifier_run.addFileArg(exe.getEmittedBin());
         linux_verifier_run.addArg(@tagName(optimize));
-        const linux_verifier_step = b.step("verify-linux-window", "Verify Linux XCB, Lavapipe, validation, Runtime pixels, and shutdown");
-        linux_verifier_step.dependOn(&linux_verifier_test_run.step);
-        linux_verifier_step.dependOn(&linux_verifier_run.step);
+        const verify_linux_window_step = b.step("verify-linux-window", "Verify Linux XCB, Lavapipe, validation, Runtime pixels, and shutdown");
+        linux_window_verifier_step = verify_linux_window_step;
+        verify_linux_window_step.dependOn(&linux_verifier_test_run.step);
+        verify_linux_window_step.dependOn(&linux_verifier_run.step);
     }
 
     // 分发目录以 bin 为运行工作目录，资产必须与 exe 保持稳定的相对位置。
@@ -1446,6 +1450,27 @@ pub fn build(b: *std.Build) void {
     };
     const install_script_artifact = b.addInstallFile(script_artifact, "bin/assets/scripts/preview.script");
     if (target.result.os.tag == .windows) b.getInstallStep().dependOn(&install_script_artifact.step);
+
+    if (linux_package_supported) {
+        // Neutral 产品场景直接复用现有 Window verifier；只增加一个 fixture workload，不建立平行 gate。
+        const neutral_fixture_root = b.path("tools/fixtures/engine-scene-neutral-01");
+        const neutral_script_build = b.addRunArtifact(behavior_tool_executable.?);
+        neutral_script_build.addArg("--project-root");
+        neutral_script_build.addDirectoryArg(neutral_fixture_root);
+        neutral_script_build.addArgs(&.{ "--manifest", "script.json", "--output" });
+        neutral_script_build.addFileInput(b.path("tools/fixtures/engine-scene-neutral-01/script.json"));
+        neutral_script_build.addFileInput(b.path("tools/fixtures/engine-scene-neutral-01/scripts/neutral_motion.luau"));
+        const neutral_script_artifact = neutral_script_build.addOutputFileArg("neutral-preview.script");
+
+        const neutral_window_run = b.addRunArtifact(linux_window_verifier_executable.?);
+        neutral_window_run.addFileArg(linux_platform_contract_binary.?);
+        neutral_window_run.addFileArg(exe.getEmittedBin());
+        neutral_window_run.addArg(@tagName(optimize));
+        neutral_window_run.addFileArg(b.path("tools/fixtures/engine-scene-neutral-01/scene.json"));
+        neutral_window_run.addFileArg(neutral_script_artifact);
+        neutral_window_run.addArg("neutral-fixture");
+        linux_window_verifier_step.?.dependOn(&neutral_window_run.step);
+    }
 
     if (target.result.os.tag == .windows and behavior_supported) {
         const install_patrol_behavior_source = b.addInstallFile(

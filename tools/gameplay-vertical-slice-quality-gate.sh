@@ -7,6 +7,7 @@ usage() {
 
 candidate_sha=""
 report=""
+legacy_replay_digest="fa77c837f249f9dfe9cdf85d597d7a06d34b3c45ceccfe9e5209e46c0947aaaf"
 while (($#)); do
     case "$1" in
         --candidate-sha) candidate_sha=${2-}; shift 2 ;;
@@ -80,6 +81,7 @@ if [[ -f "$report" ]]; then
         blocked+=("steady fixed-step allocation gate failed")
     fi
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || blocked+=("Vertical Slice replay digest invalid")
+    [[ "$digest" == "$legacy_replay_digest" ]] || blocked+=("legacy Gameplay replay digest changed")
     [[ "$rss" =~ ^[1-9][0-9]*$ && "$(value "$report" GAMEPLAY_VERTICAL_SLICE_RSS_POLICY)" == diagnostic_only ]] || \
         blocked+=("Vertical Slice RSS diagnostic payload invalid")
 
@@ -145,4 +147,5 @@ fi
 printf 'GAMEPLAY_VERTICAL_SLICE_GATE=PASS\n'
 printf 'GAMEPLAY_CANDIDATE_SHA=%s\n' "$candidate_sha"
 printf 'GAMEPLAY_VERTICAL_SLICE_RSS_DIAGNOSTIC_KB=%s\n' "$(value "$report" GAMEPLAY_VERTICAL_SLICE_PEAK_RSS_KB)"
+printf 'LEGACY_GAMEPLAY_REPLAY_UNCHANGED=true\n'
 printf 'VERTICAL_SLICE_GATE_PASS\n'

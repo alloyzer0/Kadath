@@ -77,7 +77,33 @@ EOF
     printf 'GAMEPLAY_REPORT_PAYLOAD=%s\nREPORT_PAYLOAD_SHA256=%s\n' "$payload" "$(hash "$payload")"
 } >"$report"
 
-(cd "$git_repo" && bash "$repository_root/tools/gameplay-vertical-slice-quality-gate.sh" --candidate-sha "$candidate_sha" --report "$report") | grep -q VERTICAL_SLICE_GATE_PASS
+gate_output=$(cd "$git_repo" && bash "$repository_root/tools/gameplay-vertical-slice-quality-gate.sh" --candidate-sha "$candidate_sha" --report "$report")
+grep -q VERTICAL_SLICE_GATE_PASS <<<"$gate_output"
+grep -q 'LEGACY_GAMEPLAY_REPLAY_UNCHANGED=true' <<<"$gate_output"
+
+# 合法格式但偏离冻结 VS02 基线的 digest 也必须阻断，不能只检查“64 位十六进制”。
+changed_digest=ba77c837f249f9dfe9cdf85d597d7a06d34b3c45ceccfe9e5209e46c0947aaaf
+changed_stdout="$scratch/changed-digest.stdout"
+sed "s/$digest/$changed_digest/g" "$scratch/run.stdout" >"$changed_stdout"
+changed_payload="$scratch/changed-digest.payload"
+changed_report="$scratch/changed-digest.report"
+sed \
+    -e "s/$digest/$changed_digest/g" \
+    -e "s|GAMEPLAY_VERTICAL_SLICE_STDOUT=$scratch/run.stdout|GAMEPLAY_VERTICAL_SLICE_STDOUT=$changed_stdout|" \
+    -e "s|GAMEPLAY_VERTICAL_SLICE_STDOUT_SHA256=.*|GAMEPLAY_VERTICAL_SLICE_STDOUT_SHA256=$(hash "$changed_stdout")|" \
+    "$payload" >"$changed_payload"
+{
+    cat "$changed_payload"
+    printf 'GAMEPLAY_REPORT_PAYLOAD=%s\nREPORT_PAYLOAD_SHA256=%s\n' \
+        "$changed_payload" "$(hash "$changed_payload")"
+} >"$changed_report"
+set +e
+changed_output=$(cd "$git_repo" && bash "$repository_root/tools/gameplay-vertical-slice-quality-gate.sh" \
+    --candidate-sha "$candidate_sha" --report "$changed_report" 2>&1)
+changed_status=$?
+set -e
+[[ "$changed_status" == 2 ]]
+grep -q 'legacy Gameplay replay digest changed' <<<"$changed_output"
 
 # 即使攻击者重新绑定 payload，稳态 fixed-step 出现分配也必须阻断。
 steady_bad_payload="$scratch/steady-bad.payload"

@@ -25,6 +25,7 @@ const package_sample_tolerance: u8 = 20;
 const AssetMode = enum {
     generated_fixture,
     package_root,
+    neutral_fixture,
 };
 
 const AudioExpectation = enum {
@@ -131,17 +132,32 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     const allocator = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 4 or args.len > 6) return error.InvalidVerifierArguments;
+    if (args.len < 4 or args.len > 7) return error.InvalidVerifierArguments;
 
     const platform_test_path = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], allocator);
     defer allocator.free(platform_test_path);
     const runtime_path = try std.Io.Dir.cwd().realPathFileAlloc(io, args[2], allocator);
     defer allocator.free(runtime_path);
     const profile = args[3];
-    const asset_mode: AssetMode = if (args.len >= 5) .package_root else .generated_fixture;
+    const asset_mode: AssetMode = switch (args.len) {
+        4 => .generated_fixture,
+        5, 6 => .package_root,
+        7 => if (std.mem.eql(u8, args[6], "neutral-fixture")) .neutral_fixture else return error.InvalidVerifierArguments,
+        else => unreachable,
+    };
     const package_root = if (asset_mode == .package_root) args[4] else null;
+    const neutral_scene_path = if (asset_mode == .neutral_fixture)
+        try std.Io.Dir.cwd().realPathFileAlloc(io, args[4], allocator)
+    else
+        null;
+    defer if (neutral_scene_path) |path| allocator.free(path);
+    const neutral_script_path = if (asset_mode == .neutral_fixture)
+        try std.Io.Dir.cwd().realPathFileAlloc(io, args[5], allocator)
+    else
+        null;
+    defer if (neutral_script_path) |path| allocator.free(path);
     const audio_expectation: AudioExpectation = switch (args.len) {
-        4 => .not_applicable,
+        4, 7 => .not_applicable,
         5 => .alsa,
         6 => if (std.mem.eql(u8, args[5], "expect-silent-audio")) .silent else return error.InvalidVerifierArguments,
         else => unreachable,
@@ -157,7 +173,7 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     errdefer allocator.free(evidence_root);
     try std.Io.Dir.cwd().createDirPath(io, evidence_root);
 
-    if (asset_mode == .generated_fixture) {
+    if (asset_mode != .package_root) {
         const fixture_assets = try std.fs.path.join(allocator, &.{ evidence_root, "fixture", "assets", "renderer2d" });
         defer allocator.free(fixture_assets);
         try std.Io.Dir.cwd().createDirPath(io, fixture_assets);
@@ -187,7 +203,7 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     defer allocator.free(xvfb_log);
     const xvfb = try startOwnedXvfb(io, allocator, xvfb_log, 5_000);
     owned_children.xvfb = xvfb.child;
-    const display = try std.fmt.allocPrint(allocator, ":{d}", .{xvfb.display_number});
+    const display = try std.fmt.allocPrint(allocator, "localhost:{d}", .{xvfb.display_number});
     defer allocator.free(display);
     try environment.put("DISPLAY", display);
 
@@ -246,6 +262,8 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
         runtime_path,
         package_root orelse evidence_root,
         asset_mode,
+        neutral_scene_path,
+        neutral_script_path,
         &environment,
         runtime_stdout,
         runtime_stderr,
@@ -302,6 +320,11 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     defer frame_two.deinit(allocator);
     try savePpm(io, allocator, frame_two_path, frame_two);
 
+    if (asset_mode == .neutral_fixture) {
+        try validateNeutralFrames(frame_one, frame_two);
+        try verifyNeutralReload(allocator, io, &observer, runtime, runtime_window, runtime_stderr);
+    }
+
     if (audio_expectation == .alsa) {
         try verifyPackageAudioGameplay(allocator, io, &observer, runtime, runtime_window, runtime_stderr);
     }
@@ -339,8 +362,19 @@ fn printVerificationSuccess(
     try stdout.print("linux_background_pixels=ok\n", .{});
     try stdout.print("linux_primary_texture_pixels=ok\n", .{});
     try stdout.print("linux_secondary_texture_pixels=ok\n", .{});
-    if (asset_mode == .generated_fixture) try stdout.print("linux_scene_texture_binding=ok\n", .{});
+    if (asset_mode != .package_root) try stdout.print("linux_scene_texture_binding=ok\n", .{});
     try stdout.print("linux_two_frame_evidence=ok\n", .{});
+    if (asset_mode == .neutral_fixture) {
+        // 这些字段只在对应产品观察全部通过后输出；VS02 gate 独立输出第九个兼容性字段。
+        try stdout.print("SCENE_MODE=neutral\n", .{});
+        try stdout.print("GAMEPLAY_ACTIVE=false\n", .{});
+        try stdout.print("BEHAVIOR_MOVEMENT_OBSERVED=true\n", .{});
+        try stdout.print("TRANSIENT_OBJECT_OBSERVED=true\n", .{});
+        try stdout.print("RENDER_SNAPSHOT_OBSERVED=true\n", .{});
+        try stdout.print("OUTCOME_COUNT=0\n", .{});
+        try stdout.print("GAMEPLAY_AUDIO_CUE_COUNT=0\n", .{});
+        try stdout.print("RELOAD_COMMITTED=true\n", .{});
+    }
     switch (audio_expectation) {
         .not_applicable => {},
         .alsa => {
@@ -454,6 +488,8 @@ fn startOwnedXvfb(
             "0",
             "1024x768x24",
             "-nolisten",
+            "unix",
+            "-listen",
             "tcp",
             "-noreset",
         },
@@ -466,7 +502,7 @@ fn startOwnedXvfb(
     };
 
     const display_number = try readOwnedXvfbDisplayNumber(io, &child, timeout_ms);
-    const display = try std.fmt.allocPrint(allocator, ":{d}", .{display_number});
+    const display = try std.fmt.allocPrint(allocator, "localhost:{d}", .{display_number});
     defer allocator.free(display);
     try waitForOwnedDisplay(io, allocator, &child, display, timeout_ms);
     return .{ .child = child, .display_number = display_number };
@@ -609,6 +645,8 @@ fn spawnRuntime(
     runtime_path: []const u8,
     working_root: []const u8,
     asset_mode: AssetMode,
+    neutral_scene_path: ?[]const u8,
+    neutral_script_path: ?[]const u8,
     environment: *const std.process.Environ.Map,
     stdout_path: []const u8,
     stderr_path: []const u8,
@@ -617,7 +655,7 @@ fn spawnRuntime(
     defer stdout_file.close(io);
     var stderr_file = try std.Io.Dir.cwd().createFile(io, stderr_path, .{});
     defer stderr_file.close(io);
-    const fixture_root = if (asset_mode == .generated_fixture)
+    const fixture_root = if (asset_mode != .package_root)
         try std.fs.path.join(allocator, &.{ working_root, "fixture" })
     else
         try allocator.dupe(u8, working_root);
@@ -630,8 +668,19 @@ fn spawnRuntime(
         "assets/scripts/preview.script",
     };
     const fixture_argv = [_][]const u8{ runtime_path, "--scene", "assets/scenes/preview.scene" };
+    const neutral_argv = [_][]const u8{
+        runtime_path,
+        "--scene",
+        neutral_scene_path orelse "",
+        "--script",
+        neutral_script_path orelse "",
+    };
     return try std.process.spawn(io, .{
-        .argv = if (asset_mode == .package_root) &package_argv else &fixture_argv,
+        .argv = switch (asset_mode) {
+            .generated_fixture => &fixture_argv,
+            .package_root => &package_argv,
+            .neutral_fixture => &neutral_argv,
+        },
         .cwd = .{ .path = fixture_root },
         .environ_map = environment,
         .stdin = .ignore,
@@ -848,6 +897,9 @@ fn waitForRenderedFrame(
     const expected_secondary = tintedSrgb(primary_fixture, .{ 1.0, 0.75, 0.10 });
     const package_goal_left = tintedSrgb(.{ .r = 255, .g = 0, .b = 255 }, .{ 1.0, 0.75, 0.10 });
     const package_goal_right = tintedSrgb(.{ .r = 0, .g = 255, .b = 255 }, .{ 1.0, 0.75, 0.10 });
+    const neutral_backdrop = tintedSrgb(primary_fixture, .{ 0.22, 0.34, 0.58 });
+    const neutral_mover = tintedSrgb(secondary_fixture, .{ 0.95, 0.82, 0.28 });
+    const neutral_marker = tintedSrgb(secondary_fixture, .{ 0.30, 0.90, 0.95 });
     var last_capture: ?Capture = null;
     defer if (last_capture) |*capture| capture.deinit(allocator);
 
@@ -865,6 +917,10 @@ fn waitForRenderedFrame(
             .package_root => colorNear(background, expected_background, sample_tolerance) and
                 colorNear(primary, package_primary_expected, package_sample_tolerance) and
                 hasPackageGoalSignature(capture, package_goal_left, package_goal_right),
+            .neutral_fixture => colorNear(background, expected_background, sample_tolerance) and
+                colorNear(capture.sample(450, 350), neutral_backdrop, package_sample_tolerance) and
+                colorStats(capture, neutral_mover, package_sample_tolerance).count >= 256 and
+                colorStats(capture, neutral_marker, package_sample_tolerance).count >= 128,
         };
         if (pixels_match) {
             if (last_capture) |*previous| previous.deinit(allocator);
@@ -889,6 +945,47 @@ fn waitForRenderedFrame(
         );
     }
     return error.RuntimePixelEvidenceTimeout;
+}
+
+const ColorStats = struct {
+    count: usize = 0,
+    sum_x: usize = 0,
+
+    fn centroidX(self: ColorStats) ?f64 {
+        if (self.count == 0) return null;
+        return @as(f64, @floatFromInt(self.sum_x)) / @as(f64, @floatFromInt(self.count));
+    }
+};
+
+fn colorStats(capture: Capture, expected: Color, tolerance: u8) ColorStats {
+    var result = ColorStats{};
+    var y: u16 = 0;
+    while (y < capture.height) : (y += 1) {
+        var x: u16 = 0;
+        while (x < capture.width) : (x += 1) {
+            if (!colorNear(capture.sample(x, y), expected, tolerance)) continue;
+            result.count += 1;
+            result.sum_x += x;
+        }
+    }
+    return result;
+}
+
+fn validateNeutralFrames(first: Capture, second: Capture) !void {
+    const mover = tintedSrgb(secondary_fixture, .{ 0.95, 0.82, 0.28 });
+    const marker = tintedSrgb(secondary_fixture, .{ 0.30, 0.90, 0.95 });
+    const first_mover = colorStats(first, mover, package_sample_tolerance);
+    const second_mover = colorStats(second, mover, package_sample_tolerance);
+    if (first_mover.count < 256 or second_mover.count < 256)
+        return error.NeutralMoverRenderEvidenceMissing;
+    if (colorStats(first, marker, package_sample_tolerance).count < 128 and
+        colorStats(second, marker, package_sample_tolerance).count < 128)
+    {
+        return error.NeutralTransientRenderEvidenceMissing;
+    }
+    const first_x = first_mover.centroidX() orelse return error.NeutralMoverRenderEvidenceMissing;
+    const second_x = second_mover.centroidX() orelse return error.NeutralMoverRenderEvidenceMissing;
+    if (second_x < first_x + 2.0) return error.NeutralBehaviorMovementEvidenceMissing;
 }
 
 fn hasPackageGoalSignature(capture: Capture, expected_left: Color, expected_right: Color) bool {
@@ -1047,6 +1144,27 @@ fn sendClose(context: *XcbContext, window: c.xcb_window_t) !void {
         @ptrCast(&event),
     ));
     if (c.xcb_flush(context.connection) <= 0) return error.XcbFlushFailed;
+}
+
+fn verifyNeutralReload(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    context: *XcbContext,
+    runtime: *std.process.Child,
+    window: c.xcb_window_t,
+    runtime_stderr: []const u8,
+) !void {
+    const reload = try keycodeForKeysym(context.connection, c.XK_F5);
+    try sendKey(context, window, reload, c.XCB_KEY_PRESS, 50);
+    try sendKey(context, window, reload, c.XCB_KEY_RELEASE, 51);
+    try waitForRuntimeLog(
+        allocator,
+        io,
+        runtime,
+        runtime_stderr,
+        "Neutral scene reloaded explicitly: objects=2",
+        3_000,
+    );
 }
 
 fn verifyPackageAudioGameplay(
@@ -1321,7 +1439,6 @@ fn validateRuntimeLogs(
         "Platform XCB window created (960x540)",
         "Vulkan GPU selected: llvmpipe",
         "Vulkan RHI initialized",
-        "Runtime host initialized with Vulkan RHI scene objects=",
         "Runtime main loop entered",
         "Vulkan RHI shutdown complete",
         "Platform shutdown complete",
@@ -1333,14 +1450,22 @@ fn validateRuntimeLogs(
             return error.RuntimeLogEvidenceMissing;
         }
     }
-    const scene_required: [2][]const u8 = switch (asset_mode) {
-        .generated_fixture => .{
+    const scene_required: []const []const u8 = switch (asset_mode) {
+        .generated_fixture => &.{
             "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=3",
             "Runtime host initialized with Vulkan RHI scene objects=3",
         },
-        .package_root => .{
+        .package_root => &.{
             "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=6",
             "Runtime host initialized with Vulkan RHI scene objects=5",
+        },
+        .neutral_fixture => &.{
+            "Loaded preview scene:",
+            "Loaded behavior package:",
+            "artifact_version=2",
+            "Behavior on_start hooks applied to neutral scene objects=2",
+            "Runtime host initialized with Vulkan RHI neutral scene objects=2",
+            "Neutral scene reloaded explicitly: objects=2",
         },
     };
     for (scene_required) |needle| {
@@ -1359,6 +1484,17 @@ fn validateRuntimeLogs(
                 std.log.err("Runtime Behavior evidence missing: {s}", .{needle});
                 return error.RuntimeLogEvidenceMissing;
             }
+        }
+    }
+    if (asset_mode == .neutral_fixture) {
+        const gameplay_leaks = [_][]const u8{
+            "Game session lost:",
+            "Game session won:",
+            "Audio cue played:",
+            "mode=gameplay",
+        };
+        for (gameplay_leaks) |needle| {
+            if (containsEither(stderr, stdout, needle)) return error.RuntimeNeutralGameplayLeak;
         }
     }
     const audio_required: []const []const u8 = switch (audio_expectation) {
@@ -1526,5 +1662,32 @@ test "Runtime log validation rejects unexpected error records" {
     try std.testing.expectError(
         error.RuntimeLogFailureDiagnostic,
         validateRuntimeLogs(runtime_log, "", .generated_fixture, .not_applicable),
+    );
+}
+
+test "Neutral product logs prove reload and reject Gameplay or Audio leakage" {
+    const neutral_log =
+        "info: Platform XCB window created (960x540)\n" ++
+        "info: Vulkan GPU selected: llvmpipe\n" ++
+        "info: Vulkan RHI initialized\n" ++
+        "info: Renderer2D texture upload complete\n" ++
+        "info: Renderer2D texture upload complete\n" ++
+        "info: RHI texture created\n" ++
+        "info: RHI texture created\n" ++
+        "info: Loaded preview scene: /tmp/neutral/scene.json\n" ++
+        "info: Loaded behavior package: /tmp/neutral/preview.script, artifact_version=2\n" ++
+        "info: Behavior on_start hooks applied to neutral scene objects=2\n" ++
+        "info: Runtime host initialized with Vulkan RHI neutral scene objects=2\n" ++
+        "info: Runtime main loop entered\n" ++
+        "info: Neutral scene reloaded explicitly: objects=2\n" ++
+        "info: Vulkan RHI shutdown complete\n" ++
+        "info: Platform shutdown complete\n" ++
+        "info: Kadath runtime shutdown complete\n";
+    try validateRuntimeLogs(neutral_log, "", .neutral_fixture, .not_applicable);
+
+    const leaked_audio = neutral_log ++ "info: Audio cue played: won\n";
+    try std.testing.expectError(
+        error.RuntimeNeutralGameplayLeak,
+        validateRuntimeLogs(leaked_audio, "", .neutral_fixture, .not_applicable),
     );
 }
