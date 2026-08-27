@@ -15,6 +15,7 @@
 _Static_assert(KADATH_RUNTIME_OBJECT_AUTHORITY_INTERFACE_V1 == 1U, "interface version");
 _Static_assert(KADATH_RUNTIME_PHASE_INTERFACE_V1 == 1U, "phase interface version");
 _Static_assert(KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1 == 1U, "gameplay interface version");
+_Static_assert(KADATH_RUNTIME_GAMEPLAY_INTERFACE_V2 == 2U, "gameplay interface v2 version");
 _Static_assert(KADATH_RUNTIME_PHASE_MAX_GENERATION == 8U, "phase generation limit");
 _Static_assert(KADATH_RUNTIME_PHASE_MAX_BINDINGS == 256U, "phase admission limit");
 _Static_assert(KADATH_RUNTIME_PHASE_MAX_BEHAVIORS_PER_BINDING == 4U, "phase per-binding behavior limit");
@@ -130,6 +131,17 @@ static kadath_runtime_gameplay_interface_v1_t query_gameplay_interface(void) {
     memset(&interface_value, 0, sizeof(interface_value));
     interface_value.struct_size = (uint32_t)sizeof(interface_value);
     interface_value.interface_version = KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1;
+    if (kadath_runtime_core_query_gameplay_interface(&interface_value) != KADATH_OK) {
+        memset(&interface_value, 0, sizeof(interface_value));
+    }
+    return interface_value;
+}
+
+static kadath_runtime_gameplay_interface_v1_t query_gameplay_interface_v2(void) {
+    kadath_runtime_gameplay_interface_v1_t interface_value;
+    memset(&interface_value, 0, sizeof(interface_value));
+    interface_value.struct_size = (uint32_t)sizeof(interface_value);
+    interface_value.interface_version = KADATH_RUNTIME_GAMEPLAY_INTERFACE_V2;
     if (kadath_runtime_core_query_gameplay_interface(&interface_value) != KADATH_OK) {
         memset(&interface_value, 0, sizeof(interface_value));
     }
@@ -1289,6 +1301,41 @@ static int gameplay_contract_path(
     return object_interface->destroy(&core) == KADATH_OK ? 0 : 96;
 }
 
+static int neutral_scene_candidate_path(
+    kadath_runtime_object_authority_interface_t* object_interface,
+    kadath_runtime_gameplay_interface_v1_t* gameplay_interface) {
+    kadath_runtime_core_create_desc_t create_desc;
+    kadath_runtime_core_t* core = NULL;
+    memset(&create_desc, 0, sizeof(create_desc));
+    create_desc.struct_size = (uint32_t)sizeof(create_desc);
+    if (object_interface->create(&create_desc, &core) != KADATH_OK || core == NULL) return 269;
+
+    kadath_runtime_source_object_desc_v1_t source;
+    fill_source(&source, "decor", KADATH_RUNTIME_OBJECT_KIND_SPRITE, 10.0F, 0.0F);
+    kadath_runtime_scene_prepare_desc_t scene_desc;
+    kadath_runtime_scene_candidate_info_t scene_info;
+    memset(&scene_desc, 0, sizeof(scene_desc));
+    memset(&scene_info, 0, sizeof(scene_info));
+    scene_desc.struct_size = (uint32_t)sizeof(scene_desc);
+    scene_desc.mode = KADATH_RUNTIME_PREPARE_INITIAL;
+    scene_desc.bounds_max[0] = 100.0F;
+    scene_desc.bounds_max[1] = 100.0F;
+    scene_desc.source_objects = &source;
+    scene_desc.source_object_count = 1U;
+    scene_desc.source_object_stride = sizeof(source);
+    scene_info.struct_size = (uint32_t)sizeof(scene_info);
+    if (object_interface->prepare_scene(core, &scene_desc, &scene_info) != KADATH_OK ||
+        object_interface->commit_scene(core) != KADATH_ERR_RUNTIME_INVALID_STATE ||
+        gameplay_interface->prepare_no_gameplay_state == NULL ||
+        gameplay_interface->prepare_no_gameplay_state(core) != KADATH_OK ||
+        prepare_empty_phase_candidate(core) != 0 ||
+        object_interface->commit_scene(core) != KADATH_OK) {
+        object_interface->destroy(&core);
+        return 270;
+    }
+    return object_interface->destroy(&core) == KADATH_OK ? 0 : 271;
+}
+
 static int phase_commit_path(
     kadath_runtime_object_authority_interface_t* object_interface,
     kadath_runtime_phase_interface_v1_t* phase_interface_v1,
@@ -2184,16 +2231,16 @@ int main(void) {
         phase_interface.begin_activation == NULL || phase_interface.end_phase == NULL) {
         return 2;
     }
-    kadath_runtime_gameplay_interface_v1_t gameplay_interface;
-    memset(&gameplay_interface, 0, sizeof(gameplay_interface));
-    gameplay_interface.struct_size = (uint32_t)sizeof(gameplay_interface);
-    gameplay_interface.interface_version = KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1;
-    if (kadath_runtime_core_query_gameplay_interface(&gameplay_interface) != KADATH_OK ||
+    kadath_runtime_gameplay_interface_v1_t gameplay_interface_v1 = query_gameplay_interface();
+    kadath_runtime_gameplay_interface_v1_t gameplay_interface = query_gameplay_interface_v2();
+    if (gameplay_interface_v1.prepare_no_gameplay_state != NULL ||
+        gameplay_interface.interface_version != KADATH_RUNTIME_GAMEPLAY_INTERFACE_V2 ||
         gameplay_interface.prepare_gameplay_state == NULL ||
         gameplay_interface.begin_fixed_step == NULL ||
         gameplay_interface.commit_fixed_step == NULL ||
         gameplay_interface.abort_fixed_step == NULL ||
-        gameplay_interface.publish_snapshot == NULL) {
+        gameplay_interface.publish_snapshot == NULL ||
+        gameplay_interface.prepare_no_gameplay_state == NULL) {
         return 3;
     }
     int normal_result = normal_path(&interface_value);
@@ -2216,6 +2263,8 @@ int main(void) {
     if (query_result != 0) return query_result;
     int gameplay_result = gameplay_contract_path(&interface_value, &phase_interface, &gameplay_interface);
     if (gameplay_result != 0) return gameplay_result;
+    int neutral_result = neutral_scene_candidate_path(&interface_value, &gameplay_interface);
+    if (neutral_result != 0) return neutral_result;
     puts("PHASE3_PUBLIC_GAMEPLAY_PATH=PASS");
     puts("GAMEPLAY_DECISION public_abi_preflight covered=1 total=1");
     int phase_result = phase_commit_path(&interface_value, &phase_interface_v1, &phase_interface);

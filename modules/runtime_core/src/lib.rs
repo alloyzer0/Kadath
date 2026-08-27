@@ -225,6 +225,11 @@ mod abi {
     include!(concat!(env!("OUT_DIR"), "/kadath_runtime_core_bindings.rs"));
 }
 
+enum GameplayCandidate {
+    Disabled,
+    Enabled(gameplay::State),
+}
+
 struct RuntimeCore {
     owner_thread: ThreadId,
     in_call: bool,
@@ -235,7 +240,8 @@ struct RuntimeCore {
     next_entity_value: u64,
     phase: Box<phase_commit::PhaseState>,
     gameplay: Option<gameplay::State>,
-    gameplay_candidate: Option<gameplay::State>,
+    // None=尚未准备；Some(Disabled)=显式无 Gameplay；Some(Enabled)=旧 Demo Gameplay。
+    gameplay_candidate: Option<GameplayCandidate>,
     #[cfg(feature = "contract-test-hooks")]
     next_fault: Option<TestFault>,
 }
@@ -643,7 +649,14 @@ fn commit_scene(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32
         .take()
         .expect("candidate entity high-water accompanies candidate");
     core.live = Some(candidate);
-    core.gameplay = core.gameplay_candidate.take();
+    core.gameplay = match core
+        .gameplay_candidate
+        .take()
+        .expect("validated Gameplay candidate")
+    {
+        GameplayCandidate::Disabled => None,
+        GameplayCandidate::Enabled(state) => Some(state),
+    };
     core.next_entity_value = next_entity_value;
     core.candidate_mode = None;
     core.phase.commit_after_scene();
@@ -1978,8 +1991,29 @@ fn prepare_gameplay_state(
         reserved: [0; 4],
     };
     trigger_test_fault(core, TEST_ENTRY_PREPARE)?;
-    core.gameplay_candidate = Some(state);
+    core.gameplay_candidate = Some(GameplayCandidate::Enabled(state));
     unsafe { ptr::write(out_pointer, output) };
+    Ok(())
+}
+
+fn prepare_no_gameplay_state(core_pointer: *mut abi::kadath_runtime_core_t) -> Result<(), u32> {
+    let (core, _guard) = unsafe { enter_core(core_pointer) }?;
+    if core.gameplay_candidate.is_some() || core.phase.has_candidate() {
+        return Err(abi::KADATH_ERR_RUNTIME_CANDIDATE_BUSY);
+    }
+    if core.candidate.is_none() {
+        return Err(abi::KADATH_ERR_RUNTIME_INVALID_STATE);
+    }
+    if core.candidate_mode == Some(abi::KADATH_RUNTIME_PREPARE_RESTART)
+        && core
+            .gameplay
+            .as_ref()
+            .is_some_and(|state| state.session.phase == gameplay::Phase::Playing)
+    {
+        return Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE);
+    }
+    trigger_test_fault(core, TEST_ENTRY_PREPARE)?;
+    core.gameplay_candidate = Some(GameplayCandidate::Disabled);
     Ok(())
 }
 
@@ -2488,6 +2522,11 @@ extern "C" fn prepare_gameplay_state_entry(
         prepare_gameplay_state(core, desc, out)
     })
 }
+extern "C" fn prepare_no_gameplay_state_entry(core: *mut abi::kadath_runtime_core_t) -> i32 {
+    ffi_result_for(QualityPublicCall::GameplayPrepareState, || {
+        prepare_no_gameplay_state(core)
+    })
+}
 extern "C" fn begin_gameplay_fixed_entry(
     core: *mut abi::kadath_runtime_core_t,
     desc: *const abi::kadath_runtime_gameplay_begin_fixed_desc_v1_t,
@@ -2528,10 +2567,12 @@ fn query_gameplay_interface(
 ) -> Result<(), u32> {
     valid_output(pointer)?;
     let requested = unsafe { ptr::read(pointer) };
-    if !reserved_is_zero(&requested.reserved) {
+    if requested.prepare_no_gameplay_state.is_some() || !reserved_is_zero(&requested.reserved) {
         return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
     }
-    if requested.interface_version != abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1 {
+    if requested.interface_version != abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1
+        && requested.interface_version != abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V2
+    {
         return Err(abi::KADATH_ERR_NOT_SUPPORTED);
     }
     unsafe {
@@ -2539,13 +2580,20 @@ fn query_gameplay_interface(
             pointer,
             abi::kadath_runtime_gameplay_interface_v1_t {
                 struct_size: mem::size_of::<abi::kadath_runtime_gameplay_interface_v1_t>() as u32,
-                interface_version: abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1,
+                interface_version: requested.interface_version,
                 prepare_gameplay_state: Some(prepare_gameplay_state_entry),
                 begin_fixed_step: Some(begin_gameplay_fixed_entry),
                 commit_fixed_step: Some(commit_gameplay_fixed_entry),
                 abort_fixed_step: Some(abort_gameplay_fixed_entry),
                 publish_snapshot: Some(publish_gameplay_snapshot_entry),
-                reserved: [0; 8],
+                prepare_no_gameplay_state: if requested.interface_version
+                    == abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V2
+                {
+                    Some(prepare_no_gameplay_state_entry)
+                } else {
+                    None
+                },
+                reserved: [0; 7],
             },
         )
     };
@@ -3014,13 +3062,16 @@ mod tests {
         assert_eq!(output.hazard_count, 2);
 
         // 第二项必须按 index * stride 读取，而不是重复首项或使用除法。
-        assert_eq!(
-            core.gameplay_candidate.as_ref().unwrap().hazards[1]
-                .as_ref()
-                .unwrap()
-                .object,
-            read_object_key(&hazard2.object_ref).unwrap()
-        );
+        {
+            let GameplayCandidate::Enabled(candidate) = core.gameplay_candidate.as_ref().unwrap()
+            else {
+                panic!("expected enabled Gameplay candidate");
+            };
+            assert_eq!(
+                candidate.hazards[1].as_ref().unwrap().object,
+                read_object_key(&hazard2.object_ref).unwrap()
+            );
+        };
 
         for mutate in [
             |value: &mut abi::kadath_runtime_gameplay_hazard_desc_v1_t| {
@@ -3871,7 +3922,9 @@ mod tests {
             Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)
         ));
         core.candidate = None;
-        core.gameplay_candidate = Some(core.gameplay.as_ref().unwrap().clone());
+        core.gameplay_candidate = Some(GameplayCandidate::Enabled(
+            core.gameplay.as_ref().unwrap().clone(),
+        ));
         assert!(matches!(
             begin_gameplay_fixed(pointer, &begin_desc, &mut outcome_buffer, &mut begin_result),
             Err(abi::KADATH_ERR_RUNTIME_GAMEPLAY_INVALID_STATE)
@@ -4077,6 +4130,15 @@ mod tests {
         assert!(interface.commit_fixed_step.is_some());
         assert!(interface.abort_fixed_step.is_some());
         assert!(interface.publish_snapshot.is_some());
+        assert!(interface.prepare_no_gameplay_state.is_none());
+
+        let mut version_two = abi::kadath_runtime_gameplay_interface_v1_t {
+            struct_size: mem::size_of::<abi::kadath_runtime_gameplay_interface_v1_t>() as u32,
+            interface_version: abi::KADATH_RUNTIME_GAMEPLAY_INTERFACE_V2,
+            ..unsafe { mem::zeroed() }
+        };
+        assert_eq!(query_gameplay_interface(&mut version_two), Ok(()));
+        assert!(version_two.prepare_no_gameplay_state.is_some());
 
         assert_eq!(
             query_gameplay_interface(std::ptr::null_mut()),

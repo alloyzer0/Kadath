@@ -7,6 +7,10 @@ const canonical_sources = [_]runtime_core.SourceDesc{
     .{ .object_id = "goal", .kind = 3, .sprite = .{ .position = .{ 80, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 0, 1 }, .texture_id = 1 } },
 };
 
+const neutral_sources = [_]runtime_core.SourceDesc{
+    .{ .object_id = "decor", .kind = 1, .sprite = .{ .position = .{ 10, 20 }, .size = .{ 8, 8 }, .color = .{ 1, 1, 1, 1 }, .texture_id = 1 } },
+};
+
 fn prepareGameplayCandidate(core: *runtime_core.RuntimeCore) !void {
     const player = (try core.findById(.candidate, "player")).?.object_ref;
     const hazard = (try core.findById(.candidate, "hazard")).?.object_ref;
@@ -67,6 +71,23 @@ test "Scene publication requires ready Object Gameplay and Phase candidates" {
     try core.commitScene();
     try std.testing.expect((try core.findById(.live, "player")) != null);
     std.debug.print("\nGAMEPLAY_DECISION paired_publication covered=6 total=6\n", .{});
+}
+
+test "Scene publication accepts an explicitly disabled Gameplay candidate" {
+    var core = try runtime_core.RuntimeCore.init();
+    defer core.deinit();
+    _ = try core.prepare(.initial, .{ 0, 0 }, .{ 100, 100 }, &neutral_sources);
+
+    // 未准备与显式无 Gameplay 必须是两个不同的候选状态。
+    try std.testing.expectError(error.RuntimeCoreInvalidState, core.commitScene());
+    try core.prepareNoGameplay();
+    _ = try core.preparePhaseState(.candidate, &.{});
+    try core.commitPhaseState();
+    try core.commitScene();
+
+    try std.testing.expect((try core.findById(.live, "decor")) != null);
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    try std.testing.expectError(error.InvalidGameplayState, core.beginGameplayFixed(0.0, &outcome));
 }
 
 test "Restart is terminal-only and preserves Gameplay sequence high-water marks" {

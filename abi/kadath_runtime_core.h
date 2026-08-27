@@ -81,6 +81,7 @@ extern "C" {
 #define KADATH_RUNTIME_PHASE_EVENT_VALUE_OBJECT 4U
 
 #define KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1 1U
+#define KADATH_RUNTIME_GAMEPLAY_INTERFACE_V2 2U
 #define KADATH_RUNTIME_GAMEPLAY_PHASE_PLAYING 1U
 #define KADATH_RUNTIME_GAMEPLAY_PHASE_WON 2U
 #define KADATH_RUNTIME_GAMEPLAY_PHASE_LOST 3U
@@ -788,7 +789,10 @@ typedef struct kadath_runtime_gameplay_interface_v1_t {
         kadath_runtime_core_t* core,
         kadath_runtime_render_buffer_v1_t* render_buffer,
         kadath_runtime_gameplay_snapshot_v1_t* out_snapshot);
-    uint64_t reserved[8];
+    /* V2：显式发布“已准备但不启用 Gameplay”的 private candidate。
+     * V1 查询返回 NULL；该槽位来自旧 reserved[0]，函数表总尺寸保持不变。 */
+    int32_t (*prepare_no_gameplay_state)(kadath_runtime_core_t* core);
+    uint64_t reserved[7];
 } kadath_runtime_gameplay_interface_v1_t;
 
 // Mode A caller-owned in/out descriptor，只借用本次调用。

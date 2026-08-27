@@ -146,7 +146,7 @@ pub const RuntimeCore = struct {
         try check(c.kadath_runtime_core_query_phase_interface(&phase_interface));
         var gameplay_interface = std.mem.zeroes(c.kadath_runtime_gameplay_interface_v1_t);
         gameplay_interface.struct_size = @sizeOf(c.kadath_runtime_gameplay_interface_v1_t);
-        gameplay_interface.interface_version = c.KADATH_RUNTIME_GAMEPLAY_INTERFACE_V1;
+        gameplay_interface.interface_version = c.KADATH_RUNTIME_GAMEPLAY_INTERFACE_V2;
         try check(c.kadath_runtime_core_query_gameplay_interface(&gameplay_interface));
         var create_desc = std.mem.zeroes(c.kadath_runtime_core_create_desc_t);
         create_desc.struct_size = @sizeOf(c.kadath_runtime_core_create_desc_t);
@@ -241,6 +241,11 @@ pub const RuntimeCore = struct {
         var info = std.mem.zeroes(c.kadath_runtime_gameplay_candidate_info_v1_t);
         info.struct_size = @sizeOf(c.kadath_runtime_gameplay_candidate_info_v1_t);
         try check(self.gameplay_interface.prepare_gameplay_state.?(self.handle, &desc, &info));
+    }
+
+    pub fn prepareNoGameplay(self: *RuntimeCore) !void {
+        // V2 用显式调用区分“未准备”与“候选场景有意禁用 Gameplay”。
+        try check(self.gameplay_interface.prepare_no_gameplay_state.?(self.handle));
     }
 
     pub fn beginGameplayFixed(self: *RuntimeCore, dt_seconds: f32, outcome: *GameplayOutcome) !GameplayStepResult {
