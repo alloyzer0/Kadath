@@ -137,6 +137,61 @@ internal static class Program
             Require(avaloniaViewModel.IsBehaviorContractReady
                 && avaloniaViewModel.AvailableBehaviorContracts.Count == 2,
                 "Avalonia did not project the Behavior Contract catalog");
+            if (openedProject.Scene.SchemaVersion == 6)
+            {
+                Require(avaloniaViewModel.ScenePrototypeDrafts is [{ PrototypeId: "runtime-orb" }]
+                    && !workspace.HierarchySnapshot.Value!.Nodes.Any(node =>
+                        node.Id.Contains("prototype", StringComparison.OrdinalIgnoreCase)
+                        || node.Kind.Contains("prototype", StringComparison.OrdinalIgnoreCase)),
+                    "Avalonia did not keep the Spawn Prototype projection outside Scene Hierarchy");
+                var prototypeDraft = avaloniaViewModel.ScenePrototypeDrafts[0];
+                avaloniaViewModel.SelectedScenePrototype = prototypeDraft;
+                var prototypeBinding = prototypeDraft.Behaviors.Single(binding => binding.ScriptId == 2);
+                avaloniaViewModel.SelectedBehaviorBinding = prototypeBinding;
+                var prototypeSpeed = prototypeBinding.Parameters.Single(parameter => parameter.Name == "speed");
+                prototypeSpeed.ValueText = "1001";
+                Require(!avaloniaViewModel.CanApplyAuthoring,
+                    "Avalonia enabled Apply for an out-of-range Prototype behavior override");
+                prototypeSpeed.ValueText = "200";
+                avaloniaViewModel.SelectedBehaviorContract = avaloniaViewModel.AvailableBehaviorContracts.Single(
+                    entry => entry.ScriptId == 1 && entry.SourcePath == "scripts/patrol.luau");
+                Require(avaloniaViewModel.CanAddBehaviorBinding,
+                    "Avalonia did not route shared Behavior commands to the selected Spawn Prototype");
+                avaloniaViewModel.AddBehaviorBinding();
+                var prototypeEdited = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+                Require(prototypeEdited.ChangedFields.SequenceEqual(["scene.prototypes"])
+                    && prototypeEdited.ProjectSnapshot.Scene.Prototypes![0].Behaviors is { Count: 2 }
+                    && prototypeEdited.ProjectSnapshot.Scene.Prototypes[0].Behaviors!
+                        .Single(binding => binding.ScriptId == 2).Parameters!
+                        .Single(parameter => parameter.Name == "speed").Value == 200,
+                    "Avalonia did not commit Spawn Prototype Behavior authoring through the existing mutation seam");
+                var prototypeBake = await workspace.BakeAsync(new BakeStartParameters("Both", "debug"), cancellationToken);
+                Require(prototypeBake.SceneArtifactRevision is { Length: 64 }
+                    && prototypeBake.SceneArtifactBytes is > 0,
+                    "Authored Spawn Prototype did not reach the KSCN Bake product seam");
+                _ = await workspace.StartPreviewAsync(
+                    new PreviewStartParameters(ProjectName: openProjectName, LiveBake: true),
+                    cancellationToken);
+                await WaitUntilAsync(
+                    () => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Loaded,
+                    cancellationToken,
+                    "authored Spawn Prototype Runtime load",
+                    () => workspace.Preview.Runtime.State == EditorPreviewRuntimeState.Failed
+                        || workspace.Preview.State is EditorPreviewState.Failed or EditorPreviewState.Stopped,
+                    () => $"preview={workspace.Preview.State}; runtime={workspace.Preview.Runtime.State}; error={workspace.Preview.Runtime.ErrorCode}:{workspace.Preview.Runtime.ErrorMessage}");
+                Require(workspace.Preview.Runtime.Scene.ArtifactRevision == prototypeBake.SceneArtifactRevision,
+                    "Runtime did not load the KSCN artifact produced from the authored Spawn Prototype");
+                await Task.Delay(250, cancellationToken);
+                Require(workspace.Preview.State == EditorPreviewState.Running,
+                    "Runtime did not remain active for the authored Spawn Prototype workload");
+                _ = await workspace.StopPreviewAsync(cancellationToken);
+                var prototypeRestored = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
+                Require(prototypeRestored.ProjectSnapshot.Scene.Prototypes![0].Behaviors is [{ ScriptId: 2 }]
+                    && prototypeRestored.ProjectSnapshot.Scene.Prototypes[0].Behaviors![0].Parameters!
+                        .Single(parameter => parameter.Name == "speed").Value == 180,
+                    "Avalonia Undo did not restore the original Spawn Prototype binding collection");
+                Console.WriteLine("workflow_spawn_prototype_authoring=ok");
+            }
             var bindingGoalDraft = avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal");
             Require(bindingGoalDraft.Behaviors is [{ ScriptId: 2 }],
                 "Avalonia did not project the existing goal update binding");
@@ -484,6 +539,8 @@ internal static class Program
                 && avaloniaViewModel.SelectedAssetItem is null
                 && avaloniaViewModel.SelectedSceneObject is null
                 && avaloniaViewModel.SceneObjectDrafts.Count == 0
+                && avaloniaViewModel.SelectedScenePrototype is null
+                && avaloniaViewModel.ScenePrototypeDrafts.Count == 0
                 && avaloniaViewModel.InspectorText.Length == 0
                 && avaloniaViewModel.SceneGoalX.Length == 0
                 && avaloniaViewModel.SceneGoalY.Length == 0
@@ -524,6 +581,8 @@ internal static class Program
                 : 13)
             && avaloniaViewModel.AssetItems.Count == expectedAssetCount
             && avaloniaViewModel.SceneObjectDrafts.Count == 5
+            && (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is not 6
+                || avaloniaViewModel.ScenePrototypeDrafts is [{ PrototypeId: "runtime-orb" }])
             && avaloniaViewModel.InspectorText.Contains("scene.objects[goal]", StringComparison.Ordinal),
             "Avalonia public Create did not project the new Session snapshots after atomic cache invalidation");
         Console.WriteLine("workflow_project_create=ok");
@@ -1116,6 +1175,37 @@ internal static class Program
             Require(gameplayViewModel.SceneGameplayProfile == "goal_hazard_v1"
                 && gameplayViewModel.SceneGameplayTimeLimitSeconds == "3",
                 "Scene v7 Gameplay authoring projection mismatch");
+            Require(gameplayViewModel.ScenePrototypeDrafts is [{ PrototypeId: "runtime-orb", Kind: "sprite" }]
+                && gameplayViewModel.HierarchyItems.Count == 4,
+                "Avalonia did not project Spawn Prototypes separately from the Scene Hierarchy");
+            gameplayViewModel.SelectedScenePrototype = gameplayViewModel.ScenePrototypeDrafts[0];
+            gameplayViewModel.AddScenePrototypeCommand.Execute(null);
+            var addedPrototype = gameplayViewModel.SelectedScenePrototype;
+            Require(gameplayViewModel.ScenePrototypeDrafts.Count == 2
+                && addedPrototype?.PrototypeId == "prototype-1"
+                && gameplayViewModel.DeleteScenePrototypeCommand.CanExecute(null),
+                "Spawn Prototype add/delete command gating mismatch");
+            gameplayViewModel.MoveScenePrototypeUpCommand.Execute(null);
+            Require(gameplayViewModel.ScenePrototypeDrafts[0] == addedPrototype,
+                "Spawn Prototype move-up did not preserve Source Prototype Order");
+            gameplayViewModel.DeleteScenePrototypeCommand.Execute(null);
+            Require(gameplayViewModel.ScenePrototypeDrafts is [{ PrototypeId: "runtime-orb" }],
+                "Spawn Prototype draft cleanup did not restore the baseline collection");
+
+            gameplayViewModel.SelectedScenePrototype = gameplayViewModel.ScenePrototypeDrafts[0];
+            gameplayViewModel.SelectedScenePrototype.SizeX = "0";
+            Require(!gameplayViewModel.CanApplyAuthoring,
+                "Invalid Spawn Prototype draft did not disable Authoring Apply");
+            gameplayViewModel.SelectedScenePrototype.SizeX = "52";
+            Require(gameplayViewModel.CanApplyAuthoring,
+                "Corrected Spawn Prototype draft did not re-enable Authoring Apply");
+            var prototypeApplied = await gameplayViewModel.ApplyAuthoringForCurrentProjectAsync(createTimeout.Token);
+            var prototypePatch = gameplayTransport.LastAuthoringApplyRequest?.GetProperty("params").GetProperty("patch")
+                ?? throw new InvalidOperationException("Avalonia Prototype Apply did not cross the typed transport seam");
+            Require(prototypeApplied.ChangedFields.Contains("scene.prototypes")
+                && prototypePatch.GetProperty("scenePrototypes")[0].GetProperty("prototypeId").GetString() == "runtime-orb"
+                && prototypePatch.GetProperty("scenePrototypes")[0].GetProperty("size")[0].GetDouble() == 52,
+                "Avalonia did not send the edited Spawn Prototype collection");
 
             gameplayViewModel.SceneGameplayProfile = "none";
             var disabledGameplay = await gameplayViewModel.ApplyAuthoringForCurrentProjectAsync(createTimeout.Token);
@@ -1328,6 +1418,11 @@ internal static class Program
                     {
                         changedFields.Add("scene.objects");
                     }
+                    if (authoringPatch.TryGetProperty("scenePrototypes", out var scenePrototypes)
+                        && scenePrototypes.ValueKind == JsonValueKind.Array)
+                    {
+                        changedFields.Add("scene.prototypes");
+                    }
                     if (authoringPatch.TryGetProperty("sceneTextures", out var sceneTextures)
                         && sceneTextures.ValueKind == JsonValueKind.Array)
                     {
@@ -1472,6 +1567,18 @@ internal static class Program
                         PatrolMinY: 0d, PatrolMaxY: 10d, PatrolSpeed: 2d)
             };
             var gameplayEnabled = _gameplayProfile == "goal_hazard_v1";
+            var prototypes = _sceneV7
+                ? new[]
+                {
+                    new ProjectModelScenePrototype(
+                        "runtime-orb",
+                        "sprite",
+                        [48d, 48d],
+                        [0.35d, 0.85d, 1d, 1d],
+                        2,
+                        [new ProjectModelSceneBehaviorBinding(1, [])])
+                }
+                : Array.Empty<ProjectModelScenePrototype>();
             var scene = _sceneV7
                 ? new ProjectModelScene(
                     7,
@@ -1482,7 +1589,8 @@ internal static class Program
                     textures,
                     objects,
                     GameplayProfile: _gameplayProfile,
-                    GameplayTimeLimitSeconds: _gameplayTimeLimitSeconds)
+                    GameplayTimeLimitSeconds: _gameplayTimeLimitSeconds,
+                    Prototypes: prototypes)
                 : new ProjectModelScene(4, [3d, 4d], 1, 2, 3, textures, objects);
             var script = _sceneV7
                 ? new ProjectModelScript(2, [], [], [new ProjectModelScriptDependency(1, "scripts/patrol.luau")])

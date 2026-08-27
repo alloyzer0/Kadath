@@ -297,7 +297,8 @@ public sealed class WorkspaceReadModel
                 textures,
                 objects,
                 scene.Gameplay.Profile,
-                scene.Gameplay.IsEnabled ? scene.Gameplay.TimeLimitSeconds : null),
+                scene.Gameplay.IsEnabled ? scene.Gameplay.TimeLimitSeconds : null,
+                scene.Prototypes.Select(prototype => prototype.ToProjectModel()).ToArray()),
             new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity, dependencies), new ProjectModelPreview(previewVersion));
     }
 

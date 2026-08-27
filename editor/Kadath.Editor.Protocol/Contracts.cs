@@ -257,7 +257,9 @@ public sealed record ProjectModelScene(
     IReadOnlyList<ProjectModelSceneObject>? Objects = null,
     // v7 起 Gameplay 是可选能力；旧字段保留默认值以维持现有协议调用方兼容。
     string GameplayProfile = "goal_hazard_v1",
-    double? GameplayTimeLimitSeconds = null);
+    double? GameplayTimeLimitSeconds = null,
+    // Prototype 不是 Scene Object；通过独立只读集合公开，不能投影为 Hierarchy node。
+    IReadOnlyList<ProjectModelScenePrototype>? Prototypes = null);
 
 public sealed record ProjectModelTexture(uint TextureId, string Artifact);
 
@@ -278,6 +280,14 @@ public sealed record ProjectModelSceneObject(
     double? PatrolMinY = null,
     double? PatrolMaxY = null,
     double? PatrolSpeed = null,
+    IReadOnlyList<ProjectModelSceneBehaviorBinding>? Behaviors = null);
+
+public sealed record ProjectModelScenePrototype(
+    string PrototypeId,
+    string Kind,
+    double[] Size,
+    double[] Color,
+    uint TextureId,
     IReadOnlyList<ProjectModelSceneBehaviorBinding>? Behaviors = null);
 
 public sealed record ProjectModelScriptDependency(uint ScriptId, string Source);
@@ -399,6 +409,14 @@ public sealed record SceneObjectDefinition(
     double? PatrolSpeed = null,
     IReadOnlyList<SceneBehaviorBindingDefinition>? Behaviors = null);
 
+public sealed record ScenePrototypeDefinition(
+    string PrototypeId,
+    string Kind,
+    double[] Size,
+    double[] Color,
+    uint TextureId,
+    IReadOnlyList<SceneBehaviorBindingDefinition>? Behaviors = null);
+
 public sealed record SceneBehaviorBindingDefinition(
     uint ScriptId,
     IReadOnlyDictionary<string, double>? Parameters = null);
@@ -413,7 +431,8 @@ public sealed record AuthoringPatch(
     IReadOnlyList<SceneTextureAssignment>? SceneTextures = null,
     IReadOnlyList<SceneObjectDefinition>? SceneObjects = null,
     string? SceneGameplayProfile = null,
-    double? SceneGameplayTimeLimitSeconds = null);
+    double? SceneGameplayTimeLimitSeconds = null,
+    IReadOnlyList<ScenePrototypeDefinition>? ScenePrototypes = null);
 
 public sealed record AuthoringApplyParameters(
     string? ProjectName,

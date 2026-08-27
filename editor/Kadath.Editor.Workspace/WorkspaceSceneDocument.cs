@@ -25,7 +25,33 @@ internal sealed record WorkspaceScenePrototype(
     double[] Size,
     double[] Color,
     uint TextureId,
-    WorkspaceSceneBehaviorBinding[] Behaviors);
+    WorkspaceSceneBehaviorBinding[] Behaviors)
+{
+    internal ProjectModelScenePrototype ToProjectModel() => new(
+        PrototypeId,
+        Kind,
+        Size.ToArray(),
+        Color.ToArray(),
+        TextureId,
+        Behaviors.Select(binding => new ProjectModelSceneBehaviorBinding(
+            binding.ScriptId,
+            binding.Parameters.Select(parameter => new ProjectModelSceneBehaviorParameter(
+                parameter.Name,
+                parameter.Value)).ToArray())).ToArray());
+
+    internal ScenePrototypeDefinition ToDefinition() => new(
+        PrototypeId,
+        Kind,
+        Size.ToArray(),
+        Color.ToArray(),
+        TextureId,
+        Behaviors.Select(binding => new SceneBehaviorBindingDefinition(
+            binding.ScriptId,
+            binding.Parameters.ToDictionary(
+                parameter => parameter.Name,
+                parameter => parameter.Value,
+                StringComparer.Ordinal))).ToArray());
+}
 
 internal sealed record WorkspaceSceneObject(
     string ObjectId,
@@ -177,6 +203,23 @@ internal static partial class WorkspaceSceneDocumentCodec
                     ?? Array.Empty<WorkspaceSceneBehaviorParameter>())).ToArray())).ToArray();
         Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), schemaVersion, gameplay);
         return objects;
+    }
+
+    internal static WorkspaceScenePrototype[] NormalizePrototypeDefinitions(
+        IReadOnlyList<ScenePrototypeDefinition> definitions)
+    {
+        // 最终合法性由完整 Scene candidate 一次校验；这里仅完成 defensive copy 与结构归一化。
+        return definitions.Select(value => new WorkspaceScenePrototype(
+            value.PrototypeId,
+            value.Kind,
+            CopyVector(value.Size, 2, $"Scene.prototypes[{value.PrototypeId}].size"),
+            CopyVector(value.Color, 4, $"Scene.prototypes[{value.PrototypeId}].color"),
+            value.TextureId,
+            value.Behaviors?.Select(binding => new WorkspaceSceneBehaviorBinding(
+                binding.ScriptId,
+                binding.Parameters?.Select(parameter => new WorkspaceSceneBehaviorParameter(
+                    parameter.Key,
+                    parameter.Value)).ToArray() ?? [])).ToArray() ?? [])).ToArray();
     }
 
     internal static void ValidateNormalized(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects) =>

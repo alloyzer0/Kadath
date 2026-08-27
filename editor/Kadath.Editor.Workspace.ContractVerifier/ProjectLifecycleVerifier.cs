@@ -556,6 +556,10 @@ internal static class ProjectLifecycleVerifier
             "Behavior ReadModel did not expose Scene behavior bindings.");
         Require(snapshot.Scene.Objects?.Single(value => value.ObjectId == "player").Behaviors?.Single().ScriptId == 2,
             "Behavior ReadModel did not expose Player movement behavior ownership.");
+        Require(snapshot.Scene.Prototypes is [{ PrototypeId: "runtime-orb", TextureId: 2 }]
+            && snapshot.Scene.Prototypes[0].Behaviors?.Single().ScriptId == 2
+            && snapshot.Scene.Prototypes[0].Behaviors![0].Parameters?.Single(value => value.Name == "speed").Value == 180,
+            "Behavior ReadModel did not expose the Spawn Prototype binding.");
         var hierarchy = await readModel.ReadHierarchyAsync(created, default);
         Require(hierarchy.Nodes.Any(node => node.Kind == "ScriptDependency" && node.Id == "script.dependencies[1]"),
             "Behavior hierarchy did not expose Script dependency node.");
@@ -565,6 +569,9 @@ internal static class ProjectLifecycleVerifier
             "Behavior hierarchy did not expose Scene behavior node.");
         Require(hierarchy.Nodes.Any(node => node.Kind == "SceneBehavior" && node.Id == "scene.objects[player].behaviors[2]"),
             "Behavior hierarchy did not expose Player movement behavior node.");
+        Require(!hierarchy.Nodes.Any(node => node.Id.Contains("prototype", StringComparison.OrdinalIgnoreCase)
+                || node.Kind.Contains("prototype", StringComparison.OrdinalIgnoreCase)),
+            "Spawn Prototype leaked into the Behavior Scene Hierarchy.");
         var authoring = new WorkspaceAuthoringModel();
         var previousToolPath = Environment.GetEnvironmentVariable("KADATH_BEHAVIOR_TOOL");
         try
@@ -581,8 +588,59 @@ internal static class ProjectLifecycleVerifier
             Require(nonBehaviorEdit.State == "succeeded", "Scene v6 non-behavior edit incorrectly required the Behavior Tool.");
             var nonBehaviorUndo = await authoring.UndoAsync(created, nonBehaviorEdit.Revision, nonBehaviorEdit.UndoToken!, default);
             snapshot = nonBehaviorUndo.ProjectSnapshot;
+
+            var nonBehaviorPrototypes = snapshot.Scene.Prototypes!
+                .Select(value => value with { Size = [value.Size[0] + 1, value.Size[1]] })
+                .Select(ToDefinition)
+                .ToArray();
+            var nonBehaviorPrototypeEdit = await authoring.ApplyAsync(created, snapshot.AuthoringRevision,
+                new AuthoringPatch(ScenePrototypes: nonBehaviorPrototypes), default);
+            Require(nonBehaviorPrototypeEdit.State == "succeeded",
+                "Scene v6 non-behavior Prototype edit incorrectly required the Behavior Tool.");
+            var nonBehaviorPrototypeUndo = await authoring.UndoAsync(
+                created,
+                nonBehaviorPrototypeEdit.Revision,
+                nonBehaviorPrototypeEdit.UndoToken!,
+                default);
+            snapshot = nonBehaviorPrototypeUndo.ProjectSnapshot;
         }
         finally { Environment.SetEnvironmentVariable("KADATH_BEHAVIOR_TOOL", previousToolPath); }
+
+        var editedPrototypes = snapshot.Scene.Prototypes!
+            .Select(value => value with
+            {
+                Behaviors = value.Behaviors?.Select(binding => binding.ScriptId == 2 ? binding with
+                {
+                    Parameters = binding.Parameters?.Select(parameter => parameter.Name == "speed"
+                        ? parameter with { Value = 200 }
+                        : parameter).ToArray()
+                } : binding).ToArray()
+            })
+            .Select(ToDefinition)
+            .ToArray();
+        var prototypeEdit = await authoring.ApplyAsync(created, snapshot.AuthoringRevision,
+            new AuthoringPatch(ScenePrototypes: editedPrototypes), default);
+        Require(prototypeEdit.State == "succeeded"
+            && prototypeEdit.ChangedFields.SequenceEqual(["scene.prototypes"])
+            && prototypeEdit.ProjectSnapshot.Scene.Prototypes![0].Behaviors![0].Parameters!
+                .Single(value => value.Name == "speed").Value == 200,
+            "Spawn Prototype Behavior parameter authoring mismatch.");
+        var invalidPrototypeBindings = editedPrototypes.Select(value => value with
+        {
+            Behaviors = value.Behaviors?.Select(binding => binding with
+            {
+                Parameters = new Dictionary<string, double>(StringComparer.Ordinal) { ["speed"] = 1001 }
+            }).ToArray()
+        }).ToArray();
+        await ExpectAuthoringFailureAsync(
+            () => authoring.ApplyAsync(created, prototypeEdit.Revision,
+                new AuthoringPatch(ScenePrototypes: invalidPrototypeBindings), default),
+            WorkspaceAuthoringFailureKind.InvalidPatch);
+        var prototypeUndo = await authoring.UndoAsync(created, prototypeEdit.Revision, prototypeEdit.UndoToken!, default);
+        Require(prototypeUndo.ProjectSnapshot.Scene.Prototypes![0].Behaviors![0].Parameters!
+                .Single(value => value.Name == "speed").Value == 180,
+            "Spawn Prototype Behavior authoring undo mismatch.");
+        snapshot = prototypeUndo.ProjectSnapshot;
         var editedObjects = snapshot.Scene.Objects!
             .Select(value => value.ObjectId == "hazard-1"
                 ? value with
@@ -698,7 +756,27 @@ internal static class ProjectLifecycleVerifier
             WorkspaceScriptAssetLifecycleFailureKind.InUse);
         var unbindAsset = await authoring.UndoAsync(created, bindAsset.Revision, bindAsset.UndoToken!, default);
 
-        var assetDelete = await assetLifecycle.DeleteAsync(created, unbindAsset.Revision, 3, default);
+        var prototypeBound = unbindAsset.ProjectSnapshot.Scene.Prototypes!
+            .Select(value => value with
+            {
+                Behaviors = (value.Behaviors ?? []).Concat([
+                    new ProjectModelSceneBehaviorBinding(3, [])
+                ]).ToArray()
+            })
+            .Select(ToDefinition)
+            .ToArray();
+        var bindPrototypeAsset = await authoring.ApplyAsync(created, unbindAsset.Revision,
+            new AuthoringPatch(ScenePrototypes: prototypeBound), default);
+        await ExpectScriptAssetFailureAsync(
+            () => assetLifecycle.DeleteAsync(created, bindPrototypeAsset.Revision, 3, default),
+            WorkspaceScriptAssetLifecycleFailureKind.InUse);
+        var unbindPrototypeAsset = await authoring.UndoAsync(
+            created,
+            bindPrototypeAsset.Revision,
+            bindPrototypeAsset.UndoToken!,
+            default);
+
+        var assetDelete = await assetLifecycle.DeleteAsync(created, unbindPrototypeAsset.Revision, 3, default);
         Require(assetDelete.State == "succeeded"
             && assetDelete.SourceDocument is null
             && !File.Exists(renamedPath)
@@ -987,6 +1065,16 @@ internal static class ProjectLifecycleVerifier
         value.PatrolMinY,
         value.PatrolMaxY,
         value.PatrolSpeed,
+        value.Behaviors?.Select(binding => new SceneBehaviorBindingDefinition(
+            binding.ScriptId,
+            binding.Parameters?.ToDictionary(parameter => parameter.Name, parameter => parameter.Value, StringComparer.Ordinal))).ToArray());
+
+    private static ScenePrototypeDefinition ToDefinition(ProjectModelScenePrototype value) => new(
+        value.PrototypeId,
+        value.Kind,
+        value.Size,
+        value.Color,
+        value.TextureId,
         value.Behaviors?.Select(binding => new SceneBehaviorBindingDefinition(
             binding.ScriptId,
             binding.Parameters?.ToDictionary(parameter => parameter.Name, parameter => parameter.Value, StringComparer.Ordinal))).ToArray());

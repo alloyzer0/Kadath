@@ -43,6 +43,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string? _selectedHierarchyItem;
     private string? _selectedAssetItem;
     private SceneObjectDraftViewModel? _selectedSceneObject;
+    private ScenePrototypeDraftViewModel? _selectedScenePrototype;
     private BehaviorContractEntry? _selectedBehaviorContract;
     private SceneBehaviorBindingDraftViewModel? _selectedBehaviorBinding;
     private string _inspectorText = "选择项目、场景或资产查看其会话信息。";
@@ -72,6 +73,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     ];
     public ObservableCollection<string> SceneTextureIds { get; } = [];
     public ObservableCollection<SceneObjectDraftViewModel> SceneObjectDrafts { get; } = [];
+    public ObservableCollection<ScenePrototypeDraftViewModel> ScenePrototypeDrafts { get; } = [];
 
     public AvaloniaEditorViewModel(EditorWorkspaceViewModel workspace, IEditorViewDispatcher dispatcher, string defaultPackageRoot, TimeSpan? connectionTimeout = null)
     {
@@ -128,6 +130,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         DeleteSceneObjectCommand = AddCommand(new DelegateUiCommand(DeleteSelectedSceneObjectDraft, () => CanDeleteSelectedSceneObject));
         MoveSceneObjectUpCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectUp, () => CanMoveSelectedSceneObjectUp));
         MoveSceneObjectDownCommand = AddCommand(new DelegateUiCommand(MoveSelectedSceneObjectDown, () => CanMoveSelectedSceneObjectDown));
+        AddScenePrototypeCommand = AddCommand(new DelegateUiCommand(AddScenePrototypeDraft, () => CanAddScenePrototype));
+        DeleteScenePrototypeCommand = AddCommand(new DelegateUiCommand(DeleteSelectedScenePrototypeDraft, () => CanDeleteSelectedScenePrototype));
+        MoveScenePrototypeUpCommand = AddCommand(new DelegateUiCommand(MoveSelectedScenePrototypeUp, () => CanMoveSelectedScenePrototypeUp));
+        MoveScenePrototypeDownCommand = AddCommand(new DelegateUiCommand(MoveSelectedScenePrototypeDown, () => CanMoveSelectedScenePrototypeDown));
         AddBehaviorBindingCommand = AddCommand(new DelegateUiCommand(AddBehaviorBinding, () => CanAddBehaviorBinding));
         RemoveBehaviorBindingCommand = AddCommand(new DelegateUiCommand(RemoveBehaviorBinding, () => CanRemoveBehaviorBinding));
         MoveBehaviorBindingUpCommand = AddCommand(new DelegateUiCommand(MoveBehaviorBindingUp, () => CanMoveBehaviorBindingUp));
@@ -175,6 +181,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand DeleteSceneObjectCommand { get; }
     public ICommand MoveSceneObjectUpCommand { get; }
     public ICommand MoveSceneObjectDownCommand { get; }
+    public ICommand AddScenePrototypeCommand { get; }
+    public ICommand DeleteScenePrototypeCommand { get; }
+    public ICommand MoveScenePrototypeUpCommand { get; }
+    public ICommand MoveScenePrototypeDownCommand { get; }
     public ICommand AddBehaviorBindingCommand { get; }
     public ICommand RemoveBehaviorBindingCommand { get; }
     public ICommand MoveBehaviorBindingUpCommand { get; }
@@ -209,6 +219,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             if (!SetProperty(ref _selectedHierarchyItem, value)) { return; }
             if (value is not null && _hierarchyItemsByLabel.TryGetValue(value, out var node))
             {
+                // Prototype 不属于 Hierarchy；一旦用户选择任何 Hierarchy node，就退出 Prototype 编辑上下文。
+                SelectedScenePrototype = null;
                 InspectorText = FormatHierarchyInspector(node);
                 SelectedSceneObject = node.Kind == "SceneObject"
                     ? SceneObjectDrafts.FirstOrDefault(draft => draft.OriginalObjectId == node.DisplayName || draft.ObjectId == node.DisplayName)
@@ -245,6 +257,26 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         set
         {
             if (!SetProperty(ref _selectedSceneObject, value)) { return; }
+            if (value is not null && _selectedScenePrototype is not null)
+            {
+                _selectedScenePrototype = null;
+                RaisePropertyChanged(nameof(SelectedScenePrototype));
+            }
+            SelectedBehaviorBinding = value?.Behaviors.FirstOrDefault();
+            RaiseAll();
+        }
+    }
+    public ScenePrototypeDraftViewModel? SelectedScenePrototype
+    {
+        get => _selectedScenePrototype;
+        set
+        {
+            if (!SetProperty(ref _selectedScenePrototype, value)) return;
+            if (value is not null && _selectedSceneObject is not null)
+            {
+                _selectedSceneObject = null;
+                RaisePropertyChanged(nameof(SelectedSceneObject));
+            }
             SelectedBehaviorBinding = value?.Behaviors.FirstOrDefault();
             RaiseAll();
         }
@@ -516,7 +548,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool CanApplyAuthoring => IsProjectOpen
         && _workspace.Capabilities.CanApplyAuthoring
         && !IsScriptSourceDirty
-        && AreSceneBehaviorsStructurallyValid;
+        && AreSceneBehaviorsStructurallyValid
+        && AreScenePrototypeDraftsStructurallyValid;
     public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0 && !IsScriptSourceDirty;
     public bool CanRedoAuthoring => IsProjectOpen && _workspace.Capabilities.CanRedoAuthoring && _workspace.Authoring.RedoDepth > 0 && !IsScriptSourceDirty;
     public bool SupportsScriptSourceAuthoring => IsProjectOpen
@@ -553,6 +586,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && _workspace.Capabilities.CanEditScriptSource
         && _workspace.ScriptSource.State is not (EditorScriptSourceState.Loading or EditorScriptSourceState.Saving or EditorScriptSourceState.Undoing);
     public bool HasSelectedSceneObject => SelectedSceneObject is not null;
+    public bool HasSelectedScenePrototype => SelectedScenePrototype is not null;
+    private ObservableCollection<SceneBehaviorBindingDraftViewModel>? SelectedBehaviorBindings =>
+        SelectedScenePrototype?.Behaviors ?? SelectedSceneObject?.Behaviors;
     public IReadOnlyList<BehaviorContractEntry> AvailableBehaviorContracts => IsBehaviorContractReady
         ? _workspace.BehaviorContract.Value!.Entries
         : [];
@@ -576,31 +612,32 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool HasSelectedBehaviorBinding => SelectedBehaviorBinding is not null;
     public bool CanAddBehaviorBinding => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
-        && SelectedSceneObject is { } sceneObject
+        && SelectedBehaviorBindings is { } bindings
         && SelectedBehaviorContract is { } contract
-        && sceneObject.Behaviors.Count < 4
-        && sceneObject.Behaviors.All(binding => binding.ScriptId != contract.ScriptId)
+        && bindings.Count < 4
+        && bindings.All(binding => binding.ScriptId != contract.ScriptId)
         && !IsBusy;
     public bool CanRemoveBehaviorBinding => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
-        && SelectedSceneObject is { } sceneObject
+        && SelectedBehaviorBindings is { } bindings
         && SelectedBehaviorBinding is { } binding
-        && sceneObject.Behaviors.Contains(binding)
-        && !(IsGameplayEnabled && sceneObject.IsPatrolHazard && sceneObject.Behaviors.Count == 1)
+        && bindings.Contains(binding)
+        && !(SelectedScenePrototype is null && IsGameplayEnabled && SelectedSceneObject is { IsPatrolHazard: true }
+            && bindings.Count == 1)
         && !IsBusy;
     public bool CanMoveBehaviorBindingUp => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
-        && SelectedSceneObject is { } sceneObject
+        && SelectedBehaviorBindings is { } bindings
         && SelectedBehaviorBinding is { } binding
-        && sceneObject.Behaviors.IndexOf(binding) > 0
+        && bindings.IndexOf(binding) > 0
         && !IsBusy;
     public bool CanMoveBehaviorBindingDown => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
-        && SelectedSceneObject is { } sceneObject
+        && SelectedBehaviorBindings is { } bindings
         && SelectedBehaviorBinding is { } binding
-        && sceneObject.Behaviors.IndexOf(binding) is var index
+        && bindings.IndexOf(binding) is var index
         && index >= 0
-        && index < sceneObject.Behaviors.Count - 1
+        && index < bindings.Count - 1
         && !IsBusy;
     public bool CanAddSceneObject => CanApplyAuthoring && SceneObjectDrafts.Count < 64 && SceneTextureIds.Count > 0 && !IsBusy;
     public bool CanAddPatrolHazard => CanAddSceneObject
@@ -614,6 +651,24 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool CanMoveSelectedSceneObjectDown => SelectedSceneObject is { } selected && !IsBusy
         && SceneObjectDrafts.IndexOf(selected) is var index && index >= 0 && index < SceneObjectDrafts.Count - 1;
     public string SceneObjectCountStatus => $"对象 {SceneObjectDrafts.Count}/64 · Hazard {SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard")}";
+    public bool SupportsScenePrototypeAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 6 or 7;
+    public bool CanAddScenePrototype => SupportsScenePrototypeAuthoring
+        && CanApplyAuthoring
+        && ScenePrototypeDrafts.Count < 32
+        && SceneTextureIds.Count > 0
+        && !IsBusy;
+    public bool CanDeleteSelectedScenePrototype => SupportsScenePrototypeAuthoring
+        && SelectedScenePrototype is not null
+        && !IsBusy;
+    public bool CanMoveSelectedScenePrototypeUp => SelectedScenePrototype is { } selected
+        && !IsBusy
+        && ScenePrototypeDrafts.IndexOf(selected) > 0;
+    public bool CanMoveSelectedScenePrototypeDown => SelectedScenePrototype is { } selected
+        && !IsBusy
+        && ScenePrototypeDrafts.IndexOf(selected) is var prototypeIndex
+        && prototypeIndex >= 0
+        && prototypeIndex < ScenePrototypeDrafts.Count - 1;
+    public string ScenePrototypeCountStatus => $"原型 {ScenePrototypeDrafts.Count}/32";
     public bool CanRefreshSnapshots => IsProjectOpen
         && _workspace.Capabilities.CanReadProjectSnapshot
         && _workspace.Capabilities.CanReadHierarchySnapshot
@@ -726,6 +781,9 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             SceneGameplayProfile: editsGameplay ? SceneGameplayProfile : null,
             SceneGameplayTimeLimitSeconds: editsGameplay && IsGameplayEnabled
                 ? ParsePositiveNumber(SceneGameplayTimeLimitSeconds, "scene.gameplay.timeLimitSeconds")
+                : null,
+            ScenePrototypes: project.Scene.SchemaVersion is 6 or 7
+                ? ParseScenePrototypeDrafts(allowedTextureIds)
                 : null);
         var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
         ReconcileScriptSourceDocument();
@@ -1211,6 +1269,62 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         return definitions;
     }
 
+    private IReadOnlyList<ScenePrototypeDefinition> ParseScenePrototypeDrafts(
+        IReadOnlySet<uint> allowedTextureIds)
+    {
+        if (ScenePrototypeDrafts.Count > 32)
+            throw new EditorRpcException("invalid_authoring_patch", "scene.prototypes 最多包含 32 个生成原型。");
+        if (allowedTextureIds.Count is < 1 or > 4)
+            throw new EditorRpcException("invalid_authoring_patch", "Scene texture set 必须包含 1 到 4 个 TextureId。");
+
+        var prototypeIds = new HashSet<string>(StringComparer.Ordinal);
+        var definitions = new List<ScenePrototypeDefinition>(ScenePrototypeDrafts.Count);
+        var behaviorBindingCount = 0;
+        foreach (var draft in ScenePrototypeDrafts)
+        {
+            var prototypeId = draft.PrototypeId.Trim();
+            if (!Regex.IsMatch(prototypeId, "^[a-z][a-z0-9_-]{0,62}$", RegexOptions.CultureInvariant))
+                throw new EditorRpcException("invalid_authoring_patch", $"无效 PrototypeId：{prototypeId}。");
+            if (!prototypeIds.Add(prototypeId))
+                throw new EditorRpcException("invalid_authoring_patch", $"PrototypeId 重复：{prototypeId}。");
+            if (draft.Kind != "sprite")
+                throw new EditorRpcException("invalid_authoring_patch", $"不支持的 Prototype Kind：{draft.Kind}。");
+
+            var size = ParseVector(draft.SizeX, draft.SizeY, $"scene.prototypes[{prototypeId}].size");
+            if (size.Any(value => value <= 0 || value > float.MaxValue))
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.prototypes[{prototypeId}].size 必须是正有限 f32。");
+            var color = new[]
+            {
+                ParseFiniteNumber(draft.ColorR, $"scene.prototypes[{prototypeId}].color[0]"),
+                ParseFiniteNumber(draft.ColorG, $"scene.prototypes[{prototypeId}].color[1]"),
+                ParseFiniteNumber(draft.ColorB, $"scene.prototypes[{prototypeId}].color[2]"),
+                ParseFiniteNumber(draft.ColorA, $"scene.prototypes[{prototypeId}].color[3]")
+            };
+            if (color.Any(value => value is < 0 or > 1))
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.prototypes[{prototypeId}].color 必须位于 [0, 1]。");
+            var textureId = ParseTextureId(draft.TextureIdText, $"scene.prototypes[{prototypeId}].textureId");
+            if (!allowedTextureIds.Contains(textureId))
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.prototypes[{prototypeId}].textureId 不在当前 Scene texture set 中。");
+            if (!draft.AreBehaviorsValid
+                || draft.Behaviors.Count > 4
+                || draft.Behaviors.Select(binding => binding.ScriptId).Distinct().Count() != draft.Behaviors.Count)
+            {
+                throw new EditorRpcException("invalid_authoring_patch", $"scene.prototypes[{prototypeId}].behaviors 包含重复脚本或无效参数。");
+            }
+            behaviorBindingCount += draft.Behaviors.Count;
+            if (behaviorBindingCount > 128)
+                throw new EditorRpcException("invalid_authoring_patch", "scene.prototypes 行为绑定总数超过 128。");
+            definitions.Add(new ScenePrototypeDefinition(
+                prototypeId,
+                draft.Kind,
+                size,
+                color,
+                textureId,
+                draft.CreateBehaviorDefinitions()));
+        }
+        return definitions;
+    }
+
     public void AddDecorativeSpriteDraft()
     {
         if (!CanAddSceneObject) { return; }
@@ -1230,37 +1344,37 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
     public void AddBehaviorBinding()
     {
-        if (!CanAddBehaviorBinding || SelectedSceneObject is not { } sceneObject || SelectedBehaviorContract is not { } contract) return;
+        if (!CanAddBehaviorBinding || SelectedBehaviorBindings is not { } bindings || SelectedBehaviorContract is not { } contract) return;
         var binding = SceneBehaviorBindingDraftViewModel.Create(contract);
-        sceneObject.Behaviors.Add(binding);
+        bindings.Add(binding);
         SelectedBehaviorBinding = binding;
         RaiseAll();
     }
 
     public void RemoveBehaviorBinding()
     {
-        if (!CanRemoveBehaviorBinding || SelectedSceneObject is not { } sceneObject || SelectedBehaviorBinding is not { } binding) return;
-        var index = sceneObject.Behaviors.IndexOf(binding);
-        sceneObject.Behaviors.RemoveAt(index);
-        SelectedBehaviorBinding = sceneObject.Behaviors.Count == 0
+        if (!CanRemoveBehaviorBinding || SelectedBehaviorBindings is not { } bindings || SelectedBehaviorBinding is not { } binding) return;
+        var index = bindings.IndexOf(binding);
+        bindings.RemoveAt(index);
+        SelectedBehaviorBinding = bindings.Count == 0
             ? null
-            : sceneObject.Behaviors[Math.Min(index, sceneObject.Behaviors.Count - 1)];
+            : bindings[Math.Min(index, bindings.Count - 1)];
         RaiseAll();
     }
 
     public void MoveBehaviorBindingUp()
     {
-        if (!CanMoveBehaviorBindingUp || SelectedSceneObject is not { } sceneObject || SelectedBehaviorBinding is not { } binding) return;
-        var index = sceneObject.Behaviors.IndexOf(binding);
-        sceneObject.Behaviors.Move(index, index - 1);
+        if (!CanMoveBehaviorBindingUp || SelectedBehaviorBindings is not { } bindings || SelectedBehaviorBinding is not { } binding) return;
+        var index = bindings.IndexOf(binding);
+        bindings.Move(index, index - 1);
         RaiseAll();
     }
 
     public void MoveBehaviorBindingDown()
     {
-        if (!CanMoveBehaviorBindingDown || SelectedSceneObject is not { } sceneObject || SelectedBehaviorBinding is not { } binding) return;
-        var index = sceneObject.Behaviors.IndexOf(binding);
-        sceneObject.Behaviors.Move(index, index + 1);
+        if (!CanMoveBehaviorBindingDown || SelectedBehaviorBindings is not { } bindings || SelectedBehaviorBinding is not { } binding) return;
+        var index = bindings.IndexOf(binding);
+        bindings.Move(index, index + 1);
         RaiseAll();
     }
 
@@ -1290,6 +1404,47 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         RaiseAll();
     }
 
+    public void AddScenePrototypeDraft()
+    {
+        if (!CanAddScenePrototype) return;
+        var draft = ScenePrototypeDraftViewModel.NewSprite(
+            NextPrototypeId(),
+            SceneTextureIds[0],
+            SceneTextureIds);
+        draft.PropertyChanged += OnScenePrototypeDraftPropertyChanged;
+        ScenePrototypeDrafts.Add(draft);
+        SelectedScenePrototype = draft;
+        RaiseAll();
+    }
+
+    public void DeleteSelectedScenePrototypeDraft()
+    {
+        if (!CanDeleteSelectedScenePrototype || SelectedScenePrototype is not { } selected) return;
+        var index = ScenePrototypeDrafts.IndexOf(selected);
+        selected.PropertyChanged -= OnScenePrototypeDraftPropertyChanged;
+        ScenePrototypeDrafts.RemoveAt(index);
+        SelectedScenePrototype = ScenePrototypeDrafts.Count == 0
+            ? null
+            : ScenePrototypeDrafts[Math.Min(index, ScenePrototypeDrafts.Count - 1)];
+        RaiseAll();
+    }
+
+    public void MoveSelectedScenePrototypeUp()
+    {
+        if (!CanMoveSelectedScenePrototypeUp || SelectedScenePrototype is not { } selected) return;
+        var index = ScenePrototypeDrafts.IndexOf(selected);
+        ScenePrototypeDrafts.Move(index, index - 1);
+        RaiseAll();
+    }
+
+    public void MoveSelectedScenePrototypeDown()
+    {
+        if (!CanMoveSelectedScenePrototypeDown || SelectedScenePrototype is not { } selected) return;
+        var index = ScenePrototypeDrafts.IndexOf(selected);
+        ScenePrototypeDrafts.Move(index, index + 1);
+        RaiseAll();
+    }
+
     private void AddSceneObjectDraft(SceneObjectDraftViewModel draft)
     {
         draft.PropertyChanged += OnSceneObjectDraftPropertyChanged;
@@ -1307,6 +1462,17 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             if (!existing.Contains(candidate)) { return candidate; }
         }
         throw new InvalidOperationException($"无法为 {prefix} 分配新的 ObjectId。");
+    }
+
+    private string NextPrototypeId()
+    {
+        var existing = ScenePrototypeDrafts.Select(draft => draft.PrototypeId).ToHashSet(StringComparer.Ordinal);
+        for (var suffix = 1; suffix < 10000; suffix++)
+        {
+            var candidate = $"prototype-{suffix}";
+            if (!existing.Contains(candidate)) return candidate;
+        }
+        throw new InvalidOperationException("无法分配新的 PrototypeId。");
     }
 
     private bool AreSceneBehaviorsStructurallyValid
@@ -1328,6 +1494,56 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             return true;
         }
     }
+
+    private bool AreScenePrototypeDraftsStructurallyValid
+    {
+        get
+        {
+            if (ScenePrototypeDrafts.Count > 32) return false;
+            var prototypeIds = new HashSet<string>(StringComparer.Ordinal);
+            var allowedTextureIds = SceneTextureIds
+                .Select(value => uint.TryParse(
+                    value,
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var textureId) ? textureId : 0)
+                .Where(value => value != 0)
+                .ToHashSet();
+            var behaviorBindingCount = 0;
+            foreach (var draft in ScenePrototypeDrafts)
+            {
+                var prototypeId = draft.PrototypeId.Trim();
+                if (!Regex.IsMatch(prototypeId, "^[a-z][a-z0-9_-]{0,62}$", RegexOptions.CultureInvariant)
+                    || !prototypeIds.Add(prototypeId)
+                    || draft.Kind != "sprite") return false;
+                if (!TryParseFiniteNumber(draft.SizeX, out var sizeX) || sizeX <= 0 || sizeX > float.MaxValue
+                    || !TryParseFiniteNumber(draft.SizeY, out var sizeY) || sizeY <= 0 || sizeY > float.MaxValue) return false;
+                var colors = new[] { draft.ColorR, draft.ColorG, draft.ColorB, draft.ColorA };
+                if (colors.Any(value => !TryParseFiniteNumber(value, out var color) || color is < 0 or > 1)) return false;
+                if (!uint.TryParse(
+                        draft.TextureIdText,
+                        System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out var textureId)
+                    || !allowedTextureIds.Contains(textureId)) return false;
+                if (!draft.AreBehaviorsValid
+                    || draft.Behaviors.Count > 4
+                    || draft.Behaviors.Select(binding => binding.ScriptId).Distinct().Count() != draft.Behaviors.Count)
+                    return false;
+                behaviorBindingCount += draft.Behaviors.Count;
+                if (behaviorBindingCount > 128) return false;
+            }
+            return true;
+        }
+    }
+
+    private static bool TryParseFiniteNumber(string value, out double parsed) =>
+        double.TryParse(
+            value,
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out parsed)
+        && double.IsFinite(parsed);
 
     private static double ParseFiniteNumber(string value, string field)
     {
@@ -1416,6 +1632,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         finally { _allowScriptSourceSelectionChange = false; }
         SelectedAssetItem = null;
         ClearSceneObjectDrafts();
+        ClearScenePrototypeDrafts();
         SceneTextureIds.Clear();
         InspectorText = string.Empty;
         SceneGoalX = string.Empty;
@@ -1466,6 +1683,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         }
         SetSceneTextureAssignments(project);
         SetSceneObjectDrafts(project.Scene.Objects ?? throw new InvalidOperationException("Project snapshot does not expose Scene Objects."));
+        SetScenePrototypeDrafts(project.Scene.Prototypes ?? []);
     }
     private void ApplySessionProjection(ProjectSessionInfo session)
     {
@@ -1482,6 +1700,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         InspectorText = $"Project\n{session.ProjectName}\n\nSnapshot commands unavailable.";
         ClearScriptSourceProjection();
         ClearSceneObjectDrafts();
+        ClearScenePrototypeDrafts();
         SceneTextureIds.Clear();
         ClearSceneTextureAssignments();
     }
@@ -1577,6 +1796,29 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         SelectedBehaviorBinding = null;
     }
 
+    private void SetScenePrototypeDrafts(IReadOnlyList<ProjectModelScenePrototype> prototypes)
+    {
+        ClearScenePrototypeDrafts();
+        foreach (var prototype in prototypes)
+        {
+            var draft = ScenePrototypeDraftViewModel.FromSnapshot(prototype, SceneTextureIds);
+            draft.PropertyChanged += OnScenePrototypeDraftPropertyChanged;
+            ScenePrototypeDrafts.Add(draft);
+        }
+        ApplyBehaviorContractProjection();
+        SelectedScenePrototype = null;
+        RaiseAll();
+    }
+
+    private void ClearScenePrototypeDrafts()
+    {
+        foreach (var draft in ScenePrototypeDrafts)
+            draft.PropertyChanged -= OnScenePrototypeDraftPropertyChanged;
+        ScenePrototypeDrafts.Clear();
+        SelectedScenePrototype = null;
+        if (SelectedSceneObject is null) SelectedBehaviorBinding = null;
+    }
+
     private void RefreshSceneTextureChoicesFromSlots()
     {
         var values = new List<string>();
@@ -1615,10 +1857,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         }
         var contracts = AvailableBehaviorContracts.ToDictionary(entry => entry.ScriptId);
         foreach (var draft in SceneObjectDrafts) draft.ApplyBehaviorContracts(contracts, IsBehaviorContractReady);
+        foreach (var draft in ScenePrototypeDrafts) draft.ApplyBehaviorContracts(contracts, IsBehaviorContractReady);
         if (SelectedBehaviorContract is null || !contracts.ContainsKey(SelectedBehaviorContract.ScriptId))
             SelectedBehaviorContract = contracts.Values.FirstOrDefault();
         if (SelectedBehaviorBinding is not null)
-            SelectedBehaviorBinding = SelectedSceneObject?.Behaviors.FirstOrDefault(binding => binding.ScriptId == SelectedBehaviorBinding.ScriptId);
+            SelectedBehaviorBinding = SelectedBehaviorBindings?.FirstOrDefault(binding => binding.ScriptId == SelectedBehaviorBinding.ScriptId);
         RaiseAll();
     }
 
@@ -1667,6 +1910,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         if (e.PropertyName == nameof(TextureAssignmentSlotViewModel.TextureIdText)) { RefreshSceneTextureChoicesFromSlots(); }
     }
     private void OnSceneObjectDraftPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
+    private void OnScenePrototypeDraftPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
     private void OnProjectPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(EditorProjectViewModel.Session)) { ReconcileProjectIdentity(); }
@@ -1712,8 +1956,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(AuthoringRevisionStatus));
         OnPropertyChanged(nameof(CapabilitySummary));
         OnPropertyChanged(nameof(SceneObjectCountStatus));
+        OnPropertyChanged(nameof(ScenePrototypeCountStatus));
         OnPropertyChanged(nameof(IsGameplayEnabled));
         OnPropertyChanged(nameof(HasSelectedSceneObject));
+        OnPropertyChanged(nameof(HasSelectedScenePrototype));
         OnPropertyChanged(nameof(AvailableBehaviorContracts));
         OnPropertyChanged(nameof(IsBehaviorContractReady));
         OnPropertyChanged(nameof(BehaviorContractStatus));
@@ -1766,6 +2012,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanDeleteSelectedSceneObject));
         OnPropertyChanged(nameof(CanMoveSelectedSceneObjectUp));
         OnPropertyChanged(nameof(CanMoveSelectedSceneObjectDown));
+        OnPropertyChanged(nameof(SupportsScenePrototypeAuthoring));
+        OnPropertyChanged(nameof(CanAddScenePrototype));
+        OnPropertyChanged(nameof(CanDeleteSelectedScenePrototype));
+        OnPropertyChanged(nameof(CanMoveSelectedScenePrototypeUp));
+        OnPropertyChanged(nameof(CanMoveSelectedScenePrototypeDown));
         OnPropertyChanged(nameof(CanAddBehaviorBinding));
         OnPropertyChanged(nameof(CanRemoveBehaviorBinding));
         OnPropertyChanged(nameof(CanMoveBehaviorBindingUp));
