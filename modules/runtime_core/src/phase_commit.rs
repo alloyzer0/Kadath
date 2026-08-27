@@ -297,14 +297,16 @@ struct DomainState {
     // Gameplay 热路径只触碰 compact queue；将其放在大 ABI 队列之前，
     // 避免固定域常规提交因字段偏移额外驻留一页未使用的公共存储。
     trusted_event_queue: BoundedVec<TrustedEventEntry, EVENT_CAPACITY>,
-    event_queue: BoundedVec<EventEntry, EVENT_CAPACITY>,
-    structural_queue: BoundedVec<StructuralEntry, STRUCTURAL_CAPACITY>,
     event_successor_generation: u32,
     structural_successor_generation: u32,
     event_has_drained: bool,
     structural_has_drained: bool,
     next_event_sequence: u64,
     next_structural_sequence: u64,
+    // 公共 ABI 队列仍按原容量保留，但放在热元数据之后，避免 Gameplay
+    // 常规 begin/drain 因写 generation/sequence 额外触碰这块冷存储。
+    event_queue: BoundedVec<EventEntry, EVENT_CAPACITY>,
+    structural_queue: BoundedVec<StructuralEntry, STRUCTURAL_CAPACITY>,
 }
 
 impl DomainState {
