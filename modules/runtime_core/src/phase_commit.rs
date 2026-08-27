@@ -156,33 +156,40 @@ struct TrustedEventEntry {
     sequence: u64,
     generation: u32,
     ended: bool,
-    target: abi::kadath_runtime_object_ref_v1_t,
-    other: abi::kadath_runtime_object_ref_v1_t,
+    target_source_index: u8,
+    other_source_index: u8,
 }
 
 impl TrustedEventEntry {
-    fn to_abi(self, domain: u32) -> abi::kadath_runtime_phase_event_v1_t {
+    fn to_abi(
+        self,
+        domain: u32,
+        state: &object_authority::RuntimeState,
+    ) -> Option<abi::kadath_runtime_phase_event_v1_t> {
         let name: &[u8] = if self.ended {
             b"contact_end"
         } else {
             b"contact_begin"
         };
+        let target = trusted_source_ref(state, self.target_source_index)?;
+        let other = trusted_source_ref(state, self.other_source_index)?;
         let mut event: abi::kadath_runtime_phase_event_v1_t = unsafe { mem::zeroed() };
         event.struct_size = mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
         event.domain = domain;
         event.sequence = self.sequence;
         event.generation = self.generation;
         event.has_other = 1;
-        event.target = self.target;
-        event.other = self.other;
+        event.target = target;
+        event.other = other;
         event.name_length = name.len() as u32;
         event.name[..name.len()].copy_from_slice(name);
-        event
+        Some(event)
     }
 }
 
 fn compact_trusted_event(
     event: &abi::kadath_runtime_phase_event_v1_t,
+    state: &object_authority::RuntimeState,
 ) -> Option<TrustedEventEntry> {
     if event.field_count != 0
         || event.has_sender != 0
@@ -199,13 +206,44 @@ fn compact_trusted_event(
     } else {
         return None;
     };
+    let target_source_index = trusted_source_index(state, &event.target)?;
+    let other_source_index = trusted_source_index(state, &event.other)?;
     Some(TrustedEventEntry {
         sequence: event.sequence,
         generation: event.generation,
         ended,
-        target: event.target,
-        other: event.other,
+        target_source_index,
+        other_source_index,
     })
+}
+
+/// Gameplay 只会为 authored source 发布接触事件；队列内部保存 source index，
+/// drain 时再从 Object Authority 解析最新且仍 active 的公开引用。
+fn trusted_source_index(
+    state: &object_authority::RuntimeState,
+    value: &abi::kadath_runtime_object_ref_v1_t,
+) -> Option<u8> {
+    let key = read_object_key(value).ok()?;
+    let index = state.exact_index(key, false)?;
+    let source_index = u8::try_from(index).ok()?;
+    let record = state.slots[index].record.as_ref()?;
+    (record.lifecycle == object_authority::Lifecycle::Active
+        && record.source_index == Some(source_index))
+    .then_some(source_index)
+}
+
+fn trusted_source_ref(
+    state: &object_authority::RuntimeState,
+    source_index: u8,
+) -> Option<abi::kadath_runtime_object_ref_v1_t> {
+    let record = state
+        .slots
+        .get(usize::from(source_index))?
+        .record
+        .as_ref()?;
+    (record.lifecycle == object_authority::Lifecycle::Active
+        && record.source_index == Some(source_index))
+    .then(|| object_ref(record, state.world_epoch))
 }
 
 #[derive(Clone, Copy)]
@@ -1238,6 +1276,10 @@ pub(crate) fn submit_trusted_gameplay_events_with(
         domain_state.event_successor_generation,
         domain_state.event_has_drained,
     )?;
+    let state = core
+        .live
+        .as_ref()
+        .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
     let domain_state = core.phase.domain_mut(domain)?;
     for index in 0..event_count {
         let event = build_event(index);
@@ -1249,7 +1291,7 @@ pub(crate) fn submit_trusted_gameplay_events_with(
         copied.generation = generation;
         // 仅对内部 Gameplay 生成的固定接触事件压缩；任意不满足规范的
         // trusted 调用仍保留完整 ABI，确保测试和未来扩展不会丢字段。
-        if let Some(compact) = compact_trusted_event(&copied) {
+        if let Some(compact) = compact_trusted_event(&copied, state) {
             domain_state.trusted_event_queue.push(compact)?;
         } else {
             domain_state.event_queue.push(EventEntry { item: copied })?;
@@ -1361,7 +1403,10 @@ pub(crate) fn drain_events(
             generic_index += 1;
         } else {
             let entry = trusted.expect("trusted event selected");
-            let item = entry.to_abi(domain);
+            let Some(item) = entry.to_abi(domain, state) else {
+                trusted_index += 1;
+                continue;
+            };
             if event_objects_live(&item, state) {
                 unsafe { ptr::write(output_ptr.add(output_index), item) };
                 output_index += 1;
