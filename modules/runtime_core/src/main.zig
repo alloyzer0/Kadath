@@ -28,6 +28,8 @@ pub const EntityId = u64;
 pub const invalid_entity: EntityId = c.KADATH_RUNTIME_ENTITY_INVALID;
 pub const TextureId = u32;
 pub const invalid_texture: TextureId = 0;
+pub const lifecycle_pending_spawn: u32 = c.KADATH_RUNTIME_LIFECYCLE_PENDING_SPAWN;
+pub const lifecycle_active: u32 = c.KADATH_RUNTIME_LIFECYCLE_ACTIVE;
 
 pub const ObjectRef = c.kadath_runtime_object_ref_v1_t;
 pub const ObjectView = c.kadath_runtime_object_view_v1_t;

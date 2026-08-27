@@ -478,8 +478,8 @@ fn objectId(value: runtime_core.ObjectRef) !scene_api.ObjectId {
 fn record(view: runtime_core.ObjectView) !RuntimeRecord {
     return .{
         .state = switch (view.lifecycle) {
-            1 => .pending_spawn,
-            2 => .active,
+            runtime_core.lifecycle_pending_spawn => .pending_spawn,
+            runtime_core.lifecycle_active => .active,
             else => .pending_destroy,
         },
         .object_id = try objectId(view.object_ref),

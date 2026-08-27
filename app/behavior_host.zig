@@ -568,7 +568,7 @@ const OverlayHostContext = struct {
         for (try generation.visibleViews(&views), 0..) |view, index| {
             context.handles[index] = view.object_ref;
             context.positions[index] = view.position;
-            context.present[index] = view.lifecycle == 2;
+            context.present[index] = view.lifecycle == runtime_core.lifecycle_active;
             context.handle_count += 1;
         }
         return context;

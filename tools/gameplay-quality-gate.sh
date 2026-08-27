@@ -119,6 +119,10 @@ if [[ -f "$coverage_report" ]]; then
             "$decision_manifest" || blocked+=("critical decision manifest has uncovered or invalid rows")
         [[ "$decision_covered" == "$manifest_covered" && "$decision_total" == "$manifest_total" ]] || \
             blocked+=("critical decision report totals mismatch manifest")
+        for decision_id in timer_priority contact_diff_edges paired_publication restart_reset phase_capacity snapshot_outcome_no_replay public_abi_preflight failure_no_side_effect directed_contact_order behavior_overflow_isolation; do
+            [[ "$(awk -F '\t' -v id="$decision_id" 'NR > 1 && $4 == id { count++ } END { print count+0 }' "$decision_manifest")" == 1 ]] || \
+                blocked+=("critical decision row missing or duplicated: $decision_id")
+        done
     fi
     awk -v n="$decision_percent" 'BEGIN { exit !(n+0 == 100) }' || blocked+=("critical decision coverage below 100%")
     verify_bound_file "$coverage_report" GAMEPLAY_COVERAGE_RUST_JSON GAMEPLAY_COVERAGE_RUST_JSON_SHA256 || blocked+=("Rust coverage artifact hash mismatch")
