@@ -333,6 +333,7 @@ internal static class ScriptAnalysisHostVerifier
         public Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<AuthoringMutationResult> UndoAuthoringAsync(ProjectSessionInfo project, AuthoringUndoParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
+        public Task<AuthoringMutationResult> RedoAuthoringAsync(ProjectSessionInfo project, AuthoringRedoParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<ScriptSourceMutationResult> EditScriptSourceAsync(ProjectSessionInfo project, ScriptSourceEditParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ProjectSessionInfo project, ScriptSourceUndoParameters parameters, CancellationToken cancellationToken) => throw Unsupported();
         public Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ProjectSessionInfo project, ScriptAssetCreateParameters parameters, CancellationToken cancellationToken) => throw Unsupported();

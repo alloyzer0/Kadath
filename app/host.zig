@@ -106,13 +106,12 @@ pub const Host = struct {
         var behavior_candidate: ?behavior_host.Runtime = null;
         errdefer if (behavior_candidate) |*runtime| runtime.deinit();
         if (usesBehaviorRuntime(&scene)) {
-            if (script_path) |path| {
+            if (sceneHasBehaviors(&scene)) {
+                const path = script_path orelse return error.MissingScriptPath;
                 const loaded = try behavior_host.loadWithIdentity(io, std.heap.page_allocator, path, &scene);
                 script_identity = loaded.identity;
                 behavior_candidate = loaded.value;
                 std.log.info("Loaded behavior package: {s}, artifact_version={d}", .{ path, loaded.artifact_version });
-            } else if (sceneHasBehaviors(&scene)) {
-                return error.MissingScriptPath;
             }
         } else if (script_path) |path| {
             const loaded = try script_api.loadWithIdentity(io, std.heap.page_allocator, path);
@@ -447,6 +446,10 @@ pub const Host = struct {
             return error.MissingScriptPath;
         };
         if (usesBehaviorRuntime(&self.scene)) {
+            if (!sceneHasBehaviors(&self.scene)) {
+                std.log.warn("Script reload ignored because the neutral Scene has no Behavior bindings", .{});
+                return;
+            }
             var candidate = (try behavior_host.loadWithIdentity(
                 self.io,
                 std.heap.page_allocator,
@@ -510,10 +513,10 @@ pub const Host = struct {
         var candidate_startup: ?behavior_host.TranslationBatch = null;
         var candidate_program = script_api.Program{};
         var candidate_script_enabled = false;
-        if (usesBehaviorRuntime(&candidate)) {
+        if (usesBehaviorRuntime(&candidate) and sceneHasBehaviors(&candidate)) {
             if (self.behavior_runtime.isLoaded()) {
                 candidate_behavior = try self.behavior_runtime.cloneForSceneReload(std.heap.page_allocator, &candidate);
-            } else if (sceneHasBehaviors(&candidate)) {
+            } else {
                 const script_path = self.script_path orelse return error.MissingScriptPath;
                 candidate_behavior = (try behavior_host.loadWithIdentity(
                     self.io,
@@ -527,13 +530,15 @@ pub const Host = struct {
                 try replacement.applyTranslationDeltas(batch.slice());
                 candidate_startup = batch;
             }
-        } else if (self.script_path) |script_path| {
-            candidate_program = try script_api.load(self.io, std.heap.page_allocator, script_path);
-            candidate_script_enabled = candidate_program.hasInstructions();
-            if (candidate_script_enabled) {
-                var command_buffer: script_api.CommandBuffer = undefined;
-                const commands = try candidate_program.emit(.on_start, 0.0, &command_buffer);
-                try applyScriptCommandsToGeneration(&replacement, commands);
+        } else if (!usesBehaviorRuntime(&candidate)) {
+            if (self.script_path) |script_path| {
+                candidate_program = try script_api.load(self.io, std.heap.page_allocator, script_path);
+                candidate_script_enabled = candidate_program.hasInstructions();
+                if (candidate_script_enabled) {
+                    var command_buffer: script_api.CommandBuffer = undefined;
+                    const commands = try candidate_program.emit(.on_start, 0.0, &command_buffer);
+                    try applyScriptCommandsToGeneration(&replacement, commands);
+                }
             }
         }
         if (candidate_behavior.isLoaded()) {
@@ -821,6 +826,20 @@ test "Scene v5 and v6 share Behavior Runtime while v4 keeps legacy scripts" {
     try std.testing.expect(usesBehaviorRuntime(&scene));
     scene.schemaVersion = scene_api.current_schema_version;
     try std.testing.expect(usesBehaviorRuntime(&scene));
+}
+
+test "neutral Scene without bindings does not require a Behavior package" {
+    var scene = scene_api.Scene{
+        .schemaVersion = scene_api.current_schema_version,
+        .textures = scene_api.default_scene.textures,
+        .objects = undefined,
+    };
+    scene.objects.count = 1;
+    scene.objects.entries[0] = scene_api.default_scene.objects.entries[0];
+    scene.objects.entries[0].kind = .sprite;
+    scene.objects.entries[0].behaviors.count = 0;
+    try std.testing.expect(usesBehaviorRuntime(&scene));
+    try std.testing.expect(!sceneHasBehaviors(&scene));
 }
 
 fn applyScriptCommandsToGeneration(generation: *scene_generation_api.SceneGeneration, commands: []const script_api.Command) !void {

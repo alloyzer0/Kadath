@@ -34,6 +34,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
     public bool CanImportTexture => SupportsCommand("texture_import");
     public bool CanApplyAuthoring => SupportsCommand("authoring_apply");
     public bool CanUndoAuthoring => SupportsCommand("authoring_undo");
+    public bool CanRedoAuthoring => SupportsCommand("authoring_redo");
     public bool CanBake => SupportsCommand("bake_start");
     public bool CanStartWatch => SupportsCommand("watch_start");
     public bool CanStopWatch => SupportsCommand("watch_stop");
@@ -70,6 +71,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
         RaisePropertyChanged(nameof(CanImportTexture));
         RaisePropertyChanged(nameof(CanApplyAuthoring));
         RaisePropertyChanged(nameof(CanUndoAuthoring));
+        RaisePropertyChanged(nameof(CanRedoAuthoring));
         RaisePropertyChanged(nameof(CanBake));
         RaisePropertyChanged(nameof(CanStartWatch));
         RaisePropertyChanged(nameof(CanStopWatch));

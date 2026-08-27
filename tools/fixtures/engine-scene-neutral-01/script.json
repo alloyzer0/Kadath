@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "instructions": [
+    { "hook": "on_start", "op": "set_goal_position", "value": [0, 0] },
+    { "hook": "fixed_update", "op": "move_goal_velocity", "value": [0, 0] }
+  ]
+}

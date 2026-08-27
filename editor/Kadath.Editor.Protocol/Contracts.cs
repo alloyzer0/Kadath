@@ -254,7 +254,10 @@ public sealed record ProjectModelScene(
     uint GoalTextureId,
     uint HazardTextureId,
     IReadOnlyList<ProjectModelTexture>? Textures = null,
-    IReadOnlyList<ProjectModelSceneObject>? Objects = null);
+    IReadOnlyList<ProjectModelSceneObject>? Objects = null,
+    // v7 起 Gameplay 是可选能力；旧字段保留默认值以维持现有协议调用方兼容。
+    string GameplayProfile = "goal_hazard_v1",
+    double? GameplayTimeLimitSeconds = null);
 
 public sealed record ProjectModelTexture(uint TextureId, string Artifact);
 
@@ -419,6 +422,10 @@ public sealed record AuthoringUndoParameters(
     string? ProjectName,
     string ExpectedRevision);
 
+public sealed record AuthoringRedoParameters(
+    string? ProjectName,
+    string ExpectedRevision);
+
 public sealed record AuthoringMutationResult(
     string Operation,
     string State,
@@ -428,7 +435,8 @@ public sealed record AuthoringMutationResult(
     string[] ChangedFields,
     int UndoDepth,
     ProjectModelSnapshot ProjectSnapshot,
-    HierarchySnapshot HierarchySnapshot);
+    HierarchySnapshot HierarchySnapshot,
+    int RedoDepth = 0);
 public sealed record ProjectValidateParameters(string? ProjectName = null);
 
 public sealed record ProjectValidateResult(

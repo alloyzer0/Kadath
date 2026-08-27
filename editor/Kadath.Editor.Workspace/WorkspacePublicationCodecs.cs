@@ -13,9 +13,11 @@ internal static class WorkspaceSceneCodec
     internal const string LegacyFormat = "KSCN-SCENE-V4";
     internal const string BehaviorFormat = "KSCN-SCENE-V5";
     internal const string PrototypeFormat = "KSCN-SCENE-V6";
+    internal const string CurrentFormat = "KSCN-SCENE-V7";
     private const int LegacyVersion = 4;
     private const int BehaviorVersion = 5;
     private const int PrototypeVersion = 6;
+    private const int CurrentVersion = 7;
     private const int HeaderBytes = 16;
     private const int MaxArtifactBytes = 1024 * 1024;
 
@@ -24,7 +26,8 @@ internal static class WorkspaceSceneCodec
         var scene = WorkspaceSceneDocumentCodec.Parse(source);
         var artifactVersion = scene.SourceSchemaVersion switch
         {
-            WorkspaceSceneDocumentCodec.CurrentSchemaVersion => PrototypeVersion,
+            WorkspaceSceneDocumentCodec.CurrentSchemaVersion => CurrentVersion,
+            WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => PrototypeVersion,
             WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => BehaviorVersion,
             _ => LegacyVersion
         };
@@ -35,7 +38,8 @@ internal static class WorkspaceSceneCodec
             + textures.Sum(value => 2 * sizeof(uint) + value.Artifact.Length)
             + sizeof(uint)
             + objects.Sum(value => sizeof(uint) + value.EntryBytes(artifactVersion))
-            + (artifactVersion == PrototypeVersion ? sizeof(uint) + prototypes.Sum(value => sizeof(uint) + value.EntryBytes()) : 0);
+            + (artifactVersion >= PrototypeVersion ? sizeof(uint) + prototypes.Sum(value => sizeof(uint) + value.EntryBytes()) : 0)
+            + (artifactVersion == CurrentVersion ? 2 * sizeof(uint) : 0);
         var artifact = new byte[HeaderBytes + payloadBytes];
         Encoding.ASCII.GetBytes("KSCN").CopyTo(artifact, 0);
         WriteUInt32(artifact, 4, checked((uint)artifactVersion));
@@ -86,7 +90,7 @@ internal static class WorkspaceSceneCodec
                 WriteBindings(artifact, ref offset, entry.Value.Behaviors ?? Array.Empty<WorkspaceSceneBehaviorBinding>());
             }
         }
-        if (artifactVersion == PrototypeVersion)
+        if (artifactVersion >= PrototypeVersion)
         {
             WriteUInt32(artifact, offset, checked((uint)prototypes.Length));
             offset += sizeof(uint);
@@ -108,6 +112,12 @@ internal static class WorkspaceSceneCodec
                 WriteBindings(artifact, ref offset, entry.Value.Behaviors);
             }
         }
+        if (artifactVersion == CurrentVersion)
+        {
+            WriteUInt32(artifact, offset, GameplayProfileValue(scene.Gameplay.Profile));
+            WriteSingle(artifact, offset + sizeof(uint), (float)scene.Gameplay.TimeLimitSeconds);
+            offset += 2 * sizeof(uint);
+        }
         if (offset != artifact.Length) throw new InvalidOperationException("Internal KSCN length mismatch.");
         _ = ValidateArtifact(artifact);
         return artifact;
@@ -120,7 +130,7 @@ internal static class WorkspaceSceneCodec
         var artifactVersion = ReadUInt32(artifact, 4);
         var schemaVersion = ReadUInt32(artifact, 8);
         if (artifactVersion != schemaVersion
-            || artifactVersion is not (LegacyVersion or BehaviorVersion or PrototypeVersion)
+            || artifactVersion is not (LegacyVersion or BehaviorVersion or PrototypeVersion or CurrentVersion)
             || ReadUInt32(artifact, 12) != artifact.Length - HeaderBytes)
             throw new InvalidDataException("Scene artifact header mismatch.");
         var offset = HeaderBytes;
@@ -135,7 +145,10 @@ internal static class WorkspaceSceneCodec
             textures.Add(new WorkspaceSceneTexture(textureId, path));
         }
         var objectCount = ReadRequiredUInt32(artifact, ref offset);
-        if (objectCount is < WorkspaceSceneDocumentCodec.MinObjectCount or > WorkspaceSceneDocumentCodec.MaxObjectCount)
+        var minimumObjectCount = artifactVersion == CurrentVersion
+            ? WorkspaceSceneDocumentCodec.MinNeutralObjectCount
+            : WorkspaceSceneDocumentCodec.MinObjectCount;
+        if (objectCount < minimumObjectCount || objectCount > WorkspaceSceneDocumentCodec.MaxObjectCount)
             throw new InvalidDataException("Scene artifact object count mismatch.");
         var objects = new List<WorkspaceSceneObject>();
         for (var index = 0; index < objectCount; index++)
@@ -194,7 +207,7 @@ internal static class WorkspaceSceneCodec
             objects.Add(new WorkspaceSceneObject(objectId, kind, position, size, color, textureId, moveSpeed, patrolMinY, patrolMaxY, patrolSpeed, behaviors));
         }
         var prototypes = new List<WorkspaceScenePrototype>();
-        if (artifactVersion == PrototypeVersion)
+        if (artifactVersion >= PrototypeVersion)
         {
             var prototypeCount = ReadRequiredUInt32(artifact, ref offset);
             if (prototypeCount > WorkspaceSceneDocumentCodec.MaxPrototypeCount) throw new InvalidDataException("Scene artifact prototype count mismatch.");
@@ -214,10 +227,23 @@ internal static class WorkspaceSceneCodec
                 prototypes.Add(new WorkspaceScenePrototype(prototypeId, kind, size, color, textureId, behaviors));
             }
         }
+        var gameplay = WorkspaceSceneDocumentCodec.LegacyGameplay;
+        if (artifactVersion == CurrentVersion)
+        {
+            gameplay = new WorkspaceSceneGameplay(
+                GameplayProfileName(ReadRequiredUInt32(artifact, ref offset)),
+                ReadRequiredSingle(artifact, ref offset));
+        }
         if (offset != artifact.Length) throw new InvalidDataException("Scene artifact contains trailing bytes.");
-        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects, prototypes, checked((int)schemaVersion)); }
+        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects, prototypes, checked((int)schemaVersion), gameplay); }
         catch (WorkspaceProjectValidationException exception) { throw new InvalidDataException(exception.Message, exception); }
-        var format = artifactVersion switch { PrototypeVersion => PrototypeFormat, BehaviorVersion => BehaviorFormat, _ => LegacyFormat };
+        var format = artifactVersion switch
+        {
+            CurrentVersion => CurrentFormat,
+            PrototypeVersion => PrototypeFormat,
+            BehaviorVersion => BehaviorFormat,
+            _ => LegacyFormat
+        };
         return new WorkspaceArtifactInfo(Convert.ToHexString(SHA256.HashData(artifact)).ToLowerInvariant(), artifact.LongLength, format, checked((int)artifactVersion), checked((int)artifactVersion));
     }
 
@@ -237,6 +263,20 @@ internal static class WorkspaceSceneCodec
         3 => WorkspaceSceneDocumentCodec.GoalKind,
         4 => WorkspaceSceneDocumentCodec.PatrolHazardKind,
         _ => throw new InvalidDataException($"Scene artifact contains unsupported object kind: {kind}.")
+    };
+
+    private static uint GameplayProfileValue(string profile) => profile switch
+    {
+        WorkspaceSceneDocumentCodec.NoGameplayProfile => 0,
+        WorkspaceSceneDocumentCodec.GoalHazardGameplayProfile => 1,
+        _ => throw new InvalidOperationException($"Unsupported Gameplay profile: {profile}.")
+    };
+
+    private static string GameplayProfileName(uint profile) => profile switch
+    {
+        0 => WorkspaceSceneDocumentCodec.NoGameplayProfile,
+        1 => WorkspaceSceneDocumentCodec.GoalHazardGameplayProfile,
+        _ => throw new InvalidDataException($"Scene artifact contains unsupported Gameplay profile: {profile}.")
     };
 
     private static uint ReadRequiredUInt32(byte[] bytes, ref int offset)

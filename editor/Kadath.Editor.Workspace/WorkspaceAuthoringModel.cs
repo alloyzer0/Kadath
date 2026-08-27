@@ -188,8 +188,16 @@ public sealed class WorkspaceAuthoringModel
             throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Authoring undo token cannot be projected.", exception);
         }
         Commit(project, currentBytes, intended, token.SceneChanged, token.ScriptChanged, cancellationToken);
+        // 恢复前的当前字节就是反向恢复令牌；Undo 与 Redo 共用同一事务实现。
+        var inverseToken = new WorkspaceAuthoringUndoToken(
+            project.ProjectName,
+            restored.Project.AuthoringRevision,
+            currentBytes.Scene,
+            currentBytes.Script,
+            token.SceneChanged,
+            token.ScriptChanged);
         return new WorkspaceAuthoringCommit("succeeded", current.Project.AuthoringRevision, restored.Project.AuthoringRevision,
-            [], null, restored.Project, restored.Hierarchy);
+            [], inverseToken, restored.Project, restored.Hierarchy);
     }
 
     private static T Execute<T>(Func<T> operation, CancellationToken cancellationToken)
@@ -328,6 +336,7 @@ public sealed class WorkspaceAuthoringModel
     private static NormalizedPatch NormalizePatch(ProjectModelSnapshot current, AssetCatalogSnapshot? assets, AuthoringPatch? patch)
     {
         if (patch is null) throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "Authoring patch is required.");
+        var gameplay = GameplayFromSnapshot(current.Scene);
         ValidateVector(patch.SceneGoalPosition, "scene.goal.position");
         ValidateVector(patch.ScriptGoalPosition, "script.goal.position");
         ValidateVector(patch.ScriptGoalVelocity, "script.goal.velocity");
@@ -335,6 +344,11 @@ public sealed class WorkspaceAuthoringModel
             || patch.SceneGoalTextureId is not null || patch.SceneHazardTextureId is not null))
         {
             throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "sceneObjects cannot be combined with fixed Scene fields.");
+        }
+        if (!gameplay.IsEnabled && (patch.SceneGoalPosition is not null || patch.ScenePlayerTextureId is not null
+            || patch.SceneGoalTextureId is not null || patch.SceneHazardTextureId is not null))
+        {
+            throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "Neutral Scene must be authored through sceneObjects, not fixed Gameplay fields.");
         }
         var sceneTextures = NormalizeSceneTextures(current.Scene, assets, patch.SceneTextures);
         var textureSet = sceneTextures.ResolvedTextures ?? current.Scene.Textures ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene texture set is missing from the snapshot.");
@@ -346,7 +360,7 @@ public sealed class WorkspaceAuthoringModel
         WorkspaceSceneObject[]? normalizedObjects = null;
         if (patch.SceneObjects is not null)
         {
-            try { normalizedObjects = WorkspaceSceneDocumentCodec.NormalizeDefinitions(patch.SceneObjects, workspaceTextures, TargetSceneSchema(current.Scene.SchemaVersion)); }
+            try { normalizedObjects = WorkspaceSceneDocumentCodec.NormalizeDefinitions(patch.SceneObjects, workspaceTextures, TargetSceneSchema(current.Scene.SchemaVersion), gameplay); }
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
         }
         else if (sceneTextures.ResolvedTextures is not null)
@@ -354,7 +368,7 @@ public sealed class WorkspaceAuthoringModel
             try
             {
                 _ = WorkspaceSceneDocumentCodec.NormalizeDefinitions(
-                    currentObjects.Select(ToDefinition).ToArray(), workspaceTextures, TargetSceneSchema(current.Scene.SchemaVersion));
+                    currentObjects.Select(ToDefinition).ToArray(), workspaceTextures, TargetSceneSchema(current.Scene.SchemaVersion), gameplay);
             }
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
         }
@@ -394,14 +408,18 @@ public sealed class WorkspaceAuthoringModel
             ? current.Textures
             : normalized.ResolvedSceneTextures.Select(value => new WorkspaceSceneTexture(value.TextureId, value.Artifact)).ToArray();
         var objects = normalized.ResolvedSceneObjects ?? ApplyFixedObjectPatch(current.Objects, normalized.Patch);
-        if (current.SourceSchemaVersion is WorkspaceSceneDocumentCodec.LegacySchemaVersion or WorkspaceSceneDocumentCodec.BehaviorSchemaVersion or WorkspaceSceneDocumentCodec.CurrentSchemaVersion
+        if (current.SourceSchemaVersion is WorkspaceSceneDocumentCodec.LegacySchemaVersion
+            or WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
+            or WorkspaceSceneDocumentCodec.PrototypeSchemaVersion
+            or WorkspaceSceneDocumentCodec.CurrentSchemaVersion
             || normalized.ResolvedSceneObjects is not null)
         {
             try
             {
                 return current.SourceSchemaVersion switch
                 {
-                    WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV6(textures, objects, current.Prototypes),
+                    WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV7(textures, objects, current.Prototypes, current.Gameplay),
+                    WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV6(textures, objects, current.Prototypes),
                     WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV5(textures, objects),
                     _ => WorkspaceSceneDocumentCodec.SerializeV4(textures, objects)
                 };
@@ -491,7 +509,9 @@ public sealed class WorkspaceAuthoringModel
         if (normalized.ResolvedSceneObjects is not { } requested) return;
         var currentObjects = current.Scene.Objects
             ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene object set is missing from the snapshot.");
-        if (current.Scene.SchemaVersion is not (WorkspaceSceneDocumentCodec.BehaviorSchemaVersion or WorkspaceSceneDocumentCodec.CurrentSchemaVersion)) return;
+        if (current.Scene.SchemaVersion is not (WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
+            or WorkspaceSceneDocumentCodec.PrototypeSchemaVersion
+            or WorkspaceSceneDocumentCodec.CurrentSchemaVersion)) return;
         if (!BehaviorCollectionsChanged(currentObjects, requested)) return;
 
         WorkspaceBehaviorContractObservation observation;
@@ -565,9 +585,15 @@ public sealed class WorkspaceAuthoringModel
         sourceSchemaVersion switch
         {
             WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.CurrentSchemaVersion,
+            WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => WorkspaceSceneDocumentCodec.PrototypeSchemaVersion,
             WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => WorkspaceSceneDocumentCodec.BehaviorSchemaVersion,
             _ => WorkspaceSceneDocumentCodec.LegacySchemaVersion
         };
+
+    private static WorkspaceSceneGameplay GameplayFromSnapshot(ProjectModelScene scene) =>
+        new(scene.GameplayProfile, scene.GameplayProfile == WorkspaceSceneDocumentCodec.NoGameplayProfile
+            ? 0
+            : scene.GameplayTimeLimitSeconds ?? WorkspaceSceneDocumentCodec.LegacyGameplay.TimeLimitSeconds);
 
     private static JsonObject ParseObject(byte[] bytes, string name)
     {

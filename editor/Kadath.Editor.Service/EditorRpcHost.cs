@@ -176,6 +176,9 @@ internal sealed class EditorRpcHost
                 case "authoring_undo":
                     await WriteResponseAsync(request.Id, true, await _session.UndoAuthoringAsync(DeserializeParams<AuthoringUndoParameters>(request), request.Id), null);
                     break;
+                case "authoring_redo":
+                    await WriteResponseAsync(request.Id, true, await _session.RedoAuthoringAsync(DeserializeParams<AuthoringRedoParameters>(request), request.Id), null);
+                    break;
                 case "bake_start":
                     await WriteResponseAsync(request.Id, true, await _session.BakeAsync(DeserializeParams<BakeStartParameters>(request), request.Id), null);
                     break;

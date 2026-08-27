@@ -288,7 +288,16 @@ public sealed class WorkspaceReadModel
         return new ProjectModelSnapshot(EditorSnapshotVersions.ProjectModel, project.ProjectName,
             authoringRevision,
             new ProjectModelFiles(loaded.Bytes.ProjectDirectory, loaded.Bytes.ScenePath, loaded.Bytes.ScriptPath, loaded.Bytes.PreviewPath),
-            new ProjectModelScene(scene.SourceSchemaVersion, goal.Position.ToArray(), player.TextureId, goal.TextureId, hazard.TextureId, textures, objects),
+            new ProjectModelScene(
+                scene.SourceSchemaVersion,
+                goal?.Position.ToArray() ?? [],
+                player?.TextureId ?? 0,
+                goal?.TextureId ?? 0,
+                hazard?.TextureId ?? 0,
+                textures,
+                objects,
+                scene.Gameplay.Profile,
+                scene.Gameplay.IsEnabled ? scene.Gameplay.TimeLimitSeconds : null),
             new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity, dependencies), new ProjectModelPreview(previewVersion));
     }
 

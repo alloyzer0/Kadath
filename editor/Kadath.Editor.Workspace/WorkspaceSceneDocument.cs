@@ -14,6 +14,11 @@ internal sealed record WorkspaceSceneBehaviorBinding(
     uint ScriptId,
     WorkspaceSceneBehaviorParameter[] Parameters);
 
+internal sealed record WorkspaceSceneGameplay(string Profile, double TimeLimitSeconds)
+{
+    internal bool IsEnabled => Profile != WorkspaceSceneDocumentCodec.NoGameplayProfile;
+}
+
 internal sealed record WorkspaceScenePrototype(
     string PrototypeId,
     string Kind,
@@ -54,18 +59,21 @@ internal sealed record WorkspaceSceneDocument(
     int SourceSchemaVersion,
     WorkspaceSceneTexture[] Textures,
     WorkspaceSceneObject[] Objects,
-    WorkspaceScenePrototype[] Prototypes)
+    WorkspaceScenePrototype[] Prototypes,
+    WorkspaceSceneGameplay Gameplay)
 {
-    internal WorkspaceSceneObject Player => Objects.Single(value => value.Kind == WorkspaceSceneDocumentCodec.PlayerKind);
-    internal WorkspaceSceneObject Goal => Objects.Single(value => value.Kind == WorkspaceSceneDocumentCodec.GoalKind);
-    internal WorkspaceSceneObject PrimaryHazard => Objects.First(value => value.Kind == WorkspaceSceneDocumentCodec.PatrolHazardKind);
+    internal WorkspaceSceneObject? Player => Objects.SingleOrDefault(value => value.Kind == WorkspaceSceneDocumentCodec.PlayerKind);
+    internal WorkspaceSceneObject? Goal => Objects.SingleOrDefault(value => value.Kind == WorkspaceSceneDocumentCodec.GoalKind);
+    internal WorkspaceSceneObject? PrimaryHazard => Objects.FirstOrDefault(value => value.Kind == WorkspaceSceneDocumentCodec.PatrolHazardKind);
 }
 
 internal static partial class WorkspaceSceneDocumentCodec
 {
     internal const int LegacySchemaVersion = 4;
     internal const int BehaviorSchemaVersion = 5;
-    internal const int CurrentSchemaVersion = 6;
+    internal const int PrototypeSchemaVersion = 6;
+    internal const int CurrentSchemaVersion = 7;
+    internal const int MinNeutralObjectCount = 1;
     internal const int MinObjectCount = 3;
     internal const int MaxObjectCount = 64;
     internal const int MaxBehaviorBindingsPerObject = 4;
@@ -78,6 +86,11 @@ internal static partial class WorkspaceSceneDocumentCodec
     internal const string PlayerKind = "player";
     internal const string GoalKind = "goal";
     internal const string PatrolHazardKind = "patrol_hazard";
+    internal const string NoGameplayProfile = "none";
+    internal const string GoalHazardGameplayProfile = "goal_hazard_v1";
+
+    internal static readonly WorkspaceSceneGameplay NeutralGameplay = new(NoGameplayProfile, 0);
+    internal static readonly WorkspaceSceneGameplay LegacyGameplay = new(GoalHazardGameplayProfile, 3);
 
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -104,14 +117,21 @@ internal static partial class WorkspaceSceneDocumentCodec
                 3 => ReadProperties(root, ["schemaVersion", "textures", "player", "goal", "hazard"], [], "Scene"),
                 LegacySchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects"], [], "Scene"),
                 BehaviorSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects"], [], "Scene"),
-                CurrentSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], [], "Scene"),
+                PrototypeSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], [], "Scene"),
+                CurrentSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], ["gameplay"], "Scene"),
                 _ => throw Failure("Unsupported Scene schemaVersion.")
             };
             var textures = ReadTextures(properties["textures"]);
             var objects = schemaVersion == 3 ? ReadLegacyObjects(properties) : ReadObjects(properties["objects"], schemaVersion);
-            var prototypes = schemaVersion == CurrentSchemaVersion ? ReadPrototypes(properties["prototypes"]) : Array.Empty<WorkspaceScenePrototype>();
-            Validate(textures, objects, prototypes, schemaVersion == 3 ? LegacySchemaVersion : schemaVersion);
-            return new WorkspaceSceneDocument(schemaVersion, textures, objects, prototypes);
+            var prototypes = schemaVersion is PrototypeSchemaVersion or CurrentSchemaVersion
+                ? ReadPrototypes(properties["prototypes"])
+                : Array.Empty<WorkspaceScenePrototype>();
+            // v4-v6 wire 没有 profile；读取时统一归一为旧演示 Gameplay。
+            var gameplay = schemaVersion == CurrentSchemaVersion
+                ? properties.TryGetValue("gameplay", out var gameplayValue) ? ReadGameplay(gameplayValue) : NeutralGameplay
+                : LegacyGameplay;
+            Validate(textures, objects, prototypes, schemaVersion == 3 ? LegacySchemaVersion : schemaVersion, gameplay);
+            return new WorkspaceSceneDocument(schemaVersion, textures, objects, prototypes, gameplay);
         }
         catch (JsonException exception)
         {
@@ -130,8 +150,16 @@ internal static partial class WorkspaceSceneDocumentCodec
         IReadOnlyList<SceneObjectDefinition> definitions,
         IReadOnlyList<WorkspaceSceneTexture> textures,
         int schemaVersion)
+        => NormalizeDefinitions(definitions, textures, schemaVersion, GameplayForSchema(schemaVersion));
+
+    internal static WorkspaceSceneObject[] NormalizeDefinitions(
+        IReadOnlyList<SceneObjectDefinition> definitions,
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        int schemaVersion,
+        WorkspaceSceneGameplay gameplay)
     {
-        if (definitions.Count is < MinObjectCount or > MaxObjectCount) throw Failure($"Scene.objects must contain {MinObjectCount} to {MaxObjectCount} entries.");
+        var minimum = MinimumObjectCount(schemaVersion, gameplay);
+        if (definitions.Count < minimum || definitions.Count > MaxObjectCount) throw Failure($"Scene.objects must contain {minimum} to {MaxObjectCount} entries.");
         var objects = definitions.Select(value => new WorkspaceSceneObject(
             value.ObjectId,
             value.Kind,
@@ -147,45 +175,61 @@ internal static partial class WorkspaceSceneDocumentCodec
                 binding.ScriptId,
                 binding.Parameters?.Select(parameter => new WorkspaceSceneBehaviorParameter(parameter.Key, parameter.Value)).ToArray()
                     ?? Array.Empty<WorkspaceSceneBehaviorParameter>())).ToArray())).ToArray();
-        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), schemaVersion);
+        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), schemaVersion, gameplay);
         return objects;
     }
 
     internal static void ValidateNormalized(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects) =>
-        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacySchemaVersion);
+        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacySchemaVersion, LegacyGameplay);
 
     internal static void ValidateNormalized(
         IReadOnlyList<WorkspaceSceneTexture> textures,
         IReadOnlyList<WorkspaceSceneObject> objects,
         int schemaVersion) =>
-        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), schemaVersion);
+        Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), schemaVersion, GameplayForSchema(schemaVersion));
 
     internal static void ValidateNormalized(
         IReadOnlyList<WorkspaceSceneTexture> textures,
         IReadOnlyList<WorkspaceSceneObject> objects,
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
         int schemaVersion) =>
-        Validate(textures, objects, prototypes, schemaVersion);
+        Validate(textures, objects, prototypes, schemaVersion, GameplayForSchema(schemaVersion));
+
+    internal static void ValidateNormalized(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        int schemaVersion,
+        WorkspaceSceneGameplay gameplay) =>
+        Validate(textures, objects, prototypes, schemaVersion, gameplay);
 
     internal static byte[] SerializeV4(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects)
-        => Serialize(LegacySchemaVersion, textures, objects, Array.Empty<WorkspaceScenePrototype>());
+        => Serialize(LegacySchemaVersion, textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacyGameplay);
 
     internal static byte[] SerializeV5(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects)
-        => Serialize(BehaviorSchemaVersion, textures, objects, Array.Empty<WorkspaceScenePrototype>());
+        => Serialize(BehaviorSchemaVersion, textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacyGameplay);
 
     internal static byte[] SerializeV6(
         IReadOnlyList<WorkspaceSceneTexture> textures,
         IReadOnlyList<WorkspaceSceneObject> objects,
         IReadOnlyList<WorkspaceScenePrototype> prototypes)
-        => Serialize(CurrentSchemaVersion, textures, objects, prototypes);
+        => Serialize(PrototypeSchemaVersion, textures, objects, prototypes, LegacyGameplay);
+
+    internal static byte[] SerializeV7(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        WorkspaceSceneGameplay gameplay)
+        => Serialize(CurrentSchemaVersion, textures, objects, prototypes, gameplay);
 
     private static byte[] Serialize(
         int schemaVersion,
         IReadOnlyList<WorkspaceSceneTexture> textures,
         IReadOnlyList<WorkspaceSceneObject> objects,
-        IReadOnlyList<WorkspaceScenePrototype> prototypes)
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        WorkspaceSceneGameplay gameplay)
     {
-        Validate(textures, objects, prototypes, schemaVersion);
+        Validate(textures, objects, prototypes, schemaVersion, gameplay);
         var buffer = new ArrayBufferWriter<byte>();
         using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
         {
@@ -234,7 +278,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                     writer.WriteNumber("speed", sceneObject.PatrolSpeed!.Value);
                     writer.WriteEndObject();
                 }
-                if (schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion)
+                if (SchemaHasBehaviorBindings(schemaVersion))
                 {
                     writer.WritePropertyName("behaviors");
                     writer.WriteStartArray();
@@ -256,7 +300,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
-            if (schemaVersion == CurrentSchemaVersion)
+            if (SchemaHasPrototypes(schemaVersion))
             {
                 writer.WritePropertyName("prototypes");
                 writer.WriteStartArray();
@@ -275,6 +319,14 @@ internal static partial class WorkspaceSceneDocumentCodec
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();
+            }
+            if (schemaVersion == CurrentSchemaVersion && gameplay.IsEnabled)
+            {
+                writer.WritePropertyName("gameplay");
+                writer.WriteStartObject();
+                writer.WriteString("profile", gameplay.Profile);
+                writer.WriteNumber("timeLimitSeconds", gameplay.TimeLimitSeconds);
+                writer.WriteEndObject();
             }
             writer.WriteEndObject();
         }
@@ -303,13 +355,14 @@ internal static partial class WorkspaceSceneDocumentCodec
     private static WorkspaceSceneObject[] ReadObjects(JsonElement value, int schemaVersion)
     {
         RequireArray(value, "Scene.objects");
-        if (value.GetArrayLength() is < MinObjectCount or > MaxObjectCount) throw Failure($"Scene.objects must contain {MinObjectCount} to {MaxObjectCount} entries.");
+        var minimum = schemaVersion == CurrentSchemaVersion ? MinNeutralObjectCount : MinObjectCount;
+        if (value.GetArrayLength() < minimum || value.GetArrayLength() > MaxObjectCount) throw Failure($"Scene.objects must contain {minimum} to {MaxObjectCount} entries.");
         var objects = new List<WorkspaceSceneObject>();
         var index = 0;
         foreach (var element in value.EnumerateArray())
         {
             var owner = $"Scene.objects[{index}]";
-            var properties = schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion
+            var properties = SchemaHasBehaviorBindings(schemaVersion)
                 ? ReadProperties(element, ["objectId", "kind", "transform", "sprite", "behaviors"], ["player"], owner)
                 : ReadProperties(element, ["objectId", "kind", "transform", "sprite"], ["player", "patrol"], owner);
             var objectId = RequireString(properties["objectId"], $"{owner}.objectId");
@@ -320,7 +373,7 @@ internal static partial class WorkspaceSceneDocumentCodec
             double? patrolMinY = null;
             double? patrolMaxY = null;
             double? patrolSpeed = null;
-            var behaviors = schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion
+            var behaviors = SchemaHasBehaviorBindings(schemaVersion)
                 ? ReadBehaviorBindings(properties["behaviors"], owner)
                 : Array.Empty<WorkspaceSceneBehaviorBinding>();
             switch (kind)
@@ -336,11 +389,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                     break;
                 case PatrolHazardKind:
                     if (properties.ContainsKey("player")) throw Failure($"{owner} has an invalid player payload.");
-                    if (schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion)
-                    {
-                        if (behaviors.Length == 0) throw Failure($"{owner} must contain at least one behavior binding.");
-                    }
-                    else
+                    if (!SchemaHasBehaviorBindings(schemaVersion))
                     {
                         if (!properties.TryGetValue("patrol", out var patrol)) throw Failure($"{owner} must contain patrol payload.");
                         var patrolProperties = ReadProperties(patrol, ["minY", "maxY", "speed"], [], $"{owner}.patrol");
@@ -390,6 +439,14 @@ internal static partial class WorkspaceSceneDocumentCodec
             index++;
         }
         return prototypes.ToArray();
+    }
+
+    private static WorkspaceSceneGameplay ReadGameplay(JsonElement value)
+    {
+        var properties = ReadProperties(value, ["profile", "timeLimitSeconds"], [], "Scene.gameplay");
+        return new WorkspaceSceneGameplay(
+            RequireString(properties["profile"], "Scene.gameplay.profile"),
+            RequireFiniteDouble(properties["timeLimitSeconds"], "Scene.gameplay.timeLimitSeconds"));
     }
 
     private static WorkspaceSceneBehaviorBinding[] ReadBehaviorBindings(JsonElement value, string owner)
@@ -458,9 +515,25 @@ internal static partial class WorkspaceSceneDocumentCodec
         IReadOnlyList<WorkspaceSceneTexture> textures,
         IReadOnlyList<WorkspaceSceneObject> objects,
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
-        int schemaVersion)
+        int schemaVersion,
+        WorkspaceSceneGameplay gameplay)
     {
-        if (schemaVersion is not (LegacySchemaVersion or BehaviorSchemaVersion or CurrentSchemaVersion)) throw Failure("Unsupported Scene schemaVersion.");
+        if (schemaVersion is not (LegacySchemaVersion or BehaviorSchemaVersion or PrototypeSchemaVersion or CurrentSchemaVersion)) throw Failure("Unsupported Scene schemaVersion.");
+        if (schemaVersion != CurrentSchemaVersion && gameplay.Profile != GoalHazardGameplayProfile)
+            throw Failure("Scene v4-v6 must normalize to goal_hazard_v1 Gameplay.");
+        if (gameplay.Profile == NoGameplayProfile)
+        {
+            if (gameplay.TimeLimitSeconds != 0) throw Failure("Scene.gameplay.timeLimitSeconds must be zero when Gameplay is disabled.");
+        }
+        else if (gameplay.Profile == GoalHazardGameplayProfile)
+        {
+            if (!IsFiniteF32(gameplay.TimeLimitSeconds) || gameplay.TimeLimitSeconds <= 0)
+                throw Failure("Scene.gameplay.timeLimitSeconds must be a positive finite f32 value.");
+        }
+        else
+        {
+            throw Failure($"Scene.gameplay.profile is unsupported: {gameplay.Profile}.");
+        }
         if (textures.Count is < 1 or > 4) throw Failure("Scene.textures must contain 1 to 4 entries.");
         var textureIds = new HashSet<uint>();
         foreach (var texture in textures)
@@ -468,7 +541,8 @@ internal static partial class WorkspaceSceneDocumentCodec
             if (texture.TextureId == 0 || !textureIds.Add(texture.TextureId)) throw Failure("Scene.textures textureId must be unique non-zero u32.");
             if (!WorkspaceProjectValidator.IsTextureArtifactPath(texture.Artifact)) throw Failure("Scene.textures artifact path is invalid.");
         }
-        if (objects.Count is < MinObjectCount or > MaxObjectCount) throw Failure($"Scene.objects must contain {MinObjectCount} to {MaxObjectCount} entries.");
+        var minimum = MinimumObjectCount(schemaVersion, gameplay);
+        if (objects.Count < minimum || objects.Count > MaxObjectCount) throw Failure($"Scene.objects must contain {minimum} to {MaxObjectCount} entries.");
         var objectIds = new HashSet<string>(StringComparer.Ordinal);
         var playerCount = 0;
         var goalCount = 0;
@@ -484,7 +558,7 @@ internal static partial class WorkspaceSceneDocumentCodec
             var behaviors = sceneObject.Behaviors ?? Array.Empty<WorkspaceSceneBehaviorBinding>();
             if (schemaVersion == LegacySchemaVersion && behaviors.Length != 0)
                 throw Failure($"Scene.objects[{sceneObject.ObjectId}] cannot contain behavior bindings in schema v4.");
-            if (schemaVersion is BehaviorSchemaVersion or CurrentSchemaVersion)
+            if (SchemaHasBehaviorBindings(schemaVersion))
             {
                 ValidateBehaviorBindings(behaviors, sceneObject.ObjectId);
                 behaviorBindingCount = checked(behaviorBindingCount + behaviors.Length);
@@ -515,7 +589,8 @@ internal static partial class WorkspaceSceneDocumentCodec
                             || sceneObject.Position[1] < sceneObject.PatrolMinY || sceneObject.Position[1] > sceneObject.PatrolMaxY)
                             throw Failure($"Scene.objects[{sceneObject.ObjectId}].patrol payload is invalid.");
                     }
-                    else if (sceneObject.PatrolMinY is not null || sceneObject.PatrolMaxY is not null || sceneObject.PatrolSpeed is not null || behaviors.Length == 0)
+                    else if (sceneObject.PatrolMinY is not null || sceneObject.PatrolMaxY is not null || sceneObject.PatrolSpeed is not null
+                        || gameplay.IsEnabled && behaviors.Length == 0)
                     {
                         throw Failure($"Scene.objects[{sceneObject.ObjectId}] must use behavior bindings instead of native patrol payload.");
                     }
@@ -524,8 +599,9 @@ internal static partial class WorkspaceSceneDocumentCodec
                     throw Failure($"Scene.objects[{sceneObject.ObjectId}].kind is unsupported: {sceneObject.Kind}.");
             }
         }
-        if (playerCount != 1 || goalCount != 1 || hazardCount < 1) throw Failure("Scene must contain exactly one player, exactly one goal, and at least one patrol_hazard.");
-        if (schemaVersion != CurrentSchemaVersion && prototypes.Count != 0) throw Failure("Scene prototypes require schema v6.");
+        if (gameplay.IsEnabled && (playerCount != 1 || goalCount != 1 || hazardCount < 1))
+            throw Failure("Gameplay Scene must contain exactly one player, exactly one goal, and at least one patrol_hazard.");
+        if (!SchemaHasPrototypes(schemaVersion) && prototypes.Count != 0) throw Failure("Scene prototypes require schema v6 or v7.");
         if (prototypes.Count > MaxPrototypeCount) throw Failure("Scene prototype budget exceeded.");
         var prototypeIds = new HashSet<string>(StringComparer.Ordinal);
         var prototypeBehaviorCount = 0;
@@ -541,6 +617,16 @@ internal static partial class WorkspaceSceneDocumentCodec
             if (prototypeBehaviorCount > MaxPrototypeBehaviorBindingCount) throw Failure("Scene prototype behavior binding budget exceeded.");
         }
     }
+
+    private static WorkspaceSceneGameplay GameplayForSchema(int schemaVersion) =>
+        schemaVersion == CurrentSchemaVersion ? NeutralGameplay : LegacyGameplay;
+
+    private static int MinimumObjectCount(int schemaVersion, WorkspaceSceneGameplay gameplay) =>
+        schemaVersion == CurrentSchemaVersion && !gameplay.IsEnabled ? MinNeutralObjectCount : MinObjectCount;
+
+    private static bool SchemaHasBehaviorBindings(int schemaVersion) => schemaVersion >= BehaviorSchemaVersion;
+
+    private static bool SchemaHasPrototypes(int schemaVersion) => schemaVersion >= PrototypeSchemaVersion;
 
     private static void WriteBehaviorBindings(Utf8JsonWriter writer, IReadOnlyList<WorkspaceSceneBehaviorBinding> behaviors)
     {

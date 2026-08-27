@@ -1075,7 +1075,8 @@ internal static class Program
             "Script Asset lifecycle events leaked host paths or source text, or omitted terminal events");
         Console.WriteLine("script_asset_lifecycle_service_smoke=ok");
 
-        Assert(capabilities.Commands.Contains("authoring_apply") && capabilities.Commands.Contains("authoring_undo"), "real service did not advertise authoring commands");
+        Assert(capabilities.Commands.Contains("authoring_apply") && capabilities.Commands.Contains("authoring_undo")
+            && capabilities.Commands.Contains("authoring_redo"), "real service did not advertise authoring commands");
 
         try
         {
@@ -1112,7 +1113,7 @@ internal static class Program
         catch (EditorRpcException exception) when (exception.Code == "authoring_revision_conflict") { }
 
         var undone = await client.UndoAuthoringAsync(new AuthoringUndoParameters(projectName, applied.Revision)).ConfigureAwait(false);
-        Assert(undone.Operation == "undo" && undone.UndoDepth == 0
+        Assert(undone.Operation == "undo" && undone.UndoDepth == 0 && undone.RedoDepth == 1
             && undone.ProjectSnapshot.Scene.PlayerTextureId == projectSnapshot.Scene.PlayerTextureId, "real service authoring undo failed");
         try
         {
@@ -1121,10 +1122,17 @@ internal static class Program
         }
         catch (EditorRpcException exception) when (exception.Code == "authoring_undo_empty") { }
 
+        var redone = await client.RedoAuthoringAsync(new AuthoringRedoParameters(projectName, undone.Revision)).ConfigureAwait(false);
+        Assert(redone.Operation == "redo" && redone.UndoDepth == 1 && redone.RedoDepth == 0
+            && redone.ProjectSnapshot.Scene.PlayerTextureId == updatedPlayerTextureId, "real service authoring redo failed");
+        var restored = await client.UndoAuthoringAsync(new AuthoringUndoParameters(projectName, redone.Revision)).ConfigureAwait(false);
+        Assert(restored.ProjectSnapshot.Scene.PlayerTextureId == projectSnapshot.Scene.PlayerTextureId,
+            "real service authoring undo after redo failed");
+
         var originalTextureArtifact = projectSnapshot.Scene.Textures!.First(texture => texture.TextureId == 1).Artifact;
         var goalTextureAssetId = assetSnapshot.Items.First(item => item.RelativePath == "assets/renderer2d/goal.texture").AssetId;
         var testTextureAssetId = assetSnapshot.Items.First(item => item.RelativePath == "assets/renderer2d/test.texture").AssetId;
-        var textureApplied = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(projectName, undone.Revision,
+        var textureApplied = await client.ApplyAuthoringAsync(new AuthoringApplyParameters(projectName, restored.Revision,
             new AuthoringPatch(SceneTextures: [
                 new SceneTextureAssignment(1, goalTextureAssetId),
                 new SceneTextureAssignment(2, goalTextureAssetId),

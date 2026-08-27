@@ -26,6 +26,7 @@ public interface IEditorSessionBackend : IAsyncDisposable
     Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> UndoAuthoringAsync(ProjectSessionInfo project, AuthoringUndoParameters parameters, CancellationToken cancellationToken);
+    Task<AuthoringMutationResult> RedoAuthoringAsync(ProjectSessionInfo project, AuthoringRedoParameters parameters, CancellationToken cancellationToken);
     Task<ScriptSourceMutationResult> EditScriptSourceAsync(ProjectSessionInfo project, ScriptSourceEditParameters parameters, CancellationToken cancellationToken);
     Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ProjectSessionInfo project, ScriptSourceUndoParameters parameters, CancellationToken cancellationToken);
     Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ProjectSessionInfo project, ScriptAssetCreateParameters parameters, CancellationToken cancellationToken);
@@ -59,6 +60,7 @@ public interface IEditorSession : IAsyncDisposable
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<AuthoringMutationResult> RedoAuthoringAsync(AuthoringRedoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ScriptAssetCreateParameters parameters, string? requestId, CancellationToken cancellationToken = default);
@@ -89,6 +91,7 @@ public sealed class EditorSession : IEditorSession
         "texture_import",
         "authoring_apply",
         "authoring_undo",
+        "authoring_redo",
         "script_source_edit",
         "script_source_undo",
         "script_asset_create",
@@ -366,6 +369,28 @@ public sealed class EditorSession : IEditorSession
             catch (EditorOperationException exception)
             {
                 await EmitAsync("authoring_undo_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+                throw;
+            }
+        }
+        finally { _projectMutationGate.Release(); }
+    }
+
+    public async Task<AuthoringMutationResult> RedoAuthoringAsync(AuthoringRedoParameters parameters, string? requestId, CancellationToken cancellationToken = default)
+    {
+        await _projectMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var project = RequireProject(parameters.ProjectName);
+            await EmitAsync("authoring_redo_started", new { projectName = project.ProjectName, expectedRevision = parameters.ExpectedRevision }, requestId);
+            try
+            {
+                var result = await _backend.RedoAuthoringAsync(project, parameters, cancellationToken);
+                await EmitAsync("authoring_redo_completed", result, requestId);
+                return result;
+            }
+            catch (EditorOperationException exception)
+            {
+                await EmitAsync("authoring_redo_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
                 throw;
             }
         }

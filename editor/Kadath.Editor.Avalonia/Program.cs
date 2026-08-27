@@ -575,11 +575,23 @@ internal static class Program
         var undoneAuthoring = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
         Require(string.Equals(undoneAuthoring.Operation, "undo", StringComparison.OrdinalIgnoreCase)
             && workspace.Authoring.UndoDepth == 0
+            && workspace.Authoring.RedoDepth == 1
             && avaloniaViewModel.SceneObjectDrafts.Select(draft => draft.ObjectId).SequenceEqual(originalObjectIds)
             && avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "goal").PositionX == originalGoalX
             && avaloniaViewModel.SceneObjectDrafts.Single(draft => draft.Kind == "player").TextureIdText == originalPlayerTextureId
             && avaloniaViewModel.SceneTextureAssignments[0].SelectedAssetItem == originalSceneTextureAsset, "authoring undo did not restore the prior values");
         Console.WriteLine("workflow_authoring_undo=ok");
+
+        var redoneAuthoring = await avaloniaViewModel.RedoAuthoringForCurrentProjectAsync(cancellationToken);
+        Require(string.Equals(redoneAuthoring.Operation, "redo", StringComparison.OrdinalIgnoreCase)
+            && workspace.Authoring.UndoDepth == 1
+            && workspace.Authoring.RedoDepth == 0
+            && avaloniaViewModel.SceneObjectDrafts.Any(draft => draft.ObjectId == addedSpriteId),
+            "authoring redo did not restore the edited Scene Objects");
+        _ = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
+        Require(avaloniaViewModel.SceneObjectDrafts.Select(draft => draft.ObjectId).SequenceEqual(originalObjectIds),
+            "authoring undo after redo did not restore the baseline");
+        Console.WriteLine("workflow_authoring_redo=ok");
 
         var validation = await workspace.ValidateProjectAsync(createdProjectName, cancellationToken);
         Require(string.Equals(validation.State, "valid", StringComparison.OrdinalIgnoreCase), "project_validate was not valid");
@@ -1289,7 +1301,7 @@ internal static class Program
             var commands = new List<string>
             {
                 "get_capabilities", "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot",
-                "asset_catalog_snapshot", "script_source_read", "script_source_analyze", "texture_import", "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
+                "asset_catalog_snapshot", "script_source_read", "script_source_analyze", "texture_import", "authoring_apply", "authoring_undo", "authoring_redo", "bake_start", "watch_start", "watch_stop", "preview_start", "preview_stop", "shutdown"
             };
             if (_advertiseProjectCreate) { commands.Insert(2, "project_create"); }
             return commands.ToArray();

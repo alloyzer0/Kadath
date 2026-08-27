@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 7,
+  "textures": [
+    { "textureId": 1, "artifact": "assets/renderer2d/test.texture" },
+    { "textureId": 2, "artifact": "assets/renderer2d/goal.texture" }
+  ],
+  "objects": [
+    {
+      "objectId": "backdrop",
+      "kind": "sprite",
+      "transform": { "position": [400, 300] },
+      "sprite": { "size": [360, 220], "color": [0.22, 0.34, 0.58, 1], "textureId": 1 },
+      "behaviors": []
+    },
+    {
+      "objectId": "marker",
+      "kind": "sprite",
+      "transform": { "position": [400, 300] },
+      "sprite": { "size": [72, 72], "color": [0.95, 0.82, 0.28, 1], "textureId": 2 },
+      "behaviors": []
+    }
+  ],
+  "prototypes": []
+}

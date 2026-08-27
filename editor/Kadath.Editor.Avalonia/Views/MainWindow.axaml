@@ -307,6 +307,7 @@
                   <StackPanel Orientation="Horizontal" Spacing="6">
                     <Button Command="{Binding ApplyAuthoringCommand}" Content="Apply Objects" />
                     <Button Command="{Binding UndoAuthoringCommand}" Content="Undo" />
+                    <Button Command="{Binding RedoAuthoringCommand}" Content="Redo" />
                   </StackPanel>
                   <TextBlock Foreground="#AEBAC8" Text="{Binding AuthoringStatus}" TextWrapping="Wrap" />
                   <TextBlock FontSize="11" Foreground="#AEBAC8" Text="{Binding AuthoringRevisionStatus}" />

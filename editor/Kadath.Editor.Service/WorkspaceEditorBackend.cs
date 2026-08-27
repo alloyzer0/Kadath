@@ -20,6 +20,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private readonly SemaphoreSlim _authoringGate = new(1, 1);
     private readonly SemaphoreSlim _scriptAnalysisGate = new(1, 1);
     private readonly List<AuthoringUndoRecord> _authoringHistory = [];
+    private readonly List<AuthoringUndoRecord> _authoringRedoHistory = [];
     private readonly List<ScriptSourceUndoRecord> _scriptSourceHistory = [];
     private readonly List<ScriptAssetUndoRecord> _scriptAssetHistory = [];
     private const int MaxAuthoringHistory = 32;
@@ -56,6 +57,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     {
         var project = await ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.OpenAsync(parameters, cancellationToken));
         _authoringHistory.Clear();
+        _authoringRedoHistory.Clear();
         _scriptSourceHistory.Clear();
         _scriptAssetHistory.Clear();
         return project;
@@ -65,6 +67,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     {
         var project = await ExecuteProjectLifecycleAsync(() => _projectLifecycleModel.CreateAsync(parameters, cancellationToken));
         _authoringHistory.Clear();
+        _authoringRedoHistory.Clear();
         _scriptSourceHistory.Clear();
         _scriptAssetHistory.Clear();
         return project;
@@ -185,14 +188,15 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             if (commit.State == "unchanged")
             {
                 return new AuthoringMutationResult("apply", "unchanged", project.ProjectName, commit.PreviousRevision, commit.Revision,
-                    [], _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
+                    [], _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot, _authoringRedoHistory.Count);
             }
 
             if (commit.UndoToken is null) { throw new EditorOperationException("authoring_protocol_error", "Native authoring commit emitted no undo token."); }
             _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Revision, commit.ChangedFields, commit.UndoToken));
             if (_authoringHistory.Count > MaxAuthoringHistory) { _authoringHistory.RemoveAt(0); }
+            _authoringRedoHistory.Clear();
             return new AuthoringMutationResult("apply", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
-                commit.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
+                commit.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot, 0);
         }
         finally { _authoringGate.Release(); }
     }
@@ -214,9 +218,39 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
 
             var commit = await UndoWorkspaceAuthoringAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
             if (commit.State != "succeeded") { throw new EditorOperationException("authoring_protocol_error", "Native authoring undo did not restore a changed state."); }
+            if (commit.UndoToken is null) { throw new EditorOperationException("authoring_protocol_error", "Native authoring undo emitted no redo token."); }
             _authoringHistory.RemoveAt(_authoringHistory.Count - 1);
+            _authoringRedoHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Revision, record.ChangedFields, commit.UndoToken));
+            if (_authoringRedoHistory.Count > MaxAuthoringHistory) { _authoringRedoHistory.RemoveAt(0); }
             return new AuthoringMutationResult("undo", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
-                record.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot);
+                record.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot, _authoringRedoHistory.Count);
+        }
+        finally { _authoringGate.Release(); }
+    }
+
+    public async Task<AuthoringMutationResult> RedoAuthoringAsync(ProjectSessionInfo project, AuthoringRedoParameters parameters, CancellationToken cancellationToken)
+    {
+        await _authoringGate.WaitAsync(cancellationToken);
+        try
+        {
+            var current = await GetProjectSnapshotAsync(project, cancellationToken);
+            ValidateExpectedRevision(parameters.ExpectedRevision, current.AuthoringRevision);
+            if (_authoringRedoHistory.Count == 0) { throw new EditorOperationException("authoring_redo_empty", "There is no authoring mutation to redo."); }
+            var record = _authoringRedoHistory[^1];
+            if (!string.Equals(record.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(record.RevisionAfter, current.AuthoringRevision, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new EditorOperationException("authoring_history_diverged", "Authoring redo history no longer matches the current revision.");
+            }
+
+            var commit = await UndoWorkspaceAuthoringAsync(project, parameters.ExpectedRevision, record.Token, cancellationToken);
+            if (commit.State != "succeeded" || commit.UndoToken is null)
+                throw new EditorOperationException("authoring_protocol_error", "Native authoring redo did not emit a reverse token.");
+            _authoringRedoHistory.RemoveAt(_authoringRedoHistory.Count - 1);
+            _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Revision, record.ChangedFields, commit.UndoToken));
+            if (_authoringHistory.Count > MaxAuthoringHistory) { _authoringHistory.RemoveAt(0); }
+            return new AuthoringMutationResult("redo", "succeeded", project.ProjectName, commit.PreviousRevision, commit.Revision,
+                record.ChangedFields, _authoringHistory.Count, commit.ProjectSnapshot, commit.HierarchySnapshot, _authoringRedoHistory.Count);
         }
         finally { _authoringGate.Release(); }
     }
@@ -553,12 +587,21 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 var textures = sceneModel?.Textures;
                 var objects = sceneModel?.Objects;
                 var scriptDependencies = model.Script?.Dependencies;
+                var gameplayEnabled = sceneModel?.GameplayProfile == "goal_hazard_v1";
+                var gameplayContractValid = sceneModel is not null && sceneModel.GameplayProfile switch
+                {
+                    "none" => sceneModel.SchemaVersion == 7 && sceneModel.GameplayTimeLimitSeconds is null,
+                    "goal_hazard_v1" => (sceneModel.SchemaVersion <= 6 && sceneModel.GameplayTimeLimitSeconds is null)
+                        || (sceneModel.GameplayTimeLimitSeconds is double limit && limit > 0 && double.IsFinite(limit)),
+                    _ => false
+                };
                 var textureSetValid = sceneModel is not null && textures is { Count: >= 1 and <= 4 }
                     && textures.All(texture => texture.TextureId != 0 && IsTextureArtifactPath(texture.Artifact))
                     && textures.Select(texture => texture.TextureId).Distinct().Count() == textures.Count
-                    && textures.Any(texture => texture.TextureId == sceneModel.PlayerTextureId)
-                    && textures.Any(texture => texture.TextureId == sceneModel.GoalTextureId)
-                    && textures.Any(texture => texture.TextureId == sceneModel.HazardTextureId);
+                    && (!gameplayEnabled
+                        || textures.Any(texture => texture.TextureId == sceneModel.PlayerTextureId)
+                        && textures.Any(texture => texture.TextureId == sceneModel.GoalTextureId)
+                        && textures.Any(texture => texture.TextureId == sceneModel.HazardTextureId));
                 var behaviorDependencySetValid = model.Script?.SchemaVersion == 2
                     && scriptDependencies is { Count: >= 1 and <= 16 }
                     && scriptDependencies.All(dependency => dependency.ScriptId != 0 && IsScriptSourcePath(dependency.Source))
@@ -571,13 +614,14 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion is not (3 or 4 or 5 or 6)
+                    || model.Scene.SchemaVersion is not (3 or 4 or 5 or 6 or 7)
+                    || !gameplayContractValid
                     || !textureSetValid
                     || !ValidateSceneObjects(objects, textures!, sceneModel!, behaviorDependencySetValid ? scriptDependencies!.Select(dependency => dependency.ScriptId).ToHashSet() : null)
                     || model.Script.SchemaVersion is not (1 or 2)
                     || model.Preview.SchemaVersion != 1
                     || !string.Equals(model.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
-                    || model.Scene.GoalPosition.Length != 2
+                    || model.Scene.GoalPosition.Length != (gameplayEnabled ? 2 : 0)
                     || model.Script.SchemaVersion == 1 && (model.Script.GoalPosition.Length != 2 || model.Script.GoalVelocity.Length != 2)
                     || model.Script.SchemaVersion == 2 && (!behaviorDependencySetValid || model.Script.GoalPosition.Length != 0 || model.Script.GoalVelocity.Length != 0)
                     || !model.Scene.GoalPosition.Concat(model.Script.GoalPosition).Concat(model.Script.GoalVelocity).All(double.IsFinite))
@@ -683,13 +727,15 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         ProjectModelScene scene,
         IReadOnlySet<uint>? behaviorScriptIds)
     {
-        if (objects is not { Count: >= 3 and <= 64 }) return false;
+        var gameplayEnabled = scene.GameplayProfile == "goal_hazard_v1";
+        var minimumObjectCount = scene.SchemaVersion == 7 && !gameplayEnabled ? 1 : 3;
+        if (objects is null || objects.Count < minimumObjectCount || objects.Count > 64) return false;
         var textureIds = textures.Select(value => value.TextureId).ToHashSet();
         var objectIds = new HashSet<string>(StringComparer.Ordinal);
         var players = objects.Where(value => value.Kind == "player").ToArray();
         var goals = objects.Where(value => value.Kind == "goal").ToArray();
         var hazards = objects.Where(value => value.Kind == "patrol_hazard").ToArray();
-        if (players.Length != 1 || goals.Length != 1 || hazards.Length < 1) return false;
+        if (gameplayEnabled && (players.Length != 1 || goals.Length != 1 || hazards.Length < 1)) return false;
         foreach (var value in objects)
         {
             if (!IsObjectId(value.ObjectId) || !objectIds.Add(value.ObjectId)
@@ -706,10 +752,9 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 if (value.MoveSpeed is null || value.MoveSpeed < 0 || !double.IsFinite(value.MoveSpeed.Value)
                     || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null) return false;
             }
-            if (scene.SchemaVersion is 5 or 6)
+            if (scene.SchemaVersion is 5 or 6 or 7)
             {
-                if (behaviorScriptIds is null
-                    || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null
+                if (value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null
                     || value.Behaviors is null || value.Behaviors.Count > 4)
                 {
                     return false;
@@ -717,7 +762,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 var bindingIds = new HashSet<uint>();
                 foreach (var binding in value.Behaviors)
                 {
-                    if (binding.ScriptId == 0 || !behaviorScriptIds.Contains(binding.ScriptId)
+                    if (behaviorScriptIds is null || binding.ScriptId == 0 || !behaviorScriptIds.Contains(binding.ScriptId)
                         || !bindingIds.Add(binding.ScriptId)
                         || binding.Parameters is not { Count: <= 16 }) return false;
                     var parameterNames = new HashSet<string>(StringComparer.Ordinal);
@@ -727,7 +772,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                             || !double.IsFinite(parameter.Value) || !float.IsFinite((float)parameter.Value)) return false;
                     }
                 }
-                if (value.Kind == "patrol_hazard" && value.Behaviors.Count == 0) return false;
+                if (gameplayEnabled && value.Kind == "patrol_hazard" && value.Behaviors.Count == 0) return false;
             }
             else
             {
@@ -745,7 +790,8 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 }
             }
         }
-        return scene.PlayerTextureId == players[0].TextureId
+        return !gameplayEnabled
+            || scene.PlayerTextureId == players[0].TextureId
             && scene.GoalTextureId == goals[0].TextureId
             && scene.HazardTextureId == hazards[0].TextureId
             && scene.GoalPosition.SequenceEqual(goals[0].Position);

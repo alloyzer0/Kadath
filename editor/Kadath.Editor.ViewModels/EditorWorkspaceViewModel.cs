@@ -600,6 +600,25 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         }
     }
 
+    public async Task<AuthoringMutationResult> RedoAuthoringAsync(AuthoringRedoParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanRedoAuthoring, "authoring_redo");
+        await _dispatcher.InvokeAsync(() => Authoring.Begin("redo")).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.RedoAuthoringAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() => ApplyAuthoringResult(result)).ConfigureAwait(false);
+            await RefreshBehaviorContractAfterOperationAsync(result.ProjectName, cancellationToken).ConfigureAwait(false);
+            await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyAuthoringExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
     private void ApplyAuthoringResult(AuthoringMutationResult result)
     {
         Authoring.Apply(result);
@@ -862,12 +881,17 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
             case "authoring_undo_started":
                 Authoring.Begin("undo");
                 break;
+            case "authoring_redo_started":
+                Authoring.Begin("redo");
+                break;
             case "authoring_apply_completed":
             case "authoring_undo_completed":
+            case "authoring_redo_completed":
                 if (TryRead(notification.Data, out AuthoringMutationResult? mutation) && mutation is not null) { ApplyAuthoringResult(mutation); }
                 break;
             case "authoring_apply_failed":
             case "authoring_undo_failed":
+            case "authoring_redo_failed":
                 Authoring.ApplyFailure(
                     ReadString(notification.Data, "errorCode") ?? "authoring_failed",
                     ReadString(notification.Data, "message") ?? "Authoring operation failed.");

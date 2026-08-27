@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "runtime": {
+    "executable": "bin/kadath.exe",
+    "workingDirectory": "bin",
+    "arguments": [
+      "--scene",
+      "projects/engine-scene-neutral-01/scene.json",
+      "--script",
+      "projects/engine-scene-neutral-01/script.json"
+    ]
+  }
+}

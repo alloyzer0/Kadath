@@ -63,6 +63,7 @@ public interface IEditorRpcClient : IAsyncDisposable
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, CancellationToken cancellationToken = default);
+    Task<AuthoringMutationResult> RedoAuthoringAsync(AuthoringRedoParameters parameters, CancellationToken cancellationToken = default);
     Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, CancellationToken cancellationToken = default);
     Task<ScriptSourceMutationResult> UndoScriptSourceAsync(ScriptSourceUndoParameters parameters, CancellationToken cancellationToken = default);
     Task<ScriptAssetMutationResult> CreateScriptAssetAsync(ScriptAssetCreateParameters parameters, CancellationToken cancellationToken = default);
@@ -168,6 +169,9 @@ public sealed class EditorRpcClient : IEditorRpcClient
 
     public Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<AuthoringUndoParameters, AuthoringMutationResult>("authoring_undo", parameters, cancellationToken);
+
+    public Task<AuthoringMutationResult> RedoAuthoringAsync(AuthoringRedoParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<AuthoringRedoParameters, AuthoringMutationResult>("authoring_redo", parameters, cancellationToken);
 
     public Task<ScriptSourceMutationResult> EditScriptSourceAsync(ScriptSourceEditParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<ScriptSourceEditParameters, ScriptSourceMutationResult>("script_source_edit", parameters, cancellationToken);

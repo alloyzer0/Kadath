@@ -106,6 +106,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         RefreshSnapshotsCommand = AddCommand(new AsyncUiCommand(RefreshSnapshotsAsync, () => CanRefreshSnapshots && !IsBusy, HandleCommandError));
         ApplyAuthoringCommand = AddCommand(new AsyncUiCommand(ApplyAuthoringAsync, () => CanApplyAuthoring && !IsBusy, HandleCommandError));
         UndoAuthoringCommand = AddCommand(new AsyncUiCommand(UndoAuthoringAsync, () => CanUndoAuthoring && !IsBusy, HandleCommandError));
+        RedoAuthoringCommand = AddCommand(new AsyncUiCommand(RedoAuthoringAsync, () => CanRedoAuthoring && !IsBusy, HandleCommandError));
         SaveScriptSourceCommand = AddCommand(new AsyncUiCommand(SaveScriptSourceAsync, () => CanSaveScriptSource, HandleCommandError));
         UndoScriptSourceCommand = AddCommand(new AsyncUiCommand(UndoScriptSourceAsync, () => CanUndoScriptSource, HandleCommandError));
         ReloadScriptSourceCommand = AddCommand(new AsyncUiCommand(ReloadScriptSourceAsync, () => CanReloadScriptSource, HandleCommandError));
@@ -151,6 +152,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand RefreshSnapshotsCommand { get; }
     public ICommand ApplyAuthoringCommand { get; }
     public ICommand UndoAuthoringCommand { get; }
+    public ICommand RedoAuthoringCommand { get; }
     public ICommand SaveScriptSourceCommand { get; }
     public ICommand UndoScriptSourceCommand { get; }
     public ICommand ReloadScriptSourceCommand { get; }
@@ -460,7 +462,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     {
         EditorAuthoringState.Applying => "authoring applying…",
         EditorAuthoringState.Undoing => "authoring undoing…",
-        EditorAuthoringState.Succeeded => $"{_workspace.Authoring.Operation} succeeded · undo={_workspace.Authoring.UndoDepth}",
+        EditorAuthoringState.Redoing => "authoring redoing…",
+        EditorAuthoringState.Succeeded => $"{_workspace.Authoring.Operation} succeeded · undo={_workspace.Authoring.UndoDepth} · redo={_workspace.Authoring.RedoDepth}",
         EditorAuthoringState.Failed => $"authoring failed · {_workspace.Authoring.ErrorCode} · current content retained",
         _ => "authoring idle"
     };
@@ -474,7 +477,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         || _workspace.AssetCatalogSnapshot.State == EditorSnapshotState.Loading
         || _workspace.Publication.State == EditorPublicationState.Loading
         || _workspace.TextureImport.State == EditorTextureImportState.Running
-        || _workspace.Authoring.State is EditorAuthoringState.Applying or EditorAuthoringState.Undoing
+        || _workspace.Authoring.State is EditorAuthoringState.Applying or EditorAuthoringState.Undoing or EditorAuthoringState.Redoing
         || _workspace.ScriptSource.State is EditorScriptSourceState.Loading or EditorScriptSourceState.Saving or EditorScriptSourceState.Undoing
         || _workspace.ScriptAssetLifecycle.IsBusy
         || _workspace.Bake.State == EditorBakeState.Running
@@ -497,6 +500,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && !IsScriptSourceDirty
         && AreSceneBehaviorsStructurallyValid;
     public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0 && !IsScriptSourceDirty;
+    public bool CanRedoAuthoring => IsProjectOpen && _workspace.Capabilities.CanRedoAuthoring && _workspace.Authoring.RedoDepth > 0 && !IsScriptSourceDirty;
     public bool SupportsScriptSourceAuthoring => IsProjectOpen
         && _workspace.ProjectSnapshot.Value?.Script.SchemaVersion == 2
         && _workspace.Capabilities.CanReadScriptSource;
@@ -549,7 +553,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         { ErrorCode: { } code } => $"行为契约不可用 · {code}",
         _ => "行为契约不可用。"
     };
-    public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6;
+    public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7;
     public bool HasSelectedBehaviorBinding => SelectedBehaviorBinding is not null;
     public bool CanAddBehaviorBinding => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
@@ -717,6 +721,24 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
         var project = _workspace.ProjectSnapshot.Value ?? throw new EditorRpcException("snapshot_missing", "Project snapshot is not loaded.");
         var result = await _workspace.UndoAuthoringAsync(new AuthoringUndoParameters(session.ProjectName, project.AuthoringRevision), cancellationToken == default ? _lifetime.Token : cancellationToken);
+        ReconcileScriptSourceDocument();
+        ApplySnapshotProjection(session);
+        RaiseAll();
+        return result;
+    }
+
+    private async Task RedoAuthoringAsync()
+    {
+        await RedoAuthoringForCurrentProjectAsync(_lifetime.Token);
+    }
+
+    public async Task<AuthoringMutationResult> RedoAuthoringForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureConnectedAsync();
+        if (IsScriptSourceDirty) { throw new EditorRpcException("script_source_dirty", "请先保存或放弃行为脚本源码的未保存内容。"); }
+        var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
+        var project = _workspace.ProjectSnapshot.Value ?? throw new EditorRpcException("snapshot_missing", "Project snapshot is not loaded.");
+        var result = await _workspace.RedoAuthoringAsync(new AuthoringRedoParameters(session.ProjectName, project.AuthoringRevision), cancellationToken == default ? _lifetime.Token : cancellationToken);
         ReconcileScriptSourceDocument();
         ApplySnapshotProjection(session);
         RaiseAll();
@@ -1380,11 +1402,12 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
 
     private void SetAuthoringFields(ProjectModelSnapshot project)
     {
-        SceneGoalX = project.Scene.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
-        SceneGoalY = project.Scene.GoalPosition[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
-        ScenePlayerTextureId = project.Scene.PlayerTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        SceneGoalTextureId = project.Scene.GoalTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        SceneHazardTextureId = project.Scene.HazardTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var gameplayEnabled = project.Scene.GameplayProfile == "goal_hazard_v1";
+        SceneGoalX = gameplayEnabled ? project.Scene.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
+        SceneGoalY = gameplayEnabled ? project.Scene.GoalPosition[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
+        ScenePlayerTextureId = gameplayEnabled ? project.Scene.PlayerTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
+        SceneGoalTextureId = gameplayEnabled ? project.Scene.GoalTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
+        SceneHazardTextureId = gameplayEnabled ? project.Scene.HazardTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
         if (project.Script.SchemaVersion == 1)
         {
             ScriptGoalX = project.Script.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
@@ -1663,6 +1686,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanCreateProject));
         OnPropertyChanged(nameof(CanApplyAuthoring));
         OnPropertyChanged(nameof(CanUndoAuthoring));
+        OnPropertyChanged(nameof(CanRedoAuthoring));
         OnPropertyChanged(nameof(SupportsScriptSourceAuthoring));
         OnPropertyChanged(nameof(UsesHookScriptAuthoring));
         OnPropertyChanged(nameof(CanSaveScriptSource));

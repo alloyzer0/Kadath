@@ -41,6 +41,7 @@ internal static class Program
             await ProjectLifecycleVerifier.VerifyAsync();
             await PublicationVerifier.VerifyAsync();
             await BehaviorPublicationVerifier.VerifyAsync();
+            await NeutralSceneVerifier.VerifyAsync();
             await VerifyPreviewModelAsync(project);
 
             var missing = await readModel.ReadPublicationAsync(project, "debug", default);
@@ -136,6 +137,7 @@ internal static class Program
             Console.WriteLine("texture_import=ok");
             Console.WriteLine("native_publication=ok");
             Console.WriteLine("project_lifecycle=ok");
+            Console.WriteLine("neutral_scene_authoring=ok");
             Console.WriteLine("failure_boundaries=ok");
             Console.WriteLine("read_only=ok");
             Console.WriteLine("pwsh_dependency=none");
