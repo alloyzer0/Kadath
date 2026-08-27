@@ -436,6 +436,8 @@ pub(crate) fn contact_events(
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ContactTransition {
     pub(crate) ended: bool,
+    // 公开生产路径只需 source index；完整 ObjectKey 仅供 legacy 测试 oracle 生成 ABI 事件。
+    #[cfg(test)]
     pub(crate) other: ObjectKey,
     pub(crate) other_source_index: u8,
 }
@@ -450,6 +452,7 @@ pub(crate) fn contact_transitions(
 ) -> Result<([ContactTransition; MAX_CONTACT_TRANSITIONS], usize), u32> {
     let mut output = [ContactTransition {
         ended: false,
+        #[cfg(test)]
         other: gameplay.player,
         other_source_index: gameplay.player_source_index,
     }; MAX_CONTACT_TRANSITIONS];
@@ -469,6 +472,7 @@ pub(crate) fn contact_transitions(
         }
         output[count] = ContactTransition {
             ended: true,
+            #[cfg(test)]
             other,
             other_source_index: source_index,
         };
@@ -478,6 +482,9 @@ pub(crate) fn contact_transitions(
         let Some(other) = current[index] else {
             continue;
         };
+        // 非 test 生产路径只需 source index；保留该绑定供 legacy ABI oracle 使用。
+        #[cfg(not(test))]
+        let _ = other;
         if mask_contains(
             &gameplay.previous_contact_mask,
             current_source_indices[index],
@@ -489,6 +496,7 @@ pub(crate) fn contact_transitions(
         }
         output[count] = ContactTransition {
             ended: false,
+            #[cfg(test)]
             other,
             other_source_index: current_source_indices[index],
         };

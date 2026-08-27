@@ -187,6 +187,7 @@ impl TrustedEventEntry {
     }
 }
 
+#[cfg(test)]
 fn compact_trusted_event(
     event: &abi::kadath_runtime_phase_event_v1_t,
     state: &object_authority::RuntimeState,
@@ -219,6 +220,7 @@ fn compact_trusted_event(
 
 /// Gameplay 只会为 authored source 发布接触事件；队列内部保存 source index，
 /// drain 时再从 Object Authority 解析最新且仍 active 的公开引用。
+#[cfg(test)]
 fn trusted_source_index(
     state: &object_authority::RuntimeState,
     value: &abi::kadath_runtime_object_ref_v1_t,
@@ -1250,6 +1252,7 @@ pub(crate) fn submit_events(
 /// 该入口不属于 C ABI；调用者只能传入 `contact_events` 构造的固定事件，
 /// 因此跳过面向外部脚本的 ObjectRef/字段重复校验，同时保留队列容量、
 /// Phase 活跃状态、序列号和 generation 的不变量。
+#[cfg(test)]
 pub(crate) fn submit_trusted_gameplay_events_with(
     core: &mut RuntimeCore,
     event_count: usize,
