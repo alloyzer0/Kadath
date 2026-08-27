@@ -59,10 +59,20 @@ fn sourceFor(index: usize, id_storage: *[active_objects][32]u8) !runtime_core.So
 }
 
 fn configureGameplay(fixture: *Fixture, target: runtime_core.Target) !void {
-    fixture.player = (try fixture.core.findById(target, "player")).?.object_ref;
-    fixture.goal = (try fixture.core.findById(target, "goal")).?.object_ref;
+    var views: [active_objects]runtime_core.ObjectView = undefined;
+    const visible = try fixture.core.snapshot(target, true, &views);
+    const objectRefAtSource = struct {
+        fn get(items: []const runtime_core.ObjectView, source_index: usize) ?runtime_core.ObjectRef {
+            for (items) |view| {
+                if (@as(usize, view.origin_key) == source_index) return view.object_ref;
+            }
+            return null;
+        }
+    }.get;
+    fixture.player = objectRefAtSource(visible, 0) orelse return error.MissingPlayer;
+    fixture.goal = objectRefAtSource(visible, active_objects - 1) orelse return error.MissingGoal;
     for (&fixture.hazards, 1..) |*hazard, source_index| {
-        hazard.* = .{ .object_ref = (try fixture.core.findById(target, fixture.sources[source_index].object_id)).?.object_ref };
+        hazard.* = .{ .object_ref = objectRefAtSource(visible, source_index) orelse return error.MissingHazard };
     }
     try fixture.core.prepareGameplay(1_000_000.0, fixture.player, fixture.goal, fixture.hazards[0 .. active_objects - 2]);
     _ = try fixture.core.preparePhaseState(target, &.{});

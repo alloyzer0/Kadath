@@ -362,12 +362,24 @@ pub const SceneGeneration = struct {
     }
 
     fn prepareGameplay(self: *SceneGeneration) !void {
+        // 候选场景已经由 Rust Core 固定排序；一次 snapshot 后按 source index 取引用，
+        // 避免 restart/reload 为每个 hazard 发起逐对象 ABI findById 查询。
+        var candidate_views: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
+        const visible = try self.core.snapshot(.candidate, true, &candidate_views);
+        const objectRefAtSource = struct {
+            fn get(views: []const runtime_core.ObjectView, source_index: usize) ?runtime_core.ObjectRef {
+                for (views) |view| {
+                    if (@as(usize, view.origin_key) == source_index) return view.object_ref;
+                }
+                return null;
+            }
+        }.get;
         var hazards: [scene_api.max_scene_object_count - 2]runtime_core.HazardDesc = undefined;
         for (self.hazards[0..self.hazard_count], 0..) |hazard, index| {
             const object = &self.scene.objects.entries[hazard.object_index];
             const legacy = self.scene.schemaVersion == scene_api.legacy_object_schema_version;
             hazards[index] = .{
-                .object_ref = (try self.core.findById(.candidate, object.objectId.slice()) orelse return error.UnknownSceneObject).object_ref,
+                .object_ref = objectRefAtSource(visible, hazard.object_index) orelse return error.UnknownSceneObject,
                 .legacy_patrol = legacy,
                 .patrol_min_y = if (legacy) object.patrol.minY else 0,
                 .patrol_max_y = if (legacy) object.patrol.maxY else 0,
@@ -376,8 +388,8 @@ pub const SceneGeneration = struct {
         }
         try self.core.prepareGameplay(
             3.0,
-            (try self.core.findById(.candidate, self.scene.objects.entries[self.player_index].objectId.slice()) orelse return error.UnknownSceneObject).object_ref,
-            (try self.core.findById(.candidate, self.scene.objects.entries[self.goal_index].objectId.slice()) orelse return error.UnknownSceneObject).object_ref,
+            objectRefAtSource(visible, @as(usize, self.player_index)) orelse return error.UnknownSceneObject,
+            objectRefAtSource(visible, @as(usize, self.goal_index)) orelse return error.UnknownSceneObject,
             hazards[0..self.hazard_count],
         );
     }
