@@ -3,7 +3,7 @@
 ## 元信息
 
 - **状态**: 已采纳
-- **实施状态**: 已完成（2026-08-27，当前固定点 `b1cb26f`）
+- **实施状态**: 已完成（2026-08-27，当前固定点 `25d1c25`）
 - **日期**: 2026-08-21
 - **决策者**: @alloyzer0
 - **相关主题**: Phase 1 架构治理回环；Rust / Zig 高层 Runtime ownership
@@ -323,6 +323,7 @@ Scheduler 只有在出现第二个真实异步消费者，或 Runtime Core 需�
 - `f114d75`：fixed/frame Phase queue、sequence/generation、admission、预算和 structural/activation transaction 迁入同一 Core；
 - `3c4edb7`：collision/contact、GameSession、outcome、final tint 与 coherent render/gameplay snapshot 迁入同一 Core；
 - `b1cb26f`：通过确定性 Gameplay Vertical Slice 与 ABI header 初始化修复验证完整生产链路。
+- `ae6da4d..25d1c25`：在同一 ownership 边界上交付 Scene v7 Optional Gameplay、PreparedNone candidate、中立 fixed-step/render publication 与 Editor 产品链；没有重新引入 Zig 跨 step Runtime authority。
 
 旧 Zig `RuntimeObjectRegistry`、persistent Phase queue、`GameSession`、collision/contact ledger、`app/game.zig`、`app/collision.zig` 和 final gameplay projection 已删除；Zig 只保留 Host timing、Scene/Behavior Adapter、callback-local staging、Renderer/Audio 消费和产品生命周期。当前实现已经达到本 ADR 的 TARGET，不再处于双 authority 迁移期。
 
@@ -440,3 +441,4 @@ Kadath 已实现 **“Zig Host 驱动平台与产品生命周期，Rust Runtime 
 - 2026-08-21: 基于 `bfc5504`、现有 ADR/C4、Rust 代码历史和当前 ownership 审计形成初稿。
 - 2026-08-21: 主导者确认先固定 Runtime Object Lifecycle candidate，再实施 Rust/Zig 架构对账；状态设为“已采纳”。
 - 2026-08-27: Object Authority、Phase Commit、Gameplay 三段迁移与 Gameplay Vertical Slice 均已合并；以 `b1cb26f` 为当前固定点完成实施收口。
+- 2026-08-27: Gameplay-neutral Scene 已在 `25d1c25` 收口；Gameplay 成为显式可选 Module，既有 ownership 结论不变。
