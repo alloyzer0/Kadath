@@ -178,11 +178,6 @@ check_benchmark() {
     verify_bound_file "$report" "GAMEPLAY_${prefix}_BUILD_STDERR" "GAMEPLAY_${prefix}_BUILD_STDERR_SHA256" || blocked+=("$prefix build stderr hash mismatch")
     verify_bound_file "$report" "GAMEPLAY_${prefix}_P95_SAMPLES" "GAMEPLAY_${prefix}_P95_SAMPLES_SHA256" || blocked+=("$prefix p95 samples hash mismatch")
 }
-verify_report_payload "$candidate_report" CANDIDATE
-verify_report_payload "$oracle_report" ORACLE
-check_benchmark "$candidate_benchmark" "$candidate_report" CANDIDATE
-check_benchmark "$oracle_benchmark" "$oracle_report" ORACLE
-
 verify_performance_raw_evidence() {
     local manifest header expected_header row_count expected_run
     local run candidate_stdout candidate_stdout_hash candidate_stderr candidate_stderr_hash candidate_time candidate_time_hash
@@ -258,9 +253,6 @@ verify_performance_metrics() {
     fi
 }
 
-verify_performance_raw_evidence
-verify_performance_metrics
-
 verify_performance_commands() {
     local manifest header row_count
     manifest=$(value "$candidate_report" GAMEPLAY_PERF_COMMAND_MANIFEST)
@@ -278,7 +270,16 @@ verify_performance_commands() {
        "$(awk -F '\t' '$1 == "oracle_run" { n++ } END { print n+0 }' "$manifest")" == 5 ]] || \
         blocked+=("performance command manifest is not five paired runs")
 }
-verify_performance_commands
+
+if [[ -f "$candidate_report" && -f "$oracle_report" ]]; then
+    verify_report_payload "$candidate_report" CANDIDATE
+    verify_report_payload "$oracle_report" ORACLE
+    check_benchmark "$candidate_benchmark" "$candidate_report" CANDIDATE
+    check_benchmark "$oracle_benchmark" "$oracle_report" ORACLE
+    verify_performance_raw_evidence
+    verify_performance_metrics
+    verify_performance_commands
+fi
 
 if [[ -f "$candidate_report" && -f "$oracle_report" ]]; then
     candidate_p95=$(value "$candidate_report" GAMEPLAY_CANDIDATE_P95_NS)
