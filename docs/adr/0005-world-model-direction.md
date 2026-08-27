@@ -463,9 +463,20 @@ Kadath 的世界模型采用 **“对外 OOP 语义为主，内部热点路径�
 
 ---
 
-## 12. 审阅记录
+## 12. 2026-08-27 补充：Gameplay-neutral Scene
+
+Runtime ownership 迁移完成后，当前 Scene Object Interface 仍要求固定 Demo Gameplay 角色。该要求曾用于尽快交付 M2 Demo，但不应继续成为通用 World / Scene 的有效性前提。
+
+- Scene 必须能在没有 Player、Goal 和 Hazard 的情况下承载 Object、Behavior 与 Render 生命周期；
+- Gameplay 是 Scene 显式选择的可选 Module，不得仅由 Object Kind 或对象数量隐式激活；
+- 旧 Scene schema 可以由 Adapter 归一化到兼容 Gameplay Profile，但新 Neutral Scene 不伪造角色或 GameSession；
+- 本补充不授权公开通用 ECS、archetype 或任意组件集合，仍保持单一对象语义 Interface；
+- Gameplay 可选化后的内部存储、候选事务和 render extraction 继续由 Rust Runtime Core 隐藏，Scene、Editor 与 Luau 不依赖其 layout。
+
+## 13. 审阅记录
 
 - 2026-05-27: 初稿，待主导者审阅
 - 2026-06-02: 按 Phase 1 定稿前评审计划补充 `P4` 回答、周边子系统边界、首个实现前冻结项与定稿评审结果，状态调整为“已完成一致性评审，待主导者审阅”
 - 2026-06-03: 主导者确认 `ADR-0005` 方向基本可以确定，状态调整为“已采纳”
 - 2026-08-21: 根据 `ADR-0009` 补充 Scene/Luau/Editor 外部入口与 Rust Runtime Core 内部 authority，明确当前分裂状态只是迁移起点。
+- 2026-08-27: 主导者确认当前应先完善引擎能力；增加 Gameplay-neutral Scene 决策，不把下一增量继续定义为 Gameplay Vertical Slice。

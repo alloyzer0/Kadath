@@ -112,9 +112,20 @@ graph TD
 | RHI / Vulkan / Renderer pipeline、swapchain、GPU resource、frame token | 设备 / swapchain / frame | Zig RHI 与 Renderer2D | 是 | **保留 Zig**。属于设备状态，不是 Gameplay state。 |
 | Resource async loader、pending job、completion 与 texture refresh candidate | 单次 I/O job 至受控 completion ingestion | Zig Resource；后台执行由独立 Rust Scheduler 拥有 | 可以 | **不迁入 Runtime Core**。Host 选择 ingestion 时机，只有完成后的有界结果可穿过 seam。 |
 | Audio backend、worker、cue queue 与 owned clip | Runtime 进程 / Audio worker | Zig Audio | 是 | **保留 Zig**。只消费 one-shot Outcome，不拥有 outcome sequence 或 GameSession。 |
-| replay recorder、digest、allocation/profile 归因表 | 单次测试 / benchmark workload | Zig evidence Adapter + quality-only Rust counter | 可以；仅证据路径 | **永不成为生产权威**。VS03 复用并扩展 VS02 evidence，不建设第二套 lifecycle driver。 |
+| replay recorder、digest、allocation/profile 归因表 | 单次测试 / benchmark workload | Zig evidence Adapter + quality-only Rust counter | 可以；仅证据路径 | **永不成为生产权威**。后续能力复用现有 focused evidence，不建设第二套 lifecycle driver。 |
 
 迁移结论：剩余 Zig 状态均属于 Host timing、外部设备/I/O、Authoring/VM 专属状态、caller-owned publication 或 phase/callback 薄游标。当前没有新的跨 step Object、Phase 或 Gameplay authority 需要迁移；后续只有发现同一 Runtime 事实被两个 Module 持久写入时，才重开 ownership 迁移。
+
+### 2.4 下一能力：Gameplay-neutral Scene
+
+Runtime ownership 迁移完成不等于通用引擎能力已经完整。当前 Scene Interface 仍强制一个 Player、一个 Goal 和至少一个 Hazard，`SceneGeneration` 与 Host 也默认每个 Scene 都准备并推进 GameSession；这使 Object/Phase/Behavior/Render 的通用能力被 Demo Gameplay 形状限制。
+
+`P1-Engine-Scene-Neutral-01` 将 Gameplay 改为 Scene 的显式可选配置：
+
+- Neutral Scene 继续使用 Rust Runtime Core 的 Object Authority 与 Phase Commit，但不创建或推进 GameSession；
+- 旧 Scene v4—v6 通过 Scene Adapter 归一化为兼容 `goal_hazard_v1` Gameplay Profile，产品行为不变；
+- Zig Host 只根据已解码 profile 选择调用顺序，不保存第二份 Gameplay state；
+- Render publication 继续由 Rust Core 输出 caller-owned snapshot。若现有 Gameplay snapshot Interface 无法在不扩大语义耦合的前提下服务 Neutral Scene，才建立独立 Render Observation Interface；禁止先复制第二套 snapshot Implementation。
 
 ---
 

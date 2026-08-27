@@ -328,6 +328,12 @@ Scheduler 只有在出现第二个真实异步消费者，或 Runtime Core 需�
 
 Scheduler 条件保持不变：没有第二个真实异步消费者，也没有 Runtime Core completion ingestion 的新需求，因此本次收口不扩张 Scheduler。
 
+### 5.6 2026-08-27 Gameplay 可选化澄清
+
+Runtime Core 拥有 Gameplay authority，不代表每个 Scene 都必须创建 Gameplay state。`P1-Engine-Scene-Neutral-01` 将 Scene candidate 的 Gameplay 配对状态扩展为“显式未启用”或“已准备兼容 Demo Gameplay”；两者都由同一 Rust Core 原子 commit/abort，Zig 不得用伪角色、空 descriptor 或本地 GameSession 绕过该事务。
+
+Neutral Scene 仍使用 Object Authority、Phase Commit 与 caller-owned render publication。若 render observation 从现有 Gameplay Interface 分离，旧入口只能作为共享同一 Implementation 的兼容 Adapter，禁止形成第二套 render authority 或快照存储。
+
 ---
 
 ## 6. 不变量
