@@ -123,6 +123,8 @@ if [[ -f "$coverage_report" ]]; then
             [[ "$(awk -F '\t' -v id="$decision_id" 'NR > 1 && $4 == id { count++ } END { print count+0 }' "$decision_manifest")" == 1 ]] || \
                 blocked+=("critical decision row missing or duplicated: $decision_id")
         done
+        [[ "$(awk 'NR > 1 { rows++ } END { print rows+0 }' "$decision_manifest")" == 10 ]] || \
+            blocked+=("critical decision manifest contains unexpected rows")
     fi
     awk -v n="$decision_percent" 'BEGIN { exit !(n+0 == 100) }' || blocked+=("critical decision coverage below 100%")
     verify_bound_file "$coverage_report" GAMEPLAY_COVERAGE_RUST_JSON GAMEPLAY_COVERAGE_RUST_JSON_SHA256 || blocked+=("Rust coverage artifact hash mismatch")
