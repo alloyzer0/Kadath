@@ -420,10 +420,10 @@ pub const Host = struct {
         for (commands) |command| {
             switch (command) {
                 .set_goal_position => |position| try self.setGoalPosition(position),
-                .translate_goal => |delta| try self.setGoalPosition(.{
-                    self.generation.goalPosition()[0] + delta[0],
-                    self.generation.goalPosition()[1] + delta[1],
-                }),
+                .translate_goal => |delta| {
+                    const current = try self.generation.goalPosition();
+                    try self.setGoalPosition(.{ current[0] + delta[0], current[1] + delta[1] });
+                },
             }
         }
     }
@@ -461,7 +461,7 @@ pub const Host = struct {
         const previous_program = self.script_program;
         const previous_enabled = self.script_enabled;
         const previous_tick = self.script_tick;
-        const previous_goal_position = self.generation.goalPosition();
+        const previous_goal_position = try self.generation.goalPosition();
 
         // 关键事务边界：候选 Program 解析成功后再激活；激活失败恢复旧 Program 与 Goal 状态。
         self.script_program = candidate;
@@ -775,7 +775,7 @@ fn applyScriptCommandsToGeneration(generation: *scene_generation_api.SceneGenera
         switch (command) {
             .set_goal_position => |position| try generation.setGoalPosition(position),
             .translate_goal => |delta| {
-                const current = generation.goalPosition();
+                const current = try generation.goalPosition();
                 try generation.setGoalPosition(.{ current[0] + delta[0], current[1] + delta[1] });
             },
         }

@@ -144,7 +144,7 @@ pub const SceneGeneration = struct {
         if (extent.width == 0 or extent.height == 0) return;
         try self.core.setBounds(self.target, .{ 0, 0 }, boundsMax(extent));
         self.extent = extent;
-        try self.setGoalPosition(self.goalPosition());
+        try self.setGoalPosition(try self.goalPosition());
     }
 
     pub fn extractSprites(self: *SceneGeneration, output: []runtime_core.RenderSprite) !struct { sprites: []runtime_core.RenderSprite, snapshot: runtime_core.GameplaySnapshot } {
@@ -351,8 +351,9 @@ pub const SceneGeneration = struct {
         return objectId(view.object_ref) catch null;
     }
 
-    pub fn goalPosition(self: *const SceneGeneration) [2]f32 {
-        return self.objectPosition(self.goal_index) catch self.scene.goal().sprite.position;
+    pub fn goalPosition(self: *const SceneGeneration) ![2]f32 {
+        // Goal 的实时位置以 Rust Runtime Core 为唯一权威；查询失败必须由调用方显式处理。
+        return self.objectPosition(self.goal_index);
     }
 
     pub fn primaryHazardY(self: *const SceneGeneration) f32 {
@@ -516,6 +517,15 @@ fn testGameplayStep(generation: *SceneGeneration, dt_seconds: f32, input: runtim
 test "SceneGeneration keeps fixed-capacity Scene storage out of line" {
     try std.testing.expect(@sizeOf(scene_api.Scene) > 400 * 1024);
     try std.testing.expect(@sizeOf(SceneGeneration) < 64 * 1024);
+}
+
+test "SceneGeneration propagates an unavailable authoritative goal position" {
+    var generation = try SceneGeneration.prepare(&scene_api.default_scene, .{ .width = 1024, .height = 720 });
+    defer generation.deinit();
+
+    // 构造一个已不在 Core 快照中的索引，验证 Adapter 不会回退到旧 Scene 数据。
+    generation.goal_index = generation.scene.objects.count;
+    try std.testing.expectError(error.UnknownSceneObject, generation.goalPosition());
 }
 
 test "SceneGeneration preserves source order and updates independent hazards" {
