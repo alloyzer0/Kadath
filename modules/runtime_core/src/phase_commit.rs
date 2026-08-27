@@ -294,8 +294,10 @@ struct Candidate {
 #[derive(Clone, Copy)]
 struct DomainState {
     phase_sequence: Option<u64>,
-    event_queue: BoundedVec<EventEntry, EVENT_CAPACITY>,
+    // Gameplay 热路径只触碰 compact queue；将其放在大 ABI 队列之前，
+    // 避免固定域常规提交因字段偏移额外驻留一页未使用的公共存储。
     trusted_event_queue: BoundedVec<TrustedEventEntry, EVENT_CAPACITY>,
+    event_queue: BoundedVec<EventEntry, EVENT_CAPACITY>,
     structural_queue: BoundedVec<StructuralEntry, STRUCTURAL_CAPACITY>,
     event_successor_generation: u32,
     structural_successor_generation: u32,
