@@ -27,7 +27,7 @@ repository_root=$(git rev-parse --show-toplevel)
 mkdir -p "$evidence_root"
 
 # 只对冻结清单中的 Gameplay/Phase critical 函数做变异；lib.rs 其它通用 FFI 包装器不属于本门禁。
-critical_pattern='strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|mask_contains|source_key_is_live|append_contact_transition|step_plan|step_result|outcome_value|prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|publish_gameplay_snapshot|validate_outcome_buffer|apply_positions|valid_output_array|query_gameplay_interface|begin_phase_impl|begin_phase_v1|begin_phase_v2|submit_events|validate_event'
+critical_pattern='strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|submit_trusted_gameplay_events_with|mask_contains|source_key_is_live|append_contact_transition|step_plan|step_result|outcome_value|prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|publish_gameplay_snapshot|validate_outcome_buffer|apply_positions|valid_output_array|query_gameplay_interface|begin_phase_impl|begin_phase_v1|begin_phase_v2|submit_events|validate_event'
 mutation_root="$evidence_root/mutants"
 (cd -- "$repository_root" && cargo mutants --package kadath_runtime_core \
     --file modules/runtime_core/src/gameplay.rs \
@@ -64,7 +64,7 @@ printf 'domain\tfile\tfunction\tstatus\tmutant\tlog\n' >"$manifest"
 jq -r '.outcomes[] | select(.scenario != "Baseline") |
     (.scenario.Mutant // {}) as $m |
     ($m.function.function_name // "unknown") as $fn |
-    (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|mask_contains")) then "contact_differencing"
+    (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|submit_trusted_gameplay_events_with|mask_contains")) then "contact_differencing"
      elif ($fn | test("prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|step_plan|step_result")) then "timer_priority"
      elif ($fn | test("source_key_is_live|validate_outcome_buffer|read_object_key|object_view")) then "epoch_stale"
      elif ($fn | test("append_contact_transition|valid_output_array|apply_positions|validate_outcome_buffer")) then "capacity"
@@ -78,7 +78,7 @@ critical_manifest="$evidence_root/mutation-critical-domains.tsv"
 cat >"$critical_manifest" <<'EOF'
 domain	files	functions
 timer_priority	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/lib.rs	step_plan;step_result;prepare_gameplay_state;begin_gameplay_fixed;plan_gameplay_positions;commit_gameplay_fixed
-contact_differencing	modules/runtime_core/src/gameplay.rs	strict_overlap;active_contacts;contact_events;contact_transitions;submit_contact_transitions;mask_contains
+contact_differencing	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/phase_commit.rs	strict_overlap;active_contacts;contact_events;contact_transitions;submit_contact_transitions;submit_trusted_gameplay_events_with;mask_contains
 epoch_stale	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/lib.rs	source_key_is_live;validate_outcome_buffer;read_object_key;object_view
 capacity	modules/runtime_core/src/gameplay.rs;modules/runtime_core/src/lib.rs	append_contact_transition;valid_output_array;apply_positions
 snapshot_publication	modules/runtime_core/src/lib.rs	publish_gameplay_snapshot;gameplay_snapshot
@@ -94,7 +94,7 @@ jq -r --arg pattern "$critical_pattern" '.outcomes[]
     | select(.scenario != "Baseline" and .summary == "MissedMutant")
     | (.scenario.Mutant // {}) as $m
     | ($m.function.function_name // "unknown") as $fn
-    | (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|mask_contains")) then "contact_differencing"
+    | (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|submit_trusted_gameplay_events_with|mask_contains")) then "contact_differencing"
        elif ($fn | test("prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|step_plan|step_result")) then "timer_priority"
        elif ($fn | test("source_key_is_live|validate_outcome_buffer|read_object_key|object_view")) then "epoch_stale"
        elif ($fn | test("append_contact_transition|valid_output_array|apply_positions|validate_outcome_buffer")) then "capacity"
@@ -112,7 +112,7 @@ jq -r '.outcomes[]
     | select(.scenario != "Baseline" and .summary == "Unviable")
     | (.scenario.Mutant // {}) as $m
     | ($m.function.function_name // "unknown") as $fn
-    | (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|mask_contains")) then "contact_differencing"
+    | (if ($fn | test("strict_overlap|active_contacts|contact_events|contact_transitions|submit_contact_transitions|submit_trusted_gameplay_events_with|mask_contains")) then "contact_differencing"
        elif ($fn | test("prepare_gameplay_state|begin_gameplay_fixed|plan_gameplay_positions|commit_gameplay_fixed|step_plan|step_result")) then "timer_priority"
        elif ($fn | test("source_key_is_live|validate_outcome_buffer|read_object_key|object_view")) then "epoch_stale"
        elif ($fn | test("append_contact_transition|valid_output_array|apply_positions|validate_outcome_buffer")) then "capacity"
@@ -150,3 +150,6 @@ GAMEPLAY_MUTATION_UNVIABLE_AUDIT_SHA256=$(sha256sum "$unviable_audit" | awk '{pr
 GAMEPLAY_MUTATION_BLOCKER=$(IFS=';'; printf '%s' "${blockers[*]-}")
 EOF
 cat "$report"
+
+# 报告必须先完整落盘并输出；只要门禁判定为 FAIL，脚本最终状态也必须非零。
+[[ "$status" == PASS ]]
