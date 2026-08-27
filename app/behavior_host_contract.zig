@@ -2,6 +2,8 @@ const std = @import("std");
 const behavior_host = @import("behavior_host.zig");
 const behavior_host_stub = @import("behavior_host_stub.zig");
 const builder = @import("behavior_package_builder");
+const gameplay_replay = @import("gameplay_replay");
+const gameplay_vertical_slice_fixture = @import("gameplay_vertical_slice_fixture");
 const manifest = @import("behavior_manifest");
 const scene_api = @import("scene.zig");
 const scene_generation_api = @import("scene_generation.zig");
@@ -1111,4 +1113,271 @@ test "saved ObjectRef follows restart replacement and rejects a new world epoch"
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 1), (try fixture.generation.objectPosition(2))[0], 0.0001);
     try std.testing.expect(!fixture.runtime.active.?.bindingEnabled(1));
+}
+
+const vertical_slice_manifest = gameplay_vertical_slice_fixture.manifest;
+const vertical_slice_player_source = gameplay_vertical_slice_fixture.player_source;
+const vertical_slice_no_op_source = gameplay_vertical_slice_fixture.no_op_source;
+const vertical_slice_scene = gameplay_vertical_slice_fixture.initial_scene;
+const vertical_slice_reload_scene = gameplay_vertical_slice_fixture.reload_scene;
+
+const InitialVerticalEvidence = struct {
+    digest: gameplay_replay.Digest,
+    first_outcome: runtime_core.GameplayOutcome,
+    final_snapshot: runtime_core.GameplaySnapshot,
+    player_position: [2]f32,
+    probe_position: [2]f32,
+};
+
+const VerticalStepEvidence = struct {
+    outcome: ?runtime_core.GameplayOutcome,
+    snapshot: runtime_core.GameplaySnapshot,
+};
+
+fn runVerticalFixedStep(
+    fixture: *RuntimeFixture,
+    requested: behavior_host.InputSnapshot,
+    recorder: *gameplay_replay.Recorder,
+) !VerticalStepEvidence {
+    var outcome = std.mem.zeroes(runtime_core.GameplayOutcome);
+    const begin = try fixture.generation.beginGameplayFixed(1.0 / 60.0, &outcome);
+    recorder.recordStep(.begin, &begin);
+    var published_outcome: ?runtime_core.GameplayOutcome = null;
+    if (begin.outcome_count == 1) {
+        recorder.recordOutcome(&outcome);
+        published_outcome = outcome;
+    }
+    const routed = if (begin.accepts_input != 0) requested else behavior_host.InputSnapshot{};
+    try fixture.runtime.runFixed(&fixture.generation, 1.0 / 60.0, routed);
+    try fixture.runtime.settleFixedStructuralBeforeGameplay(&fixture.generation);
+    const committed = try fixture.generation.commitGameplayFixed(begin.step_token, .{}, &outcome);
+    recorder.recordStep(.commit, &committed);
+    if (committed.outcome_count == 1) {
+        recorder.recordOutcome(&outcome);
+        published_outcome = outcome;
+    }
+    try fixture.runtime.finishFixedStep(&fixture.generation, routed);
+    var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
+    const publication = try fixture.generation.extractSprites(&render_items);
+    recorder.recordSnapshot(&publication.snapshot, publication.sprites);
+    return .{ .outcome = published_outcome, .snapshot = publication.snapshot };
+}
+
+fn startVerticalRuntime(fixture: *RuntimeFixture) !void {
+    const startup = try fixture.runtime.onStart(&fixture.generation);
+    try fixture.generation.applyTranslationDeltas(startup.slice());
+    try fixture.runtime.publishStartupEvents(&fixture.generation, &startup);
+}
+
+fn recordVerticalSnapshot(
+    fixture: *RuntimeFixture,
+    recorder: *gameplay_replay.Recorder,
+) !runtime_core.GameplaySnapshot {
+    var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
+    const publication = try fixture.generation.extractSprites(&render_items);
+    recorder.recordSnapshot(&publication.snapshot, publication.sprites);
+    return publication.snapshot;
+}
+
+fn restartVerticalFixture(fixture: *RuntimeFixture) !void {
+    var replacement = try scene_generation_api.SceneGeneration.prepareRestart(
+        fixture.generation.scene,
+        fixture.generation.extent,
+        &fixture.generation,
+    );
+    var transferred = false;
+    errdefer if (!transferred) replacement.deinit();
+    var candidate = try fixture.runtime.cloneForRestart(std.testing.allocator, fixture.generation.scene);
+    errdefer if (!transferred) candidate.deinit();
+    const startup = try candidate.onStart(&replacement);
+    try replacement.applyTranslationDeltas(startup.slice());
+    try candidate.preparePhaseState(&replacement);
+    try candidate.commitPhaseState(&replacement);
+    try replacement.commitPrepared(&fixture.generation);
+
+    var previous_generation = fixture.generation;
+    var previous_runtime = fixture.runtime;
+    fixture.generation = replacement;
+    fixture.runtime = candidate;
+    transferred = true;
+    previous_generation.deinit();
+    previous_runtime.deinit();
+    try fixture.runtime.publishStartupEvents(&fixture.generation, &startup);
+}
+
+fn reloadVerticalFixture(fixture: *RuntimeFixture) !void {
+    const reload_scene = try scene_api.parse(std.testing.allocator, vertical_slice_reload_scene);
+    var replacement = try scene_generation_api.SceneGeneration.prepareSceneReload(
+        &reload_scene,
+        fixture.generation.extent,
+        &fixture.generation,
+    );
+    var transferred = false;
+    errdefer if (!transferred) replacement.deinit();
+    var candidate = try fixture.runtime.cloneForSceneReload(std.testing.allocator, &reload_scene);
+    errdefer if (!transferred) candidate.deinit();
+    const startup = try candidate.onStart(&replacement);
+    try replacement.applyTranslationDeltas(startup.slice());
+    try candidate.preparePhaseState(&replacement);
+    try candidate.commitPhaseState(&replacement);
+    try replacement.commitPrepared(&fixture.generation);
+
+    var previous_generation = fixture.generation;
+    var previous_runtime = fixture.runtime;
+    fixture.generation = replacement;
+    fixture.runtime = candidate;
+    transferred = true;
+    previous_generation.deinit();
+    previous_runtime.deinit();
+    try fixture.runtime.publishStartupEvents(&fixture.generation, &startup);
+}
+
+fn runInitialVerticalSlice(first_move_y: i8) !InitialVerticalEvidence {
+    var fixture = try makeRuntimeFixture(
+        vertical_slice_manifest,
+        &.{
+            .{ .path = "scripts/vertical-player.luau", .source = vertical_slice_player_source },
+            .{ .path = "scripts/no-op.luau", .source = vertical_slice_no_op_source },
+        },
+        vertical_slice_scene,
+    );
+    defer fixture.deinit();
+
+    try startVerticalRuntime(&fixture);
+
+    var recorder = gameplay_replay.Recorder.init();
+    var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
+    var publication = try fixture.generation.extractSprites(&render_items);
+    recorder.recordSnapshot(&publication.snapshot, publication.sprites);
+
+    var first_outcome: ?runtime_core.GameplayOutcome = null;
+    const requested_inputs = [_]behavior_host.InputSnapshot{
+        .{ .move_y = first_move_y },
+        .{},
+        // 终态后的这个输入必须由 Host 路由规则抑制，Behavior 只收到零输入。
+        .{ .move_y = 1 },
+    };
+    for (requested_inputs) |requested| {
+        const step = try runVerticalFixedStep(&fixture, requested, &recorder);
+        if (first_outcome == null) first_outcome = step.outcome;
+        publication.snapshot = step.snapshot;
+    }
+
+    const player_index = fixture.generation.objectIndex("player") orelse return error.MissingVerticalPlayer;
+    const probe_index = fixture.generation.objectIndex("phase-probe") orelse return error.MissingVerticalProbe;
+    return .{
+        .digest = recorder.finish(),
+        .first_outcome = first_outcome orelse return error.MissingVerticalOutcome,
+        .final_snapshot = publication.snapshot,
+        .player_position = try fixture.generation.objectPosition(player_index),
+        .probe_position = try fixture.generation.objectPosition(probe_index),
+    };
+}
+
+const FullVerticalEvidence = struct {
+    digest: gameplay_replay.Digest,
+    initial_world_epoch: u64,
+    initial_player_entity: runtime_core.EntityId,
+    restart_world_epoch: u64,
+    restart_player_entity: runtime_core.EntityId,
+    restart_snapshot: runtime_core.GameplaySnapshot,
+    restart_probe_position: [2]f32,
+    restart_outcome: runtime_core.GameplayOutcome,
+    reload_world_epoch: u64,
+    reload_snapshot: runtime_core.GameplaySnapshot,
+    reload_outcome: runtime_core.GameplayOutcome,
+};
+
+fn runFullVerticalSlice() !FullVerticalEvidence {
+    var fixture = try makeRuntimeFixture(
+        vertical_slice_manifest,
+        &.{
+            .{ .path = "scripts/vertical-player.luau", .source = vertical_slice_player_source },
+            .{ .path = "scripts/no-op.luau", .source = vertical_slice_no_op_source },
+        },
+        vertical_slice_scene,
+    );
+    defer fixture.deinit();
+    try startVerticalRuntime(&fixture);
+
+    var recorder = gameplay_replay.Recorder.init();
+    const initial_world_epoch = try fixture.generation.worldEpoch();
+    const initial_player_entity = fixture.generation.playerEntity();
+    recorder.recordLifecycle(.initial, initial_world_epoch);
+    _ = try recordVerticalSnapshot(&fixture, &recorder);
+    _ = try runVerticalFixedStep(&fixture, .{}, &recorder);
+    _ = try runVerticalFixedStep(&fixture, .{}, &recorder);
+    _ = try runVerticalFixedStep(&fixture, .{ .move_y = 1 }, &recorder);
+
+    try restartVerticalFixture(&fixture);
+    const restart_world_epoch = try fixture.generation.worldEpoch();
+    const restart_player_entity = fixture.generation.playerEntity();
+    recorder.recordLifecycle(.restart, restart_world_epoch);
+    const restart_snapshot = try recordVerticalSnapshot(&fixture, &recorder);
+    const probe_index = fixture.generation.objectIndex("phase-probe") orelse return error.MissingVerticalProbe;
+    const restart_probe_position = try fixture.generation.objectPosition(probe_index);
+    _ = try runVerticalFixedStep(&fixture, .{}, &recorder);
+    const restart_terminal = try runVerticalFixedStep(&fixture, .{}, &recorder);
+    const restart_outcome = restart_terminal.outcome orelse return error.MissingRestartOutcome;
+
+    try reloadVerticalFixture(&fixture);
+    const reload_world_epoch = try fixture.generation.worldEpoch();
+    recorder.recordLifecycle(.scene_reload, reload_world_epoch);
+    _ = try recordVerticalSnapshot(&fixture, &recorder);
+    _ = try runVerticalFixedStep(&fixture, .{}, &recorder);
+    const reload_terminal = try runVerticalFixedStep(&fixture, .{}, &recorder);
+    const reload_outcome = reload_terminal.outcome orelse return error.MissingReloadOutcome;
+
+    return .{
+        .digest = recorder.finish(),
+        .initial_world_epoch = initial_world_epoch,
+        .initial_player_entity = initial_player_entity,
+        .restart_world_epoch = restart_world_epoch,
+        .restart_player_entity = restart_player_entity,
+        .restart_snapshot = restart_snapshot,
+        .restart_probe_position = restart_probe_position,
+        .restart_outcome = restart_outcome,
+        .reload_world_epoch = reload_world_epoch,
+        .reload_snapshot = reload_terminal.snapshot,
+        .reload_outcome = reload_outcome,
+    };
+}
+
+test "Vertical Slice replay is deterministic through Behavior fixed Contact Phase and terminal Snapshot" {
+    const first = try runInitialVerticalSlice(0);
+    const replay = try runInitialVerticalSlice(0);
+    const changed_input = try runInitialVerticalSlice(1);
+
+    try std.testing.expectEqualSlices(u8, &first.digest, &replay.digest);
+    try std.testing.expect(!std.mem.eql(u8, &first.digest, &changed_input.digest));
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), first.first_outcome.phase);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), first.first_outcome.cause);
+    try std.testing.expectEqual(@as(u64, 1), first.first_outcome.sequence);
+    try std.testing.expectEqualStrings("hazard-a", runtime_core.objectIdSlice(&first.first_outcome.other));
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), first.final_snapshot.phase);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), first.final_snapshot.cause);
+    try std.testing.expectEqual(@as(u32, 0), first.final_snapshot.accepts_input);
+    try std.testing.expectEqual(@as(u64, 1), first.final_snapshot.last_outcome_sequence);
+    try std.testing.expectEqual(@as(f32, 30), first.player_position[0]);
+    // 2=begin(A)，随后 1=end(A)、2=begin(B)，证明跨接触切换的 Phase 投递顺序为 212。
+    try std.testing.expectEqual(@as(f32, 212), first.probe_position[0]);
+}
+
+test "Vertical Slice restart and reload preserve outcome sequence and advance world epoch" {
+    const first = try runFullVerticalSlice();
+    const replay = try runFullVerticalSlice();
+
+    try std.testing.expectEqualSlices(u8, &first.digest, &replay.digest);
+    try std.testing.expectEqual(@as(u64, 1), first.initial_world_epoch);
+    try std.testing.expectEqual(first.initial_world_epoch, first.restart_world_epoch);
+    try std.testing.expect(first.initial_player_entity != first.restart_player_entity);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.playing), first.restart_snapshot.phase);
+    try std.testing.expectEqual(@as(f32, 0), first.restart_probe_position[0]);
+    try std.testing.expectEqual(@as(u64, 2), first.restart_outcome.sequence);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), first.restart_outcome.cause);
+    try std.testing.expectEqual(first.restart_world_epoch + 1, first.reload_world_epoch);
+    try std.testing.expectEqual(@as(u64, 3), first.reload_outcome.sequence);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.goal), first.reload_outcome.cause);
+    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.won), first.reload_snapshot.phase);
+    try std.testing.expectEqual(first.reload_world_epoch, first.reload_snapshot.world_epoch);
 }

@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 2,
+  "scripts": [
+    { "scriptId": 1, "source": "scripts/vertical-player.luau" },
+    { "scriptId": 99, "source": "scripts/no-op.luau" }
+  ]
+}

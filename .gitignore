@@ -1,5 +1,7 @@
 .zig-cache/
+.zig-cache-*/
 .zig-global-cache/
+.scratch/
 zig-out/
 .m004-*/
 .m4-*/

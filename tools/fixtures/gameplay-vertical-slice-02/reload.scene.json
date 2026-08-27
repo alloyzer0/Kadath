@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 6,
+  "textures": [
+    { "textureId": 1, "artifact": "assets/renderer2d/test.texture" }
+  ],
+  "objects": [
+    {
+      "objectId": "goal",
+      "kind": "goal",
+      "transform": { "position": [20, 10] },
+      "sprite": { "size": [2, 2], "color": [0, 1, 0, 1], "textureId": 1 },
+      "behaviors": []
+    },
+    {
+      "objectId": "hazard-a",
+      "kind": "patrol_hazard",
+      "transform": { "position": [200, 10] },
+      "sprite": { "size": [2, 2], "color": [1, 0, 0, 1], "textureId": 1 },
+      "behaviors": [{ "scriptId": 99, "parameters": {} }]
+    },
+    {
+      "objectId": "player",
+      "kind": "player",
+      "transform": { "position": [0, 10] },
+      "sprite": { "size": [2, 2], "color": [1, 1, 1, 1], "textureId": 1 },
+      "player": { "moveSpeed": 10 },
+      "behaviors": [{ "scriptId": 1, "parameters": {} }]
+    },
+    {
+      "objectId": "hazard-b",
+      "kind": "patrol_hazard",
+      "transform": { "position": [300, 10] },
+      "sprite": { "size": [2, 2], "color": [1, 0.5, 0, 1], "textureId": 1 },
+      "behaviors": [{ "scriptId": 99, "parameters": {} }]
+    },
+    {
+      "objectId": "phase-probe",
+      "kind": "sprite",
+      "transform": { "position": [0, 40] },
+      "sprite": { "size": [1, 1], "color": [0, 0, 1, 1], "textureId": 1 },
+      "behaviors": []
+    }
+  ],
+  "prototypes": []
+}

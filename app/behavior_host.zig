@@ -295,10 +295,8 @@ pub const Runtime = struct {
         var did_work = false;
         while (true) {
             var drained: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
-            for (&drained) |*event| {
-                event.* = std.mem.zeroes(runtime_core.PhaseEvent);
-                event.struct_size = @sizeOf(runtime_core.PhaseEvent);
-            }
+            // Rust Core 会完整写入返回 count 范围；预清零 64 个大型事件既不参与
+            // ABI preflight，也不会被空队列读取，避免在每次 Phase settle 制造固定成本。
             const count = try generation.core.drainPhaseEvents(session.domain, session.sequence, &drained);
             if (count == 0) break;
             did_work = true;

@@ -269,6 +269,22 @@ pub fn build(b: *std.Build) void {
     });
     runtime_core_mod.addIncludePath(b.path("abi"));
 
+    const gameplay_replay_test_mod = b.createModule(.{
+        .root_source_file = b.path("app/gameplay_replay.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gameplay_replay_test_mod.addImport("runtime_core", runtime_core_mod);
+    const gameplay_vertical_slice_fixture_mod = b.createModule(.{
+        .root_source_file = b.path("gameplay_vertical_slice_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const gameplay_replay_tests = b.addTest(.{ .root_module = gameplay_replay_test_mod });
+    const gameplay_replay_test_run = b.addRunArtifact(gameplay_replay_tests);
+    const gameplay_replay_test_step = b.step("test-gameplay-replay", "Run deterministic Gameplay replay digest contracts");
+    gameplay_replay_test_step.dependOn(&gameplay_replay_test_run.step);
+
     const renderer2d_mod = b.createModule(.{
         .root_source_file = b.path("modules/renderer2d/src/main.zig"),
         .target = target,
@@ -499,6 +515,7 @@ pub fn build(b: *std.Build) void {
     });
     const runtime_options_test_run = b.addRunArtifact(runtime_options_tests);
     const test_step = b.step("test", "Run Preview protocol unit tests");
+    test_step.dependOn(gameplay_replay_test_step);
     test_step.dependOn(&preview_status_test_run.step);
     test_step.dependOn(&preview_control_test_run.step);
     test_step.dependOn(&runtime_options_test_run.step);
@@ -608,6 +625,8 @@ pub fn build(b: *std.Build) void {
         behavior_host_test_mod.addImport("behavior_artifact", behavior_artifact_mod.?);
         behavior_host_test_mod.addImport("behavior_manifest", behavior_manifest_mod.?);
         behavior_host_test_mod.addImport("behavior_package_builder", behavior_package_builder_mod.?);
+        behavior_host_test_mod.addImport("gameplay_replay", gameplay_replay_test_mod);
+        behavior_host_test_mod.addImport("gameplay_vertical_slice_fixture", gameplay_vertical_slice_fixture_mod);
         behavior_host_test_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
         behavior_host_test_mod.addImport("behavior_scene_binding", behavior_scene_binding_mod.?);
         behavior_host_test_mod.addImport("platform", platform_mod);
@@ -652,6 +671,92 @@ pub fn build(b: *std.Build) void {
             });
             const emit_behavior_host_evidence = b.step("emit-phase-behavior-contract", "Emit the Behavior Host Phase contract without running it");
             emit_behavior_host_evidence.dependOn(&install_behavior_host_evidence.step);
+        }
+        if (gameplay_quality_evidence) {
+            if (runtime_core_library_path) |library_path| {
+                const vertical_fixture_root = b.path("tools/fixtures/gameplay-vertical-slice-02");
+                const vertical_package_build = b.addRunArtifact(behavior_tool_executable.?);
+                vertical_package_build.addArg("--project-root");
+                vertical_package_build.addDirectoryArg(vertical_fixture_root);
+                vertical_package_build.addArgs(&.{ "--manifest", "script.json", "--output" });
+                const vertical_package = vertical_package_build.addOutputFileArg("vertical-slice.script");
+
+                const vertical_bench_mod = b.createModule(.{
+                    .root_source_file = b.path("gameplay_vertical_slice_bench_root.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                    .link_libcpp = true,
+                });
+                vertical_bench_mod.addIncludePath(b.path("abi"));
+                vertical_bench_mod.addImport("behavior_artifact", behavior_artifact_mod.?);
+                vertical_bench_mod.addImport("behavior_runtime", behavior_runtime_mod.?);
+                vertical_bench_mod.addImport("behavior_scene_binding", behavior_scene_binding_mod.?);
+                vertical_bench_mod.addImport("platform", platform_mod);
+                vertical_bench_mod.addImport("runtime_core", runtime_core_mod);
+                vertical_bench_mod.addLibraryPath(.{ .cwd_relative = library_path });
+                vertical_bench_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
+                if (target.result.os.tag == .windows) {
+                    vertical_bench_mod.addLibraryPath(.{ .cwd_relative = mingw_gcc_runtime_dir.? });
+                    vertical_bench_mod.linkSystemLibrary("gcc_eh", .{ .preferred_link_mode = .static });
+                    vertical_bench_mod.linkSystemLibrary("kernel32", .{});
+                    vertical_bench_mod.linkSystemLibrary("dbghelp", .{});
+                    vertical_bench_mod.linkSystemLibrary("advapi32", .{});
+                    vertical_bench_mod.linkSystemLibrary("bcrypt", .{});
+                    vertical_bench_mod.linkSystemLibrary("ntdll", .{});
+                    vertical_bench_mod.linkSystemLibrary("userenv", .{});
+                    vertical_bench_mod.linkSystemLibrary("ws2_32", .{});
+                } else if (target.result.os.tag == .linux) {
+                    vertical_bench_mod.linkSystemLibrary("gcc_s", .{});
+                    vertical_bench_mod.linkSystemLibrary("util", .{});
+                    vertical_bench_mod.linkSystemLibrary("rt", .{});
+                    vertical_bench_mod.linkSystemLibrary("pthread", .{});
+                    vertical_bench_mod.linkSystemLibrary("m", .{});
+                    vertical_bench_mod.linkSystemLibrary("dl", .{});
+                }
+                const vertical_bench = b.addExecutable(.{
+                    .name = "gameplay-vertical-slice-bench",
+                    .root_module = vertical_bench_mod,
+                });
+                vertical_bench.step.dependOn(behavior_native_step.?);
+                vertical_bench.step.dependOn(runtime_core_cargo_step.?);
+                const vertical_bench_run = b.addRunArtifact(vertical_bench);
+                vertical_bench_run.addFileArg(vertical_package);
+                vertical_bench_run.addFileArg(b.path("tools/fixtures/gameplay-vertical-slice-02/initial.scene.json"));
+                vertical_bench_run.addFileArg(b.path("tools/fixtures/gameplay-vertical-slice-02/reload.scene.json"));
+                const vertical_bench_step = b.step("bench-gameplay-vertical-slice", "Run the full Gameplay Vertical Slice 02 workload");
+                vertical_bench_step.dependOn(&vertical_bench_run.step);
+
+                if (gameplay_quality_emit_dir) |emit_dir| {
+                    const install_vertical_bench = b.addInstallArtifact(vertical_bench, .{
+                        .dest_dir = .{ .override = .{ .custom = emit_dir } },
+                        .dest_sub_path = if (target.result.os.tag == .windows)
+                            "gameplay-vertical-slice-bench.exe"
+                        else
+                            "gameplay-vertical-slice-bench",
+                    });
+                    const install_vertical_package = b.addInstallFileWithDir(
+                        vertical_package,
+                        .{ .custom = emit_dir },
+                        "vertical-slice.script",
+                    );
+                    const install_vertical_initial_scene = b.addInstallFileWithDir(
+                        b.path("tools/fixtures/gameplay-vertical-slice-02/initial.scene.json"),
+                        .{ .custom = emit_dir },
+                        "vertical-slice-initial.scene.json",
+                    );
+                    const install_vertical_reload_scene = b.addInstallFileWithDir(
+                        b.path("tools/fixtures/gameplay-vertical-slice-02/reload.scene.json"),
+                        .{ .custom = emit_dir },
+                        "vertical-slice-reload.scene.json",
+                    );
+                    const emit_vertical_bench = b.step("emit-gameplay-vertical-slice-bench", "Emit the Gameplay Vertical Slice 02 benchmark and fixtures");
+                    emit_vertical_bench.dependOn(&install_vertical_bench.step);
+                    emit_vertical_bench.dependOn(&install_vertical_package.step);
+                    emit_vertical_bench.dependOn(&install_vertical_initial_scene.step);
+                    emit_vertical_bench.dependOn(&install_vertical_reload_scene.step);
+                }
+            }
         }
         const behavior_tool_test_mod = b.createModule(.{
             .root_source_file = b.path("tools/behavior-script-tool.zig"),
