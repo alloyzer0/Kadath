@@ -9,4 +9,3 @@ rust-version = "1.85"
 
 [profile.release]
 panic = "unwind"
-lto = "thin"
