@@ -217,8 +217,9 @@ test "Linux product scene and behavior package preserve their frozen disk ABI" {
     defer std.testing.allocator.free(scene);
     const script = try buildScriptArtifact(std.testing.io, std.testing.allocator, script_json);
     defer std.testing.allocator.free(script);
-    try std.testing.expectEqual(scene_api.scene_artifact_version, readU32(scene[4..8]));
-    try std.testing.expectEqual(scene_api.current_schema_version, readU32(scene[8..12]));
+    // 默认产品 fixture 仍是 v6 compatibility oracle；Scene v7 由 Neutral fixture 独立覆盖。
+    try std.testing.expectEqual(scene_api.prototype_artifact_version, readU32(scene[4..8]));
+    try std.testing.expectEqual(scene_api.prototype_schema_version, readU32(scene[8..12]));
     try std.testing.expectEqual(@as(u32, 3), readU32(scene[16..20]));
     var cursor: usize = 20;
     for (0..3) |_| {
