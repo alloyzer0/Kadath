@@ -28,15 +28,22 @@ fn sprite(x: f32, y: f32, texture: rhi.TextureHandle) renderer2d.SpriteInstance 
     };
 }
 
-fn expectRecordingDelta(before: rhi.NullStats, after: rhi.NullStats, expected: u32) !void {
-    try std.testing.expectEqual(expected, after.pipeline_binds - before.pipeline_binds);
-    try std.testing.expectEqual(expected, after.texture_binds - before.texture_binds);
-    try std.testing.expectEqual(expected, after.push_constant_writes - before.push_constant_writes);
-    try std.testing.expectEqual(expected, after.draws - before.draws);
+fn expectRecordingDelta(
+    before: rhi.NullStats,
+    after: rhi.NullStats,
+    expected_pipeline_binds: u32,
+    expected_texture_binds: u32,
+    expected_sprites: u32,
+) !void {
+    try std.testing.expectEqual(expected_pipeline_binds, after.pipeline_binds - before.pipeline_binds);
+    try std.testing.expectEqual(expected_texture_binds, after.texture_binds - before.texture_binds);
+    // 提交批处理只减少状态绑定；每个精灵仍必须保留自己的常量和 draw。
+    try std.testing.expectEqual(expected_sprites, after.push_constant_writes - before.push_constant_writes);
+    try std.testing.expectEqual(expected_sprites, after.draws - before.draws);
 }
 
 fn expectNoRecordingDelta(before: rhi.NullStats, after: rhi.NullStats) !void {
-    try expectRecordingDelta(before, after, 0);
+    try expectRecordingDelta(before, after, 0, 0, 0);
 }
 
 test "Renderer2D init and deinit use the existing RHI seam" {
@@ -57,7 +64,7 @@ test "Renderer2D init and deinit use the existing RHI seam" {
     renderer.deinit(&backend);
 }
 
-test "Renderer2D records one command sequence per sprite" {
+test "Renderer2D batches pipeline and consecutive identical texture state" {
     var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
@@ -69,11 +76,11 @@ test "Renderer2D records one command sequence per sprite" {
     const before = backend.stats();
     try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites));
     const after = backend.stats();
-    try expectRecordingDelta(before, after, 3);
+    try expectRecordingDelta(before, after, 1, 1, 3);
     try std.testing.expectEqual(@as(u32, 1), after.frames_finished - before.frames_finished);
 }
 
-test "Renderer2D binds each sprite texture in input order" {
+test "Renderer2D preserves input order while batching consecutive texture runs" {
     var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
@@ -91,10 +98,39 @@ test "Renderer2D binds each sprite texture in input order" {
     const before = backend.stats();
     try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites));
     const after = backend.stats();
-    try expectRecordingDelta(before, after, 3);
+    try expectRecordingDelta(before, after, 1, 2, 3);
+    // Null trace 按 draw 记录实际纹理，用它证明批处理没有改变输入顺序。
     try std.testing.expectEqualSlices(
         rhi.TextureHandle,
         &.{ secondary, primary, primary },
+        after.draw_texture_trace[before.draw_texture_trace_len..after.draw_texture_trace_len],
+    );
+}
+
+test "Renderer2D starts a new texture batch when input returns to an earlier texture" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const primary = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(primary);
+    const secondary = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(secondary);
+
+    const sprites = [_]renderer2d.SpriteInstance{
+        sprite(4, 4, primary),
+        sprite(12, 4, primary),
+        sprite(20, 4, secondary),
+        sprite(28, 4, secondary),
+        sprite(36, 4, primary),
+    };
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites));
+    const after = backend.stats();
+    try expectRecordingDelta(before, after, 1, 3, 5);
+    try std.testing.expectEqualSlices(
+        rhi.TextureHandle,
+        &.{ primary, primary, secondary, secondary, primary },
         after.draw_texture_trace[before.draw_texture_trace_len..after.draw_texture_trace_len],
     );
 }
@@ -158,7 +194,7 @@ test "Renderer2D consumes a failed frame and can present the next frame" {
         renderer.renderSprites(&backend, extent, &invalid_sprites),
     );
     const after_failure = backend.stats();
-    try std.testing.expectEqual(@as(u32, 2), after_failure.pipeline_binds - before.pipeline_binds);
+    try std.testing.expectEqual(@as(u32, 1), after_failure.pipeline_binds - before.pipeline_binds);
     try std.testing.expectEqual(@as(u32, 1), after_failure.texture_binds - before.texture_binds);
     try std.testing.expectEqual(@as(u32, 1), after_failure.push_constant_writes - before.push_constant_writes);
     try std.testing.expectEqual(@as(u32, 1), after_failure.draws - before.draws);
@@ -182,4 +218,28 @@ test "Renderer2D consumes a failed frame and can present the next frame" {
     const after_success = backend.stats();
     try std.testing.expectEqual(@as(u32, 1), after_success.frames_finished - after_failure.frames_finished);
     try std.testing.expectEqual(@as(u32, 3), after_success.draws - after_failure.draws);
+}
+
+test "Renderer2D validates an invalid first texture before recording a draw" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+
+    const before = backend.stats();
+    const invalid_sprites = [_]renderer2d.SpriteInstance{sprite(4, 4, rhi.invalid_texture)};
+    try std.testing.expectError(
+        error.InvalidTexture,
+        renderer.renderSprites(&backend, extent, &invalid_sprites),
+    );
+    const after_failure = backend.stats();
+    // optional 绑定状态不能把 invalid_texture 误当成“已经绑定”的哨兵值。
+    try expectRecordingDelta(before, after_failure, 1, 0, 0);
+    try std.testing.expectEqual(@as(u32, 1), after_failure.failed_frames_consumed - before.failed_frames_consumed);
+
+    const replacement = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(replacement);
+    const valid_sprites = [_]renderer2d.SpriteInstance{sprite(4, 4, replacement)};
+    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &valid_sprites));
+    try std.testing.expectEqual(@as(u32, 1), backend.stats().frames_finished - after_failure.frames_finished);
 }

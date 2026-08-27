@@ -101,6 +101,11 @@ pub const Renderer2D = struct {
 
                 const width: f32 = @floatFromInt(extent.width);
                 const height: f32 = @floatFromInt(extent.height);
+                if (sprites.len != 0) {
+                    // 同一帧只使用一个 Renderer2D pipeline；空帧不录制无意义的状态。
+                    try encoder.bindPipeline(self.pipeline);
+                }
+                var bound_texture: ?rhi.TextureHandle = null;
                 for (sprites) |sprite| {
                     const push = QuadPushConstants{
                         .rect_ndc = .{
@@ -112,8 +117,11 @@ pub const Renderer2D = struct {
                         .color = sprite.color,
                     };
 
-                    try encoder.bindPipeline(self.pipeline);
-                    try encoder.bindTexture(sprite.texture);
+                    // 只合并连续纹理批次，绝不重排 Runtime Snapshot 冻结的绘制顺序。
+                    if (bound_texture == null or bound_texture.? != sprite.texture) {
+                        try encoder.bindTexture(sprite.texture);
+                        bound_texture = sprite.texture;
+                    }
                     try encoder.pushConstants(std.mem.asBytes(&push));
                     try encoder.draw(6);
                 }
