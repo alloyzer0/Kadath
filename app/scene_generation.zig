@@ -30,6 +30,23 @@ pub const ReservedSpawn = struct {
 
 pub const ActivationCommand = runtime_core.ActivationCommand;
 
+pub const RenderObservation = union(enum) {
+    neutral: runtime_core.RenderSnapshot,
+    gameplay: runtime_core.GameplaySnapshot,
+};
+
+pub const RenderPublication = struct {
+    sprites: []runtime_core.RenderSprite,
+    observation: RenderObservation,
+
+    pub fn gameplaySnapshot(self: *const RenderPublication) !runtime_core.GameplaySnapshot {
+        return switch (self.observation) {
+            .gameplay => |snapshot| snapshot,
+            .neutral => error.GameplayObservationUnavailable,
+        };
+    }
+};
+
 const HazardSource = struct {
     object_index: u8 = 0,
 };
@@ -39,8 +56,8 @@ pub const SceneGeneration = struct {
     core: runtime_core.RuntimeCore,
     target: runtime_core.Target,
     extent: PlatformExtent,
-    player_index: u8,
-    goal_index: u8,
+    player_index: ?u8,
+    goal_index: ?u8,
     hazards: [scene_api.max_scene_object_count]HazardSource = [_]HazardSource{.{}} ** scene_api.max_scene_object_count,
     hazard_count: u8 = 0,
     phase_candidate_ready: bool = false,
@@ -113,6 +130,10 @@ pub const SceneGeneration = struct {
         return self.core.commitGameplayFixed(token, input, outcome);
     }
 
+    pub fn hasGameplay(self: *const SceneGeneration) bool {
+        return self.scene.gameplayEnabled();
+    }
+
     pub fn applyTranslationDeltas(self: *SceneGeneration, deltas: []const [2]f64) !void {
         var views: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
         const active = try self.core.snapshot(self.target, true, &views);
@@ -135,21 +156,26 @@ pub const SceneGeneration = struct {
     }
 
     pub fn setGoalPosition(self: *SceneGeneration, position: [2]f32) !void {
+        const goal_index = self.goal_index orelse return error.UnknownSceneObject;
         const goal = self.scene.goal();
         const clamped = clampPosition(position, goal.sprite.size, self.extent);
-        try self.setObjectPosition(self.goal_index, clamped);
+        try self.setObjectPosition(goal_index, clamped);
     }
 
     pub fn setExtent(self: *SceneGeneration, extent: PlatformExtent) !void {
         if (extent.width == 0 or extent.height == 0) return;
         try self.core.setBounds(self.target, .{ 0, 0 }, boundsMax(extent));
         self.extent = extent;
-        try self.setGoalPosition(try self.goalPosition());
+        if (self.hasGameplay()) try self.setGoalPosition(try self.goalPosition());
     }
 
-    pub fn extractSprites(self: *SceneGeneration, output: []runtime_core.RenderSprite) !struct { sprites: []runtime_core.RenderSprite, snapshot: runtime_core.GameplaySnapshot } {
-        const snapshot = try self.core.gameplaySnapshot(output);
-        return .{ .sprites = output[0..snapshot.render_count], .snapshot = snapshot };
+    pub fn extractSprites(self: *SceneGeneration, output: []runtime_core.RenderSprite) !RenderPublication {
+        if (self.hasGameplay()) {
+            const snapshot = try self.core.gameplaySnapshot(output);
+            return .{ .sprites = output[0..snapshot.render_count], .observation = .{ .gameplay = snapshot } };
+        }
+        const snapshot = try self.core.renderSnapshot(self.target, output);
+        return .{ .sprites = output[0..snapshot.render_count], .observation = .{ .neutral = snapshot } };
     }
 
     /// Runtime identity 由 Rust Core 统一产生；SceneGeneration 只提供只读 Adapter。
@@ -264,15 +290,17 @@ pub const SceneGeneration = struct {
     }
 
     pub fn playerEntity(self: *const SceneGeneration) runtime_core.EntityId {
-        return self.entityForObject(self.player_index) orelse runtime_core.invalid_entity;
+        const index = self.player_index orelse return runtime_core.invalid_entity;
+        return self.entityForObject(index) orelse runtime_core.invalid_entity;
     }
 
-    pub fn playerObjectIndex(self: *const SceneGeneration) usize {
+    pub fn playerObjectIndex(self: *const SceneGeneration) ?usize {
         return self.player_index;
     }
 
     pub fn goalEntity(self: *const SceneGeneration) runtime_core.EntityId {
-        return self.entityForObject(self.goal_index) orelse runtime_core.invalid_entity;
+        const index = self.goal_index orelse return runtime_core.invalid_entity;
+        return self.entityForObject(index) orelse runtime_core.invalid_entity;
     }
 
     pub fn entityForObject(self: *const SceneGeneration, object_index: usize) ?runtime_core.EntityId {
@@ -353,7 +381,7 @@ pub const SceneGeneration = struct {
 
     pub fn goalPosition(self: *const SceneGeneration) ![2]f32 {
         // Goal 的实时位置以 Rust Runtime Core 为唯一权威；查询失败必须由调用方显式处理。
-        return self.objectPosition(self.goal_index);
+        return self.objectPosition(self.goal_index orelse return error.UnknownSceneObject);
     }
 
     pub fn primaryHazardY(self: *const SceneGeneration) f32 {
@@ -362,6 +390,10 @@ pub const SceneGeneration = struct {
     }
 
     fn prepareGameplay(self: *SceneGeneration) !void {
+        if (!self.hasGameplay()) {
+            try self.core.prepareNoGameplay();
+            return;
+        }
         // 候选场景已经由 Rust Core 固定排序；一次 snapshot 后按 source index 取引用，
         // 避免 restart/reload 为每个 hazard 发起逐对象 ABI findById 查询。
         var candidate_views: [runtime_core.max_object_count]runtime_core.ObjectView = undefined;
@@ -387,9 +419,9 @@ pub const SceneGeneration = struct {
             };
         }
         try self.core.prepareGameplay(
-            3.0,
-            objectRefAtSource(visible, @as(usize, self.player_index)) orelse return error.UnknownSceneObject,
-            objectRefAtSource(visible, @as(usize, self.goal_index)) orelse return error.UnknownSceneObject,
+            if (self.scene.schemaVersion == scene_api.current_schema_version) self.scene.gameplay.timeLimitSeconds else 3.0,
+            objectRefAtSource(visible, @as(usize, self.player_index orelse return error.UnknownSceneObject)) orelse return error.UnknownSceneObject,
+            objectRefAtSource(visible, @as(usize, self.goal_index orelse return error.UnknownSceneObject)) orelse return error.UnknownSceneObject,
             hazards[0..self.hazard_count],
         );
     }
@@ -435,8 +467,8 @@ fn prepareWithCore(
         .core = core,
         .target = target,
         .extent = extent,
-        .player_index = player_index orelse return error.SceneGenerationMissingPlayer,
-        .goal_index = goal_index orelse return error.SceneGenerationMissingGoal,
+        .player_index = player_index,
+        .goal_index = goal_index,
         .hazards = hazards,
         .hazard_count = hazard_count,
         .phase_candidate_ready = false,
@@ -555,6 +587,29 @@ test "SceneGeneration preserves source order and updates independent hazards" {
     try std.testing.expect(stepped[2].position[1] != first_y);
     try std.testing.expect(stepped[3].position[1] != second_y);
     try std.testing.expect(stepped[2].position[1] - first_y != stepped[3].position[1] - second_y);
+}
+
+test "SceneGeneration prepares and renders one-object neutral scene without Gameplay" {
+    const contents =
+        \\{"schemaVersion":7,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"decor","kind":"sprite","transform":{"position":[10,20]},"sprite":{"size":[16,16],"color":[1,1,1,1],"textureId":1},"behaviors":[]}
+        \\],"prototypes":[]}
+    ;
+    const scene = try scene_api.parse(std.testing.allocator, contents);
+    var generation = try SceneGeneration.prepare(&scene, .{ .width = 1024, .height = 720 });
+    defer generation.deinit();
+
+    try std.testing.expect(!generation.hasGameplay());
+    try std.testing.expectEqual(runtime_core.invalid_entity, generation.playerEntity());
+    var sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
+    const publication = try generation.extractSprites(&sprites);
+    try std.testing.expectEqual(@as(usize, 1), publication.sprites.len);
+    switch (publication.observation) {
+        .neutral => |snapshot| try std.testing.expectEqual(@as(usize, 1), snapshot.render_count),
+        .gameplay => return error.UnexpectedGameplayObservation,
+    }
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    try std.testing.expectError(error.InvalidGameplayState, generation.beginGameplayFixed(0.0, &outcome));
 }
 
 test "SceneGeneration activates and despawns transient prototype objects without exposing pending state" {

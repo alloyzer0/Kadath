@@ -184,11 +184,15 @@ pub const Host = struct {
         self.last_heartbeat_seconds = now;
         try self.resetScript();
         self.texture_registry = texture_registry.take();
-        std.log.info("Runtime host initialized with Vulkan RHI scene objects={d}, player={d}, goal={d}", .{
-            scene.objects.count,
-            self.generation.playerEntity(),
-            self.generation.goalEntity(),
-        });
+        if (scene.gameplayEnabled()) {
+            std.log.info("Runtime host initialized with Vulkan RHI scene objects={d}, player={d}, goal={d}", .{
+                scene.objects.count,
+                self.generation.playerEntity(),
+                self.generation.goalEntity(),
+            });
+        } else {
+            std.log.info("Runtime host initialized with Vulkan RHI neutral scene objects={d}", .{scene.objects.count});
+        }
         return self;
     }
 
@@ -280,22 +284,24 @@ pub const Host = struct {
 
             self.syncExternalResults();
             try self.syncWorldBounds();
-            const before_fixed = try self.queryGameplaySnapshot();
-            const accepts_input = try self.runFixedUpdates(
-                delta,
-                events.input,
-                before_fixed.accepts_input != 0,
-            );
+            const accepts_input = if (self.scene.gameplayEnabled()) blk: {
+                const before_fixed = try self.queryGameplaySnapshot();
+                break :blk try self.runFixedUpdates(
+                    delta,
+                    events.input,
+                    before_fixed.accepts_input != 0,
+                );
+            } else try self.runNeutralFixedUpdates(delta, events.input);
             try self.runBehaviorUpdate(
                 @floatCast(@min(@max(delta, 0.0), 0.25)),
                 events.input,
                 accepts_input,
             );
-            const gameplay = try self.extractRender();
+            const observation = try self.extractRender();
 
             try self.submitRender();
 
-            self.endFrame(now, delta, @enumFromInt(gameplay.phase));
+            self.endFrame(now, delta, observation);
             self.platform.sleepMilliseconds(1);
         }
         return .window_close;
@@ -350,13 +356,17 @@ pub const Host = struct {
             const batch = try self.behavior_runtime.onStart(&self.generation);
             try self.generation.applyTranslationDeltas(batch.slice());
             try self.behavior_runtime.publishStartupEvents(&self.generation, &batch);
-            var sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
-            const ordered = (try self.generation.extractSprites(&sprites)).sprites;
-            const player_entity = self.generation.playerEntity();
-            const player = for (ordered) |sprite| {
-                if (sprite.entity_value == player_entity) break sprite;
-            } else return error.WorldProducedNoPlayerSprite;
-            std.log.info("Behavior on_start hooks applied: player_position=({d:.2},{d:.2})", .{ player.position[0], player.position[1] });
+            if (self.scene.gameplayEnabled()) {
+                var sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
+                const ordered = (try self.generation.extractSprites(&sprites)).sprites;
+                const player_entity = self.generation.playerEntity();
+                const player = for (ordered) |sprite| {
+                    if (sprite.entity_value == player_entity) break sprite;
+                } else return error.WorldProducedNoPlayerSprite;
+                std.log.info("Behavior on_start hooks applied: player_position=({d:.2},{d:.2})", .{ player.position[0], player.position[1] });
+            } else {
+                std.log.info("Behavior on_start hooks applied to neutral scene objects={d}", .{self.generation.activeCount()});
+            }
             return;
         }
         self.script_tick = 0;
@@ -547,16 +557,22 @@ pub const Host = struct {
         previous_registry.deinit(&self.rhi);
         previous_behavior.deinit();
         if (candidate_startup) |*startup| try self.behavior_runtime.publishStartupEvents(&self.generation, startup);
-        std.log.info("Scene reloaded explicitly: objects={d}, player={d}, goal={d}", .{
-            candidate.objects.count,
-            self.generation.playerEntity(),
-            self.generation.goalEntity(),
-        });
+        if (candidate.gameplayEnabled()) {
+            std.log.info("Scene reloaded explicitly: objects={d}, player={d}, goal={d}", .{
+                candidate.objects.count,
+                self.generation.playerEntity(),
+                self.generation.goalEntity(),
+            });
+        } else {
+            std.log.info("Neutral scene reloaded explicitly: objects={d}", .{candidate.objects.count});
+        }
     }
 
     fn restartGame(self: *Host) !void {
-        const snapshot = try self.queryGameplaySnapshot();
-        if (snapshot.phase == @intFromEnum(runtime_core.GameplayPhase.playing)) return;
+        if (self.scene.gameplayEnabled()) {
+            const snapshot = try self.queryGameplaySnapshot();
+            if (snapshot.phase == @intFromEnum(runtime_core.GameplayPhase.playing)) return;
+        }
         if (usesBehaviorRuntime(&self.scene)) {
             if (!self.behavior_runtime.isLoaded()) {
                 try self.generation.reset();
@@ -591,11 +607,15 @@ pub const Host = struct {
         }
         self.accumulator_seconds = 0.0;
         self.render_count = 0;
-        std.log.info("Game session restarted: entity={d}, position=({d:.2},{d:.2})", .{
-            self.generation.playerEntity(),
-            self.scene.player().sprite.position[0],
-            self.scene.player().sprite.position[1],
-        });
+        if (self.scene.gameplayEnabled()) {
+            std.log.info("Game session restarted: entity={d}, position=({d:.2},{d:.2})", .{
+                self.generation.playerEntity(),
+                self.scene.player().sprite.position[0],
+                self.scene.player().sprite.position[1],
+            });
+        } else {
+            std.log.info("Neutral scene restarted: objects={d}", .{self.generation.activeCount()});
+        }
     }
 
     fn syncWorldBounds(self: *Host) !void {
@@ -681,10 +701,42 @@ pub const Host = struct {
         return accepts_input;
     }
 
-    fn extractRender(self: *Host) !runtime_core.GameplaySnapshot {
+    fn runNeutralFixedUpdates(self: *Host, delta_seconds: f64, input: InputSnapshot) !bool {
+        self.accumulator_seconds += @min(delta_seconds, 0.25);
+        var steps: u8 = 0;
+        while (self.accumulator_seconds >= fixed_dt_seconds and steps < max_fixed_steps_per_frame) : (steps += 1) {
+            const routed_input = player_movement_ownership.route(&self.scene, .{
+                .move_x = input.move_x,
+                .move_y = input.move_y,
+            });
+            if (usesBehaviorRuntime(&self.scene) and self.behavior_runtime.isLoaded()) {
+                const behavior_input = InputSnapshot{
+                    .move_x = @intCast(routed_input.behaviors.move_x),
+                    .move_y = @intCast(routed_input.behaviors.move_y),
+                };
+                try self.runBehaviorFixed(@floatCast(fixed_dt_seconds), behavior_input);
+                // 中立场景没有 Gameplay contact 插入点，直接结算 structural/events 并关闭 Phase。
+                try self.behavior_runtime.finishFixedStep(&self.generation, .{
+                    .move_x = behavior_input.move_x,
+                    .move_y = behavior_input.move_y,
+                });
+            } else {
+                self.runScriptFixed(@floatCast(fixed_dt_seconds));
+                const phase_sequence = try self.generation.core.beginPhaseOwned(.fixed);
+                try self.generation.core.endPhase(.fixed, phase_sequence);
+            }
+            self.accumulator_seconds -= fixed_dt_seconds;
+        }
+        if (steps == max_fixed_steps_per_frame and self.accumulator_seconds >= fixed_dt_seconds) {
+            self.accumulator_seconds = @mod(self.accumulator_seconds, fixed_dt_seconds);
+        }
+        return true;
+    }
+
+    fn extractRender(self: *Host) !scene_generation_api.RenderObservation {
         const publication = try self.generation.extractSprites(&self.render_sprites);
         self.render_count = publication.sprites.len;
-        return publication.snapshot;
+        return publication.observation;
     }
 
     fn queryGameplaySnapshot(self: *Host) !runtime_core.GameplaySnapshot {
@@ -722,24 +774,26 @@ pub const Host = struct {
         }
         return null;
     }
-    fn endFrame(self: *Host, now_seconds: f64, delta_seconds: f64, gameplay_phase: runtime_core.GameplayPhase) void {
+    fn endFrame(self: *Host, now_seconds: f64, delta_seconds: f64, observation: scene_generation_api.RenderObservation) void {
         self.frame_count += 1;
         if (now_seconds - self.last_heartbeat_seconds >= 1.0) {
-            if (self.render_count > 0) {
-                const sprite = self.renderSprite(self.generation.playerEntity()) orelse return;
-                std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, phase={s}, position=({d:.2},{d:.2}), hazard_y={d:.2}", .{
+            switch (observation) {
+                .gameplay => |snapshot| {
+                    const sprite = self.renderSprite(self.generation.playerEntity()) orelse return;
+                    std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, phase={s}, position=({d:.2},{d:.2}), hazard_y={d:.2}", .{
+                        self.frame_count,
+                        delta_seconds,
+                        @tagName(@as(runtime_core.GameplayPhase, @enumFromInt(snapshot.phase))),
+                        sprite.position[0],
+                        sprite.position[1],
+                        self.generation.primaryHazardY(),
+                    });
+                },
+                .neutral => |snapshot| std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s, mode=neutral, objects={d}", .{
                     self.frame_count,
                     delta_seconds,
-                    @tagName(gameplay_phase),
-                    sprite.position[0],
-                    sprite.position[1],
-                    self.generation.primaryHazardY(),
-                });
-            } else {
-                std.log.debug("Runtime heartbeat: frame={d}, delta={d:.6}s", .{
-                    self.frame_count,
-                    delta_seconds,
-                });
+                    snapshot.render_count,
+                }),
             }
             self.last_heartbeat_seconds = now_seconds;
         }

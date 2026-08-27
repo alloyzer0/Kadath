@@ -118,6 +118,41 @@ test "Behavior Host keeps runtime ownership stack bounded" {
     try std.testing.expect(@sizeOf(behavior_host.Runtime) < 1024);
 }
 
+test "neutral scene runs Behavior fixed Phase without Gameplay lifecycle" {
+    const neutral_manifest =
+        \\{"schemaVersion":2,"scripts":[{"scriptId":1,"source":"scripts/mover.luau"}]}
+    ;
+    const mover_source =
+        \\--!strict
+        \\return { fixed_update = function(self: Kadath.Object, dt: number)
+        \\    local move_x, move_y = kadath.input.move_axis()
+        \\    self:translate(move_x, move_y + dt * 10)
+        \\end }
+    ;
+    const neutral_scene =
+        \\{"schemaVersion":7,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"decor","kind":"sprite","transform":{"position":[10,20]},"sprite":{"size":[16,16],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]}
+        \\],"prototypes":[]}
+    ;
+    var fixture = try makeRuntimeFixture(neutral_manifest, &.{.{ .path = "scripts/mover.luau", .source = mover_source }}, neutral_scene);
+    defer fixture.deinit();
+
+    try fixture.runtime.runFixed(&fixture.generation, 0.5, .{ .move_x = 1, .move_y = -1 });
+    try fixture.runtime.finishFixedStep(&fixture.generation, .{ .move_x = 1, .move_y = -1 });
+    const decor = fixture.generation.objectIndex("decor") orelse return error.MissingNeutralObject;
+    try std.testing.expectEqual([2]f32{ 11, 24 }, try fixture.generation.objectPosition(decor));
+
+    var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
+    const publication = try fixture.generation.extractSprites(&render_items);
+    try std.testing.expectEqual(@as(usize, 1), publication.sprites.len);
+    switch (publication.observation) {
+        .neutral => {},
+        .gameplay => return error.UnexpectedGameplayObservation,
+    }
+    var outcome: runtime_core.GameplayOutcome = undefined;
+    try std.testing.expectError(error.InvalidGameplayState, fixture.generation.beginGameplayFixed(0.0, &outcome));
+}
+
 test "unsupported Behavior Host stub mirrors the Host v4 scheduling surface" {
     var runtime = behavior_host_stub.Runtime{};
     var generation: scene_generation_api.SceneGeneration = undefined;
@@ -1182,12 +1217,13 @@ fn runVerticalFixedStep(
     if (publication.sprites.len != vertical_slice_object_count) return error.InvalidVerticalRenderCount;
     var render_sprites: [vertical_slice_object_count]runtime_core.RenderSprite = undefined;
     @memcpy(render_sprites[0..], publication.sprites);
-    recorder.recordSnapshot(&publication.snapshot, publication.sprites);
+    const snapshot = try publication.gameplaySnapshot();
+    recorder.recordSnapshot(&snapshot, publication.sprites);
     return .{
         .begin = begin,
         .commit = committed,
         .outcome = published_outcome,
-        .snapshot = publication.snapshot,
+        .snapshot = snapshot,
         .render_sprites = render_sprites,
     };
 }
@@ -1204,8 +1240,9 @@ fn recordVerticalSnapshot(
 ) !runtime_core.GameplaySnapshot {
     var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
     const publication = try fixture.generation.extractSprites(&render_items);
-    recorder.recordSnapshot(&publication.snapshot, publication.sprites);
-    return publication.snapshot;
+    const snapshot = try publication.gameplaySnapshot();
+    recorder.recordSnapshot(&snapshot, publication.sprites);
+    return snapshot;
 }
 
 fn restartVerticalFixture(fixture: *RuntimeFixture) !void {
@@ -1276,8 +1313,9 @@ fn runInitialVerticalSlice(first_move_y: i8) !InitialVerticalEvidence {
 
     var recorder = gameplay_replay.Recorder.init();
     var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
-    var publication = try fixture.generation.extractSprites(&render_items);
-    recorder.recordSnapshot(&publication.snapshot, publication.sprites);
+    const publication = try fixture.generation.extractSprites(&render_items);
+    var latest_snapshot = try publication.gameplaySnapshot();
+    recorder.recordSnapshot(&latest_snapshot, publication.sprites);
 
     var first_outcome: ?runtime_core.GameplayOutcome = null;
     const player_index = fixture.generation.objectIndex("player") orelse return error.MissingVerticalPlayer;
@@ -1294,14 +1332,14 @@ fn runInitialVerticalSlice(first_move_y: i8) !InitialVerticalEvidence {
         const step = try runVerticalFixedStep(&fixture, requested, &recorder);
         steps[index] = step;
         if (first_outcome == null) first_outcome = step.outcome;
-        publication.snapshot = step.snapshot;
+        latest_snapshot = step.snapshot;
     }
 
     const probe_index = fixture.generation.objectIndex("phase-probe") orelse return error.MissingVerticalProbe;
     return .{
         .digest = recorder.finish(),
         .first_outcome = first_outcome orelse return error.MissingVerticalOutcome,
-        .final_snapshot = publication.snapshot,
+        .final_snapshot = latest_snapshot,
         .player_entity = fixture.generation.playerEntity(),
         .player_position = try fixture.generation.objectPosition(player_index),
         .probe_position = try fixture.generation.objectPosition(probe_index),
