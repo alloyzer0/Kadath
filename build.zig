@@ -800,6 +800,39 @@ pub fn build(b: *std.Build) void {
                     const emit_gameplay_bench = b.step("emit-runtime-core-gameplay-bench", "Emit the Runtime Core Gameplay benchmark without running it");
                     emit_gameplay_bench.dependOn(&install_gameplay_bench.step);
                 }
+
+                const representative_bench_mod = b.createModule(.{
+                    .root_source_file = b.path("tools/runtime-core-representative-bench.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                });
+                representative_bench_mod.addIncludePath(b.path("abi"));
+                representative_bench_mod.addImport("runtime_core", runtime_core_mod);
+                representative_bench_mod.addLibraryPath(.{ .cwd_relative = library_path });
+                representative_bench_mod.linkSystemLibrary("kadath_runtime_core", .{ .preferred_link_mode = .static });
+                representative_bench_mod.linkSystemLibrary("gcc_s", .{});
+                representative_bench_mod.linkSystemLibrary("util", .{});
+                representative_bench_mod.linkSystemLibrary("rt", .{});
+                representative_bench_mod.linkSystemLibrary("pthread", .{});
+                representative_bench_mod.linkSystemLibrary("m", .{});
+                representative_bench_mod.linkSystemLibrary("dl", .{});
+                const representative_bench = b.addExecutable(.{
+                    .name = "runtime-core-representative-bench",
+                    .root_module = representative_bench_mod,
+                });
+                representative_bench.step.dependOn(runtime_core_cargo_step.?);
+                const representative_bench_run = b.addRunArtifact(representative_bench);
+                const representative_bench_step = b.step("bench-runtime-core-representative", "Run the representative Runtime Core lifecycle workload");
+                representative_bench_step.dependOn(&representative_bench_run.step);
+                if (gameplay_quality_emit_dir) |emit_dir| {
+                    const install_representative_bench = b.addInstallArtifact(representative_bench, .{
+                        .dest_dir = .{ .override = .{ .custom = emit_dir } },
+                        .dest_sub_path = "runtime-core-representative-bench",
+                    });
+                    const emit_representative_bench = b.step("emit-runtime-core-representative-bench", "Emit the representative Runtime Core lifecycle benchmark without running it");
+                    emit_representative_bench.dependOn(&install_representative_bench.step);
+                }
             }
 
             const gameplay_oracle_mod = b.createModule(.{

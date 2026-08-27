@@ -160,6 +160,59 @@ GAMEPLAY_TOOL_HOST=test
 EOF
 bind_report "$steady_payload" "$evidence_root/steady-state.report"
 
+representative_stdout="$evidence_root/representative.stdout"
+representative_stderr="$evidence_root/representative.stderr"
+representative_time="$evidence_root/representative.time"
+: >"$representative_stdout"
+cat >"$representative_stderr" <<'EOF'
+representative_fixed_step_samples=256 p95_ns=100 p99_ns=120 allocations=0
+representative_phase_drain_samples=256 p95_ns=100 p99_ns=120 allocations=0
+representative_snapshot_samples=256 p95_ns=100 p99_ns=120 allocations=0
+representative_restart_samples=256 p95_ns=100 p99_ns=120 allocations=266
+representative_scene_reload_samples=256 p95_ns=100 p99_ns=120 allocations=263
+EOF
+printf 'Maximum resident set size (kbytes): 1000\n' >"$representative_time"
+representative_payload="$evidence_root/representative.payload"
+cat >"$representative_payload" <<EOF
+GAMEPLAY_CANDIDATE_SHA=$candidate_sha
+GAMEPLAY_COMMAND=representative-test-fixture
+GAMEPLAY_REPRESENTATIVE_STATUS=PASS
+GAMEPLAY_REPRESENTATIVE_SAMPLES=256
+GAMEPLAY_REPRESENTATIVE_ACTIVE_OBJECTS=128
+GAMEPLAY_REPRESENTATIVE_PHASE_EVENTS=64
+GAMEPLAY_REPRESENTATIVE_FIXED_STEP_P95_NS=100
+GAMEPLAY_REPRESENTATIVE_FIXED_STEP_P99_NS=120
+GAMEPLAY_REPRESENTATIVE_FIXED_STEP_ALLOCATIONS=0
+GAMEPLAY_REPRESENTATIVE_PHASE_DRAIN_P95_NS=100
+GAMEPLAY_REPRESENTATIVE_PHASE_DRAIN_P99_NS=120
+GAMEPLAY_REPRESENTATIVE_PHASE_DRAIN_ALLOCATIONS=0
+GAMEPLAY_REPRESENTATIVE_SNAPSHOT_P95_NS=100
+GAMEPLAY_REPRESENTATIVE_SNAPSHOT_P99_NS=120
+GAMEPLAY_REPRESENTATIVE_SNAPSHOT_ALLOCATIONS=0
+GAMEPLAY_REPRESENTATIVE_RESTART_P95_NS=100
+GAMEPLAY_REPRESENTATIVE_RESTART_P99_NS=120
+GAMEPLAY_REPRESENTATIVE_RESTART_ALLOCATIONS=266
+GAMEPLAY_REPRESENTATIVE_SCENE_RELOAD_P95_NS=100
+GAMEPLAY_REPRESENTATIVE_SCENE_RELOAD_P99_NS=120
+GAMEPLAY_REPRESENTATIVE_SCENE_RELOAD_ALLOCATIONS=263
+GAMEPLAY_REPRESENTATIVE_BENCHMARK=$candidate
+GAMEPLAY_REPRESENTATIVE_BENCHMARK_SHA256=$(hash "$candidate")
+GAMEPLAY_REPRESENTATIVE_BUILD_STDOUT=$candidate_build_stdout
+GAMEPLAY_REPRESENTATIVE_BUILD_STDOUT_SHA256=$(hash "$candidate_build_stdout")
+GAMEPLAY_REPRESENTATIVE_BUILD_STDERR=$candidate_build_stderr
+GAMEPLAY_REPRESENTATIVE_BUILD_STDERR_SHA256=$(hash "$candidate_build_stderr")
+GAMEPLAY_REPRESENTATIVE_STDOUT=$representative_stdout
+GAMEPLAY_REPRESENTATIVE_STDOUT_SHA256=$(hash "$representative_stdout")
+GAMEPLAY_REPRESENTATIVE_STDERR=$representative_stderr
+GAMEPLAY_REPRESENTATIVE_STDERR_SHA256=$(hash "$representative_stderr")
+GAMEPLAY_REPRESENTATIVE_TIME=$representative_time
+GAMEPLAY_REPRESENTATIVE_TIME_SHA256=$(hash "$representative_time")
+GAMEPLAY_TOOL_ZIG_VERSION=test
+GAMEPLAY_TOOL_GNU_TIME_VERSION=test
+GAMEPLAY_TOOL_HOST=test
+EOF
+bind_report "$representative_payload" "$evidence_root/representative.report"
+
 printf 'tampered\n' >>"$evidence_root/candidate-1.stdout"
 set +e
 raw_tamper_output=$("${runner[@]}" \
@@ -167,7 +220,7 @@ raw_tamper_output=$("${runner[@]}" \
     --candidate-benchmark "$candidate" --candidate-report "$evidence_root/candidate.report" \
     --oracle-benchmark "$oracle" --oracle-report "$evidence_root/oracle.report" \
     --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" \
-    --steady-state-report "$evidence_root/steady-state.report" 2>&1)
+    --steady-state-report "$evidence_root/steady-state.report" --representative-report "$evidence_root/representative.report" 2>&1)
 set -e
 grep -Fq 'performance raw candidate stdout hash mismatch on run 1' <<<"$raw_tamper_output"
 printf 'p95_ns=100\nallocations=0\n' >"$evidence_root/candidate-1.stdout"
@@ -179,7 +232,7 @@ payload_tamper_output=$("${runner[@]}" \
     --candidate-benchmark "$candidate" --candidate-report "$evidence_root/candidate.report" \
     --oracle-benchmark "$oracle" --oracle-report "$evidence_root/oracle.report" \
     --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" \
-    --steady-state-report "$evidence_root/steady-state.report" 2>&1)
+    --steady-state-report "$evidence_root/steady-state.report" --representative-report "$evidence_root/representative.report" 2>&1)
 set -e
 grep -Fq 'CANDIDATE report payload hash mismatch' <<<"$payload_tamper_output"
 printf 'GAMEPLAY_QUALITY_GATE_BLOCKED_PATH=PASS\n'

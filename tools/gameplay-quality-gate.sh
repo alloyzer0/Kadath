@@ -6,13 +6,13 @@ usage() {
 Usage: gameplay-quality-gate.sh --candidate-sha SHA --oracle-sha SHA --candidate-benchmark PATH
   --candidate-report PATH --oracle-benchmark PATH --oracle-report PATH
   --coverage-report PATH --mutation-report PATH --seed-report PATH
-  --steady-state-report PATH
+  --steady-state-report PATH --representative-report PATH
 EOF
 }
 
 candidate_sha= oracle_sha= candidate_benchmark= candidate_report=
 oracle_benchmark= oracle_report= coverage_report= mutation_report=
-seed_report= steady_state_report=
+seed_report= steady_state_report= representative_report=
 while (($#)); do
     case "$1" in
         --candidate-sha) candidate_sha=${2-}; shift 2 ;;
@@ -25,6 +25,7 @@ while (($#)); do
         --mutation-report) mutation_report=${2-}; shift 2 ;;
         --seed-report) seed_report=${2-}; shift 2 ;;
         --steady-state-report) steady_state_report=${2-}; shift 2 ;;
+        --representative-report) representative_report=${2-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -56,6 +57,7 @@ require_file "$seed_report" "seed matrix report"
 require_file "$candidate_report" "candidate performance report"
 require_file "$oracle_report" "oracle performance report"
 require_file "$steady_state_report" "steady-state memory report"
+require_file "$representative_report" "representative workload report"
 [[ -x "$candidate_benchmark" ]] || blocked+=("candidate benchmark missing")
 [[ -x "$oracle_benchmark" ]] || blocked+=("oracle benchmark missing")
 
@@ -126,6 +128,45 @@ verify_steady_state_report() {
        -n "$(value "$report" GAMEPLAY_TOOL_GNU_TIME_VERSION)" &&
        -n "$(value "$report" GAMEPLAY_TOOL_HOST)" ]] || blocked+=("steady-state tool provenance missing")
     verify_report_payload "$report" STEADY_STATE
+}
+
+verify_representative_report() {
+    local report=$1 actual expected benchmark
+    [[ -f "$report" ]] || return
+    [[ "$(value "$report" GAMEPLAY_CANDIDATE_SHA)" == "$candidate_sha" ]] || blocked+=("representative report SHA mismatch")
+    [[ "$(value "$report" GAMEPLAY_REPRESENTATIVE_STATUS)" == PASS ]] || blocked+=("representative workload status is not PASS")
+    [[ "$(value "$report" GAMEPLAY_REPRESENTATIVE_SAMPLES)" == 256 &&
+       "$(value "$report" GAMEPLAY_REPRESENTATIVE_ACTIVE_OBJECTS)" == 128 &&
+       "$(value "$report" GAMEPLAY_REPRESENTATIVE_PHASE_EVENTS)" == 64 ]] || blocked+=("representative workload shape is incomplete")
+    for operation in FIXED_STEP PHASE_DRAIN SNAPSHOT RESTART SCENE_RELOAD; do
+        p95=$(value "$report" "GAMEPLAY_REPRESENTATIVE_${operation}_P95_NS")
+        p99=$(value "$report" "GAMEPLAY_REPRESENTATIVE_${operation}_P99_NS")
+        allocations=$(value "$report" "GAMEPLAY_REPRESENTATIVE_${operation}_ALLOCATIONS")
+        [[ "$p95" =~ ^[1-9][0-9]*$ && "$p99" =~ ^[1-9][0-9]*$ && "$allocations" =~ ^[0-9]+$ ]] || \
+            blocked+=("representative ${operation} p95/p99 payload invalid")
+        if [[ "$operation" == FIXED_STEP || "$operation" == PHASE_DRAIN || "$operation" == SNAPSHOT ]]; then
+            [[ "$allocations" == 0 ]] || blocked+=("representative ${operation} hot path allocated")
+        fi
+    done
+    benchmark=$(value "$report" GAMEPLAY_REPRESENTATIVE_BENCHMARK)
+    [[ -x "$benchmark" ]] || blocked+=("representative benchmark missing")
+    actual=$(sha256sum "$benchmark" | awk '{print $1}')
+    expected=$(value "$report" GAMEPLAY_REPRESENTATIVE_BENCHMARK_SHA256)
+    [[ "$actual" == "$expected" ]] || blocked+=("representative benchmark hash mismatch")
+    for pair in \
+        "GAMEPLAY_REPRESENTATIVE_BUILD_STDOUT|GAMEPLAY_REPRESENTATIVE_BUILD_STDOUT_SHA256|representative build stdout" \
+        "GAMEPLAY_REPRESENTATIVE_BUILD_STDERR|GAMEPLAY_REPRESENTATIVE_BUILD_STDERR_SHA256|representative build stderr" \
+        "GAMEPLAY_REPRESENTATIVE_STDOUT|GAMEPLAY_REPRESENTATIVE_STDOUT_SHA256|representative stdout" \
+        "GAMEPLAY_REPRESENTATIVE_STDERR|GAMEPLAY_REPRESENTATIVE_STDERR_SHA256|representative stderr" \
+        "GAMEPLAY_REPRESENTATIVE_TIME|GAMEPLAY_REPRESENTATIVE_TIME_SHA256|representative time"; do
+        IFS='|' read -r path_key hash_key label <<<"$pair"
+        verify_bound_file "$report" "$path_key" "$hash_key" || blocked+=("$label hash mismatch")
+    done
+    [[ -n "$(value "$report" GAMEPLAY_COMMAND)" &&
+       -n "$(value "$report" GAMEPLAY_TOOL_ZIG_VERSION)" &&
+       -n "$(value "$report" GAMEPLAY_TOOL_GNU_TIME_VERSION)" &&
+       -n "$(value "$report" GAMEPLAY_TOOL_HOST)" ]] || blocked+=("representative tool provenance missing")
+    verify_report_payload "$report" REPRESENTATIVE
 }
 
 if [[ -f "$coverage_report" ]]; then
@@ -346,6 +387,9 @@ fi
 
 if [[ -f "$steady_state_report" ]]; then
     verify_steady_state_report "$steady_state_report"
+fi
+if [[ -f "$representative_report" ]]; then
+    verify_representative_report "$representative_report"
 fi
 
 if ((${#blocked[@]})); then
