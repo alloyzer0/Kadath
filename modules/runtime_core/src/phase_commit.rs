@@ -1301,6 +1301,51 @@ pub(crate) fn submit_trusted_gameplay_events_with(
     Ok(())
 }
 
+/// Gameplay 接触事件已经在 Gameplay 层完成 authored-source 解析；热路径只传递
+/// 两个 source index，避免每个事件重复构造/解析 2 份 128 字节 ABI ObjectRef。
+pub(crate) fn submit_compact_trusted_gameplay_events_with(
+    core: &mut RuntimeCore,
+    event_count: usize,
+    mut build: impl FnMut(usize) -> (bool, u8, u8),
+) -> Result<(), u32> {
+    if event_count == 0 {
+        return Ok(());
+    }
+    if event_count > EVENT_CAPACITY {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+    }
+    let domain = abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
+    let domain_state = core.phase.domain(domain)?;
+    if domain_state.phase_sequence.is_none() {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED);
+    }
+    if domain_state.event_len() + event_count > EVENT_CAPACITY {
+        return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
+    }
+    let first_sequence = domain_state.next_event_sequence;
+    let next_sequence = first_sequence
+        .checked_add(event_count as u64)
+        .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)?;
+    let generation = PhaseState::normalize_generation(
+        0,
+        domain_state.event_successor_generation,
+        domain_state.event_has_drained,
+    )?;
+    let domain_state = core.phase.domain_mut(domain)?;
+    for index in 0..event_count {
+        let (ended, target_source_index, other_source_index) = build(index);
+        domain_state.trusted_event_queue.push(TrustedEventEntry {
+            sequence: first_sequence + index as u64,
+            generation,
+            ended,
+            target_source_index,
+            other_source_index,
+        })?;
+    }
+    domain_state.next_event_sequence = next_sequence;
+    Ok(())
+}
+
 pub(crate) fn drain_events(
     core: &mut RuntimeCore,
     domain: u32,

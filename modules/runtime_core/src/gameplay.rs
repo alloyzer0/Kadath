@@ -437,6 +437,7 @@ pub(crate) fn contact_events(
 pub(crate) struct ContactTransition {
     pub(crate) ended: bool,
     pub(crate) other: ObjectKey,
+    pub(crate) other_source_index: u8,
 }
 
 pub(crate) fn contact_transitions(
@@ -450,6 +451,7 @@ pub(crate) fn contact_transitions(
     let mut output = [ContactTransition {
         ended: false,
         other: gameplay.player,
+        other_source_index: gameplay.player_source_index,
     }; MAX_CONTACT_TRANSITIONS];
     let mut count = 0;
     for index in 0..gameplay.previous_contact_count {
@@ -465,7 +467,11 @@ pub(crate) fn contact_transitions(
         if count >= output.len() {
             return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
         }
-        output[count] = ContactTransition { ended: true, other };
+        output[count] = ContactTransition {
+            ended: true,
+            other,
+            other_source_index: source_index,
+        };
         count += 1;
     }
     for index in 0..current_count {
@@ -484,6 +490,7 @@ pub(crate) fn contact_transitions(
         output[count] = ContactTransition {
             ended: false,
             other,
+            other_source_index: current_source_indices[index],
         };
         count += 1;
     }
@@ -492,34 +499,21 @@ pub(crate) fn contact_transitions(
 
 pub(crate) fn submit_contact_transitions(
     core: &mut RuntimeCore,
-    player: ObjectKey,
+    player_source_index: u8,
     transitions: &[ContactTransition],
 ) -> Result<usize, u32> {
     let event_count = transitions
         .len()
         .checked_mul(2)
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY)?;
-    phase_commit::submit_trusted_gameplay_events_with(core, event_count, |index| {
+    phase_commit::submit_compact_trusted_gameplay_events_with(core, event_count, |index| {
         let transition = transitions[index / 2];
-        let name = if transition.ended {
-            b"contact_end".as_slice()
+        let (target_source_index, opposite_source_index) = if index % 2 == 0 {
+            (player_source_index, transition.other_source_index)
         } else {
-            b"contact_begin".as_slice()
+            (transition.other_source_index, player_source_index)
         };
-        let (target, opposite) = if index % 2 == 0 {
-            (player, transition.other)
-        } else {
-            (transition.other, player)
-        };
-        let mut event: abi::kadath_runtime_phase_event_v1_t = unsafe { std::mem::zeroed() };
-        event.struct_size = std::mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
-        event.domain = abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED;
-        event.target = key_ref(target);
-        event.has_other = 1;
-        event.other = key_ref(opposite);
-        event.name_length = name.len() as u32;
-        event.name[..name.len()].copy_from_slice(name);
-        event
+        (transition.ended, target_source_index, opposite_source_index)
     })?;
     Ok(event_count)
 }
@@ -976,14 +970,16 @@ mod tests {
             ContactTransition {
                 ended: true,
                 other: first,
+                other_source_index: 1,
             },
             ContactTransition {
                 ended: false,
                 other: second,
+                other_source_index: 2,
             },
         ];
         assert_eq!(
-            submit_contact_transitions(&mut core, player, &transitions),
+            submit_contact_transitions(&mut core, 0, &transitions),
             Ok(4)
         );
 

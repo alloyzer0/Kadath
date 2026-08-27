@@ -2116,7 +2116,7 @@ fn commit_gameplay_fixed(
     // 先通过 Phase authority 提交，再发布 Gameplay 状态；事件在队列边界直接构造。
     let event_count = gameplay::submit_contact_transitions(
         core,
-        gameplay.player,
+        gameplay.player_source_index,
         &transitions[..transition_count],
     )?;
     core.live
