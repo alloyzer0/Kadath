@@ -993,6 +993,14 @@ internal static class Program
             && viewModel.SceneObjectDrafts.Count == 3
             && viewModel.SelectedSceneObject?.ObjectId == "goal",
             "public Avalonia Create workflow did not project the created snapshots");
+        Require(viewModel.SceneGameplayProfile == "goal_hazard_v1"
+            && viewModel.SceneGameplayTimeLimitSeconds == "3"
+            && viewModel.IsGameplayEnabled,
+            "Avalonia did not project the Gameplay Profile authoring fields");
+        viewModel.SceneGameplayProfile = "none";
+        Require(!viewModel.IsGameplayEnabled,
+            "Avalonia did not update Gameplay-dependent authoring state after Profile changed");
+        viewModel.SceneGameplayProfile = "goal_hazard_v1";
 
         var retainedSceneGoalX = viewModel.SceneGoalX;
         await transport.EmitProjectCreatedAsync(created with
@@ -1096,6 +1104,45 @@ internal static class Program
             "Create did not recover after both Watch and Preview returned to Stopped");
         Console.WriteLine("failed_lifecycle_stop_recovery=ok");
 
+        await using (var gameplayTransport = new SmokeTransport(sceneV7: true))
+        await using (var gameplayClient = new EditorRpcClient(gameplayTransport, "avalonia-gameplay-authoring-smoke", "1"))
+        await using (var gameplayWorkspace = new EditorWorkspaceViewModel(gameplayClient, new InlineEditorViewDispatcher()))
+        {
+            var gameplayViewModel = new AvaloniaEditorViewModel(gameplayWorkspace, new InlineEditorViewDispatcher(), "C:/gameplay-package");
+            await gameplayWorkspace.ConnectAsync(createTimeout.Token);
+            gameplayViewModel.PackageRoot = "C:/gameplay-package";
+            gameplayViewModel.ProjectName = "gameplay";
+            _ = await gameplayViewModel.CreateProjectForCurrentInputAsync(createTimeout.Token);
+            Require(gameplayViewModel.SceneGameplayProfile == "goal_hazard_v1"
+                && gameplayViewModel.SceneGameplayTimeLimitSeconds == "3",
+                "Scene v7 Gameplay authoring projection mismatch");
+
+            gameplayViewModel.SceneGameplayProfile = "none";
+            var disabledGameplay = await gameplayViewModel.ApplyAuthoringForCurrentProjectAsync(createTimeout.Token);
+            var disabledPatch = gameplayTransport.LastAuthoringApplyRequest?.GetProperty("params").GetProperty("patch")
+                ?? throw new InvalidOperationException("Avalonia Gameplay Apply did not cross the typed transport seam");
+            Require(disabledGameplay.ChangedFields.Contains("scene.gameplay.profile")
+                && disabledPatch.GetProperty("sceneGameplayProfile").GetString() == "none",
+                "Avalonia did not send the disabled Gameplay Profile");
+
+            // 中立场景只要求至少一个对象，UI 不能继续套用旧 Gameplay 三角色约束。
+            while (gameplayViewModel.SceneObjectDrafts.Count > 1)
+                gameplayViewModel.SceneObjectDrafts.RemoveAt(gameplayViewModel.SceneObjectDrafts.Count - 1);
+            gameplayViewModel.SceneObjectDrafts[0].PositionX = "12";
+            _ = await gameplayViewModel.ApplyAuthoringForCurrentProjectAsync(createTimeout.Token);
+
+            gameplayViewModel.SceneGameplayProfile = "goal_hazard_v1";
+            gameplayViewModel.SceneGameplayTimeLimitSeconds = "4.25";
+            var enabledGameplay = await gameplayViewModel.ApplyAuthoringForCurrentProjectAsync(createTimeout.Token);
+            var enabledPatch = gameplayTransport.LastAuthoringApplyRequest!.Value.GetProperty("params").GetProperty("patch");
+            Require(enabledGameplay.ChangedFields.Contains("scene.gameplay.profile")
+                && enabledGameplay.ChangedFields.Contains("scene.gameplay.timeLimitSeconds")
+                && enabledPatch.GetProperty("sceneGameplayProfile").GetString() == "goal_hazard_v1"
+                && enabledPatch.GetProperty("sceneGameplayTimeLimitSeconds").GetDouble() == 4.25,
+                "Avalonia did not send the enabled Gameplay Profile and time limit");
+        }
+        Console.WriteLine("gameplay_profile_authoring=ok");
+
         await using var noCreateTransport = new SmokeTransport(advertiseProjectCreate: false);
         await using var noCreateClient = new EditorRpcClient(noCreateTransport, "avalonia-no-create-smoke", "1");
         await using var noCreateWorkspace = new EditorWorkspaceViewModel(noCreateClient, new InlineEditorViewDispatcher());
@@ -1122,14 +1169,23 @@ internal static class Program
         private bool _failNextWatchStart;
         private bool _failNextPreviewStart;
         private readonly bool _advertiseProjectCreate;
+        private readonly bool _sceneV7;
+        private string _gameplayProfile = "goal_hazard_v1";
+        private double? _gameplayTimeLimitSeconds = 3;
+        private string _authoringRevision = new('1', 64);
+        private int _authoringMutationCount;
         private TaskCompletionSource<bool>? _delayedCreateRelease;
         private TaskCompletionSource<bool>? _delayedCreateCompleted;
         public bool IsOpen { get; private set; }
         public bool DelayedCreatePending => _delayedCreateRelease is not null;
         public JsonElement? LastProjectCreateRequest { get; private set; }
+        public JsonElement? LastAuthoringApplyRequest { get; private set; }
 
-        public SmokeTransport(bool advertiseProjectCreate = true) =>
+        public SmokeTransport(bool advertiseProjectCreate = true, bool sceneV7 = false)
+        {
             _advertiseProjectCreate = advertiseProjectCreate;
+            _sceneV7 = sceneV7;
+        }
 
         public Task StartAsync(CancellationToken cancellationToken = default)
         {
@@ -1249,6 +1305,49 @@ internal static class Program
                     await EmitEventAsync("texture_import_completed", importResult, id).ConfigureAwait(false);
                     await SendResponseAsync(id, importResult).ConfigureAwait(false);
                     break;
+                case "authoring_apply":
+                    LastAuthoringApplyRequest = root.Clone();
+                    var authoringParameters = root.GetProperty("params");
+                    var authoringPatch = authoringParameters.GetProperty("patch");
+                    var changedFields = new List<string>();
+                    if (authoringPatch.TryGetProperty("sceneGameplayProfile", out var gameplayProfile)
+                        && gameplayProfile.ValueKind == JsonValueKind.String)
+                    {
+                        _gameplayProfile = gameplayProfile.GetString()!;
+                        if (_gameplayProfile == "none") _gameplayTimeLimitSeconds = null;
+                        changedFields.Add("scene.gameplay.profile");
+                    }
+                    if (authoringPatch.TryGetProperty("sceneGameplayTimeLimitSeconds", out var gameplayTimeLimit)
+                        && gameplayTimeLimit.ValueKind == JsonValueKind.Number)
+                    {
+                        _gameplayTimeLimitSeconds = gameplayTimeLimit.GetDouble();
+                        changedFields.Add("scene.gameplay.timeLimitSeconds");
+                    }
+                    if (authoringPatch.TryGetProperty("sceneObjects", out var sceneObjects)
+                        && sceneObjects.ValueKind == JsonValueKind.Array)
+                    {
+                        changedFields.Add("scene.objects");
+                    }
+                    if (authoringPatch.TryGetProperty("sceneTextures", out var sceneTextures)
+                        && sceneTextures.ValueKind == JsonValueKind.Array)
+                    {
+                        changedFields.Add("scene.textures");
+                    }
+                    var previousRevision = _authoringRevision;
+                    _authoringMutationCount++;
+                    _authoringRevision = new string("23456789abcdef"[_authoringMutationCount - 1], 64);
+                    var authoredProject = NewProjectSnapshot();
+                    await SendResponseAsync(id, new AuthoringMutationResult(
+                        "apply",
+                        "succeeded",
+                        _activeProjectName,
+                        previousRevision,
+                        _authoringRevision,
+                        changedFields.Distinct(StringComparer.Ordinal).ToArray(),
+                        1,
+                        authoredProject,
+                        NewHierarchySnapshot())).ConfigureAwait(false);
+                    break;
                 case "watch_start":
                     if (_failNextWatchStart)
                     {
@@ -1352,29 +1451,55 @@ internal static class Program
                 1);
         }
 
-        private ProjectModelSnapshot NewProjectSnapshot() => new(
-            1,
-            _activeProjectName,
-            new string('1', 64),
-            new ProjectModelFiles(
-                $"{_activePackageRoot}/bin/projects/{_activeProjectName}",
-                $"{_activePackageRoot}/bin/projects/{_activeProjectName}/scene.json",
-                $"{_activePackageRoot}/bin/projects/{_activeProjectName}/script.json",
-                $"{_activePackageRoot}/bin/projects/{_activeProjectName}/preview.json"),
-            new ProjectModelScene(
-                4,
-                [3d, 4d],
+        private ProjectModelSnapshot NewProjectSnapshot()
+        {
+            var textures = new[]
+            {
+                new ProjectModelTexture(1, "assets/renderer2d/test.texture"),
+                new ProjectModelTexture(2, "assets/renderer2d/goal.texture"),
+                new ProjectModelTexture(3, "assets/renderer2d/hazard.texture")
+            };
+            var objects = new[]
+            {
+                new ProjectModelSceneObject("player", "player", [1d, 2d], [32d, 32d], [1d, 1d, 1d, 1d], 1, MoveSpeed: 180d, Behaviors: []),
+                new ProjectModelSceneObject("goal", "goal", [3d, 4d], [24d, 24d], [1d, 0.75d, 0.1d, 1d], 2, Behaviors: []),
+                _sceneV7
+                    ? new ProjectModelSceneObject(
+                        "hazard", "patrol_hazard", [5d, 6d], [24d, 24d], [1d, 0.2d, 0.2d, 1d], 3,
+                        Behaviors: [new ProjectModelSceneBehaviorBinding(1, [])])
+                    : new ProjectModelSceneObject(
+                        "hazard", "patrol_hazard", [5d, 6d], [24d, 24d], [1d, 0.2d, 0.2d, 1d], 3,
+                        PatrolMinY: 0d, PatrolMaxY: 10d, PatrolSpeed: 2d)
+            };
+            var gameplayEnabled = _gameplayProfile == "goal_hazard_v1";
+            var scene = _sceneV7
+                ? new ProjectModelScene(
+                    7,
+                    gameplayEnabled ? [3d, 4d] : [],
+                    gameplayEnabled ? 1u : 0u,
+                    gameplayEnabled ? 2u : 0u,
+                    gameplayEnabled ? 3u : 0u,
+                    textures,
+                    objects,
+                    GameplayProfile: _gameplayProfile,
+                    GameplayTimeLimitSeconds: _gameplayTimeLimitSeconds)
+                : new ProjectModelScene(4, [3d, 4d], 1, 2, 3, textures, objects);
+            var script = _sceneV7
+                ? new ProjectModelScript(2, [], [], [new ProjectModelScriptDependency(1, "scripts/patrol.luau")])
+                : new ProjectModelScript(1, [3d, 4d], [1d, 0d]);
+            return new ProjectModelSnapshot(
                 1,
-                2,
-                3,
-                [new ProjectModelTexture(1, "assets/renderer2d/test.texture"), new ProjectModelTexture(2, "assets/renderer2d/goal.texture"), new ProjectModelTexture(3, "assets/renderer2d/goal.texture")],
-                [
-                    new ProjectModelSceneObject("player", "player", [1d, 2d], [32d, 32d], [1d, 1d, 1d, 1d], 1, MoveSpeed: 180d),
-                    new ProjectModelSceneObject("goal", "goal", [3d, 4d], [24d, 24d], [1d, 0.75d, 0.1d, 1d], 2),
-                    new ProjectModelSceneObject("hazard", "patrol_hazard", [5d, 6d], [24d, 24d], [1d, 0.2d, 0.2d, 1d], 3, PatrolMinY: 0d, PatrolMaxY: 10d, PatrolSpeed: 2d)
-                ]),
-            new ProjectModelScript(1, [3d, 4d], [1d, 0d]),
-            new ProjectModelPreview(1));
+                _activeProjectName,
+                _authoringRevision,
+                new ProjectModelFiles(
+                    $"{_activePackageRoot}/bin/projects/{_activeProjectName}",
+                    $"{_activePackageRoot}/bin/projects/{_activeProjectName}/scene.json",
+                    $"{_activePackageRoot}/bin/projects/{_activeProjectName}/script.json",
+                    $"{_activePackageRoot}/bin/projects/{_activeProjectName}/preview.json"),
+                scene,
+                script,
+                new ProjectModelPreview(1));
+        }
 
         private HierarchySnapshot NewHierarchySnapshot() => new(
             2,
@@ -1393,6 +1518,13 @@ internal static class Program
             {
                 new("asset://scenes/smoke.scene", "smoke.scene", "assets/scenes/smoke.scene", "Scene", "scene", 64, [])
             };
+            if (_sceneV7)
+            {
+                // v7 authoring smoke 需要真实 texture catalog 映射，避免绕过公开 SceneTextureAssignment seam。
+                items.Add(new("asset://renderer2d/test.texture", "test.texture", "assets/renderer2d/test.texture", "Texture", "texture", 64, []));
+                items.Add(new("asset://renderer2d/goal.texture", "goal.texture", "assets/renderer2d/goal.texture", "Texture", "texture", 64, []));
+                items.Add(new("asset://renderer2d/hazard.texture", "hazard.texture", "assets/renderer2d/hazard.texture", "Texture", "texture", 64, []));
+            }
             if (_importedRelativePath is not null)
             {
                 items.Add(new AssetCatalogItem(

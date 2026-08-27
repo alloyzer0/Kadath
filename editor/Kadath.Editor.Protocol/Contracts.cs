@@ -411,7 +411,9 @@ public sealed record AuthoringPatch(
     uint? SceneGoalTextureId = null,
     uint? SceneHazardTextureId = null,
     IReadOnlyList<SceneTextureAssignment>? SceneTextures = null,
-    IReadOnlyList<SceneObjectDefinition>? SceneObjects = null);
+    IReadOnlyList<SceneObjectDefinition>? SceneObjects = null,
+    string? SceneGameplayProfile = null,
+    double? SceneGameplayTimeLimitSeconds = null);
 
 public sealed record AuthoringApplyParameters(
     string? ProjectName,

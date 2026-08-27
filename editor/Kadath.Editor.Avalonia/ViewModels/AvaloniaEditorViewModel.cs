@@ -51,6 +51,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _scenePlayerTextureId = "1";
     private string _sceneGoalTextureId = "2";
     private string _sceneHazardTextureId = "1";
+    private string _sceneGameplayProfile = "none";
+    private string _sceneGameplayTimeLimitSeconds = string.Empty;
     private string _scriptGoalX = string.Empty;
     private string _scriptGoalY = string.Empty;
     private string _scriptVelocityX = string.Empty;
@@ -144,6 +146,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public IReadOnlyList<string> BakeTargets { get; } = ["Both", "Scene", "Script"];
     public IReadOnlyList<string> BakeProfiles { get; } = ["debug", "release"];
     public IReadOnlyList<string> TextureImportProfiles { get; } = ["debug", "release"];
+    public IReadOnlyList<string> SceneGameplayProfiles { get; } = ["none", "goal_hazard_v1"];
 
     public ICommand ConnectCommand { get; }
     public ICommand OpenProjectCommand { get; }
@@ -270,6 +273,21 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public string ScenePlayerTextureId { get => _scenePlayerTextureId; set => SetProperty(ref _scenePlayerTextureId, value); }
     public string SceneGoalTextureId { get => _sceneGoalTextureId; set => SetProperty(ref _sceneGoalTextureId, value); }
     public string SceneHazardTextureId { get => _sceneHazardTextureId; set => SetProperty(ref _sceneHazardTextureId, value); }
+    public string SceneGameplayProfile
+    {
+        get => _sceneGameplayProfile;
+        set
+        {
+            if (!SetProperty(ref _sceneGameplayProfile, value)) return;
+            RaiseAll();
+        }
+    }
+    public string SceneGameplayTimeLimitSeconds
+    {
+        get => _sceneGameplayTimeLimitSeconds;
+        set => SetProperty(ref _sceneGameplayTimeLimitSeconds, value);
+    }
+    public bool IsGameplayEnabled => SceneGameplayProfile == "goal_hazard_v1";
     public string ScriptGoalX { get => _scriptGoalX; set => SetProperty(ref _scriptGoalX, value); }
     public string ScriptGoalY { get => _scriptGoalY; set => SetProperty(ref _scriptGoalY, value); }
     public string ScriptVelocityX { get => _scriptVelocityX; set => SetProperty(ref _scriptVelocityX, value); }
@@ -554,6 +572,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _ => "行为契约不可用。"
     };
     public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7;
+    public bool SupportsGameplayProfileAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion == 7;
     public bool HasSelectedBehaviorBinding => SelectedBehaviorBinding is not null;
     public bool CanAddBehaviorBinding => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
@@ -567,7 +586,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && SelectedSceneObject is { } sceneObject
         && SelectedBehaviorBinding is { } binding
         && sceneObject.Behaviors.Contains(binding)
-        && !(sceneObject.IsPatrolHazard && sceneObject.Behaviors.Count == 1)
+        && !(IsGameplayEnabled && sceneObject.IsPatrolHazard && sceneObject.Behaviors.Count == 1)
         && !IsBusy;
     public bool CanMoveBehaviorBindingUp => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
@@ -586,10 +605,11 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool CanAddSceneObject => CanApplyAuthoring && SceneObjectDrafts.Count < 64 && SceneTextureIds.Count > 0 && !IsBusy;
     public bool CanAddPatrolHazard => CanAddSceneObject
         && _workspace.ProjectSnapshot.Value is { } project
-        && (project.Scene.SchemaVersion != 5 || IsBehaviorContractReady && AvailableBehaviorContracts.Count > 0);
+        && (!IsGameplayEnabled || project.Scene.SchemaVersion < 5 || IsBehaviorContractReady && AvailableBehaviorContracts.Count > 0);
     public bool CanDeleteSelectedSceneObject => SelectedSceneObject is { } selected
         && !IsBusy
-        && (selected.Kind == "sprite" || selected.Kind == "patrol_hazard" && SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard") > 1);
+        && (!IsGameplayEnabled || selected.Kind == "sprite"
+            || selected.Kind == "patrol_hazard" && SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard") > 1);
     public bool CanMoveSelectedSceneObjectUp => SelectedSceneObject is { } selected && !IsBusy && SceneObjectDrafts.IndexOf(selected) > 0;
     public bool CanMoveSelectedSceneObjectDown => SelectedSceneObject is { } selected && !IsBusy
         && SceneObjectDrafts.IndexOf(selected) is var index && index >= 0 && index < SceneObjectDrafts.Count - 1;
@@ -697,11 +717,16 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         var allowedTextureIds = sceneTextures?.Select(texture => texture.TextureId).ToHashSet()
             ?? (project.Scene.Textures ?? []).Select(texture => texture.TextureId).ToHashSet();
         var editsHookScript = project.Script.SchemaVersion == 1;
+        var editsGameplay = project.Scene.SchemaVersion == 7;
         var patch = new AuthoringPatch(
             ScriptGoalPosition: editsHookScript ? ParseVector(ScriptGoalX, ScriptGoalY, "script.goal.position") : null,
             ScriptGoalVelocity: editsHookScript ? ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity") : null,
             SceneTextures: sceneTextures,
-            SceneObjects: ParseSceneObjectDrafts(allowedTextureIds));
+            SceneObjects: ParseSceneObjectDrafts(allowedTextureIds, IsGameplayEnabled),
+            SceneGameplayProfile: editsGameplay ? SceneGameplayProfile : null,
+            SceneGameplayTimeLimitSeconds: editsGameplay && IsGameplayEnabled
+                ? ParsePositiveNumber(SceneGameplayTimeLimitSeconds, "scene.gameplay.timeLimitSeconds")
+                : null);
         var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
         ReconcileScriptSourceDocument();
         ApplySnapshotProjection(session);
@@ -1069,11 +1094,14 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         return assignments.Count == 0 ? null : assignments;
     }
 
-    private IReadOnlyList<SceneObjectDefinition> ParseSceneObjectDrafts(IReadOnlySet<uint> allowedTextureIds)
+    private IReadOnlyList<SceneObjectDefinition> ParseSceneObjectDrafts(
+        IReadOnlySet<uint> allowedTextureIds,
+        bool gameplayEnabled)
     {
-        if (SceneObjectDrafts.Count is < 3 or > 64)
+        var minimumObjectCount = gameplayEnabled ? 3 : 1;
+        if (SceneObjectDrafts.Count < minimumObjectCount || SceneObjectDrafts.Count > 64)
         {
-            throw new EditorRpcException("invalid_authoring_patch", "scene.objects 必须包含 3 到 64 个对象。");
+            throw new EditorRpcException("invalid_authoring_patch", $"scene.objects 必须包含 {minimumObjectCount} 到 64 个对象。");
         }
         if (allowedTextureIds.Count is < 1 or > 4)
         {
@@ -1154,7 +1182,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                             throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}] 的 Patrol 范围或初始 Y 无效。");
                         }
                     }
-                    else if (behaviors.Count == 0)
+                    else if (gameplayEnabled && behaviors.Count == 0)
                     {
                         throw new EditorRpcException("invalid_authoring_patch", $"scene.objects[{objectId}] 必须至少绑定一个行为脚本。");
                     }
@@ -1176,7 +1204,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                 patrolSpeed,
                 behaviors));
         }
-        if (playerCount != 1 || goalCount != 1 || hazardCount < 1)
+        if (gameplayEnabled && (playerCount != 1 || goalCount != 1 || hazardCount < 1))
         {
             throw new EditorRpcException("invalid_authoring_patch", "scene.objects 必须恰好包含一个 Player、一个 Goal，并至少包含一个 Patrol Hazard。");
         }
@@ -1293,7 +1321,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                     || draft.Behaviors.Count > 4
                     || draft.Behaviors.Select(binding => binding.ScriptId).Distinct().Count() != draft.Behaviors.Count)
                     return false;
-                if (project.Scene.SchemaVersion is 5 or 6 && draft.IsPatrolHazard && draft.Behaviors.Count == 0) return false;
+                if (IsGameplayEnabled && project.Scene.SchemaVersion is 5 or 6 or 7
+                    && draft.IsPatrolHazard && draft.Behaviors.Count == 0) return false;
                 if (project.Scene.SchemaVersion is 5 or 6 && draft.IsPatrolHazard && draft.UsesNativePatrol) return false;
             }
             return true;
@@ -1314,6 +1343,13 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     {
         var parsed = ParseFiniteNumber(value, field);
         if (parsed < 0) { throw new EditorRpcException("invalid_authoring_patch", $"{field} 不能为负数。"); }
+        return parsed;
+    }
+
+    private static double ParsePositiveNumber(string value, string field)
+    {
+        var parsed = ParseFiniteNumber(value, field);
+        if (parsed <= 0) { throw new EditorRpcException("invalid_authoring_patch", $"{field} 必须大于零。"); }
         return parsed;
     }
 
@@ -1384,6 +1420,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         InspectorText = string.Empty;
         SceneGoalX = string.Empty;
         SceneGoalY = string.Empty;
+        SceneGameplayProfile = "none";
+        SceneGameplayTimeLimitSeconds = string.Empty;
         ScriptGoalX = string.Empty;
         ScriptGoalY = string.Empty;
         ScriptVelocityX = string.Empty;
@@ -1403,6 +1441,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private void SetAuthoringFields(ProjectModelSnapshot project)
     {
         var gameplayEnabled = project.Scene.GameplayProfile == "goal_hazard_v1";
+        SceneGameplayProfile = project.Scene.GameplayProfile;
+        SceneGameplayTimeLimitSeconds = gameplayEnabled
+            ? (project.Scene.GameplayTimeLimitSeconds ?? 3).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)
+            : string.Empty;
         SceneGoalX = gameplayEnabled ? project.Scene.GoalPosition[0].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
         SceneGoalY = gameplayEnabled ? project.Scene.GoalPosition[1].ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
         ScenePlayerTextureId = gameplayEnabled ? project.Scene.PlayerTextureId.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty;
@@ -1670,11 +1712,13 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(AuthoringRevisionStatus));
         OnPropertyChanged(nameof(CapabilitySummary));
         OnPropertyChanged(nameof(SceneObjectCountStatus));
+        OnPropertyChanged(nameof(IsGameplayEnabled));
         OnPropertyChanged(nameof(HasSelectedSceneObject));
         OnPropertyChanged(nameof(AvailableBehaviorContracts));
         OnPropertyChanged(nameof(IsBehaviorContractReady));
         OnPropertyChanged(nameof(BehaviorContractStatus));
         OnPropertyChanged(nameof(UsesBehaviorBindingAuthoring));
+        OnPropertyChanged(nameof(SupportsGameplayProfileAuthoring));
         OnPropertyChanged(nameof(HasSelectedBehaviorBinding));
         OnPropertyChanged(nameof(IsBusy));
         OnPropertyChanged(nameof(IsConnected));

@@ -150,6 +150,25 @@
                 </StackPanel>
               </Border>
 
+              <Border IsVisible="{Binding SupportsGameplayProfileAuthoring}" Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="6">
+                  <TextBlock FontWeight="SemiBold" Text="Gameplay Profile" />
+                  <Grid ColumnDefinitions="Auto,*,Auto,*" ColumnSpacing="6">
+                    <TextBlock VerticalAlignment="Center" Text="Profile" />
+                    <ComboBox Grid.Column="1"
+                              ItemsSource="{Binding SceneGameplayProfiles}"
+                              SelectedItem="{Binding SceneGameplayProfile}" />
+                    <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="时间限制（秒）" />
+                    <TextBox Grid.Column="3"
+                             IsEnabled="{Binding IsGameplayEnabled}"
+                             Text="{Binding SceneGameplayTimeLimitSeconds}" />
+                  </Grid>
+                  <TextBlock FontSize="11"
+                             Foreground="#AEBAC8"
+                             Text="none 关闭引擎 Gameplay；goal_hazard_v1 启用兼容 Gameplay。" />
+                </StackPanel>
+              </Border>
+
               <Border Padding="8" Background="#252D37" CornerRadius="4">
                 <StackPanel Spacing="6">
                   <Grid ColumnDefinitions="*,Auto">

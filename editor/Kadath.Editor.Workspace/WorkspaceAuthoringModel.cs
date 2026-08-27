@@ -336,7 +336,15 @@ public sealed class WorkspaceAuthoringModel
     private static NormalizedPatch NormalizePatch(ProjectModelSnapshot current, AssetCatalogSnapshot? assets, AuthoringPatch? patch)
     {
         if (patch is null) throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "Authoring patch is required.");
-        var gameplay = GameplayFromSnapshot(current.Scene);
+        var currentGameplay = GameplayFromSnapshot(current.Scene);
+        var gameplay = NormalizeGameplay(
+            current.Scene,
+            patch.SceneGameplayProfile,
+            patch.SceneGameplayTimeLimitSeconds,
+            currentGameplay);
+        var gameplayProfileChanged = gameplay.Profile != currentGameplay.Profile;
+        var gameplayTimeLimitChanged = patch.SceneGameplayTimeLimitSeconds is not null
+            && (!currentGameplay.IsEnabled || gameplay.TimeLimitSeconds != currentGameplay.TimeLimitSeconds);
         ValidateVector(patch.SceneGoalPosition, "scene.goal.position");
         ValidateVector(patch.ScriptGoalPosition, "script.goal.position");
         ValidateVector(patch.ScriptGoalVelocity, "script.goal.velocity");
@@ -374,7 +382,8 @@ public sealed class WorkspaceAuthoringModel
         }
         var provided = patch.SceneGoalPosition is not null || patch.ScriptGoalPosition is not null || patch.ScriptGoalVelocity is not null
             || patch.ScenePlayerTextureId is not null || patch.SceneGoalTextureId is not null || patch.SceneHazardTextureId is not null
-            || patch.SceneTextures is not null || patch.SceneObjects is not null;
+            || patch.SceneTextures is not null || patch.SceneObjects is not null || patch.SceneGameplayProfile is not null
+            || patch.SceneGameplayTimeLimitSeconds is not null;
         if (!provided) throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "At least one authoring field is required.");
 
         var sceneGoal = Changed(patch.SceneGoalPosition, current.Scene.GoalPosition) ? patch.SceneGoalPosition : null;
@@ -388,15 +397,18 @@ public sealed class WorkspaceAuthoringModel
             ? normalizedObjects.Select(value => value.ToDefinition()).ToArray()
             : null;
         var normalized = new AuthoringPatch(sceneGoal, scriptGoal, velocity, playerTexture, goalTexture, hazardTexture,
-            sceneTextures.RequestedTextures, objectDefinitions);
+            sceneTextures.RequestedTextures, objectDefinitions, gameplayProfileChanged ? gameplay.Profile : null,
+            gameplayTimeLimitChanged ? gameplay.TimeLimitSeconds : null);
         var fields = ChangedFields(normalized);
-        if (fields.Length == 0) return new NormalizedPatch(normalized, [], false, false, null, null);
+        if (fields.Length == 0) return new NormalizedPatch(normalized, [], false, false, null, null, null);
         return new NormalizedPatch(normalized, fields,
             sceneGoal is not null || playerTexture is not null || goalTexture is not null || hazardTexture is not null
-                || sceneTextures.ResolvedTextures is not null || objectDefinitions is not null,
+                || sceneTextures.ResolvedTextures is not null || objectDefinitions is not null || gameplayProfileChanged
+                || gameplayTimeLimitChanged,
             scriptGoal is not null || velocity is not null,
             sceneTextures.ResolvedTextures,
-            objectDefinitions is null ? null : normalizedObjects);
+            objectDefinitions is null ? null : normalizedObjects,
+            gameplayProfileChanged || gameplayTimeLimitChanged ? gameplay : null);
     }
 
     private static byte[] BuildSceneBytes(byte[] original, NormalizedPatch normalized)
@@ -418,7 +430,11 @@ public sealed class WorkspaceAuthoringModel
             {
                 return current.SourceSchemaVersion switch
                 {
-                    WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV7(textures, objects, current.Prototypes, current.Gameplay),
+                    WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV7(
+                        textures,
+                        objects,
+                        current.Prototypes,
+                        normalized.ResolvedSceneGameplay ?? current.Gameplay),
                     WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV6(textures, objects, current.Prototypes),
                     WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV5(textures, objects),
                     _ => WorkspaceSceneDocumentCodec.SerializeV4(textures, objects)
@@ -595,6 +611,33 @@ public sealed class WorkspaceAuthoringModel
             ? 0
             : scene.GameplayTimeLimitSeconds ?? WorkspaceSceneDocumentCodec.LegacyGameplay.TimeLimitSeconds);
 
+    private static WorkspaceSceneGameplay NormalizeGameplay(
+        ProjectModelScene scene,
+        string? requestedProfile,
+        double? requestedTimeLimitSeconds,
+        WorkspaceSceneGameplay current)
+    {
+        if (requestedProfile is null && requestedTimeLimitSeconds is null) return current;
+        if (scene.SchemaVersion != WorkspaceSceneDocumentCodec.CurrentSchemaVersion)
+            throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "scene.gameplay can only be authored for Scene v7.");
+
+        var profile = requestedProfile ?? current.Profile;
+        if (profile == WorkspaceSceneDocumentCodec.NoGameplayProfile)
+        {
+            if (requestedTimeLimitSeconds is not null)
+                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "scene.gameplay.timeLimitSeconds cannot be authored while Gameplay is disabled.");
+            return WorkspaceSceneDocumentCodec.NeutralGameplay;
+        }
+        if (profile != WorkspaceSceneDocumentCodec.GoalHazardGameplayProfile)
+            throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, $"scene.gameplay.profile is unsupported: {profile}.");
+
+        var timeLimitSeconds = requestedTimeLimitSeconds
+            ?? (current.IsEnabled ? current.TimeLimitSeconds : WorkspaceSceneDocumentCodec.LegacyGameplay.TimeLimitSeconds);
+        if (!double.IsFinite(timeLimitSeconds) || timeLimitSeconds <= 0 || timeLimitSeconds > float.MaxValue)
+            throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "scene.gameplay.timeLimitSeconds must be a positive finite f32 value.");
+        return new WorkspaceSceneGameplay(profile, timeLimitSeconds);
+    }
+
     private static JsonObject ParseObject(byte[] bytes, string name)
     {
         try
@@ -633,6 +676,8 @@ public sealed class WorkspaceAuthoringModel
         if (patch.SceneHazardTextureId is not null) fields.Add("scene.hazard.textureId");
         if (patch.SceneTextures is not null) fields.Add("scene.textures");
         if (patch.SceneObjects is not null) fields.Add("scene.objects");
+        if (patch.SceneGameplayProfile is not null) fields.Add("scene.gameplay.profile");
+        if (patch.SceneGameplayTimeLimitSeconds is not null) fields.Add("scene.gameplay.timeLimitSeconds");
         return fields.ToArray();
     }
 
@@ -707,7 +752,8 @@ public sealed class WorkspaceAuthoringModel
         bool SceneChanged,
         bool ScriptChanged,
         ProjectModelTexture[]? ResolvedSceneTextures,
-        WorkspaceSceneObject[]? ResolvedSceneObjects);
+        WorkspaceSceneObject[]? ResolvedSceneObjects,
+        WorkspaceSceneGameplay? ResolvedSceneGameplay);
     private sealed record SceneTextureNormalization(ProjectModelTexture[]? ResolvedTextures, SceneTextureAssignment[]? RequestedTextures);
     private sealed record TransactionEntry(string TargetPath, string StagedPath, string RecoveryPath, byte[] Intended);
 }
