@@ -150,8 +150,10 @@ const StepEvidence = struct {
 fn recordSnapshot(session: *Session, recorder: *gameplay_replay.Recorder) !runtime_core.GameplaySnapshot {
     var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
     const publication = try session.generation.extractSprites(&render_items);
-    recorder.recordSnapshot(&publication.snapshot, publication.sprites);
-    return publication.snapshot;
+    // VS02 fixture 显式启用 Gameplay；通过 union accessor 拒绝把 Neutral publication 当作 Gameplay。
+    const snapshot = try publication.gameplaySnapshot();
+    recorder.recordSnapshot(&snapshot, publication.sprites);
+    return snapshot;
 }
 
 fn runFixed(
