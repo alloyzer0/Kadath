@@ -102,12 +102,16 @@ verify_report_payload() {
 }
 
 verify_steady_state_report() {
-    local report=$1 actual expected allowed_growth peak_growth allocations benchmark
+    local report=$1 actual expected allowed_growth peak_growth allocations benchmark raw_stderr warmup_iterations warmup_allocations
     [[ -f "$report" ]] || return
     [[ "$(value "$report" GAMEPLAY_CANDIDATE_SHA)" == "$candidate_sha" ]] || blocked+=("steady-state report SHA mismatch")
     [[ "$(value "$report" GAMEPLAY_STEADY_STATE_STATUS)" == PASS ]] || blocked+=("steady-state memory status is not PASS")
     [[ "$(value "$report" GAMEPLAY_STEADY_STATE_BATCHES)" == 120 &&
        "$(value "$report" GAMEPLAY_STEADY_STATE_SAMPLE_COUNT)" == 120 ]] || blocked+=("steady-state memory sample shape is incomplete")
+    warmup_iterations=$(value "$report" GAMEPLAY_STEADY_STATE_WARMUP_ITERATIONS)
+    warmup_allocations=$(value "$report" GAMEPLAY_STEADY_STATE_WARMUP_ALLOCATIONS)
+    [[ "$warmup_iterations" == 10000 && "$warmup_allocations" == 0 ]] || \
+        blocked+=("steady-state warm-up shape or allocation evidence is invalid")
     [[ "$(value "$report" GAMEPLAY_STEADY_STATE_ITERATIONS)" == 1200000 ]] || blocked+=("steady-state memory iteration shape is incomplete")
     allocations=$(value "$report" GAMEPLAY_STEADY_STATE_ALLOCATIONS)
     [[ "$allocations" == 0 ]] || blocked+=("steady-state memory observed Gameplay allocations")
@@ -130,6 +134,9 @@ verify_steady_state_report() {
        -n "$(value "$report" GAMEPLAY_TOOL_ZIG_VERSION)" &&
        -n "$(value "$report" GAMEPLAY_TOOL_GNU_TIME_VERSION)" &&
        -n "$(value "$report" GAMEPLAY_TOOL_HOST)" ]] || blocked+=("steady-state tool provenance missing")
+    raw_stderr=$(value "$report" GAMEPLAY_STEADY_STATE_STDERR)
+    grep -Fqx "runtime_core_gameplay_steady_warmup iterations=$warmup_iterations allocations=$warmup_allocations" "$raw_stderr" 2>/dev/null || \
+        blocked+=("steady-state raw warm-up evidence missing")
     verify_report_payload "$report" STEADY_STATE
 }
 

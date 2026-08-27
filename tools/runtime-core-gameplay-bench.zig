@@ -146,6 +146,24 @@ pub fn main(init: std.process.Init) !void {
     try runStep(&fixture, near_position, &outcome, &events, &render_items);
 
     if (try parseSteadyBatches(args)) |batches| {
+        // 正式 RSS 基线前运行同形状 warm-up，吸收日志/代码页的首次懒提交；warm-up 本身仍必须零分配。
+        if (c.kadath_runtime_core_phase_quality_begin_allocation_count() != c.KADATH_OK) {
+            return error.AllocationCounterUnavailable;
+        }
+        for (0..iterations) |index| {
+            const position = if (index % 2 == 0) far_position else near_position;
+            try runStep(&fixture, position, &outcome, &events, &render_items);
+        }
+        var warmup_allocations: u64 = 0;
+        if (c.kadath_runtime_core_phase_quality_end_allocation_count(&warmup_allocations) != c.KADATH_OK) {
+            return error.AllocationCounterUnavailable;
+        }
+        if (warmup_allocations != 0) return error.SteadyStateGameplayAllocated;
+        std.debug.print(
+            "runtime_core_gameplay_steady_warmup iterations={d} allocations={d}\n",
+            .{ iterations, warmup_allocations },
+        );
+
         const first_rss = try currentRssKb();
         var last_rss = first_rss;
         var peak_rss = first_rss;

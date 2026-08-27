@@ -49,6 +49,8 @@ metric() {
 }
 
 sample_count="$(grep -c '^steady_sample=' "$raw_stderr" || true)"
+warmup_iterations="$(sed -n 's/.*runtime_core_gameplay_steady_warmup iterations=\([0-9][0-9]*\).*/\1/p' "$raw_stdout" "$raw_stderr" | tail -n 1)"
+warmup_allocations="$(sed -n 's/.*runtime_core_gameplay_steady_warmup.*allocations=\([0-9][0-9]*\).*/\1/p' "$raw_stdout" "$raw_stderr" | tail -n 1)"
 first_rss="$(metric first_rss_kb)"
 last_rss="$(metric last_rss_kb)"
 peak_rss="$(metric peak_rss_kb)"
@@ -60,6 +62,7 @@ if [[ -z "$allocations" ]]; then allocations="$(sed -n 's/.*runtime_core_gamepla
 status=PASS
 [[ "$run_status" == 0 ]] || status=BLOCKED
 [[ "$sample_count" == "$steady_batches" ]] || status=BLOCKED
+[[ "$warmup_iterations" == 10000 && "$warmup_allocations" == 0 ]] || status=BLOCKED
 [[ "$first_rss" =~ ^[0-9]+$ && "$last_rss" =~ ^[0-9]+$ && "$peak_rss" =~ ^[0-9]+$ && "$growth" =~ ^[0-9]+$ && "$peak_growth" =~ ^[0-9]+$ && "$allocations" =~ ^[0-9]+$ ]] || status=BLOCKED
 [[ "$allocations" == 0 ]] || status=BLOCKED
 [[ "$peak_growth" =~ ^[0-9]+$ && "$peak_growth" -le 64 ]] || status=BLOCKED
@@ -73,6 +76,8 @@ GAMEPLAY_COMMAND=gameplay-steady-state-memory.sh --candidate-sha $candidate_sha 
 GAMEPLAY_STEADY_STATE_STATUS=$status
 GAMEPLAY_STEADY_STATE_BATCHES=$steady_batches
 GAMEPLAY_STEADY_STATE_SAMPLE_COUNT=$sample_count
+GAMEPLAY_STEADY_STATE_WARMUP_ITERATIONS=$warmup_iterations
+GAMEPLAY_STEADY_STATE_WARMUP_ALLOCATIONS=$warmup_allocations
 GAMEPLAY_STEADY_STATE_ITERATIONS=$(metric iterations)
 GAMEPLAY_STEADY_STATE_FIRST_RSS_KB=$first_rss
 GAMEPLAY_STEADY_STATE_LAST_RSS_KB=$last_rss

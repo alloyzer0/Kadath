@@ -126,6 +126,7 @@ steady_stderr="$evidence_root/steady-state.stderr"
 steady_time="$evidence_root/steady-state.time"
 : >"$steady_stdout"
 : >"$steady_stderr"
+printf 'runtime_core_gameplay_steady_warmup iterations=10000 allocations=0\n' >>"$steady_stderr"
 for sample in {1..120}; do
     printf 'steady_sample=%s rss_kb=1000 allocations=0\n' "$sample" >>"$steady_stderr"
 done
@@ -138,6 +139,8 @@ GAMEPLAY_COMMAND=steady-test-fixture
 GAMEPLAY_STEADY_STATE_STATUS=PASS
 GAMEPLAY_STEADY_STATE_BATCHES=120
 GAMEPLAY_STEADY_STATE_SAMPLE_COUNT=120
+GAMEPLAY_STEADY_STATE_WARMUP_ITERATIONS=10000
+GAMEPLAY_STEADY_STATE_WARMUP_ALLOCATIONS=0
 GAMEPLAY_STEADY_STATE_ITERATIONS=1200000
 GAMEPLAY_STEADY_STATE_FIRST_RSS_KB=1000
 GAMEPLAY_STEADY_STATE_LAST_RSS_KB=1000
