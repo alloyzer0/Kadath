@@ -12,6 +12,8 @@ pub const PipelineHandle = types.PipelineHandle;
 pub const invalid_pipeline = types.invalid_pipeline;
 pub const TextureHandle = types.TextureHandle;
 pub const invalid_texture = types.invalid_texture;
+pub const max_instance_data_bytes_per_frame = types.max_instance_data_bytes_per_frame;
+pub const max_instance_data_bindings_per_frame = types.max_instance_data_bindings_per_frame;
 pub const TextureSamplerProfile = types.TextureSamplerProfile;
 pub const TextureMipUpload = types.TextureMipUpload;
 pub const TextureUploadDesc = types.TextureUploadDesc;
@@ -30,7 +32,10 @@ pub const NullStats = struct {
     pipeline_binds: u32 = 0,
     texture_binds: u32 = 0,
     push_constant_writes: u32 = 0,
+    instance_data_binds: u32 = 0,
+    instance_data_bytes: u32 = 0,
     draws: u32 = 0,
+    instances_drawn: u32 = 0,
     frames_finished: u32 = 0,
     failed_frames_consumed: u32 = 0,
     recreates: u32 = 0,
@@ -46,6 +51,9 @@ pub const FrameEncoder = struct {
     frame_token: u64,
     bound_pipeline: types.PipelineHandle = types.invalid_pipeline,
     bound_texture: types.TextureHandle = types.invalid_texture,
+    bound_instance_capacity: u32 = 0,
+    instance_data_bytes_uploaded: usize = 0,
+    instance_data_binding_count: usize = 0,
     recording: bool = true,
     finished: bool = false,
 
@@ -54,6 +62,7 @@ pub const FrameEncoder = struct {
         try self.rhi.validateFrame(self);
         try self.rhi.validatePipeline(pipeline);
         self.bound_pipeline = pipeline;
+        self.bound_instance_capacity = 0;
         self.rhi.stats_value.pipeline_binds += 1;
     }
 
@@ -80,16 +89,58 @@ pub const FrameEncoder = struct {
         self.rhi.stats_value.push_constant_writes += 1;
     }
 
-    pub fn draw(self: *FrameEncoder, vertex_count: u32) !void {
+    pub fn bindInstanceData(self: *FrameEncoder, bytes: []const u8) !void {
         if (!self.recording or self.finished) return error.FrameAlreadyFinished;
         try self.rhi.validateFrame(self);
-        if (self.bound_pipeline == types.invalid_pipeline) return error.InvalidPipeline;
+        const desc = try self.boundPipelineDesc();
+        if (desc.instance_data_stride == 0) return error.InstanceDataBindingUnsupported;
+        const stride: usize = @intCast(desc.instance_data_stride);
+        if (bytes.len == 0 or bytes.len % stride != 0) return error.InvalidInstanceDataSize;
+        if (self.instance_data_binding_count >= types.max_instance_data_bindings_per_frame) {
+            return error.InstanceDataBindingLimitReached;
+        }
+        if (bytes.len > types.max_instance_data_bytes_per_frame - self.instance_data_bytes_uploaded) {
+            return error.InstanceDataFrameLimitReached;
+        }
+
+        self.instance_data_binding_count += 1;
+        self.instance_data_bytes_uploaded += bytes.len;
+        self.bound_instance_capacity = @intCast(bytes.len / stride);
+        self.rhi.stats_value.instance_data_binds += 1;
+        self.rhi.stats_value.instance_data_bytes += @intCast(bytes.len);
+    }
+
+    pub fn draw(self: *FrameEncoder, vertex_count: u32) !void {
+        return self.recordDraw(vertex_count, 1, false);
+    }
+
+    pub fn drawInstanced(self: *FrameEncoder, vertex_count: u32, instance_count: u32) !void {
+        return self.recordDraw(vertex_count, instance_count, true);
+    }
+
+    fn recordDraw(self: *FrameEncoder, vertex_count: u32, instance_count: u32, require_instanced: bool) !void {
+        if (!self.recording or self.finished) return error.FrameAlreadyFinished;
+        try self.rhi.validateFrame(self);
+        const desc = try self.boundPipelineDesc();
+        if (require_instanced and desc.instance_data_stride == 0) return error.InstanceDataBindingUnsupported;
         if (vertex_count == 0) return error.InvalidDrawCount;
+        if (instance_count == 0) return error.InvalidInstanceCount;
+        if (desc.instance_data_stride != 0) {
+            if (self.bound_instance_capacity == 0) return error.InstanceDataRequired;
+            if (instance_count > self.bound_instance_capacity) return error.InstanceCountExceedsBoundData;
+        }
         if (self.rhi.stats_value.draw_texture_trace_len < max_draw_texture_trace) {
             self.rhi.stats_value.draw_texture_trace[self.rhi.stats_value.draw_texture_trace_len] = self.bound_texture;
             self.rhi.stats_value.draw_texture_trace_len += 1;
         }
         self.rhi.stats_value.draws += 1;
+        self.rhi.stats_value.instances_drawn += instance_count;
+    }
+
+    fn boundPipelineDesc(self: *FrameEncoder) !types.GraphicsPipelineDesc {
+        if (self.bound_pipeline == types.invalid_pipeline) return error.InvalidPipeline;
+        const slot = self.rhi.pipelineSlot(self.bound_pipeline) orelse return error.InvalidPipeline;
+        return slot.desc orelse error.InvalidPipeline;
     }
 
     /// 失败帧必须释放 active token，否则下一帧会永久收到 FrameAlreadyActive。
@@ -158,6 +209,11 @@ pub const Rhi = struct {
             desc.fragment_shader.len == 0 or desc.fragment_shader.len % 4 != 0)
         {
             return error.InvalidShaderCode;
+        }
+        if (desc.instance_data_stride != 0 and
+            (desc.instance_data_stride % 4 != 0 or desc.instance_data_stride > types.max_instance_data_bytes_per_frame))
+        {
+            return error.InvalidInstanceDataStride;
         }
         for (&self.pipeline_slots, 0..) |*slot, index| {
             if (slot.desc == null) {
@@ -465,4 +521,100 @@ test "null adapter draw trace saturation does not fail rendering" {
     const stats = rhi.stats();
     try std.testing.expectEqual(@as(u32, max_draw_texture_trace + 1), stats.draws);
     try std.testing.expectEqual(max_draw_texture_trace, stats.draw_texture_trace_len);
+}
+
+test "null adapter validates bounded instance data and instanced draws" {
+    var rhi = try Rhi.init(.{ .width = 64, .height = 64 });
+    defer rhi.deinit();
+    const shader = [_]u8{ 0, 0, 0, 0 };
+    const pipeline = try rhi.createGraphicsPipeline(.{
+        .vertex_shader = &shader,
+        .fragment_shader = &shader,
+        .push_constant_size = 32,
+        .instance_data_stride = 32,
+    });
+
+    const begin = try rhi.beginFrame(.{ .width = 64, .height = 64 }, .{ 0, 0, 0, 1 });
+    var encoder = switch (begin) {
+        .ready => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try encoder.bindPipeline(pipeline);
+    try std.testing.expectError(error.InstanceDataRequired, encoder.drawInstanced(6, 1));
+    try std.testing.expectError(error.InvalidInstanceDataSize, encoder.bindInstanceData(&([_]u8{0} ** 31)));
+
+    const two_instances = [_]u8{0} ** 64;
+    try encoder.bindInstanceData(&two_instances);
+    try std.testing.expectError(error.InvalidDrawCount, encoder.drawInstanced(0, 2));
+    try std.testing.expectError(error.InvalidInstanceCount, encoder.drawInstanced(6, 0));
+    try std.testing.expectError(error.InstanceCountExceedsBoundData, encoder.drawInstanced(6, 3));
+    try encoder.drawInstanced(6, 2);
+    try std.testing.expectEqual(.presented, try encoder.finish());
+
+    const stats = rhi.stats();
+    try std.testing.expectEqual(@as(u32, 1), stats.instance_data_binds);
+    try std.testing.expectEqual(@as(u32, 64), stats.instance_data_bytes);
+    try std.testing.expectEqual(@as(u32, 1), stats.draws);
+    try std.testing.expectEqual(@as(u32, 2), stats.instances_drawn);
+}
+
+test "null adapter separates ordinary and instanced pipeline contracts" {
+    var rhi = try Rhi.init(.{ .width = 32, .height = 32 });
+    defer rhi.deinit();
+    const shader = [_]u8{ 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidInstanceDataStride, rhi.createGraphicsPipeline(.{
+        .vertex_shader = &shader,
+        .fragment_shader = &shader,
+        .push_constant_size = 4,
+        .instance_data_stride = 2,
+    }));
+    const ordinary = try rhi.createGraphicsPipeline(.{
+        .vertex_shader = &shader,
+        .fragment_shader = &shader,
+        .push_constant_size = 4,
+    });
+
+    const begin = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
+    var encoder = switch (begin) {
+        .ready => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try encoder.bindPipeline(ordinary);
+    try std.testing.expectError(error.InstanceDataBindingUnsupported, encoder.bindInstanceData(&([_]u8{0} ** 4)));
+    try std.testing.expectError(error.InstanceDataBindingUnsupported, encoder.drawInstanced(6, 1));
+    encoder.consumeFailedFrame();
+}
+
+test "null adapter enforces per-frame instance byte and binding budgets" {
+    var rhi = try Rhi.init(.{ .width = 32, .height = 32 });
+    defer rhi.deinit();
+    const shader = [_]u8{ 0, 0, 0, 0 };
+    const pipeline = try rhi.createGraphicsPipeline(.{
+        .vertex_shader = &shader,
+        .fragment_shader = &shader,
+        .push_constant_size = 4,
+        .instance_data_stride = 4,
+    });
+
+    const first = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
+    var byte_limited = switch (first) {
+        .ready => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try byte_limited.bindPipeline(pipeline);
+    try byte_limited.bindInstanceData(&([_]u8{0} ** types.max_instance_data_bytes_per_frame));
+    try std.testing.expectError(error.InstanceDataFrameLimitReached, byte_limited.bindInstanceData(&([_]u8{0} ** 4)));
+    byte_limited.consumeFailedFrame();
+
+    const second = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
+    var binding_limited = switch (second) {
+        .ready => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try binding_limited.bindPipeline(pipeline);
+    for (0..types.max_instance_data_bindings_per_frame) |_| {
+        try binding_limited.bindInstanceData(&([_]u8{0} ** 4));
+    }
+    try std.testing.expectError(error.InstanceDataBindingLimitReached, binding_limited.bindInstanceData(&([_]u8{0} ** 4)));
+    binding_limited.consumeFailedFrame();
 }

@@ -33,17 +33,21 @@ fn expectRecordingDelta(
     after: rhi.NullStats,
     expected_pipeline_binds: u32,
     expected_texture_binds: u32,
-    expected_sprites: u32,
+    expected_instance_data_binds: u32,
+    expected_draws: u32,
+    expected_instances: u32,
 ) !void {
     try std.testing.expectEqual(expected_pipeline_binds, after.pipeline_binds - before.pipeline_binds);
     try std.testing.expectEqual(expected_texture_binds, after.texture_binds - before.texture_binds);
-    // 提交批处理只减少状态绑定；每个精灵仍必须保留自己的常量和 draw。
-    try std.testing.expectEqual(expected_sprites, after.push_constant_writes - before.push_constant_writes);
-    try std.testing.expectEqual(expected_sprites, after.draws - before.draws);
+    try std.testing.expectEqual(expected_instance_data_binds, after.instance_data_binds - before.instance_data_binds);
+    // 实例化路径不再写 per-Sprite push constants；draw 数必须等于连续纹理批次数。
+    try std.testing.expectEqual(@as(u32, 0), after.push_constant_writes - before.push_constant_writes);
+    try std.testing.expectEqual(expected_draws, after.draws - before.draws);
+    try std.testing.expectEqual(expected_instances, after.instances_drawn - before.instances_drawn);
 }
 
 fn expectNoRecordingDelta(before: rhi.NullStats, after: rhi.NullStats) !void {
-    try expectRecordingDelta(before, after, 0, 0, 0);
+    try expectRecordingDelta(before, after, 0, 0, 0, 0, 0);
 }
 
 test "Renderer2D init and deinit use the existing RHI seam" {
@@ -76,7 +80,7 @@ test "Renderer2D batches pipeline and consecutive identical texture state" {
     const before = backend.stats();
     try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites));
     const after = backend.stats();
-    try expectRecordingDelta(before, after, 1, 1, 3);
+    try expectRecordingDelta(before, after, 1, 1, 1, 1, 3);
     try std.testing.expectEqual(@as(u32, 1), after.frames_finished - before.frames_finished);
 }
 
@@ -98,11 +102,11 @@ test "Renderer2D preserves input order while batching consecutive texture runs" 
     const before = backend.stats();
     try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites));
     const after = backend.stats();
-    try expectRecordingDelta(before, after, 1, 2, 3);
+    try expectRecordingDelta(before, after, 1, 2, 2, 2, 3);
     // Null trace 按 draw 记录实际纹理，用它证明批处理没有改变输入顺序。
     try std.testing.expectEqualSlices(
         rhi.TextureHandle,
-        &.{ secondary, primary, primary },
+        &.{ secondary, primary },
         after.draw_texture_trace[before.draw_texture_trace_len..after.draw_texture_trace_len],
     );
 }
@@ -127,10 +131,10 @@ test "Renderer2D starts a new texture batch when input returns to an earlier tex
     const before = backend.stats();
     try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &sprites));
     const after = backend.stats();
-    try expectRecordingDelta(before, after, 1, 3, 5);
+    try expectRecordingDelta(before, after, 1, 3, 3, 3, 5);
     try std.testing.expectEqualSlices(
         rhi.TextureHandle,
-        &.{ primary, primary, secondary, secondary, primary },
+        &.{ primary, secondary, primary },
         after.draw_texture_trace[before.draw_texture_trace_len..after.draw_texture_trace_len],
     );
 }
@@ -196,8 +200,10 @@ test "Renderer2D consumes a failed frame and can present the next frame" {
     const after_failure = backend.stats();
     try std.testing.expectEqual(@as(u32, 1), after_failure.pipeline_binds - before.pipeline_binds);
     try std.testing.expectEqual(@as(u32, 1), after_failure.texture_binds - before.texture_binds);
-    try std.testing.expectEqual(@as(u32, 1), after_failure.push_constant_writes - before.push_constant_writes);
+    try std.testing.expectEqual(@as(u32, 1), after_failure.instance_data_binds - before.instance_data_binds);
+    try std.testing.expectEqual(@as(u32, 0), after_failure.push_constant_writes - before.push_constant_writes);
     try std.testing.expectEqual(@as(u32, 1), after_failure.draws - before.draws);
+    try std.testing.expectEqual(@as(u32, 1), after_failure.instances_drawn - before.instances_drawn);
     try std.testing.expectEqual(@as(u32, 1), after_failure.failed_frames_consumed - before.failed_frames_consumed);
     try std.testing.expectEqual(@as(u32, 0), after_failure.frames_finished - before.frames_finished);
     try std.testing.expectEqualSlices(
@@ -234,7 +240,7 @@ test "Renderer2D validates an invalid first texture before recording a draw" {
     );
     const after_failure = backend.stats();
     // optional 绑定状态不能把 invalid_texture 误当成“已经绑定”的哨兵值。
-    try expectRecordingDelta(before, after_failure, 1, 0, 0);
+    try expectRecordingDelta(before, after_failure, 1, 0, 0, 0, 0);
     try std.testing.expectEqual(@as(u32, 1), after_failure.failed_frames_consumed - before.failed_frames_consumed);
 
     const replacement = try makeTexture(&backend, &renderer);
@@ -242,4 +248,24 @@ test "Renderer2D validates an invalid first texture before recording a draw" {
     const valid_sprites = [_]renderer2d.SpriteInstance{sprite(4, 4, replacement)};
     try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, &valid_sprites));
     try std.testing.expectEqual(@as(u32, 1), backend.stats().frames_finished - after_failure.frames_finished);
+}
+
+test "Renderer2D rejects more than one bounded instance frame before recording" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    var sprites: [129]renderer2d.SpriteInstance = undefined;
+    for (&sprites, 0..) |*item, index| {
+        item.* = sprite(@floatFromInt(index), 4, texture);
+    }
+    const before = backend.stats();
+    try std.testing.expectError(error.SpriteLimitExceeded, renderer.renderSprites(&backend, extent, &sprites));
+    try expectNoRecordingDelta(before, backend.stats());
+
+    // 预检必须发生在 beginFrame 前；拒绝后下一帧仍可正常提交。
+    try std.testing.expectEqual(.presented, try renderer.renderSprites(&backend, extent, sprites[0..1]));
 }

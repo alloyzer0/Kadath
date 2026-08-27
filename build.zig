@@ -1079,6 +1079,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Null 同时是 Renderer2D Adapter 与 RHI Interface 的测试根，避免导入时静默跳过内部契约。
+    const null_rhi_contract_tests = b.addTest(.{ .root_module = null_rhi_mod });
+    const null_rhi_contract_run = b.addRunArtifact(null_rhi_contract_tests);
     const null_renderer2d_mod = b.createModule(.{
         .root_source_file = b.path("modules/renderer2d/src/main.zig"),
         .target = target,
@@ -1107,6 +1110,7 @@ pub fn build(b: *std.Build) void {
     const renderer2d_remap_run = b.addRunArtifact(renderer2d_remap_tests);
 
     const renderer2d_null_test_step = b.step("test-renderer2d-null", "Run Renderer2D contracts against the Null RHI");
+    renderer2d_null_test_step.dependOn(&null_rhi_contract_run.step);
     renderer2d_null_test_step.dependOn(&renderer2d_null_contract_run.step);
     renderer2d_null_test_step.dependOn(&renderer2d_remap_run.step);
     test_step.dependOn(renderer2d_null_test_step);

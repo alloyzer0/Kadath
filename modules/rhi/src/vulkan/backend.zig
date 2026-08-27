@@ -10,6 +10,8 @@ const api_version: u32 = 1 << 22;
 const max_pipelines: usize = 8;
 const max_textures: usize = 8;
 const max_texture_mip_levels: usize = 32;
+const max_instance_data_bytes_per_frame = types.max_instance_data_bytes_per_frame;
+const max_instance_data_bindings_per_frame = types.max_instance_data_bindings_per_frame;
 
 const TextureSlot = struct {
     image: c.VkImage = null,
@@ -79,6 +81,10 @@ pub const FrameEncoder = struct {
     acquire_result: c.VkResult,
     frame_token: u64,
     bound_pipeline: types.PipelineHandle = types.invalid_pipeline,
+    bound_instance_capacity: u32 = 0,
+    instance_data_bytes_uploaded: usize = 0,
+    instance_data_binding_count: usize = 0,
+    instance_data_cursor: usize = 0,
     recording: bool = true,
     finished: bool = false,
 
@@ -89,6 +95,7 @@ pub const FrameEncoder = struct {
         const slot = self.rhi.pipelineSlot(pipeline) orelse return error.InvalidPipeline;
         c.vkCmdBindPipeline(self.rhi.command_buffer, c.VK_PIPELINE_BIND_POINT_GRAPHICS, slot.pipeline);
         self.bound_pipeline = pipeline;
+        self.bound_instance_capacity = 0;
     }
 
     pub fn bindTexture(self: *FrameEncoder, texture: types.TextureHandle) !void {
@@ -130,12 +137,74 @@ pub const FrameEncoder = struct {
         );
     }
 
-    pub fn draw(self: *FrameEncoder, vertex_count: u32) !void {
+    pub fn bindInstanceData(self: *FrameEncoder, bytes: []const u8) !void {
         if (!self.recording or self.finished) return error.FrameAlreadyFinished;
         try self.rhi.validateFrame(self);
-        if (self.bound_pipeline == types.invalid_pipeline) return error.InvalidPipeline;
+        const pipeline = try self.boundPipelineSlot();
+        const desc = pipeline.desc orelse return error.InvalidPipeline;
+        if (desc.instance_data_stride == 0) return error.InstanceDataBindingUnsupported;
+        const stride: usize = @intCast(desc.instance_data_stride);
+        if (bytes.len == 0 or bytes.len % stride != 0) return error.InvalidInstanceDataSize;
+        if (self.instance_data_binding_count >= max_instance_data_bindings_per_frame) {
+            return error.InstanceDataBindingLimitReached;
+        }
+        if (bytes.len > max_instance_data_bytes_per_frame - self.instance_data_bytes_uploaded) {
+            return error.InstanceDataFrameLimitReached;
+        }
+
+        const mapped: [*]u8 = @ptrCast(self.rhi.instance_data_mapped orelse return error.InstanceDataUnavailable);
+        // 同一 command buffer 的后续上传不能覆盖先前 draw；每批使用独立且设备对齐的 dynamic offset。
+        const offset = std.mem.alignForward(usize, self.instance_data_cursor, self.rhi.instance_data_alignment);
+        if (offset + max_instance_data_bytes_per_frame > self.rhi.instance_data_arena_bytes) {
+            return error.InstanceDataArenaExhausted;
+        }
+        @memcpy(mapped[offset .. offset + bytes.len], bytes);
+
+        const descriptor_set_index: u32 = if (desc.uses_texture) 1 else 0;
+        const dynamic_offset: u32 = @intCast(offset);
+        c.vkCmdBindDescriptorSets(
+            self.rhi.command_buffer,
+            c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipeline.layout,
+            descriptor_set_index,
+            1,
+            &self.rhi.instance_data_descriptor_set,
+            1,
+            &dynamic_offset,
+        );
+
+        self.instance_data_cursor = offset + bytes.len;
+        self.instance_data_bytes_uploaded += bytes.len;
+        self.instance_data_binding_count += 1;
+        self.bound_instance_capacity = @intCast(bytes.len / stride);
+    }
+
+    pub fn draw(self: *FrameEncoder, vertex_count: u32) !void {
+        return self.recordDraw(vertex_count, 1, false);
+    }
+
+    pub fn drawInstanced(self: *FrameEncoder, vertex_count: u32, instance_count: u32) !void {
+        return self.recordDraw(vertex_count, instance_count, true);
+    }
+
+    fn recordDraw(self: *FrameEncoder, vertex_count: u32, instance_count: u32, require_instanced: bool) !void {
+        if (!self.recording or self.finished) return error.FrameAlreadyFinished;
+        try self.rhi.validateFrame(self);
+        const pipeline = try self.boundPipelineSlot();
+        const desc = pipeline.desc orelse return error.InvalidPipeline;
+        if (require_instanced and desc.instance_data_stride == 0) return error.InstanceDataBindingUnsupported;
         if (vertex_count == 0) return error.InvalidDrawCount;
-        c.vkCmdDraw(self.rhi.command_buffer, vertex_count, 1, 0, 0);
+        if (instance_count == 0) return error.InvalidInstanceCount;
+        if (desc.instance_data_stride != 0) {
+            if (self.bound_instance_capacity == 0) return error.InstanceDataRequired;
+            if (instance_count > self.bound_instance_capacity) return error.InstanceCountExceedsBoundData;
+        }
+        c.vkCmdDraw(self.rhi.command_buffer, vertex_count, instance_count, 0, 0);
+    }
+
+    fn boundPipelineSlot(self: *FrameEncoder) !*PipelineSlot {
+        if (self.bound_pipeline == types.invalid_pipeline) return error.InvalidPipeline;
+        return self.rhi.pipelineSlot(self.bound_pipeline) orelse error.InvalidPipeline;
     }
 
     // Completes a partially recorded frame so acquire/fence state stays reusable.
@@ -187,6 +256,12 @@ pub const Rhi = struct {
     texture_slots: [max_textures]TextureSlot = [_]TextureSlot{.{}} ** max_textures,
     descriptor_pool: c.VkDescriptorPool = null,
     texture_descriptor_set_layout: c.VkDescriptorSetLayout = null,
+    instance_data_descriptor_set_layout: c.VkDescriptorSetLayout = null,
+    instance_data_descriptor_set: c.VkDescriptorSet = null,
+    instance_data_buffer: BufferAllocation = .{},
+    instance_data_mapped: ?*anyopaque = null,
+    instance_data_alignment: usize = 1,
+    instance_data_arena_bytes: usize = 0,
     sampler_anisotropy_supported: bool = false,
     max_sampler_anisotropy: f32 = 1.0,
 
@@ -198,7 +273,8 @@ pub const Rhi = struct {
         try surface_bridge.create(self.instance, native_surface, &self.surface);
         try self.selectPhysicalDevice();
         try self.createDevice();
-        try self.createTextureDescriptors();
+        try self.createResourceDescriptors();
+        try self.createInstanceDataArena();
         try self.createCommandPool();
         try self.createSyncObjects();
         if (requested_extent.width != 0 and requested_extent.height != 0) {
@@ -219,7 +295,9 @@ pub const Rhi = struct {
         self.destroySwapchainResources();
         self.destroyTextureObjects();
         self.destroyPipelineLayouts();
-        self.destroyTextureDescriptors();
+        // Pipeline layout 先释放，随后销毁 descriptor pool/layout，最后解除映射并销毁其 Buffer。
+        self.destroyResourceDescriptors();
+        self.destroyInstanceDataArena();
         if (self.in_flight != null and self.device != null) {
             c.vkDestroyFence(self.device, self.in_flight, null);
             self.in_flight = null;
@@ -259,9 +337,18 @@ pub const Rhi = struct {
         {
             return error.InvalidShaderCode;
         }
+        if (desc.instance_data_stride != 0 and
+            (desc.instance_data_stride % 4 != 0 or desc.instance_data_stride > max_instance_data_bytes_per_frame))
+        {
+            return error.InvalidInstanceDataStride;
+        }
         for (&self.pipeline_slots, 0..) |*slot, index| {
             if (slot.desc == null) {
-                const layout = try self.createPipelineLayout(desc.push_constant_size, desc.uses_texture);
+                const layout = try self.createPipelineLayout(
+                    desc.push_constant_size,
+                    desc.uses_texture,
+                    desc.instance_data_stride != 0,
+                );
                 slot.layout = layout;
                 slot.desc = desc;
                 errdefer {
@@ -489,7 +576,12 @@ pub const Rhi = struct {
         if (slot.pipeline == null) return error.PipelineNotReady;
     }
 
-    fn createPipelineLayout(self: *Rhi, push_constant_size: u32, uses_texture: bool) !c.VkPipelineLayout {
+    fn createPipelineLayout(
+        self: *Rhi,
+        push_constant_size: u32,
+        uses_texture: bool,
+        uses_instance_data: bool,
+    ) !c.VkPipelineLayout {
         var range = std.mem.zeroes(c.VkPushConstantRange);
         range.stageFlags = @intCast(c.VK_SHADER_STAGE_VERTEX_BIT | c.VK_SHADER_STAGE_FRAGMENT_BIT);
         range.offset = 0;
@@ -498,10 +590,20 @@ pub const Rhi = struct {
         info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         info.pushConstantRangeCount = 1;
         info.pPushConstantRanges = &range;
-        var set_layouts = [_]c.VkDescriptorSetLayout{self.texture_descriptor_set_layout};
+        var set_layouts: [2]c.VkDescriptorSetLayout = undefined;
+        var set_layout_count: u32 = 0;
         if (uses_texture) {
             if (self.texture_descriptor_set_layout == null) return error.TextureDescriptorsUnavailable;
-            info.setLayoutCount = 1;
+            set_layouts[set_layout_count] = self.texture_descriptor_set_layout;
+            set_layout_count += 1;
+        }
+        if (uses_instance_data) {
+            if (self.instance_data_descriptor_set_layout == null) return error.InstanceDataUnavailable;
+            set_layouts[set_layout_count] = self.instance_data_descriptor_set_layout;
+            set_layout_count += 1;
+        }
+        if (set_layout_count != 0) {
+            info.setLayoutCount = set_layout_count;
             info.pSetLayouts = &set_layouts;
         }
         var layout: c.VkPipelineLayout = null;
@@ -810,7 +912,7 @@ pub const Rhi = struct {
         });
     }
 
-    fn createTextureDescriptors(self: *Rhi) !void {
+    fn createResourceDescriptors(self: *Rhi) !void {
         var binding = std.mem.zeroes(c.VkDescriptorSetLayoutBinding);
         binding.binding = 0;
         binding.descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -828,33 +930,133 @@ pub const Rhi = struct {
             &self.texture_descriptor_set_layout,
         ), "vkCreateDescriptorSetLayout(texture)");
 
-        var pool_size = std.mem.zeroes(c.VkDescriptorPoolSize);
-        pool_size.type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        pool_size.descriptorCount = max_textures;
+        var instance_binding = std.mem.zeroes(c.VkDescriptorSetLayoutBinding);
+        instance_binding.binding = 0;
+        instance_binding.descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        instance_binding.descriptorCount = 1;
+        instance_binding.stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT;
+        layout_info.pBindings = &instance_binding;
+        try check(c.vkCreateDescriptorSetLayout(
+            self.device,
+            &layout_info,
+            null,
+            &self.instance_data_descriptor_set_layout,
+        ), "vkCreateDescriptorSetLayout(instance data)");
+
+        var pool_sizes = [_]c.VkDescriptorPoolSize{
+            std.mem.zeroes(c.VkDescriptorPoolSize),
+            std.mem.zeroes(c.VkDescriptorPoolSize),
+        };
+        pool_sizes[0].type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        pool_sizes[0].descriptorCount = max_textures;
+        pool_sizes[1].type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        pool_sizes[1].descriptorCount = 1;
 
         var pool_info = std.mem.zeroes(c.VkDescriptorPoolCreateInfo);
         pool_info.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.flags = c.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-        pool_info.maxSets = max_textures;
-        pool_info.poolSizeCount = 1;
-        pool_info.pPoolSizes = &pool_size;
+        pool_info.maxSets = max_textures + 1;
+        pool_info.poolSizeCount = pool_sizes.len;
+        pool_info.pPoolSizes = &pool_sizes;
         try check(c.vkCreateDescriptorPool(
             self.device,
             &pool_info,
             null,
             &self.descriptor_pool,
-        ), "vkCreateDescriptorPool(texture)");
+        ), "vkCreateDescriptorPool(resources)");
     }
 
-    fn destroyTextureDescriptors(self: *Rhi) void {
+    fn destroyResourceDescriptors(self: *Rhi) void {
         if (self.descriptor_pool != null) {
             c.vkDestroyDescriptorPool(self.device, self.descriptor_pool, null);
             self.descriptor_pool = null;
+            self.instance_data_descriptor_set = null;
         }
         if (self.texture_descriptor_set_layout != null) {
             c.vkDestroyDescriptorSetLayout(self.device, self.texture_descriptor_set_layout, null);
             self.texture_descriptor_set_layout = null;
         }
+        if (self.instance_data_descriptor_set_layout != null) {
+            c.vkDestroyDescriptorSetLayout(self.device, self.instance_data_descriptor_set_layout, null);
+            self.instance_data_descriptor_set_layout = null;
+        }
+    }
+
+    fn createInstanceDataArena(self: *Rhi) !void {
+        var properties: c.VkPhysicalDeviceProperties = undefined;
+        c.vkGetPhysicalDeviceProperties(self.physical_device, &properties);
+        const alignment: usize = @intCast(@max(
+            @as(c.VkDeviceSize, 1),
+            properties.limits.minStorageBufferOffsetAlignment,
+        ));
+        // beginFrame 等待唯一 in-flight fence，故 arena 可跨帧复用；帧内则为每次 bind 预留 alignment padding。
+        const padding = try std.math.mul(usize, max_instance_data_bindings_per_frame, alignment);
+        const arena_bytes = try std.math.add(
+            usize,
+            max_instance_data_bytes_per_frame * 2,
+            padding,
+        );
+
+        const allocation = try self.createBuffer(
+            arena_bytes,
+            c.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        );
+        errdefer self.destroyBuffer(allocation);
+        var mapped: ?*anyopaque = null;
+        try check(c.vkMapMemory(
+            self.device,
+            allocation.memory,
+            0,
+            arena_bytes,
+            0,
+            &mapped,
+        ), "vkMapMemory(instance data)");
+        errdefer c.vkUnmapMemory(self.device, allocation.memory);
+
+        var allocate_info = std.mem.zeroes(c.VkDescriptorSetAllocateInfo);
+        allocate_info.sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocate_info.descriptorPool = self.descriptor_pool;
+        allocate_info.descriptorSetCount = 1;
+        allocate_info.pSetLayouts = &self.instance_data_descriptor_set_layout;
+        var descriptor_set: c.VkDescriptorSet = null;
+        try check(c.vkAllocateDescriptorSets(
+            self.device,
+            &allocate_info,
+            &descriptor_set,
+        ), "vkAllocateDescriptorSets(instance data)");
+        errdefer _ = c.vkFreeDescriptorSets(self.device, self.descriptor_pool, 1, &descriptor_set);
+
+        var descriptor_buffer = std.mem.zeroes(c.VkDescriptorBufferInfo);
+        descriptor_buffer.buffer = allocation.buffer;
+        descriptor_buffer.offset = 0;
+        // 固定 range 让任一 dynamic offset 都可读取完整单批；arena 尾部额外预留同等范围。
+        descriptor_buffer.range = max_instance_data_bytes_per_frame;
+        var write = std.mem.zeroes(c.VkWriteDescriptorSet);
+        write.sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = descriptor_set;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        write.pBufferInfo = &descriptor_buffer;
+        c.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
+
+        self.instance_data_buffer = allocation;
+        self.instance_data_mapped = mapped;
+        self.instance_data_descriptor_set = descriptor_set;
+        self.instance_data_alignment = alignment;
+        self.instance_data_arena_bytes = arena_bytes;
+    }
+
+    fn destroyInstanceDataArena(self: *Rhi) void {
+        if (self.instance_data_mapped != null and self.instance_data_buffer.memory != null) {
+            c.vkUnmapMemory(self.device, self.instance_data_buffer.memory);
+        }
+        self.instance_data_mapped = null;
+        self.destroyBuffer(self.instance_data_buffer);
+        self.instance_data_buffer = .{};
+        self.instance_data_alignment = 1;
+        self.instance_data_arena_bytes = 0;
     }
 
     fn createTextureImage(self: *Rhi, destination: *TextureSlot, desc: types.TextureUploadDesc) !void {
@@ -1049,7 +1251,7 @@ pub const Rhi = struct {
         info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
         var allocation = BufferAllocation{};
         errdefer self.destroyBuffer(allocation);
-        try check(c.vkCreateBuffer(self.device, &info, null, &allocation.buffer), "vkCreateBuffer(texture staging)");
+        try check(c.vkCreateBuffer(self.device, &info, null, &allocation.buffer), "vkCreateBuffer");
 
         var requirements: c.VkMemoryRequirements = undefined;
         c.vkGetBufferMemoryRequirements(self.device, allocation.buffer, &requirements);
@@ -1057,8 +1259,8 @@ pub const Rhi = struct {
         memory_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         memory_info.allocationSize = requirements.size;
         memory_info.memoryTypeIndex = try self.findMemoryType(requirements.memoryTypeBits, properties);
-        try check(c.vkAllocateMemory(self.device, &memory_info, null, &allocation.memory), "vkAllocateMemory(texture staging)");
-        try check(c.vkBindBufferMemory(self.device, allocation.buffer, allocation.memory, 0), "vkBindBufferMemory(texture staging)");
+        try check(c.vkAllocateMemory(self.device, &memory_info, null, &allocation.memory), "vkAllocateMemory(buffer)");
+        try check(c.vkBindBufferMemory(self.device, allocation.buffer, allocation.memory, 0), "vkBindBufferMemory");
         return allocation;
     }
 

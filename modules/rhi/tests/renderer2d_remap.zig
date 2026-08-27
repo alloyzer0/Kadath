@@ -12,6 +12,7 @@ test "Renderer2D compiles and renders through the Null RHI module remap" {
         .fragment_shader = &shader,
         .push_constant_size = 32,
         .uses_texture = true,
+        .instance_data_stride = 32,
     });
     const pixels = [_]u8{ 255, 255, 255, 255 };
     const texture = try backend.createTexture(.{ .width = 1, .height = 1, .rgba8 = &pixels });
@@ -33,6 +34,8 @@ test "Renderer2D compiles and renders through the Null RHI module remap" {
     const stats = backend.stats();
     try std.testing.expectEqual(@as(u32, 1), stats.pipeline_binds);
     try std.testing.expectEqual(@as(u32, 1), stats.texture_binds);
-    try std.testing.expectEqual(@as(u32, 1), stats.push_constant_writes);
+    try std.testing.expectEqual(@as(u32, 1), stats.instance_data_binds);
+    try std.testing.expectEqual(@as(u32, 0), stats.push_constant_writes);
     try std.testing.expectEqual(@as(u32, 1), stats.draws);
+    try std.testing.expectEqual(@as(u32, 1), stats.instances_drawn);
 }

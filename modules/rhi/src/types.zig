@@ -15,6 +15,10 @@ pub const invalid_pipeline: PipelineHandle = 0;
 pub const TextureHandle = u32;
 pub const invalid_texture: TextureHandle = 0;
 
+/// 单帧实例上传保持有界；当前 128 个 Renderer2D Sprite × 32 bytes 正好填满。
+pub const max_instance_data_bytes_per_frame: usize = 4096;
+pub const max_instance_data_bindings_per_frame: usize = 128;
+
 pub const TextureSamplerProfile = enum {
     pixel_nearest,
     smooth_linear,
@@ -44,4 +48,6 @@ pub const GraphicsPipelineDesc = struct {
     fragment_shader: []const u8,
     push_constant_size: u32,
     uses_texture: bool = false,
+    // 0 表示普通 pipeline；非零值由 RHI 用于校验 opaque instance bytes。
+    instance_data_stride: u32 = 0,
 };

@@ -6,21 +6,23 @@ extern const kadath_renderer2d_quad_vert_spv_word_count: u32;
 extern const kadath_renderer2d_quad_frag_spv: u32;
 extern const kadath_renderer2d_quad_frag_spv_word_count: u32;
 
-const QuadPushConstants = extern struct {
+const GpuSpriteInstance = extern struct {
     rect_ndc: [4]f32,
     color: [4]f32,
 };
 
 comptime {
-    if (@sizeOf(QuadPushConstants) != 32) {
-        @compileError("Renderer2D push constants must stay 32 bytes");
+    if (@sizeOf(GpuSpriteInstance) != 32) {
+        @compileError("Renderer2D GPU sprite instance must stay 32 bytes");
     }
-    if (@offsetOf(QuadPushConstants, "rect_ndc") != 0 or
-        @offsetOf(QuadPushConstants, "color") != 16)
+    if (@offsetOf(GpuSpriteInstance, "rect_ndc") != 0 or
+        @offsetOf(GpuSpriteInstance, "color") != 16)
     {
-        @compileError("Renderer2D push constant layout changed");
+        @compileError("Renderer2D GPU sprite instance layout changed");
     }
 }
+
+pub const max_sprites_per_frame: usize = rhi.max_instance_data_bytes_per_frame / @sizeOf(GpuSpriteInstance);
 
 pub const SpriteInstance = struct {
     position: [2]f32,
@@ -52,8 +54,10 @@ pub const Renderer2D = struct {
             .pipeline = try backend.createGraphicsPipeline(.{
                 .vertex_shader = vertex_shader,
                 .fragment_shader = fragment_shader,
-                .push_constant_size = @sizeOf(QuadPushConstants),
+                // 先保留既有 32-byte pipeline layout；本轮只替换 per-Sprite 提交路径。
+                .push_constant_size = @sizeOf(GpuSpriteInstance),
                 .uses_texture = true,
+                .instance_data_stride = @sizeOf(GpuSpriteInstance),
             }),
         };
     }
@@ -91,6 +95,8 @@ pub const Renderer2D = struct {
         extent: rhi.Extent2D,
         sprites: []const SpriteInstance,
     ) !rhi.FrameOutcome {
+        // Runtime 当前最多发布 128 个对象；在 beginFrame 前拒绝可避免部分命令录制。
+        if (sprites.len > max_sprites_per_frame) return error.SpriteLimitExceeded;
         const begin = try backend.beginFrame(extent, .{ 0.035, 0.10, 0.22, 1.0 });
         switch (begin) {
             .skipped_minimized => return .skipped_minimized,
@@ -105,25 +111,32 @@ pub const Renderer2D = struct {
                     // 同一帧只使用一个 Renderer2D pipeline；空帧不录制无意义的状态。
                     try encoder.bindPipeline(self.pipeline);
                 }
-                var bound_texture: ?rhi.TextureHandle = null;
-                for (sprites) |sprite| {
-                    const push = QuadPushConstants{
-                        .rect_ndc = .{
-                            sprite.position[0] / width * 2.0 - 1.0,
-                            1.0 - sprite.position[1] / height * 2.0,
-                            sprite.size[0] / width * 2.0,
-                            sprite.size[1] / height * 2.0,
-                        },
-                        .color = sprite.color,
-                    };
 
-                    // 只合并连续纹理批次，绝不重排 Runtime Snapshot 冻结的绘制顺序。
-                    if (bound_texture == null or bound_texture.? != sprite.texture) {
-                        try encoder.bindTexture(sprite.texture);
-                        bound_texture = sprite.texture;
+                var gpu_instances: [max_sprites_per_frame]GpuSpriteInstance = undefined;
+                var batch_start: usize = 0;
+                while (batch_start < sprites.len) {
+                    const batch_texture = sprites[batch_start].texture;
+                    var batch_end = batch_start + 1;
+                    // 只合并连续纹理 run，绝不为减少 draw 而重排 Runtime Snapshot。
+                    while (batch_end < sprites.len and sprites[batch_end].texture == batch_texture) : (batch_end += 1) {}
+
+                    const batch_count = batch_end - batch_start;
+                    for (sprites[batch_start..batch_end], 0..) |sprite, batch_index| {
+                        gpu_instances[batch_index] = .{
+                            .rect_ndc = .{
+                                sprite.position[0] / width * 2.0 - 1.0,
+                                1.0 - sprite.position[1] / height * 2.0,
+                                sprite.size[0] / width * 2.0,
+                                sprite.size[1] / height * 2.0,
+                            },
+                            .color = sprite.color,
+                        };
                     }
-                    try encoder.pushConstants(std.mem.asBytes(&push));
-                    try encoder.draw(6);
+
+                    try encoder.bindTexture(batch_texture);
+                    try encoder.bindInstanceData(std.mem.sliceAsBytes(gpu_instances[0..batch_count]));
+                    try encoder.drawInstanced(6, @intCast(batch_count));
+                    batch_start = batch_end;
                 }
                 return try encoder.finish();
             },
