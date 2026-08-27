@@ -1325,6 +1325,29 @@ const FullVerticalEvidence = struct {
     reload_outcome: runtime_core.GameplayOutcome,
 };
 
+const ExpectedVerticalStepResult = struct {
+    phase: runtime_core.GameplayPhase,
+    cause: runtime_core.GameplayCause,
+    accepts_input: u32,
+    time_remaining_seconds: f32,
+    step_token: u64,
+    contact_event_count: u64,
+    outcome_count: u64,
+};
+
+fn expectVerticalStepResult(
+    actual: runtime_core.GameplayStepResult,
+    expected: ExpectedVerticalStepResult,
+) !void {
+    try std.testing.expectEqual(@intFromEnum(expected.phase), actual.phase);
+    try std.testing.expectEqual(@intFromEnum(expected.cause), actual.cause);
+    try std.testing.expectEqual(expected.accepts_input, actual.accepts_input);
+    try std.testing.expectEqual(expected.time_remaining_seconds, actual.time_remaining_seconds);
+    try std.testing.expectEqual(expected.step_token, actual.step_token);
+    try std.testing.expectEqual(expected.contact_event_count, actual.submitted_contact_event_count);
+    try std.testing.expectEqual(expected.outcome_count, actual.outcome_count);
+}
+
 fn runFullVerticalSlice() !FullVerticalEvidence {
     var fixture = try makeRuntimeFixture(
         vertical_slice_manifest,
@@ -1399,33 +1422,28 @@ test "Vertical Slice replay is deterministic through Behavior fixed Contact Phas
     try std.testing.expectEqual(@as(f32, 10), first.position_before_terminal_input[1]);
     try std.testing.expectEqual(first.position_before_terminal_input[1], first.player_position[1]);
 
-    try std.testing.expectEqual(@as(u64, 1), first.steps[0].begin.step_token);
-    try std.testing.expectEqual(first.steps[0].begin.step_token, first.steps[0].commit.step_token);
-    try std.testing.expectEqual(@as(u64, 2), first.steps[1].begin.step_token);
-    try std.testing.expectEqual(first.steps[1].begin.step_token, first.steps[1].commit.step_token);
-    try std.testing.expectEqual(@as(u64, 3), first.steps[2].begin.step_token);
-    try std.testing.expectEqual(first.steps[2].begin.step_token, first.steps[2].commit.step_token);
-    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.playing), first.steps[0].begin.phase);
-    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.playing), first.steps[1].begin.phase);
-    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), first.steps[1].commit.phase);
-    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), first.steps[1].commit.cause);
-    try std.testing.expectEqual(@as(u32, 0), first.steps[1].commit.accepts_input);
-    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayPhase.lost), first.steps[2].begin.phase);
-    try std.testing.expectEqual(@intFromEnum(runtime_core.GameplayCause.hazard), first.steps[2].begin.cause);
-    try std.testing.expect(first.steps[1].begin.time_remaining_seconds < first.steps[0].begin.time_remaining_seconds);
-    try std.testing.expectEqual(first.steps[0].begin.time_remaining_seconds, first.steps[0].commit.time_remaining_seconds);
-    try std.testing.expectEqual(first.steps[1].begin.time_remaining_seconds, first.steps[1].commit.time_remaining_seconds);
-    try std.testing.expectEqual(first.steps[1].commit.time_remaining_seconds, first.steps[2].begin.time_remaining_seconds);
-    try std.testing.expectEqual(@as(u64, 0), first.steps[0].commit.submitted_contact_event_count);
-    // Rust 对每个 contact transition 发布 source/other 两个定向事件。
-    try std.testing.expectEqual(@as(u64, 2), first.steps[1].commit.submitted_contact_event_count);
-    try std.testing.expectEqual(@as(u64, 4), first.steps[2].commit.submitted_contact_event_count);
-    try std.testing.expectEqual(@as(u64, 1), first.steps[1].commit.outcome_count);
-    try std.testing.expectEqual(@as(u64, 0), first.steps[2].commit.outcome_count);
-    try std.testing.expectEqual(@as(u32, 0), first.steps[2].begin.accepts_input);
-    for (first.steps) |step| {
-        try std.testing.expectEqual(@as(u64, 0), step.begin.submitted_contact_event_count);
-        try std.testing.expectEqual(@as(u64, 0), step.begin.outcome_count);
+    const first_time = first.steps[0].begin.time_remaining_seconds;
+    const terminal_time = first.steps[1].begin.time_remaining_seconds;
+    try std.testing.expect(terminal_time < first_time);
+    const expected_steps = [_][2]ExpectedVerticalStepResult{
+        .{
+            .{ .phase = .playing, .cause = .none, .accepts_input = 1, .time_remaining_seconds = first_time, .step_token = 1, .contact_event_count = 0, .outcome_count = 0 },
+            .{ .phase = .playing, .cause = .none, .accepts_input = 1, .time_remaining_seconds = first_time, .step_token = 1, .contact_event_count = 0, .outcome_count = 0 },
+        },
+        .{
+            .{ .phase = .playing, .cause = .none, .accepts_input = 1, .time_remaining_seconds = terminal_time, .step_token = 2, .contact_event_count = 0, .outcome_count = 0 },
+            // Rust 对单个 begin contact 发布 source/other 两个定向事件。
+            .{ .phase = .lost, .cause = .hazard, .accepts_input = 0, .time_remaining_seconds = terminal_time, .step_token = 2, .contact_event_count = 2, .outcome_count = 1 },
+        },
+        .{
+            .{ .phase = .lost, .cause = .hazard, .accepts_input = 0, .time_remaining_seconds = terminal_time, .step_token = 3, .contact_event_count = 0, .outcome_count = 0 },
+            // end(A) 与 begin(B) 各发布两个定向事件。
+            .{ .phase = .lost, .cause = .hazard, .accepts_input = 0, .time_remaining_seconds = terminal_time, .step_token = 3, .contact_event_count = 4, .outcome_count = 0 },
+        },
+    };
+    for (first.steps, expected_steps) |step, expected| {
+        try expectVerticalStepResult(step.begin, expected[0]);
+        try expectVerticalStepResult(step.commit, expected[1]);
     }
 
     const expected_render_order = [_][]const u8{ "goal", "hazard-a", "player", "hazard-b", "phase-probe" };
@@ -1435,6 +1453,10 @@ test "Vertical Slice replay is deterministic through Behavior fixed Contact Phas
     }
     const player_sprite = first.final_render_sprites[2];
     try std.testing.expectEqual(first.first_outcome.player, player_sprite.object_ref);
+    try std.testing.expectEqual(@intFromEnum(scene_api.ObjectKind.player), player_sprite.object_ref.kind);
+    try std.testing.expectEqual(@as(u64, 1), player_sprite.object_ref.world_epoch);
+    try std.testing.expectEqual(@as(u64, 1), player_sprite.object_ref.logical_generation);
+    try std.testing.expectEqualStrings("player", runtime_core.objectIdSlice(&player_sprite.object_ref));
     try std.testing.expectEqual(first.player_entity, player_sprite.entity_value);
     try std.testing.expectEqual([2]f32{ 30, 10 }, player_sprite.position);
     try std.testing.expectEqual([2]f32{ 2, 2 }, player_sprite.size);
