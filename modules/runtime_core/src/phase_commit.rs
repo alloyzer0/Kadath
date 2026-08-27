@@ -1148,9 +1148,10 @@ pub(crate) fn submit_trusted_gameplay_events_with(
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }
     let first_sequence = domain_state.next_event_sequence;
-    let last_sequence = first_sequence
+    // 与公开 submit_events 一致，先预留完整的 [first, next) 区间；
+    // next 必须指向批次后的首个空闲序列，不能停在已使用的 last 上。
+    let next_sequence = first_sequence
         .checked_add(event_count as u64)
-        .and_then(|value| value.checked_sub(1))
         .ok_or(abi::KADATH_ERR_RUNTIME_PHASE_SEQUENCE_EXHAUSTED)?;
     let generation = PhaseState::normalize_generation(
         0,
@@ -1168,7 +1169,7 @@ pub(crate) fn submit_trusted_gameplay_events_with(
         copied.generation = generation;
         domain_state.event_queue.push(EventEntry { item: copied })?;
     }
-    domain_state.next_event_sequence = last_sequence;
+    domain_state.next_event_sequence = next_sequence;
     Ok(())
 }
 

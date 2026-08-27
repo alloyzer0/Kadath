@@ -535,14 +535,24 @@ test "Runtime Core Gameplay owns terminal priority contact events outcome and fi
     try std.testing.expectEqual(@as(u64, 1), outcome.sequence);
     try std.testing.expect(runtime_core.sameObjectRef(hazard, outcome.other));
 
+    // Gameplay 内部 trusted 批次与公开 Phase 提交共享同一序列命名空间；
+    // 后续普通事件必须从四个接触事件之后继续，不能复用最后一个序列号。
+    const ordinary = seededPhaseEvent(player, @intFromEnum(runtime_core.PhaseDomain.fixed), 0, 5);
+    const ordinary_batch = try core.submitPhaseEvents(&[_]runtime_core.PhaseEvent{ordinary});
+    try std.testing.expectEqual(@as(u64, 5), ordinary_batch.first_sequence);
+    try std.testing.expectEqual(@as(u64, 5), ordinary_batch.last_sequence);
+
     var events: [runtime_core.max_phase_events]runtime_core.PhaseEvent = undefined;
     for (&events) |*event| {
         event.* = std.mem.zeroes(runtime_core.PhaseEvent);
         event.struct_size = @sizeOf(runtime_core.PhaseEvent);
     }
     const event_count = try core.drainPhaseEvents(.fixed, phase_sequence, &events);
-    try std.testing.expectEqual(@as(usize, 4), event_count);
+    try std.testing.expectEqual(@as(usize, 5), event_count);
     try std.testing.expectEqualStrings("contact_begin", events[0].name[0..events[0].name_length]);
+    for (events[0..event_count], 1..) |event, expected_sequence| {
+        try std.testing.expectEqual(@as(u64, @intCast(expected_sequence)), event.sequence);
+    }
     try core.endPhase(.fixed, phase_sequence);
 
     var render_items: [runtime_core.max_object_count]runtime_core.GameplayRenderItem = undefined;
