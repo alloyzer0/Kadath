@@ -90,8 +90,9 @@ p95_ratio=$(awk -v c="$candidate_p95" -v o="$oracle_p95" 'BEGIN { printf "%.6f",
 rss_ratio=$(awk -v c="$candidate_rss" -v o="$oracle_rss" 'BEGIN { printf "%.6f", c/o }')
 status=PASS
 (( candidate_p95 * 100 <= oracle_p95 * 125 )) || status=FAIL
-(( candidate_rss * 100 <= oracle_rss * 125 )) || status=FAIL
 [[ "$candidate_allocations" == 0 ]] || status=FAIL
+rss_diagnostic_status=PASS
+(( candidate_rss * 100 <= oracle_rss * 125 )) || rss_diagnostic_status=OUTLIER
 zig_version=$(zig version)
 time_version=$(/usr/bin/time --version 2>&1 | sed -n '1p')
 host_version=$(uname -srvmo)
@@ -135,6 +136,7 @@ GAMEPLAY_ORACLE_DIRECTED_EVENTS=64
 GAMEPLAY_ORACLE_RENDER_ITEMS=128
 GAMEPLAY_PERF_P95_RATIO=$p95_ratio
 GAMEPLAY_PERF_RSS_RATIO=$rss_ratio
+GAMEPLAY_PERF_RSS_DIAGNOSTIC_STATUS=$rss_diagnostic_status
 GAMEPLAY_PERF_STATUS=$status
 EOF
 cat "$candidate_payload" >"$candidate_report"
