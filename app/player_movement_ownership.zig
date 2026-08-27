@@ -11,9 +11,10 @@ pub const RoutedInput = struct {
 };
 
 pub fn route(scene: *const scene_api.Scene, input: AxisInput) RoutedInput {
-    const behavior_owned = (scene.schemaVersion == scene_api.behavior_schema_version or
-        scene.schemaVersion == scene_api.current_schema_version) and
-        scene.player().behaviors.count != 0;
+    const player_index = if (scene.gameplayEnabled()) scene.objects.indexOfKind(.player) else null;
+    const behavior_owned = scene.supportsBehaviorRuntime() and
+        player_index != null and
+        scene.objects.entries[player_index.?].behaviors.count != 0;
     return .{
         .world = if (behavior_owned) .{} else input,
         .behaviors = input,
@@ -34,6 +35,7 @@ test "Scene v4 keeps Player movement in Native World" {
 test "Behavior Scene without Player bindings keeps Player movement in Native World" {
     var scene = scene_api.default_scene;
     scene.schemaVersion = scene_api.current_schema_version;
+    scene.gameplay = scene_api.goal_hazard_v1_gameplay;
     const input = AxisInput{ .move_x = -1, .move_y = 1 };
     const routed = route(&scene, input);
     try @import("std").testing.expectEqual(input, routed.world);
@@ -43,6 +45,7 @@ test "Behavior Scene without Player bindings keeps Player movement in Native Wor
 test "Behavior Scene with any Player binding moves ownership to Behavior Bindings" {
     var scene = scene_api.default_scene;
     scene.schemaVersion = scene_api.current_schema_version;
+    scene.gameplay = scene_api.goal_hazard_v1_gameplay;
     const player = &scene.objects.entries[scene.objects.indexOfKind(.player).?];
     player.behaviors.count = 1;
     player.behaviors.entries[0].scriptId = 999;
@@ -55,6 +58,7 @@ test "Behavior Scene with any Player binding moves ownership to Behavior Binding
 test "terminal Gameplay state suppresses both movement ownership outputs" {
     var scene = scene_api.default_scene;
     scene.schemaVersion = scene_api.current_schema_version;
+    scene.gameplay = scene_api.goal_hazard_v1_gameplay;
     const player = &scene.objects.entries[scene.objects.indexOfKind(.player).?];
     player.behaviors.count = 1;
     player.behaviors.entries[0].scriptId = 999;

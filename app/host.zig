@@ -41,8 +41,7 @@ fn sceneHasBehaviors(scene: *const scene_api.Scene) bool {
 }
 
 fn usesBehaviorRuntime(scene: *const scene_api.Scene) bool {
-    return scene.schemaVersion == scene_api.behavior_schema_version or
-        scene.schemaVersion == scene_api.current_schema_version;
+    return scene.supportsBehaviorRuntime();
 }
 
 fn initialLoadedTarget(identity: ?content_identity.ContentIdentity) preview_status_api.InitialLoadedTarget {

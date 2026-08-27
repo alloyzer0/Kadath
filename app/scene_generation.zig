@@ -560,6 +560,7 @@ test "SceneGeneration preserves source order and updates independent hazards" {
 test "SceneGeneration activates and despawns transient prototype objects without exposing pending state" {
     var scene = scene_api.default_scene;
     scene.schemaVersion = scene_api.current_schema_version;
+    scene.gameplay = scene_api.goal_hazard_v1_gameplay;
     for (scene.objects.mutableSlice()) |*object| {
         if (object.kind == .patrol_hazard) {
             object.behaviors.count = 1;
@@ -647,6 +648,7 @@ test "SceneGeneration behavior schema stops native patrol and applies one atomic
 test "SceneGeneration restart and reload keep live isolated until candidate commit" {
     var scene = scene_api.default_scene;
     scene.schemaVersion = scene_api.current_schema_version;
+    scene.gameplay = scene_api.goal_hazard_v1_gameplay;
     for (scene.objects.mutableSlice()) |*object| {
         if (object.kind == .patrol_hazard) {
             object.behaviors.count = 1;

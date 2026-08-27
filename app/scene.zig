@@ -1,10 +1,12 @@
 const std = @import("std");
 const content_identity = @import("content_identity.zig");
 
-pub const current_schema_version: u32 = 6;
+pub const current_schema_version: u32 = 7;
+pub const prototype_schema_version: u32 = 6;
 pub const behavior_schema_version: u32 = 5;
 pub const legacy_object_schema_version: u32 = 4;
-pub const scene_artifact_version: u32 = 6;
+pub const scene_artifact_version: u32 = 7;
+pub const prototype_artifact_version: u32 = 6;
 pub const behavior_artifact_version: u32 = 5;
 pub const legacy_object_artifact_version: u32 = 4;
 pub const max_texture_count: usize = 4;
@@ -18,6 +20,7 @@ pub const max_behavior_parameter_count: usize = 16;
 pub const max_behavior_parameter_name_bytes: usize = 63;
 pub const max_spawn_prototype_count: usize = 32;
 pub const max_prototype_behavior_binding_count: usize = 128;
+pub const min_neutral_scene_object_count: usize = 1;
 
 const scene_artifact_header_bytes: usize = 16;
 const scene_artifact_v1_payload_bytes: usize = 28 * @sizeOf(f32);
@@ -201,11 +204,45 @@ pub const TextureSet = struct {
     }
 };
 
+pub const GameplayProfile = enum(u32) {
+    none = 0,
+    goal_hazard_v1 = 1,
+};
+
+pub const GameplayConfig = struct {
+    profile: GameplayProfile = .none,
+    timeLimitSeconds: f32 = 0,
+};
+
+// 旧 Demo 玩法的显式配置；v7 夹具和调用方不能再借 schema 版本隐式启用 Gameplay。
+pub const goal_hazard_v1_gameplay = GameplayConfig{
+    .profile = .goal_hazard_v1,
+    .timeLimitSeconds = 3,
+};
+
 pub const Scene = struct {
     schemaVersion: u32 = current_schema_version,
     textures: TextureSet,
     objects: SceneObjectSet,
     prototypes: SpawnPrototypeSet = .{},
+    gameplay: GameplayConfig = .{},
+
+    pub fn gameplayProfile(self: *const Scene) GameplayProfile {
+        // v4-v6 的 wire 没有显式 profile；兼容 Adapter 必须保持旧 Demo 语义。
+        return if (self.schemaVersion < current_schema_version) .goal_hazard_v1 else self.gameplay.profile;
+    }
+
+    pub fn gameplayEnabled(self: *const Scene) bool {
+        return self.gameplayProfile() != .none;
+    }
+
+    pub fn supportsBehaviorRuntime(self: *const Scene) bool {
+        return schemaHasBehaviorBindings(self.schemaVersion);
+    }
+
+    pub fn supportsSpawnPrototypes(self: *const Scene) bool {
+        return schemaHasSpawnPrototypes(self.schemaVersion);
+    }
 
     pub fn player(self: *const Scene) *const SceneObject {
         return &self.objects.entries[self.objects.indexOfKind(.player) orelse unreachable];
@@ -319,6 +356,19 @@ const WireSceneV6 = struct {
     textures: []const WireTextureSpec,
     objects: []const WireSceneObjectV5,
     prototypes: []const WireSpawnPrototype,
+};
+
+const WireGameplayConfig = struct {
+    profile: GameplayProfile,
+    timeLimitSeconds: f32,
+};
+
+const WireSceneV7 = struct {
+    schemaVersion: u32,
+    textures: []const WireTextureSpec,
+    objects: []const WireSceneObjectV5,
+    prototypes: []const WireSpawnPrototype,
+    gameplay: ?WireGameplayConfig = null,
 };
 
 const SchemaProbe = struct {
@@ -460,7 +510,8 @@ fn parseInto(allocator: std.mem.Allocator, contents: []const u8, output: *Scene)
         3 => output.* = try parseSourceV3(allocator, contents),
         legacy_object_schema_version => output.* = try parseSourceV4(allocator, contents),
         behavior_schema_version => try parseSourceV5Into(allocator, contents, output),
-        current_schema_version => try parseSourceV6Into(allocator, contents, output),
+        prototype_schema_version => try parseSourceV6Into(allocator, contents, output),
+        current_schema_version => try parseSourceV7Into(allocator, contents, output),
         else => return error.UnsupportedSceneSchema,
     }
 }
@@ -535,20 +586,20 @@ fn parseSourceV5Into(allocator: std.mem.Allocator, contents: []const u8, output:
         .textures = try normalizeTextures(parsed.value.textures),
         .objects = undefined,
     };
-    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, &output.objects);
+    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, min_scene_object_count, &output.objects);
     try validate(output);
 }
 
 fn parseSourceV6Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
     const parsed = try std.json.parseFromSlice(WireSceneV6, allocator, contents, .{});
     defer parsed.deinit();
-    if (parsed.value.schemaVersion != current_schema_version) return error.UnsupportedSceneSchema;
+    if (parsed.value.schemaVersion != prototype_schema_version) return error.UnsupportedSceneSchema;
     output.* = .{
-        .schemaVersion = current_schema_version,
+        .schemaVersion = prototype_schema_version,
         .textures = try normalizeTextures(parsed.value.textures),
         .objects = undefined,
     };
-    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, &output.objects);
+    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, min_scene_object_count, &output.objects);
     if (parsed.value.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
     output.prototypes.count = @intCast(parsed.value.prototypes.len);
     for (parsed.value.prototypes, 0..) |wire, index| {
@@ -566,8 +617,40 @@ fn parseSourceV6Into(allocator: std.mem.Allocator, contents: []const u8, output:
     try validate(output);
 }
 
-fn normalizeBehaviorSceneObjectsInto(wire_objects: []const WireSceneObjectV5, output: *SceneObjectSet) !void {
-    if (wire_objects.len < min_scene_object_count or wire_objects.len > max_scene_object_count) {
+fn parseSourceV7Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
+    const parsed = try std.json.parseFromSlice(WireSceneV7, allocator, contents, .{});
+    defer parsed.deinit();
+    if (parsed.value.schemaVersion != current_schema_version) return error.UnsupportedSceneSchema;
+    const gameplay = if (parsed.value.gameplay) |wire|
+        GameplayConfig{ .profile = wire.profile, .timeLimitSeconds = wire.timeLimitSeconds }
+    else
+        GameplayConfig{};
+    output.* = .{
+        .schemaVersion = current_schema_version,
+        .textures = try normalizeTextures(parsed.value.textures),
+        .objects = undefined,
+        .gameplay = gameplay,
+    };
+    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, min_neutral_scene_object_count, &output.objects);
+    if (parsed.value.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
+    output.prototypes.count = @intCast(parsed.value.prototypes.len);
+    for (parsed.value.prototypes, 0..) |wire, index| {
+        output.prototypes.entries[index] = .{
+            .prototypeId = try PrototypeId.init(wire.prototypeId),
+            .kind = wire.kind,
+            .sprite = .{
+                .size = wire.sprite.size,
+                .color = wire.sprite.color,
+                .textureId = wire.sprite.textureId,
+            },
+            .behaviors = try normalizeBehaviorBindings(wire.behaviors),
+        };
+    }
+    try validate(output);
+}
+
+fn normalizeBehaviorSceneObjectsInto(wire_objects: []const WireSceneObjectV5, minimum_count: usize, output: *SceneObjectSet) !void {
+    if (wire_objects.len < minimum_count or wire_objects.len > max_scene_object_count) {
         return error.InvalidSceneObjectCount;
     }
     output.* = .{ .count = @intCast(wire_objects.len) };
@@ -709,12 +792,16 @@ pub fn artifactByteCount(value: *const Scene) !usize {
         payload_bytes = try std.math.add(usize, payload_bytes, 4);
         payload_bytes = try std.math.add(usize, payload_bytes, try objectEntryBytes(value.schemaVersion, &object));
     }
-    if (value.schemaVersion == current_schema_version) {
+    if (schemaHasSpawnPrototypes(value.schemaVersion)) {
         payload_bytes = try std.math.add(usize, payload_bytes, 4);
         for (value.prototypes.slice()) |prototype| {
             payload_bytes = try std.math.add(usize, payload_bytes, 4);
             payload_bytes = try std.math.add(usize, payload_bytes, try prototypeEntryBytes(&prototype));
         }
+    }
+    if (value.schemaVersion == current_schema_version) {
+        // KSCN v7 尾部显式保存 profile 与 time limit，Runtime 不再从角色表猜测模式。
+        payload_bytes = try std.math.add(usize, payload_bytes, 8);
     }
     return try std.math.add(usize, scene_artifact_header_bytes, payload_bytes);
 }
@@ -774,7 +861,7 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
             cursor = writeBehaviorBindingSet(output, cursor, &object.behaviors);
         }
     }
-    if (value.schemaVersion == current_schema_version) {
+    if (schemaHasSpawnPrototypes(value.schemaVersion)) {
         writeLittleU32(output[cursor..][0..4], value.prototypes.count);
         cursor += 4;
         for (value.prototypes.slice()) |prototype| {
@@ -795,6 +882,11 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
             cursor = writeBehaviorBindingSet(output, cursor, &prototype.behaviors);
         }
     }
+    if (value.schemaVersion == current_schema_version) {
+        writeLittleU32(output[cursor..][0..4], @intFromEnum(value.gameplay.profile));
+        writeLittleF32(output[cursor + 4 ..][0..4], value.gameplay.timeLimitSeconds);
+        cursor += 8;
+    }
     std.debug.assert(cursor == output.len);
     return output;
 }
@@ -803,6 +895,7 @@ fn artifactVersionForSchema(schema_version: u32) !u32 {
     return switch (schema_version) {
         legacy_object_schema_version => legacy_object_artifact_version,
         behavior_schema_version => behavior_artifact_version,
+        prototype_schema_version => prototype_artifact_version,
         current_schema_version => scene_artifact_version,
         else => error.UnsupportedSceneSchema,
     };
@@ -860,7 +953,13 @@ fn writeBehaviorBindingSet(output: []u8, start: usize, bindings: *const Behavior
 }
 
 fn schemaHasBehaviorBindings(schema_version: u32) bool {
-    return schema_version == behavior_schema_version or schema_version == current_schema_version;
+    return schema_version == behavior_schema_version or
+        schema_version == prototype_schema_version or
+        schema_version == current_schema_version;
+}
+
+fn schemaHasSpawnPrototypes(schema_version: u32) bool {
+    return schema_version == prototype_schema_version or schema_version == current_schema_version;
 }
 
 fn parseArtifact(source: []const u8) !Scene {
@@ -881,11 +980,15 @@ fn parseArtifactInto(source: []const u8, output: *Scene) !void {
         legacy_object_artifact_version => try parseArtifactV4Into(source, schema_version, output),
         behavior_artifact_version => {
             if (schema_version != behavior_schema_version) return error.UnsupportedSceneSchema;
-            try parseArtifactBehaviorSceneInto(source, behavior_schema_version, false, output);
+            try parseArtifactBehaviorSceneInto(source, behavior_schema_version, false, false, output);
+        },
+        prototype_artifact_version => {
+            if (schema_version != prototype_schema_version) return error.UnsupportedSceneSchema;
+            try parseArtifactBehaviorSceneInto(source, prototype_schema_version, true, false, output);
         },
         scene_artifact_version => {
             if (schema_version != current_schema_version) return error.UnsupportedSceneSchema;
-            try parseArtifactBehaviorSceneInto(source, current_schema_version, true, output);
+            try parseArtifactBehaviorSceneInto(source, current_schema_version, true, true, output);
         },
         else => return error.UnsupportedSceneArtifactVersion,
     }
@@ -996,7 +1099,7 @@ fn parseArtifactV4Into(source: []const u8, schema_version: u32, output: *Scene) 
     try validate(output);
 }
 
-fn parseArtifactBehaviorSceneInto(source: []const u8, schema_version: u32, read_prototypes: bool, output: *Scene) !void {
+fn parseArtifactBehaviorSceneInto(source: []const u8, schema_version: u32, read_prototypes: bool, read_gameplay: bool, output: *Scene) !void {
     var reader = ByteReader{ .source = source, .cursor = scene_artifact_header_bytes };
     output.* = .{
         .schemaVersion = schema_version,
@@ -1004,7 +1107,8 @@ fn parseArtifactBehaviorSceneInto(source: []const u8, schema_version: u32, read_
         .objects = undefined,
     };
     const object_count = try reader.readU32();
-    if (object_count < min_scene_object_count or object_count > max_scene_object_count) return error.InvalidSceneObjectCount;
+    const minimum_count: usize = if (schema_version == current_schema_version) min_neutral_scene_object_count else min_scene_object_count;
+    if (object_count < minimum_count or object_count > max_scene_object_count) return error.InvalidSceneObjectCount;
     output.objects = .{ .count = @intCast(object_count) };
     for (output.objects.mutableSlice()) |*object| {
         const entry_bytes = try reader.readU32();
@@ -1051,6 +1155,14 @@ fn parseArtifactBehaviorSceneInto(source: []const u8, schema_version: u32, read_
             prototype.behaviors = try readBehaviorBindingSet(&entry);
             if (!entry.atEnd()) return error.InvalidSpawnPrototypePayload;
         }
+    }
+    if (read_gameplay) {
+        output.gameplay.profile = switch (try reader.readU32()) {
+            0 => .none,
+            1 => .goal_hazard_v1,
+            else => return error.InvalidGameplayProfile,
+        };
+        output.gameplay.timeLimitSeconds = try reader.readF32();
     }
     if (!reader.atEnd()) return error.InvalidSceneArtifact;
     try validate(output);
@@ -1128,6 +1240,7 @@ fn readTextureSet(reader: *ByteReader) !TextureSet {
 pub fn validate(value: *const Scene) !void {
     if (value.schemaVersion != legacy_object_schema_version and
         value.schemaVersion != behavior_schema_version and
+        value.schemaVersion != prototype_schema_version and
         value.schemaVersion != current_schema_version)
     {
         return error.UnsupportedSceneSchema;
@@ -1140,9 +1253,18 @@ pub fn validate(value: *const Scene) !void {
             if (previous.textureId == entry.textureId) return error.DuplicateTextureId;
         }
     }
-    if (value.objects.count < min_scene_object_count or value.objects.count > max_scene_object_count) {
+    const minimum_object_count: usize = if (value.schemaVersion == current_schema_version and !value.gameplayEnabled())
+        min_neutral_scene_object_count
+    else
+        min_scene_object_count;
+    if (value.objects.count < minimum_object_count or value.objects.count > max_scene_object_count) {
         return error.InvalidSceneObjectCount;
     }
+    if (value.schemaVersion == current_schema_version) switch (value.gameplay.profile) {
+        .none => if (value.gameplay.timeLimitSeconds != 0) return error.InvalidGameplayTimeLimit,
+        .goal_hazard_v1 => if (!std.math.isFinite(value.gameplay.timeLimitSeconds) or value.gameplay.timeLimitSeconds <= 0)
+            return error.InvalidGameplayTimeLimit,
+    };
     var player_count: usize = 0;
     var goal_count: usize = 0;
     var hazard_count: usize = 0;
@@ -1186,14 +1308,16 @@ pub fn validate(value: *const Scene) !void {
                     {
                         return error.InvalidHazardPatrol;
                     }
-                } else if (object.behaviors.count == 0) {
+                } else if (value.gameplayEnabled() and object.behaviors.count == 0) {
                     return error.MissingHazardBehaviorBinding;
                 }
             },
         }
     }
-    if (player_count != 1 or goal_count != 1 or hazard_count == 0) return error.InvalidSceneRoleCount;
-    if (value.schemaVersion != current_schema_version) {
+    if (value.gameplayEnabled() and (player_count != 1 or goal_count != 1 or hazard_count == 0)) {
+        return error.InvalidSceneRoleCount;
+    }
+    if (!schemaHasSpawnPrototypes(value.schemaVersion)) {
         if (value.prototypes.count != 0) return error.LegacySceneSpawnPrototype;
         return;
     }
@@ -1390,6 +1514,34 @@ const scene_v6_source =
     \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[]}],"prototypes":[
     \\{"prototypeId":"runtime-orb","kind":"sprite","sprite":{"size":[2,3],"color":[0.25,0.5,0.75,1],"textureId":1},"behaviors":[{"scriptId":9,"parameters":{"speed":12}}]}]}
 ;
+
+test "scene v7 parses one-object neutral scene" {
+    const contents =
+        \\{"schemaVersion":7,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"decor","kind":"sprite","transform":{"position":[10,20]},"sprite":{"size":[16,16],"color":[1,1,1,1],"textureId":1},"behaviors":[]}
+        \\],"prototypes":[]}
+    ;
+    const value = try parse(std.testing.allocator, contents);
+    try std.testing.expectEqual(current_schema_version, value.schemaVersion);
+    try std.testing.expectEqual(GameplayProfile.none, value.gameplay.profile);
+    try std.testing.expectEqual(@as(u8, 1), value.objects.count);
+    try std.testing.expectEqualStrings("decor", value.objects.entries[0].objectId.slice());
+}
+
+test "KSCN v7 round trips explicit neutral profile" {
+    const contents =
+        \\{"schemaVersion":7,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"decor","kind":"sprite","transform":{"position":[10,20]},"sprite":{"size":[16,16],"color":[1,1,1,1],"textureId":1},"behaviors":[]}
+        \\],"prototypes":[]}
+    ;
+    const source = try parse(std.testing.allocator, contents);
+    const artifact = try encodeArtifact(std.testing.allocator, &source);
+    defer std.testing.allocator.free(artifact);
+    try std.testing.expectEqual(scene_artifact_version, readLittleU32(artifact[4..8]));
+    const decoded = try parseArtifact(artifact);
+    try std.testing.expectEqual(GameplayProfile.none, decoded.gameplay.profile);
+    try std.testing.expectEqual(@as(u8, 1), decoded.objects.count);
+}
 
 test "scene v4 parses ordered objects" {
     const contents =

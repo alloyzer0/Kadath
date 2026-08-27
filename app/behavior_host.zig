@@ -1288,8 +1288,7 @@ pub fn loadWithIdentity(
 }
 
 pub fn initArtifact(allocator: std.mem.Allocator, bytes: []const u8, scene: *const scene_api.Scene) !Runtime {
-    if (scene.schemaVersion != scene_api.behavior_schema_version and
-        scene.schemaVersion != scene_api.current_schema_version) return error.UnsupportedBehaviorSceneSchema;
+    if (!scene.supportsBehaviorRuntime()) return error.UnsupportedBehaviorSceneSchema;
     var diagnostic = behavior_runtime.Diagnostic{};
     const package = try allocator.create(behavior_runtime.Package);
     errdefer allocator.destroy(package);

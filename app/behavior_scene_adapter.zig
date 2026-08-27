@@ -6,8 +6,7 @@ pub fn normalize(
     package: *const artifact.Package,
     scene: *const scene_api.Scene,
 ) !scene_binding.Set {
-    if (scene.schemaVersion != scene_api.behavior_schema_version and
-        scene.schemaVersion != scene_api.current_schema_version) return error.UnsupportedBehaviorSceneSchema;
+    if (!scene.supportsBehaviorRuntime()) return error.UnsupportedBehaviorSceneSchema;
     try scene_api.validate(scene);
 
     var object_inputs: [scene_api.max_scene_object_count]scene_binding.ObjectInput = undefined;
