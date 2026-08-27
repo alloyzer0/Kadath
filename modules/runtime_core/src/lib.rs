@@ -1142,60 +1142,9 @@ fn apply_single_position_batch_in_place(
     item_range: (usize, usize),
     result_range: (usize, usize),
 ) -> Result<(), u32> {
-    // 单一位置批次先完整验证，再一次性发布；跳过整份 RuntimeState 克隆。
-    if value.patches.is_null()
-        || value.patch_count == 0
-        || value.patch_count > MAX_OBJECTS
-        || (value.patches as usize) % mem::align_of::<abi::kadath_runtime_position_patch_v1_t>()
-            != 0
-        || value.patch_stride < mem::size_of::<abi::kadath_runtime_position_patch_v1_t>()
-    {
-        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-    }
-    let patch_range = strided_range(
-        value.patches as usize,
-        value.patch_count,
-        value.patch_stride,
-        mem::size_of::<abi::kadath_runtime_position_patch_v1_t>(),
-    )
-    .ok_or(abi::KADATH_ERR_INVALID_ARGUMENT)?;
-    if ranges_overlap(patch_range, item_range) || ranges_overlap(patch_range, result_range) {
-        return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-    }
-    let mut parsed = [(unsafe { mem::zeroed() }, [0.0; 2], [0.0; 2]); MAX_OBJECTS];
-    for index in 0..value.patch_count {
-        let patch = unsafe {
-            &*value
-                .patches
-                .cast::<u8>()
-                .add(index * value.patch_stride)
-                .cast::<abi::kadath_runtime_position_patch_v1_t>()
-        };
-        if patch.struct_size < mem::size_of::<abi::kadath_runtime_position_patch_v1_t>() as u32
-            || patch.reserved0 != 0
-            || !reserved_is_zero(&patch.reserved)
-            || !patch.position.iter().all(|position| position.is_finite())
-        {
-            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-        }
-        let key = read_object_key(&patch.object_ref)?;
-        if parsed[..index]
-            .iter()
-            .any(|(existing, _, _): &(ObjectKey, [f32; 2], [f32; 2])| *existing == key)
-        {
-            return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
-        }
-        let old_position = state
-            .visible_exact(key)
-            .ok_or(abi::KADATH_ERR_RUNTIME_STALE_OBJECT)?
-            .sprite
-            .position;
-        parsed[index] = (key, patch.position, old_position);
-    }
-    for (key, position, _) in parsed[..value.patch_count].iter().copied() {
-        state.set_position(key, position).map_err(authority_error)?;
-    }
-    Ok(())
+    // 快路径仅跳过整份 RuntimeState 克隆；patch ABI 预检与原地发布必须
+    // 复用唯一实现，避免安全 guard 在快慢路径间再次漂移。
+    apply_positions(state, value, item_range, result_range)
 }
 
 fn mutate(
@@ -3335,6 +3284,33 @@ mod tests {
         invalid = base;
         invalid.patch_stride = mem::size_of::<abi::kadath_runtime_position_patch_v1_t>() + 1;
         assert!(apply_positions(&mut initial.clone(), &invalid, empty_range, empty_range).is_err());
+        #[cfg(not(feature = "contract-test-hooks"))]
+        {
+            // 生产 mutate 的单项快路径也必须执行完整 stride 对齐预检；
+            // 即使 count=1 不会访问第二项，也不能接受不满足 ABI 的批次。
+            let mut fast_path_state = initial.clone();
+            assert_eq!(
+                apply_single_position_batch_in_place(
+                    &mut fast_path_state,
+                    &invalid,
+                    empty_range,
+                    empty_range
+                ),
+                Err(abi::KADATH_ERR_INVALID_ARGUMENT)
+            );
+            assert_eq!(
+                fast_path_state
+                    .visible_exact(read_object_key(&player).unwrap())
+                    .unwrap()
+                    .sprite
+                    .position,
+                initial
+                    .visible_exact(read_object_key(&player).unwrap())
+                    .unwrap()
+                    .sprite
+                    .position
+            );
+        }
         invalid = base;
         invalid.patch_stride = mem::size_of::<abi::kadath_runtime_position_patch_v1_t>()
             + mem::align_of::<abi::kadath_runtime_position_patch_v1_t>();
