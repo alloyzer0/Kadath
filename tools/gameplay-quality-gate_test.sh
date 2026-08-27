@@ -225,6 +225,19 @@ set -e
 grep -Fq 'performance raw candidate stdout hash mismatch on run 1' <<<"$raw_tamper_output"
 printf 'p95_ns=100\nallocations=0\n' >"$evidence_root/candidate-1.stdout"
 
+# 报告即使重新绑定 payload，也不得把 64KB 长稳容差改大。
+sed -i 's/GAMEPLAY_STEADY_STATE_ALLOWED_GROWTH_KB=64/GAMEPLAY_STEADY_STATE_ALLOWED_GROWTH_KB=65/' "$steady_payload"
+bind_report "$steady_payload" "$evidence_root/steady-state.report"
+set +e
+threshold_tamper_output=$("${runner[@]}" \
+    --candidate-sha "$candidate_sha" --oracle-sha "$oracle_sha" \
+    --candidate-benchmark "$candidate" --candidate-report "$evidence_root/candidate.report" \
+    --oracle-benchmark "$oracle" --oracle-report "$evidence_root/oracle.report" \
+    --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" \
+    --steady-state-report "$evidence_root/steady-state.report" --representative-report "$evidence_root/representative.report" 2>&1)
+set -e
+grep -Fq 'steady-state allowed growth must be 64KB' <<<"$threshold_tamper_output"
+
 printf 'tampered-payload\n' >>"$candidate_payload"
 set +e
 payload_tamper_output=$("${runner[@]}" \

@@ -112,8 +112,11 @@ verify_steady_state_report() {
     allocations=$(value "$report" GAMEPLAY_STEADY_STATE_ALLOCATIONS)
     [[ "$allocations" == 0 ]] || blocked+=("steady-state memory observed Gameplay allocations")
     peak_growth=$(value "$report" GAMEPLAY_STEADY_STATE_PEAK_GROWTH_KB)
-    allowed_growth=$(value "$report" GAMEPLAY_STEADY_STATE_ALLOWED_GROWTH_KB)
-    [[ "$peak_growth" =~ ^[0-9]+$ && "$allowed_growth" =~ ^[0-9]+$ && "$peak_growth" -le "$allowed_growth" ]] || \
+    # 64KB 是契约固定的页粒度抖动容差，不能由报告生产者自行放宽。
+    allowed_growth=64
+    [[ "$(value "$report" GAMEPLAY_STEADY_STATE_ALLOWED_GROWTH_KB)" == "$allowed_growth" ]] || \
+        blocked+=("steady-state allowed growth must be 64KB")
+    [[ "$peak_growth" =~ ^[0-9]+$ && "$peak_growth" -le "$allowed_growth" ]] || \
         blocked+=("steady-state RSS growth exceeds allowed tolerance")
     benchmark=$(value "$report" GAMEPLAY_STEADY_STATE_BENCHMARK)
     [[ "$benchmark" == "$candidate_benchmark" ]] || blocked+=("steady-state benchmark path is not candidate benchmark")
