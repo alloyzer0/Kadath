@@ -73,7 +73,7 @@ if [[ -f "$report" ]]; then
     [[ "$allocations_total" =~ ^[0-9]+$ && "$allocations_max" =~ ^[0-9]+$ ]] || \
         blocked+=("Vertical Slice cold-path allocation payload invalid")
     if [[ ! "$steady_samples" =~ ^[0-9]+$ || ! "$steady_allocations_total" =~ ^[0-9]+$ ||
-          ! "$steady_allocations_max" =~ ^[0-9]+$ || "$steady_samples" != 256 || "$steady_allowed_max" != 96 ]]; then
+          ! "$steady_allocations_max" =~ ^[0-9]+$ || "$steady_samples" != 256 || "$steady_allowed_max" != 0 ]]; then
         blocked+=("steady fixed-step allocation gate failed")
     elif (( steady_allocations_max > steady_allowed_max ||
             steady_allocations_total > steady_samples * steady_allowed_max )); then
@@ -112,7 +112,7 @@ if [[ -f "$report" ]]; then
        "$raw_metric" == *"rust_steady_fixed_allocations_max=$steady_allocations_max"* &&
        "$raw_metric" == *"digest=$digest"* ]] || \
         blocked+=("Vertical Slice report metrics do not match raw output")
-    [[ "$raw_contract" == *"objects=5 fixed_steps=7 outcomes=3 steady_fixed_samples=256 steady_fixed_max_allocations=96"* &&
+    [[ "$raw_contract" == *"objects=5 fixed_steps=7 outcomes=3 steady_fixed_samples=256 steady_fixed_max_allocations=0"* &&
        "$raw_contract" == *"status=PASS"* ]] || \
         blocked+=("Vertical Slice raw contract evidence missing")
     time_file=$(value "$report" GAMEPLAY_VERTICAL_SLICE_TIME)
