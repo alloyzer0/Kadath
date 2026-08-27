@@ -86,6 +86,11 @@ test "Scene publication accepts an explicitly disabled Gameplay candidate" {
     try core.commitScene();
 
     try std.testing.expect((try core.findById(.live, "decor")) != null);
+    var render_items: [1]runtime_core.RenderSprite = undefined;
+    const render = try core.renderSnapshot(.live, &render_items);
+    try std.testing.expectEqual(@as(usize, 1), render.render_count);
+    try std.testing.expectEqual(@as(u64, 1), render_items[0].entity_value);
+    try std.testing.expectEqual([4]f32{ 1, 1, 1, 1 }, render_items[0].final_color);
     var outcome: runtime_core.GameplayOutcome = undefined;
     try std.testing.expectError(error.InvalidGameplayState, core.beginGameplayFixed(0.0, &outcome));
 }

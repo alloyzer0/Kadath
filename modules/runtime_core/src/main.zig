@@ -114,6 +114,11 @@ pub const CandidateInfo = struct {
     source_object_count: usize,
 };
 
+pub const RenderSnapshot = struct {
+    world_epoch: u64,
+    render_count: usize,
+};
+
 pub const DestroyDisposition = enum { cancelled_pending_spawn, awaiting_finalize };
 
 pub const PositionPatch = struct {
@@ -307,6 +312,28 @@ pub const RuntimeCore = struct {
         try check(self.gameplay_interface.publish_snapshot.?(self.handle, &buffer, &gameplay_snapshot));
         @memcpy(output, candidate_output[0..output.len]);
         return gameplay_snapshot;
+    }
+
+    pub fn renderSnapshot(self: *const RuntimeCore, target: Target, output: []RenderSprite) !RenderSnapshot {
+        // Object Authority 已原子发布有序 active views；这里仅做无状态的渲染投影。
+        var views: [max_object_count]ObjectView = undefined;
+        const active = try self.snapshot(target, true, &views);
+        if (output.len < active.len) return error.RuntimeCoreBufferTooSmall;
+        for (active, 0..) |view, index| {
+            var item = std.mem.zeroes(RenderSprite);
+            item.struct_size = @sizeOf(RenderSprite);
+            item.object_ref = view.object_ref;
+            item.entity_value = view.entity_value;
+            item.position = view.position;
+            item.size = view.size;
+            item.final_color = view.color;
+            item.texture_id = view.texture_id;
+            output[index] = item;
+        }
+        return .{
+            .world_epoch = if (active.len == 0) 0 else active[0].object_ref.world_epoch,
+            .render_count = active.len,
+        };
     }
 
     pub fn abortScene(self: *RuntimeCore) !void {
