@@ -21,15 +21,15 @@
 
 本文同时记录：
 
-- **CURRENT**：截至本地 `codex/p1-renderer2d-tilemap-01` 候选（集成基线 `752f299`）的实现事实；
+- **CURRENT**：截至 Inner `main@2d13c4a` 的实现事实；
 - **TARGET**：`ADR-0009` 冻结的长期 ownership 边界；当前三个迁移增量已经达到该边界；
 - **MIGRATION**：从历史基线 `bfc5504` 到当前固定点的已完成迁移记录。
 
-图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。历史章节中的 TARGET 措辞只描述候选合并前的状态；当前应以本地 Tilemap 候选及本文 CURRENT 为准。
+图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。历史章节中的 TARGET 措辞只描述候选合并前的状态；当前应以 `main@2d13c4a` 及本文 CURRENT 为准。
 
 ---
 
-## 2. CURRENT：本地 Tilemap 集成候选
+## 2. CURRENT：`2d13c4a` 当前实现
 
 ```mermaid
 graph TD
@@ -263,7 +263,7 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 - `a11e4dc`：SceneGeneration、Behavior 与 Host 中立 fixed-step 生命周期；
 - `25d1c25`：Editor Authoring/Bake/Undo/Redo/Preview 与产品 fixture 的历史固定点；
 - `752f299`：Renderer2D Instance Batching 与 Spawn Prototype Authoring 的本地集成基线；
-- `codex/p1-renderer2d-tilemap-01`：Scene/KSCN v8、静态 Tilemap、Atlas sampling、Editor 创作与双平台产品证据；当前 C4 的 CURRENT 图以此候选为准。
+- `2d13c4a`：Scene/KSCN v8、静态 Tilemap、Atlas sampling、Editor 创作与双平台产品证据；当前 C4 的 CURRENT 图以此主线固定点为准。
 
 ### 6.2 迁移顺序
 
