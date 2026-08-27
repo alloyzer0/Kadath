@@ -36,8 +36,20 @@ impl<T: Copy, const CAPACITY: usize> BoundedVec<T, CAPACITY> {
         }
     }
 
+    /// 在调用方已经分配好的地址上初始化空队列，避免返回值临时占用大栈帧。
+    unsafe fn write_new(destination: *mut Self) {
+        // SAFETY: 调用方保证 `destination` 指向一块尚未初始化且大小、对齐
+        // 均满足 `Self` 的可写内存；只写入长度字段，容量元素由 `len == 0`
+        // 保护，直到 `push` 时才逐项初始化。
+        ptr::addr_of_mut!((*destination).len).write(0);
+    }
+
     fn len(&self) -> usize {
         self.len
+    }
+
+    fn get(&self, index: usize) -> Option<&T> {
+        (index < self.len).then(|| &self[index])
     }
 
     fn clear(&mut self) {
@@ -137,6 +149,65 @@ struct EventEntry {
     item: abi::kadath_runtime_phase_event_v1_t,
 }
 
+/// Gameplay 接触事件只有 target/other、generation 和 begin/end 两种名称；
+/// 在 Rust 内部暂存其窄表示，drain 时再恢复为公开 ABI 结构。
+#[derive(Clone, Copy)]
+struct TrustedEventEntry {
+    sequence: u64,
+    generation: u32,
+    ended: bool,
+    target: abi::kadath_runtime_object_ref_v1_t,
+    other: abi::kadath_runtime_object_ref_v1_t,
+}
+
+impl TrustedEventEntry {
+    fn to_abi(self, domain: u32) -> abi::kadath_runtime_phase_event_v1_t {
+        let name: &[u8] = if self.ended {
+            b"contact_end"
+        } else {
+            b"contact_begin"
+        };
+        let mut event: abi::kadath_runtime_phase_event_v1_t = unsafe { mem::zeroed() };
+        event.struct_size = mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
+        event.domain = domain;
+        event.sequence = self.sequence;
+        event.generation = self.generation;
+        event.has_other = 1;
+        event.target = self.target;
+        event.other = self.other;
+        event.name_length = name.len() as u32;
+        event.name[..name.len()].copy_from_slice(name);
+        event
+    }
+}
+
+fn compact_trusted_event(
+    event: &abi::kadath_runtime_phase_event_v1_t,
+) -> Option<TrustedEventEntry> {
+    if event.field_count != 0
+        || event.has_sender != 0
+        || event.has_other != 1
+        || event.reserved != [0; 4]
+    {
+        return None;
+    }
+    let name = event.name.get(..event.name_length as usize)?;
+    let ended = if name == b"contact_end" {
+        true
+    } else if name == b"contact_begin" {
+        false
+    } else {
+        return None;
+    };
+    Some(TrustedEventEntry {
+        sequence: event.sequence,
+        generation: event.generation,
+        ended,
+        target: event.target,
+        other: event.other,
+    })
+}
+
 #[derive(Clone, Copy)]
 struct StructuralEntry {
     item: abi::kadath_runtime_phase_structural_v1_t,
@@ -186,6 +257,7 @@ struct Candidate {
 struct DomainState {
     phase_sequence: Option<u64>,
     event_queue: BoundedVec<EventEntry, EVENT_CAPACITY>,
+    trusted_event_queue: BoundedVec<TrustedEventEntry, EVENT_CAPACITY>,
     structural_queue: BoundedVec<StructuralEntry, STRUCTURAL_CAPACITY>,
     event_successor_generation: u32,
     structural_successor_generation: u32,
@@ -196,18 +268,24 @@ struct DomainState {
 }
 
 impl DomainState {
-    fn new() -> Self {
-        Self {
-            phase_sequence: None,
-            event_queue: BoundedVec::new(),
-            structural_queue: BoundedVec::new(),
-            event_successor_generation: 0,
-            structural_successor_generation: 0,
-            event_has_drained: false,
-            structural_has_drained: false,
-            next_event_sequence: 1,
-            next_structural_sequence: 1,
-        }
+    fn event_len(&self) -> usize {
+        self.event_queue.len() + self.trusted_event_queue.len()
+    }
+
+    /// 直接在 `PhaseState` 的最终 arena 中构造 domain，避免先生成大值再搬运。
+    unsafe fn write_new(destination: *mut Self) {
+        // SAFETY: `destination` 来自 `PhaseState::new_boxed` 的合法 arena，且
+        // 每个字段在返回前都会被完整初始化；两个队列只初始化长度字段。
+        ptr::addr_of_mut!((*destination).phase_sequence).write(None);
+        BoundedVec::write_new(ptr::addr_of_mut!((*destination).event_queue));
+        BoundedVec::write_new(ptr::addr_of_mut!((*destination).trusted_event_queue));
+        BoundedVec::write_new(ptr::addr_of_mut!((*destination).structural_queue));
+        ptr::addr_of_mut!((*destination).event_successor_generation).write(0);
+        ptr::addr_of_mut!((*destination).structural_successor_generation).write(0);
+        ptr::addr_of_mut!((*destination).event_has_drained).write(false);
+        ptr::addr_of_mut!((*destination).structural_has_drained).write(false);
+        ptr::addr_of_mut!((*destination).next_event_sequence).write(1);
+        ptr::addr_of_mut!((*destination).next_structural_sequence).write(1);
     }
 }
 
@@ -234,10 +312,10 @@ impl PhaseState {
         // the initialized inline capacities below.
         unsafe {
             ptr::addr_of_mut!((*pointer).candidate).write(None);
-            ptr::addr_of_mut!((*pointer).active_bindings).write(BoundedVec::new());
+            BoundedVec::write_new(ptr::addr_of_mut!((*pointer).active_bindings));
             ptr::addr_of_mut!((*pointer).admission_used).write(0);
-            ptr::addr_of_mut!((*pointer).domains[0]).write(DomainState::new());
-            ptr::addr_of_mut!((*pointer).domains[1]).write(DomainState::new());
+            DomainState::write_new(ptr::addr_of_mut!((*pointer).domains[0]));
+            DomainState::write_new(ptr::addr_of_mut!((*pointer).domains[1]));
             ptr::addr_of_mut!((*pointer).next_phase_sequence).write(1);
             ptr::addr_of_mut!((*pointer).next_flush_token).write(1);
             ptr::addr_of_mut!((*pointer).next_transaction_id).write(1);
@@ -303,6 +381,7 @@ impl PhaseState {
         for domain in &mut self.domains {
             domain.phase_sequence = None;
             domain.event_queue.clear();
+            domain.trusted_event_queue.clear();
             domain.structural_queue.clear();
             domain.event_successor_generation = 0;
             domain.structural_successor_generation = 0;
@@ -994,6 +1073,7 @@ fn begin_phase_impl(
     let domain = core.phase.domain_mut(desc.domain)?;
     domain.phase_sequence = Some(phase_sequence);
     domain.event_queue.clear();
+    domain.trusted_event_queue.clear();
     domain.structural_queue.clear();
     domain.event_successor_generation = 0;
     domain.structural_successor_generation = 0;
@@ -1071,7 +1151,7 @@ pub(crate) fn submit_events(
     if domain_state.phase_sequence.is_none() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED);
     }
-    if domain_state.event_queue.len() + item_count > EVENT_CAPACITY {
+    if domain_state.event_len() + item_count > EVENT_CAPACITY {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }
     let state = core
@@ -1144,7 +1224,7 @@ pub(crate) fn submit_trusted_gameplay_events_with(
     if domain_state.phase_sequence.is_none() {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_ACTIVE_REQUIRED);
     }
-    if domain_state.event_queue.len() + event_count > EVENT_CAPACITY {
+    if domain_state.event_len() + event_count > EVENT_CAPACITY {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
     }
     let first_sequence = domain_state.next_event_sequence;
@@ -1167,7 +1247,13 @@ pub(crate) fn submit_trusted_gameplay_events_with(
         let mut copied = event;
         copied.sequence = first_sequence + index as u64;
         copied.generation = generation;
-        domain_state.event_queue.push(EventEntry { item: copied })?;
+        // 仅对内部 Gameplay 生成的固定接触事件压缩；任意不满足规范的
+        // trusted 调用仍保留完整 ABI，确保测试和未来扩展不会丢字段。
+        if let Some(compact) = compact_trusted_event(&copied) {
+            domain_state.trusted_event_queue.push(compact)?;
+        } else {
+            domain_state.event_queue.push(EventEntry { item: copied })?;
+        }
     }
     domain_state.next_event_sequence = next_sequence;
     Ok(())
@@ -1211,6 +1297,12 @@ pub(crate) fn drain_events(
         .event_queue
         .iter()
         .map(|entry| entry.item.generation)
+        .chain(
+            domain_state
+                .trusted_event_queue
+                .iter()
+                .map(|entry| entry.generation),
+        )
         .min();
     let Some(generation) = generation else {
         unsafe { ptr::write(out_count, 0) };
@@ -1220,7 +1312,12 @@ pub(crate) fn drain_events(
         .event_queue
         .iter()
         .filter(|entry| entry.item.generation == generation)
-        .count();
+        .count()
+        + domain_state
+            .trusted_event_queue
+            .iter()
+            .filter(|entry| entry.generation == generation)
+            .count();
     if output_capacity < count {
         return Err(abi::KADATH_ERR_BUFFER_TOO_SMALL);
     }
@@ -1230,25 +1327,59 @@ pub(crate) fn drain_events(
         .as_ref()
         .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
     let mut output_index = 0;
-    for entry in domain_state
-        .event_queue
-        .iter()
-        .filter(|entry| entry.item.generation == generation)
+    let mut generic_index = 0;
+    let mut trusted_index = 0;
+    while generic_index < domain_state.event_queue.len()
+        || trusted_index < domain_state.trusted_event_queue.len()
     {
-        // Gameplay 事件只跳过提交时的外部 ABI 重复校验；投递时仍重新解析
-        // target/sender/other，防止 structural settle 后把幽灵引用交给 Zig。
-        if event_objects_live(&entry.item, state) {
-            unsafe { ptr::write(output_ptr.add(output_index), entry.item) };
-            output_index += 1;
+        while generic_index < domain_state.event_queue.len()
+            && domain_state.event_queue[generic_index].item.generation != generation
+        {
+            generic_index += 1;
+        }
+        while trusted_index < domain_state.trusted_event_queue.len()
+            && domain_state.trusted_event_queue[trusted_index].generation != generation
+        {
+            trusted_index += 1;
+        }
+        let generic = domain_state.event_queue.get(generic_index);
+        let trusted = domain_state.trusted_event_queue.get(trusted_index);
+        let take_generic = match (generic, trusted) {
+            (Some(generic), Some(trusted)) => generic.item.sequence <= trusted.sequence,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_generic {
+            let entry = generic.expect("generic event selected");
+            // Gameplay 事件只跳过提交时的外部 ABI 重复校验；投递时仍重新解析
+            // target/sender/other，防止 structural settle 后把幽灵引用交给 Zig。
+            if event_objects_live(&entry.item, state) {
+                unsafe { ptr::write(output_ptr.add(output_index), entry.item) };
+                output_index += 1;
+            }
+            generic_index += 1;
+        } else {
+            let entry = trusted.expect("trusted event selected");
+            let item = entry.to_abi(domain);
+            if event_objects_live(&item, state) {
+                unsafe { ptr::write(output_ptr.add(output_index), item) };
+                output_index += 1;
+            }
+            trusted_index += 1;
         }
     }
     let domain_state = core.phase.domain_mut(domain)?;
-    if count == domain_state.event_queue.len() {
+    if count == domain_state.event_len() {
         domain_state.event_queue.clear();
+        domain_state.trusted_event_queue.clear();
     } else {
         domain_state
             .event_queue
             .retain(|entry| entry.item.generation != generation);
+        domain_state
+            .trusted_event_queue
+            .retain(|entry| entry.generation != generation);
     }
     domain_state.event_has_drained = true;
     domain_state.event_successor_generation = generation.saturating_add(1);
@@ -1582,10 +1713,7 @@ pub(crate) fn end_phase(
     let domain_state = core.phase.domain(domain)?;
     if core.phase.flush[PhaseState::domain_index(domain)?].is_some()
         || core.phase.activation.is_some()
-        || domain_state
-            .event_queue
-            .iter()
-            .any(|entry| entry.item.domain == domain)
+        || domain_state.event_len() != 0
         || domain_state
             .structural_queue
             .iter()
@@ -2021,7 +2149,7 @@ pub(crate) fn submit_activation(
             structural.push(copied)?;
         }
     }
-    if domain_state.event_queue.len() + existing_event_count + events.len() > EVENT_CAPACITY
+    if domain_state.event_len() + existing_event_count + events.len() > EVENT_CAPACITY
         || domain_state.structural_queue.len() + existing_structural_count + structural.len()
             > STRUCTURAL_CAPACITY
     {
@@ -2095,8 +2223,9 @@ pub(crate) fn commit_activation(
     let used = activation.staged_used;
     let domain_state = *core.phase.domain(domain)?;
     let mut event_queue = domain_state.event_queue;
+    let trusted_event_queue = domain_state.trusted_event_queue;
     let mut structural_queue = domain_state.structural_queue;
-    if event_queue.len() + activation.events.len() > EVENT_CAPACITY
+    if event_queue.len() + trusted_event_queue.len() + activation.events.len() > EVENT_CAPACITY
         || structural_queue.len() + activation.structural.len() > STRUCTURAL_CAPACITY
     {
         return Err(abi::KADATH_ERR_RUNTIME_PHASE_QUEUE_CAPACITY);
@@ -2181,6 +2310,7 @@ pub(crate) fn commit_activation(
     {
         let domain_state = core.phase.domain_mut(domain)?;
         domain_state.event_queue = event_queue;
+        domain_state.trusted_event_queue = trusted_event_queue;
         domain_state.structural_queue = structural_queue;
     }
     core.phase.flush[domain_index] = flush;
@@ -3458,6 +3588,116 @@ mod tests {
             assert_eq!(domain.event_queue.as_slice()[0].item.sequence, 1);
             assert_eq!(domain.event_queue.as_slice()[1].item.sequence, 2);
             assert_eq!(domain.next_event_sequence, 3);
+        }
+
+        {
+            // 规范化 Gameplay 接触事件走紧凑队列，并在 drain 时恢复 ABI 字段。
+            let mut core = test_core();
+            begin(&mut core);
+            let phase_sequence = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap()
+                .phase_sequence
+                .unwrap();
+            let mut compact = event();
+            compact.has_other = 1;
+            compact.other = compact.target;
+            compact.name_length = b"contact_begin".len() as u32;
+            compact.name[..b"contact_begin".len()].copy_from_slice(b"contact_begin");
+            assert_eq!(
+                submit_trusted_gameplay_events_with(&mut core, 1, |_| compact),
+                Ok(())
+            );
+            let domain = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap();
+            assert_eq!(domain.event_queue.len(), 0);
+            assert_eq!(domain.trusted_event_queue.len(), 1);
+            let mut output = [unsafe { mem::zeroed::<abi::kadath_runtime_phase_event_v1_t>() }];
+            output[0].struct_size = mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
+            let mut count = 0;
+            drain_events(
+                &mut core,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                phase_sequence,
+                output.as_mut_ptr(),
+                output.len(),
+                &mut count,
+            )
+            .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(
+                &output[0].name[..output[0].name_length as usize],
+                b"contact_begin"
+            );
+            assert_eq!(
+                read_object_key(&output[0].target),
+                read_object_key(&compact.target)
+            );
+            assert_eq!(
+                read_object_key(&output[0].other),
+                read_object_key(&compact.other)
+            );
+            let domain = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap();
+            assert_eq!(domain.event_len(), 0);
+        }
+
+        {
+            // 公共 ABI 事件与紧凑 Gameplay 事件交错提交时，drain 仍按全局
+            // sequence 合并，且两条队列共同受 64 项容量约束。
+            let mut core = test_core();
+            begin(&mut core);
+            let phase_sequence = core
+                .phase
+                .domain(abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED)
+                .unwrap()
+                .phase_sequence
+                .unwrap();
+            let generic = event();
+            let mut compact = generic;
+            compact.has_other = 1;
+            compact.other = compact.target;
+            compact.name_length = b"contact_end".len() as u32;
+            compact.name[..b"contact_end".len()].copy_from_slice(b"contact_end");
+            let mut result: abi::kadath_runtime_phase_batch_result_v1_t = unsafe { mem::zeroed() };
+            result.struct_size =
+                mem::size_of::<abi::kadath_runtime_phase_batch_result_v1_t>() as u32;
+            submit_events(
+                &mut core,
+                &generic,
+                1,
+                mem::size_of::<abi::kadath_runtime_phase_event_v1_t>(),
+                &mut result,
+            )
+            .unwrap();
+            submit_trusted_gameplay_events_with(&mut core, 1, |_| compact).unwrap();
+            let mut output = [unsafe { mem::zeroed::<abi::kadath_runtime_phase_event_v1_t>() }; 2];
+            for item in &mut output {
+                item.struct_size = mem::size_of::<abi::kadath_runtime_phase_event_v1_t>() as u32;
+            }
+            let mut count = 0;
+            drain_events(
+                &mut core,
+                abi::KADATH_RUNTIME_PHASE_DOMAIN_FIXED,
+                phase_sequence,
+                output.as_mut_ptr(),
+                output.len(),
+                &mut count,
+            )
+            .unwrap();
+            assert_eq!(count, 2);
+            assert_eq!(output[0].sequence, 1);
+            assert_eq!(output[0].name_length, 0);
+            assert_eq!(output[1].sequence, 2);
+            assert_eq!(
+                &output[1].name[..output[1].name_length as usize],
+                b"contact_end"
+            );
         }
     }
 
