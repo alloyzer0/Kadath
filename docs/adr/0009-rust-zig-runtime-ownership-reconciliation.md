@@ -3,6 +3,7 @@
 ## 元信息
 
 - **状态**: 已采纳
+- **实施状态**: 已完成（2026-08-27，当前固定点 `b1cb26f`）
 - **日期**: 2026-08-21
 - **决策者**: @alloyzer0
 - **相关主题**: Phase 1 架构治理回环；Rust / Zig 高层 Runtime ownership
@@ -56,9 +57,11 @@ Phase 2 的实际演进形成了不同的重心：
 
 ---
 
-## 2. 当前态
+## 2. 迁移前当前态（`bfc5504`）
 
-### 2.1 Zig 当前拥有
+本节保留 2026-08-21 作出决策时的事实，作为问题背景和行为 oracle；2026-08-27 之后的 CURRENT 见 §5.5 与 Runtime C4。
+
+### 2.1 迁移前 Zig 拥有
 
 - Runtime 进程、主循环、Platform event pump、Clock 与阶段调用；
 - Win32/XCB Platform、Vulkan RHI、Renderer2D、Audio；
@@ -71,7 +74,7 @@ Phase 2 的实际演进形成了不同的重心：
 - contact query、GameSession 与部分 demo gameplay；
 - reload/restart candidate 的外层事务编排。
 
-### 2.2 Rust 当前拥有
+### 2.2 迁移前 Rust 拥有
 
 - Sprite Entity 存储；
 - spawn、replace、despawn；
@@ -80,14 +83,14 @@ Phase 2 的实际演进形成了不同的重心：
 - render sprite extraction；
 - Scheduler 的 bounded read worker 与 completion ownership。
 
-### 2.3 其它语言当前拥有
+### 2.3 其它语言当时拥有
 
 - C#：Editor、Workspace、Publication、Service、Client、Avalonia；
 - Luau：项目 Behavior source；
 - C++：vendored Luau 与受限 native bridge；
 - C ABI：Zig / Rust / C++ 之间的稳定外部契约。
 
-### 2.4 当前问题
+### 2.4 当时的问题
 
 当前 Zig `SceneGeneration` 与 Rust `world` 共同参与对象状态，Zig `RuntimeObjectRegistry` 又拥有动态对象身份和 stale 语义。虽然具体字段尚未形成直接双写，但 Object Authority、Phase Commit 和 Gameplay ownership 已跨多个浅 Interface 分散：
 
@@ -312,6 +315,19 @@ Runtime Core 的外部 Interface 必须：
 
 Scheduler 只有在出现第二个真实异步消费者，或 Runtime Core 需要统一 completion ingestion 时才扩张。禁止为了提高 Rust 占比提前引入线程池、`rayon`、`tokio`、async runtime 或通用 task graph。
 
+### 5.5 2026-08-27 迁移收口
+
+三个 replace-not-layer 增量已经按顺序完成并进入 Inner `main`：
+
+- `444dc5b`：Object Authority、Runtime Object 生命周期与 Scene candidate state 迁入 Rust Runtime Core；
+- `f114d75`：fixed/frame Phase queue、sequence/generation、admission、预算和 structural/activation transaction 迁入同一 Core；
+- `3c4edb7`：collision/contact、GameSession、outcome、final tint 与 coherent render/gameplay snapshot 迁入同一 Core；
+- `b1cb26f`：通过确定性 Gameplay Vertical Slice 与 ABI header 初始化修复验证完整生产链路。
+
+旧 Zig `RuntimeObjectRegistry`、persistent Phase queue、`GameSession`、collision/contact ledger、`app/game.zig`、`app/collision.zig` 和 final gameplay projection 已删除；Zig 只保留 Host timing、Scene/Behavior Adapter、callback-local staging、Renderer/Audio 消费和产品生命周期。当前实现已经达到本 ADR 的 TARGET，不再处于双 authority 迁移期。
+
+Scheduler 条件保持不变：没有第二个真实异步消费者，也没有 Runtime Core completion ingestion 的新需求，因此本次收口不扩张 Scheduler。
+
 ---
 
 ## 6. 不变量
@@ -409,7 +425,7 @@ Scheduler 只有在出现第二个真实异步消费者，或 Runtime Core 需�
 
 ## 11. 一句话结论
 
-Kadath 采用 **“Zig Host 驱动平台与产品生命周期，Rust Runtime Core 统一拥有 World 对象、生命周期、阶段事务和 Gameplay 状态，通过稳定 C ABI + 版本化接口描述符输出 coarse snapshot”** 的目标架构；迁移按 Object Authority、Phase Commit、Gameplay 三个固定点替换旧 Zig authority，不设置语言行数配额，也不进行一次性重写。
+Kadath 已实现 **“Zig Host 驱动平台与产品生命周期，Rust Runtime Core 统一拥有 World 对象、生命周期、阶段事务和 Gameplay 状态，通过稳定 C ABI + 版本化接口描述符输出 coarse snapshot”** 的架构；Object Authority、Phase Commit、Gameplay 三个固定点均已替换旧 Zig authority，后续扩展继续按 ownership 而非语言行数决策。
 
 ---
 
@@ -417,3 +433,4 @@ Kadath 采用 **“Zig Host 驱动平台与产品生命周期，Rust Runtime Cor
 
 - 2026-08-21: 基于 `bfc5504`、现有 ADR/C4、Rust 代码历史和当前 ownership 审计形成初稿。
 - 2026-08-21: 主导者确认先固定 Runtime Object Lifecycle candidate，再实施 Rust/Zig 架构对账；状态设为“已采纳”。
+- 2026-08-27: Object Authority、Phase Commit、Gameplay 三段迁移与 Gameplay Vertical Slice 均已合并；以 `b1cb26f` 为当前固定点完成实施收口。

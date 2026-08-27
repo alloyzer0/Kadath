@@ -2,9 +2,9 @@
 
 ## 元信息
 
-- **状态**: 已确认；2026-08-22 Phase Commit implementation clarification
+- **状态**: 已确认；2026-08-27 Runtime Core 迁移收口
 - **初始日期**: 2026-06-04
-- **更新日期**: 2026-08-22
+- **更新日期**: 2026-08-27
 - **主题**: Kadath Runtime 当前态、目标态与迁移 seam
 - **依据**:
   - `ADR-0002`: 构建系统与项目结构
@@ -21,15 +21,15 @@
 
 本文同时记录：
 
-- **CURRENT**：截至 `P2-Runtime-Object-Lifecycle-01` candidate `bfc5504` 的实现事实；
-- **TARGET**：完成 `ADR-0009` 分阶段迁移后的目标 ownership；
-- **MIGRATION**：从 CURRENT 到 TARGET 的固定点顺序。
+- **CURRENT**：截至 Inner `main@b1cb26f` 的实现事实；
+- **TARGET**：`ADR-0009` 冻结的长期 ownership 边界；当前三个迁移增量已经达到该边界；
+- **MIGRATION**：从历史基线 `bfc5504` 到当前固定点的已完成迁移记录。
 
-目标态在对应代码候选合并前不得改写成当前态。图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。
+图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。历史章节中的 TARGET 措辞只描述候选合并前的状态；`b1cb26f` 之后应以本文 CURRENT 为准。
 
 ---
 
-## 2. CURRENT：`bfc5504` 当前实现
+## 2. CURRENT：`b1cb26f` 当前实现
 
 ```mermaid
 graph TD
@@ -42,15 +42,15 @@ graph TD
     end
 
     subgraph Runtime["Kadath Runtime 当前容器"]
-        ZigHost["Zig Host<br/>进程、主循环、阶段调用、产品生命周期"]
+        ZigHost["Zig Host<br/>进程、平台节奏、设备与产品生命周期"]
         ZigPlatform["Zig Platform / Input / Clock"]
         ZigMemory["Zig Memory / Allocator Policy"]
-        ZigResource["Zig Resource / Package Adapter"]
-        ZigScene["Zig SceneGeneration<br/>Scene 对象映射与 reload 编排"]
-        ZigBehavior["Zig BehaviorHost<br/>fixed/update/event 与结构提交"]
-        ZigRegistry["Zig RuntimeObjectRegistry<br/>transient ObjectId / generation / stale"]
-        LuauBridge["C++ / Zig Luau Bridge"]
-        RustWorld["Rust World<br/>Sprite Entity 存储与 fixed-step"]
+        ZigResource["Zig Resource / Artifact Adapter"]
+        ZigScene["Zig Scene / KSCN / KSCP Adapter"]
+        ZigLuauAdapter["Zig / C++ Luau Adapter"]
+        ZigCoreAdapter["Zig Runtime Core Adapter<br/>稳定 C ABI + 版本化接口描述符"]
+        RustCore["Rust Runtime Core<br/>Object Authority / Phase Commit / Gameplay"]
+        Snapshot["Caller-owned Render / Event Snapshot"]
         RustScheduler["Rust Scheduler<br/>bounded read worker"]
         ZigRenderer["Zig Renderer2D / RHI"]
         ZigAudio["Zig Audio"]
@@ -68,35 +68,36 @@ graph TD
     ZigMemory --> ZigRenderer
     ZigHost --> ZigResource
     ZigHost --> ZigScene
-    ZigHost --> ZigBehavior
+    ZigHost --> ZigLuauAdapter
+    ZigHost --> ZigCoreAdapter
     ZigHost --> ZigAudio
-    ZigScene --> ZigRegistry
-    ZigBehavior --> ZigRegistry
-    ZigBehavior --> LuauBridge
-    ZigScene -->|"Zig C ABI Adapter"| RustWorld
+    ZigScene --> ZigCoreAdapter
+    ZigLuauAdapter -->|"phase-bound ObjectRef"| ZigCoreAdapter
+    ZigCoreAdapter --> RustCore
+    RustCore --> Snapshot
     ZigResource --> RustScheduler
-    RustWorld -->|"Render Sprite extraction"| ZigRenderer
+    RustScheduler -->|"bounded completion"| ZigCoreAdapter
+    Snapshot -->|"caller-owned snapshot"| ZigRenderer
     ZigResource --> ZigRenderer
 ```
 
 ### 2.1 当前职责
 
-- `Zig Host` 已经是实际组合根，拥有 Platform pump、Clock、fixed accumulator、reload/restart 外层事务和产品生命周期；
-- `Zig SceneGeneration` 拥有 Scene Object 到 Rust Entity 的映射，并编排 source/artifact generation；
-- `Zig BehaviorHost` 拥有双时钟 callback、ObjectRef Adapter、event FIFO、Activation Overlay 和 Structural Flush；
-- `Zig RuntimeObjectRegistry` 拥有动态 ObjectId、generation、stale、spawn/despawn reservation 与预算；
-- `Rust World` 拥有 Sprite Entity 存储、位置、bounds、fixed-step、spawn/despawn 与 render extraction；
+- `Zig Host` 是实际组合根，拥有 Platform pump、Clock、fixed accumulator、阶段调用时机、reload/restart 外层事务和产品生命周期；
+- `Zig Scene/Behavior Adapter` 负责 Scene/KSCN/KSCP 解码、Luau VM callback、caller-owned POD 转换、调用编排和错误映射，不保存跨 step 的对象、阶段或 Gameplay authority；
+- `Rust Runtime Core` 通过同一 opaque Core 后的 versioned Object、Phase 与 Gameplay Interface，唯一拥有 ObjectId/Entity/generation/stale、对象生命周期、阶段队列/预算、collision/contact、GameSession、outcome 与 coherent snapshot；
+- `Renderer2D`、Audio 与日志只消费 Runtime Core 的 caller-owned snapshot/outcome，不反向写入 Core 状态；
 - `Rust Scheduler` 是隔离的异步读取 Module，不拥有主线程 Runtime 推进；
 - `Zig Memory / Allocator Policy` 保留原 C4 的底层内存职责；当前实现可以分散使用显式 allocator，不宣称已经存在一个成熟的独立 Memory Module；
 - `C# Editor`、Asset Tool pipeline 与 `Luau Behavior` 已是实际产品入口，不再是 Future 组件。
 
-### 2.2 当前架构债务
+### 2.2 迁移收口判断
 
-World 对象语义横跨 `SceneGeneration`、`BehaviorHost`、`RuntimeObjectRegistry` 与 Rust `World`。它们没有直接共享私有容器，但调用方必须理解多个 Module 的顺序、identity 和 failure domain，导致 Object Authority 与 Phase Commit 缺少单一深 Interface。
+历史 `bfc5504` 中横跨 `SceneGeneration`、`BehaviorHost`、`RuntimeObjectRegistry` 与 Rust `World` 的 authority 已被替换：旧 Zig Registry、persistent Phase queue、`GameSession`、collision/contact ledger 和 final gameplay projection 均已删除。当前没有第二份跨 step authority；保留在 Zig 的 callback-local staging、调用时机、Renderer/Audio 消费和 replay recorder 都属于 Adapter 或产品编排。
 
 ---
 
-## 3. TARGET：Zig Host + Rust Runtime Core
+## 3. TARGET：Zig Host + Rust Runtime Core（已达成）
 
 ```mermaid
 graph TD
@@ -168,19 +169,19 @@ graph TD
 | Memory / allocator policy | Zig 显式 allocator | Zig 显式 allocator | 不迁移 |
 | RHI、Renderer、Audio、Resource I/O | Zig | Zig | 不迁移 |
 | Scene/KSCN/KSCP 解码 | Zig | Zig Adapter | 不迁移 authority |
-| Sprite Entity 存储 | Rust World | Rust Runtime Core | Object Authority |
-| ObjectId→Entity 映射 | Zig SceneGeneration | Rust Runtime Core | Object Authority |
-| transient ObjectId / generation / stale | Zig Registry | Rust Runtime Core | Object Authority |
-| spawn/despawn 生命周期 | Zig Registry + Rust World | Rust Runtime Core | Object Authority |
-| Scene candidate Runtime state prepare/commit/abort | Zig Host/SceneGeneration | Rust Runtime Core；Zig Host 保留跨 Module 外层编排 | Object Authority |
-| restart Runtime object replacement | Zig Host/SceneGeneration | Rust Runtime Core | Object Authority |
-| fixed/frame structure queue | Zig BehaviorHost | Rust Runtime Core | Phase Commit |
-| Runtime Object 物理存储上限（128 records） | Zig Registry | Rust Runtime Core | Object Authority |
-| Behavior Instance、结构、事件与跨资源 admission（256/64/64） | Zig BehaviorHost/Registry | Rust Runtime Core | Phase Commit；Object Authority 增量期间继续由 Zig `BehaviorHost` 唯一持有 |
-| collision/contact | Zig SceneGeneration/Contact | Rust Runtime Core | Gameplay |
-| GameSession / demo gameplay | Zig Host/SceneGeneration | Rust Runtime Core | Gameplay |
-| Object Authority active read view → 现有 `RenderSprite` 投影 | Rust World + Zig ordering | Rust Runtime Core read view → Zig `SceneGeneration` projection | Object Authority 临时 Adapter seam |
-| 最终 Render extraction | Rust World + Zig ordering | Rust render snapshot → Zig Renderer | Gameplay；建立后删除上述 Zig projection |
+| Sprite Entity 存储 | Rust Runtime Core | Rust Runtime Core | Object Authority 已完成（`444dc5b`） |
+| ObjectId→Entity 映射 | Rust Runtime Core | Rust Runtime Core | Object Authority 已完成（`444dc5b`） |
+| transient ObjectId / generation / stale | Rust Runtime Core | Rust Runtime Core | Object Authority 已完成（`444dc5b`） |
+| spawn/despawn 生命周期 | Rust Runtime Core | Rust Runtime Core | Object Authority 已完成（`444dc5b`） |
+| Scene candidate Runtime state prepare/commit/abort | Rust Runtime Core；Zig Host 保留跨 Module 外层编排 | 同 CURRENT | Object/Phase/Gameplay paired transaction 已完成 |
+| restart Runtime object replacement | Rust Runtime Core | Rust Runtime Core | Object Authority 已完成（`444dc5b`） |
+| fixed/frame structure queue | Rust Runtime Core | Rust Runtime Core | Phase Commit 已完成（`f114d75`） |
+| Runtime Object 物理存储上限（128 records） | Rust Runtime Core | Rust Runtime Core | Object Authority 已完成（`444dc5b`） |
+| Behavior Instance admission、结构与事件预算（256/64/64） | Rust Runtime Core | Rust Runtime Core | Phase Commit 已完成（`f114d75`） |
+| collision/contact | Rust Runtime Core | Rust Runtime Core | Gameplay 已完成（`3c4edb7`） |
+| GameSession / demo gameplay | Rust Runtime Core | Rust Runtime Core | Gameplay 已完成（`3c4edb7`） |
+| Runtime active read view | Rust Runtime Core caller-owned snapshot | Rust Runtime Core caller-owned snapshot | Gameplay 收口后不再由 Zig 保存投影 authority |
+| 最终 Render extraction | Rust render snapshot → Zig Renderer | 同 CURRENT | Gameplay 已完成（`3c4edb7`） |
 | Runtime 调用时机 | Zig Host | Zig Host | 不迁移 |
 | Editor authoring/read-model | C# | C# | 不迁移 |
 | Behavior source | Luau | Luau | 不迁移 |
@@ -191,7 +192,7 @@ graph TD
 
 ## 5. 外部 seam
 
-Rust Runtime Core 通过稳定 C ABI + 版本化接口描述符提供一个深 Interface。具体函数表由 `P1-Rust-Runtime-Core-Object-Authority-01` 冻结，但必须满足：
+Rust Runtime Core 通过稳定 C ABI + 版本化接口描述符提供一个深 Interface。Object、Phase 与 Gameplay 函数表已经由三个独立冻结契约实现，并持续满足：
 
 - opaque handle；
 - 不设置构建产物级全局 ABI version；descriptor、callback table 和 snapshot 使用 `struct_size`，只有语义不兼容时才使用各自 `interface_version`；
@@ -211,17 +212,19 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 
 ### 6.1 当前固定点
 
-- `e1a9313`：Behavior 双阶段对象与事件 API 已进入 Inner main；
-- `bfc5504`：Runtime Object Lifecycle candidate，作为对象生命周期行为 oracle；
-- 当前 C4 的 CURRENT 图以 `bfc5504` 为准，不能将 TARGET 图解释为已经实现。
+- `bfc5504`：迁移前 Runtime Object Lifecycle 行为 oracle；
+- `444dc5b`：Object Authority 迁入 Rust Runtime Core；
+- `f114d75`：Phase Commit 迁入同一 opaque Core；
+- `3c4edb7`：Gameplay、collision/contact 与 coherent snapshot 迁入 Core，并完成质量门禁与双平台产品验收；
+- `b1cb26f`：确定性 Gameplay Vertical Slice、ABI header 初始化修复与合并后 smoke 固定点；当前 C4 的 CURRENT 图以此为准。
 
 ### 6.2 迁移顺序
 
-1. `P1-Rust-Runtime-Core-Object-Authority-01`：迁移 ObjectId/Entity/generation/lifecycle、Runtime state candidate prepare/commit/abort 与 restart replacement，并删除 Zig Registry authority；
-2. `P1-Rust-Runtime-Core-Phase-Commit-01`：迁移 phase queue、结构提交、事件与预算；
-3. `P1-Rust-Runtime-Core-Gameplay-01`：迁移 collision/contact、GameSession 与 snapshot authority。
+1. ✅ `P1-Rust-Runtime-Core-Object-Authority-01`：已迁移 ObjectId/Entity/generation/lifecycle、Runtime state candidate prepare/commit/abort 与 restart replacement，并删除 Zig Registry authority；
+2. ✅ `P1-Rust-Runtime-Core-Phase-Commit-01`：已迁移 phase queue、结构提交、事件与预算；
+3. ✅ `P1-Rust-Runtime-Core-Gameplay-01`：已迁移 collision/contact、GameSession 与 snapshot authority。
 
-每个增量必须：
+三个增量均已按以下门禁交付；该清单继续作为未来 authority 迁移的约束：
 
 - 独立 contract discovery 与 `GO_IMPLEMENT`；
 - 使用前一固定点行为作为 oracle；
@@ -230,9 +233,9 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 - 不以 Linux 证据宣告 Windows 产品验收；
 - 不修改 `.scratch/` 或新增 PowerShell 脚本。
 
-### 6.3 2026-08-22 Phase Commit implementation clarification
+### 6.3 2026-08-22 Phase Commit implementation clarification（历史）
 
-`P1-Rust-Runtime-Core-Phase-Commit-01` 的 implementation target 已按独立冻结契约登记，但在 candidate 合并前仍属于 TARGET，不改变 `## 2 CURRENT` 图：
+以下内容记录 candidate 合并前的 implementation target；该增量已在 `f114d75` 合并，当前事实已经进入 `## 2 CURRENT`：
 
 - Rust Runtime Core 是 fixed/frame phase queue、event/structural sequence、generation、256 Behavior admission、fixed/frame 各 64 event 与 64 structural budget、flush token、activation transaction 和 same-flush/failure semantics 的唯一 authority；Object Authority v1 保持独立接口。
 - Zig Host 继续决定 **何时** begin/dispatch/flush/end，保留 clock、fixed accumulator、phase timing、Luau VM/C++ bridge、callback 执行、ActiveSet、callback staging、diagnostic、collision/contact observer、gameplay 与 render projection；Zig Runtime Core Adapter 不复制 Rust state machine。
@@ -240,9 +243,9 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 - 同一实现 candidate 必须删除 Zig persistent phase queue/admission/sequence/generation writer；callback-local staging 可保留。Scene/KSCN/KSCP、Luau Host v4、Editor/Preview/Package wire、collision/gameplay migration、final render snapshot 和 Scheduler 不在本增量内。
 - 该 clarification 对应 Outer contract discovery `P1-Rust-Runtime-Core-Phase-Commit-01`，Inner baseline `444dc5b`；Linux 证据仍不代理 Windows/NTFS/HWND/Vulkan acceptance。
 
-### 6.4 2026-08-25 Gameplay 实现澄清
+### 6.4 2026-08-25 Gameplay 实现澄清（历史）
 
-`P1-Rust-Runtime-Core-Gameplay-01` 在 Object Authority 与 Phase Commit 已交付的同一 opaque Core 上完成最后一个 authority cluster；本节记录 implementation candidate 的目标态，在合并前不反写 `## 2 CURRENT`：
+以下内容记录 Gameplay candidate 合并前的 implementation target；最终候选 `3c4edb7` 已完成交付，Vertical Slice 固定点 `b1cb26f` 已验证这条边界：
 
 - Rust Runtime Core 唯一拥有 `Playing/Won/Lost`、timer、terminal cause、outcome sequence high-water、Player↔source Goal/Hazard strict-AABB contact ledger、legacy patrol movement、Player final tint 与 coherent render/gameplay snapshot；Zig 不保存跨 step 的 Gameplay/contact/outcome mirror。
 - Scene publication 固定为 Object prepare → Gameplay prepare → Phase prepare/ready → Object commit。Object、Gameplay、Phase 任一 candidate 缺失或 Phase 未 ready 时拒绝，成功时一次发布；restart 仅允许从 terminal live state进入，并保留 step/outcome high-water，Scene reload 递增 epoch 且清空 contact。
@@ -266,8 +269,8 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 
 ## 8. 结构结论
 
-1. CURRENT 是 Zig 高层 orchestration + Rust Sprite World 的分裂 ownership；它是迁移起点，不是目标架构；
-2. TARGET 是 Zig Host + Rust Runtime Core，Host 拥有 timing，Core 拥有 state transition；
+1. CURRENT 已是 Zig Host + Rust Runtime Core：Host 拥有 timing 与产品生命周期，Core 拥有对象、阶段和 Gameplay state transition；
+2. 历史 `bfc5504` 的分裂 ownership 只保留为迁移 oracle，不再代表当前架构；
 3. Editor、Luau 和 Renderer 只通过 Adapter/snapshot 接近 Runtime Core；
 4. 迁移采用替换而不是叠层，同一事实禁止双 authority；
 5. 架构验收基于 ownership、Interface Depth、旧状态删除和产品等价，不基于语言行数。
@@ -276,4 +279,4 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 
 ## 9. 一句话结论
 
-Kadath 当前以 Zig Host/Scene/Behavior 编排 Rust Sprite World；目标是在保留 Zig 平台与产品优势的同时，用版本化 coarse C ABI 将 Object Authority、Phase Commit 和 Gameplay 逐步收敛到 Rust Runtime Core，并在每个固定点删除对应 Zig authority。
+Kadath 当前由 **Zig Host 驱动平台与产品生命周期，Rust Runtime Core 统一拥有 Object Authority、Phase Commit 与 Gameplay 状态，并通过版本化 coarse C ABI 输出 caller-owned snapshot**；三段 ownership 迁移已经完成，后续功能必须沿用这一边界。
