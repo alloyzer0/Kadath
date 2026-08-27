@@ -12,8 +12,53 @@ const c = @cImport({
 
 const default_sample_count: usize = 64;
 const steady_fixed_sample_count: usize = 256;
-const steady_fixed_max_allocations: u64 = 96;
+// 优化后 256/256 样本均为 0；门槛绑定该确定性基线，不保留历史宽限值。
+const steady_fixed_max_allocations: u64 = 0;
 const max_input_bytes: usize = 4 * 1024 * 1024;
+const quality_call_count: usize = c.KADATH_RUNTIME_QUALITY_CALL_COUNT;
+const quality_call_names = [_][]const u8{
+    "unknown",
+    "object_create",
+    "object_destroy",
+    "object_prepare_scene",
+    "object_commit_scene",
+    "object_abort_scene",
+    "object_query",
+    "object_mutate",
+    "phase_prepare_state",
+    "phase_commit_state",
+    "phase_abort_state",
+    "phase_begin",
+    "phase_submit_events",
+    "phase_drain_events",
+    "phase_submit_structural",
+    "phase_take_structural",
+    "phase_begin_activation",
+    "phase_submit_activation",
+    "phase_commit_activation",
+    "phase_abort_activation",
+    "phase_complete_structural",
+    "phase_abort_structural",
+    "phase_end",
+    "gameplay_prepare_state",
+    "gameplay_begin_fixed",
+    "gameplay_commit_fixed",
+    "gameplay_abort_fixed",
+    "gameplay_publish_snapshot",
+};
+const query_tag_names = [_][]const u8{
+    "unknown",
+    "state_info",
+    "find_by_id",
+    "resolve_exact_ref",
+    "visible_objects",
+    "active_objects",
+    "find_by_entity",
+};
+
+comptime {
+    if (quality_call_names.len != quality_call_count) @compileError("Runtime Core quality call table drifted");
+}
 
 const Session = struct {
     allocator: std.mem.Allocator,
@@ -241,6 +286,12 @@ fn validateEvidence(evidence: *const WorkloadEvidence) !void {
 const SteadyFixedAllocationEvidence = struct {
     total: u64,
     max: u64,
+    call_totals: [quality_call_count]u64,
+    call_maxes: [quality_call_count]u64,
+    object_query_invocations_total: u64,
+    object_query_invocations_max: u64,
+    query_tag_totals: [query_tag_names.len]u64,
+    query_tag_maxes: [query_tag_names.len]u64,
 };
 
 fn measureSteadyFixedAllocations(
@@ -250,6 +301,12 @@ fn measureSteadyFixedAllocations(
 ) !SteadyFixedAllocationEvidence {
     var total: u64 = 0;
     var max: u64 = 0;
+    var call_totals = [_]u64{0} ** quality_call_count;
+    var call_maxes = [_]u64{0} ** quality_call_count;
+    var object_query_invocations_total: u64 = 0;
+    var object_query_invocations_max: u64 = 0;
+    var query_tag_totals = [_]u64{0} ** query_tag_names.len;
+    var query_tag_maxes = [_]u64{0} ** query_tag_names.len;
     for (0..steady_fixed_sample_count) |_| {
         var session = try Session.init(allocator, artifact_bytes, initial_source);
         defer session.deinit();
@@ -269,13 +326,49 @@ fn measureSteadyFixedAllocations(
         if (c.kadath_runtime_core_phase_quality_end_allocation_count(&allocations) != c.KADATH_OK) {
             return error.AllocationCounterUnavailable;
         }
+        var attributed: u64 = 0;
+        for (0..quality_call_count) |call_id| {
+            var call_allocations: u64 = 0;
+            if (c.kadath_runtime_core_phase_quality_call_allocation_count(@intCast(call_id), &call_allocations) != c.KADATH_OK) {
+                return error.AllocationCounterUnavailable;
+            }
+            attributed += call_allocations;
+            call_totals[call_id] += call_allocations;
+            call_maxes[call_id] = @max(call_maxes[call_id], call_allocations);
+        }
+        var object_query_invocations: u64 = 0;
+        if (c.kadath_runtime_core_phase_quality_call_invocation_count(
+            c.KADATH_RUNTIME_QUALITY_CALL_OBJECT_QUERY,
+            &object_query_invocations,
+        ) != c.KADATH_OK) return error.AllocationCounterUnavailable;
+        object_query_invocations_total += object_query_invocations;
+        object_query_invocations_max = @max(object_query_invocations_max, object_query_invocations);
+        for (0..query_tag_names.len) |query_tag| {
+            var query_tag_count: u64 = 0;
+            if (c.kadath_runtime_core_phase_quality_query_tag_count(@intCast(query_tag), &query_tag_count) != c.KADATH_OK) {
+                return error.AllocationCounterUnavailable;
+            }
+            query_tag_totals[query_tag] += query_tag_count;
+            query_tag_maxes[query_tag] = @max(query_tag_maxes[query_tag], query_tag_count);
+        }
+        // 所有 Rust 分配必须落到某个公开调用；否则该归因不能作为热点证据。
+        if (attributed != allocations) return error.AllocationAttributionMismatch;
         if (step.outcome != null or step.snapshot.phase != @intFromEnum(runtime_core.GameplayPhase.playing)) {
             return error.SteadyFixedStepLeftPlayingPhase;
         }
         total += allocations;
         max = @max(max, allocations);
     }
-    return .{ .total = total, .max = max };
+    return .{
+        .total = total,
+        .max = max,
+        .call_totals = call_totals,
+        .call_maxes = call_maxes,
+        .object_query_invocations_total = object_query_invocations_total,
+        .object_query_invocations_max = object_query_invocations_max,
+        .query_tag_totals = query_tag_totals,
+        .query_tag_maxes = query_tag_maxes,
+    };
 }
 
 fn percentile(sorted: []const u64, numerator: usize, denominator: usize) u64 {
@@ -357,5 +450,31 @@ pub fn main(init: std.process.Init) !void {
         "vertical_slice_contract objects=5 fixed_steps=7 outcomes=3 steady_fixed_samples=256 steady_fixed_max_allocations={d} initial_epoch=1 restart_epoch=1 reload_epoch=2 contact_order=212 status=PASS\n",
         .{steady_fixed_max_allocations},
     );
+    try stdout.writeAll("rust_steady_fixed_allocation_calls");
+    for (quality_call_names, 0..) |name, call_id| {
+        const call_total = steady_fixed_allocations.call_totals[call_id];
+        if (call_total == 0) continue;
+        try stdout.print(" {s}_total={d} {s}_max={d}", .{
+            name,
+            call_total,
+            name,
+            steady_fixed_allocations.call_maxes[call_id],
+        });
+    }
+    try stdout.print(" object_query_invocations_total={d} object_query_invocations_max={d}", .{
+        steady_fixed_allocations.object_query_invocations_total,
+        steady_fixed_allocations.object_query_invocations_max,
+    });
+    for (query_tag_names, 0..) |name, query_tag| {
+        const query_tag_total = steady_fixed_allocations.query_tag_totals[query_tag];
+        if (query_tag_total == 0) continue;
+        try stdout.print(" query_{s}_total={d} query_{s}_max={d}", .{
+            name,
+            query_tag_total,
+            name,
+            steady_fixed_allocations.query_tag_maxes[query_tag],
+        });
+    }
+    try stdout.writeAll(" status=PASS\n");
     try stdout.flush();
 }

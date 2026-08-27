@@ -800,6 +800,37 @@ int32_t kadath_runtime_core_query_gameplay_interface(
  * These symbols are absent from normal Runtime Core builds and are not part of
  * the production Phase v1 interface descriptor. */
 #if defined(KADATH_RUNTIME_PHASE_QUALITY_EVIDENCE)
+/* 仅用于 VS02 证据程序的公开调用归因编号；生产 ABI 不导出这些符号。 */
+#define KADATH_RUNTIME_QUALITY_CALL_UNKNOWN 0u
+#define KADATH_RUNTIME_QUALITY_CALL_OBJECT_CREATE 1u
+#define KADATH_RUNTIME_QUALITY_CALL_OBJECT_DESTROY 2u
+#define KADATH_RUNTIME_QUALITY_CALL_OBJECT_PREPARE_SCENE 3u
+#define KADATH_RUNTIME_QUALITY_CALL_OBJECT_COMMIT_SCENE 4u
+#define KADATH_RUNTIME_QUALITY_CALL_OBJECT_ABORT_SCENE 5u
+#define KADATH_RUNTIME_QUALITY_CALL_OBJECT_QUERY 6u
+#define KADATH_RUNTIME_QUALITY_CALL_OBJECT_MUTATE 7u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_PREPARE_STATE 8u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_COMMIT_STATE 9u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_ABORT_STATE 10u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_BEGIN 11u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_SUBMIT_EVENTS 12u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_DRAIN_EVENTS 13u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_SUBMIT_STRUCTURAL 14u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_TAKE_STRUCTURAL 15u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_BEGIN_ACTIVATION 16u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_SUBMIT_ACTIVATION 17u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_COMMIT_ACTIVATION 18u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_ABORT_ACTIVATION 19u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_COMPLETE_STRUCTURAL 20u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_ABORT_STRUCTURAL 21u
+#define KADATH_RUNTIME_QUALITY_CALL_PHASE_END 22u
+#define KADATH_RUNTIME_QUALITY_CALL_GAMEPLAY_PREPARE_STATE 23u
+#define KADATH_RUNTIME_QUALITY_CALL_GAMEPLAY_BEGIN_FIXED 24u
+#define KADATH_RUNTIME_QUALITY_CALL_GAMEPLAY_COMMIT_FIXED 25u
+#define KADATH_RUNTIME_QUALITY_CALL_GAMEPLAY_ABORT_FIXED 26u
+#define KADATH_RUNTIME_QUALITY_CALL_GAMEPLAY_PUBLISH_SNAPSHOT 27u
+#define KADATH_RUNTIME_QUALITY_CALL_COUNT 28u
+
 /* Mode: no cross-boundary allocation or borrowed pointers.
  * Lifetime: no caller-owned or Core-owned storage crosses this call.
  * Single-thread: the evidence benchmark must serialize begin/end pairs on one thread.
@@ -810,6 +841,20 @@ int32_t kadath_runtime_core_phase_quality_begin_allocation_count(void);
  * Single-thread: the evidence benchmark must serialize begin/end pairs on one thread.
  * Reentrant: no. Success writes the completed count; failure leaves output unchanged. */
 int32_t kadath_runtime_core_phase_quality_end_allocation_count(uint64_t* out_allocation_count);
+/* Mode: caller-allocates, callee-writes the uint64_t output。
+ * Lifetime: call_id 与输出仅在本次调用中使用；用于把总量归因到公开 ABI 调用。
+ * Single-thread: 与对应 begin/end 证据窗口在同一线程串行调用。 */
+int32_t kadath_runtime_core_phase_quality_call_allocation_count(
+    uint32_t call_id,
+    uint64_t* out_allocation_count);
+/* 与 allocation_count 使用相同 call_id，返回证据窗口内的公开调用次数。 */
+int32_t kadath_runtime_core_phase_quality_call_invocation_count(
+    uint32_t call_id,
+    uint64_t* out_invocation_count);
+/* query_tag 使用 KADATH_RUNTIME_QUERY_*；返回 object_query 批次中的 item 次数。 */
+int32_t kadath_runtime_core_phase_quality_query_tag_count(
+    uint32_t query_tag,
+    uint64_t* out_item_count);
 #endif
 
 #ifdef __cplusplus

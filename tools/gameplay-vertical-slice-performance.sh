@@ -9,7 +9,8 @@ candidate_sha=""
 evidence_root=""
 max_p95_ns=50000000
 max_p99_ns=100000000
-steady_fixed_max_allocations=96
+# 2026-08-27 的 object_query 热点优化后，active fixed-step 的 256 个样本均为 0。
+steady_fixed_max_allocations=0
 while (($#)); do
     case "$1" in
         --candidate-sha) candidate_sha=${2-}; shift 2 ;;

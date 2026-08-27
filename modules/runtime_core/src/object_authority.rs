@@ -297,15 +297,21 @@ impl RuntimeState {
         Ok(source)
     }
 
-    pub(crate) fn for_each_active_ordered(&self, mut visit: impl FnMut(&Record)) {
+    pub(crate) fn for_each_visible_ordered(
+        &self,
+        active_only: bool,
+        mut visit: impl FnMut(&Record),
+    ) {
+        let is_visible = |record: &Record| match record.lifecycle {
+            Lifecycle::PendingSpawn => !active_only,
+            Lifecycle::Active => true,
+            Lifecycle::PendingDestroy => false,
+        };
         for source_index in 0..self.authored_source_count {
             if let Some(record) = self.slots[usize::from(source_index)]
                 .record
                 .as_ref()
-                .filter(|record| {
-                    record.lifecycle == Lifecycle::Active
-                        && record.source_index == Some(source_index)
-                })
+                .filter(|record| is_visible(record) && record.source_index == Some(source_index))
             {
                 visit(record);
             }
@@ -321,7 +327,7 @@ impl RuntimeState {
                 .iter()
                 .filter_map(|slot| slot.record.as_ref())
                 .filter(|record| {
-                    record.lifecycle == Lifecycle::Active
+                    is_visible(record)
                         && record.source_index.is_none()
                         && record.spawn_serial > last_serial
                 })
@@ -330,6 +336,10 @@ impl RuntimeState {
             visit(record);
             last_serial = record.spawn_serial;
         }
+    }
+
+    pub(crate) fn for_each_active_ordered(&self, visit: impl FnMut(&Record)) {
+        self.for_each_visible_ordered(true, visit);
     }
 
     pub(crate) fn visible_exact(&self, key: ObjectKey) -> Option<&Record> {

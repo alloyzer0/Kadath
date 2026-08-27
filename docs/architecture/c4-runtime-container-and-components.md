@@ -95,6 +95,27 @@ graph TD
 
 历史 `bfc5504` 中横跨 `SceneGeneration`、`BehaviorHost`、`RuntimeObjectRegistry` 与 Rust `World` 的 authority 已被替换：旧 Zig Registry、persistent Phase queue、`GameSession`、collision/contact ledger 和 final gameplay projection 均已删除。当前没有第二份跨 step authority；保留在 Zig 的 callback-local staging、调用时机、Renderer/Audio 消费和 replay recorder 都属于 Adapter 或产品编排。
 
+### 2.3 CURRENT 剩余 Zig 状态清单
+
+以下清单按 Module / Interface ownership 记录 Zig 中仍然存在的状态，而不是按文件或代码量计数。“跨 step”只说明存储寿命，不等于它拥有 Runtime Gameplay authority；只读 publication、设备句柄和 Luau VM 私有状态即使跨 step，也不能成为 Object/Phase/Gameplay 的第二权威。
+
+| 状态 | 生命周期 | 当前权威 | 是否跨 step | 迁移结论 |
+|---|---|---|---|---|
+| Host 时序与泵状态：clock、`last_time_seconds`、fixed accumulator、frame/heartbeat counter、quit flag | Runtime 进程 / frame loop | Zig Host | 是 | **保留 Zig**。它决定何时推进 Core，不决定 Core 内状态如何变化。 |
+| Platform 窗口、设备、键位 held/pressed edge、reload requestId | 进程 / 窗口 / 两次 event pump 之间 | Zig Platform | 是 | **保留 Zig**。Platform state 不进入 Runtime Core；每帧只向 Host 发布 caller-owned `InputSnapshot` / command。 |
+| Scene Document、artifact 路径、Script Program 与纹理注册表 | 项目打开至 reload / Runtime 进程 | Zig Host、Resource 与 Scene Adapter | 是 | **不迁移 authoring / I/O authority**。成功 reload 只在受控 seam 生成新的 Core candidate。 |
+| `SceneGeneration` 的 `target`、`extent`、Player/Goal/Hazard source index 和 `phase_candidate_ready` | 单个 Scene Generation / candidate transaction | Zig Scene Adapter；对象和 Gameplay 当代事实仍由 Rust Core 拥有 | 是；candidate-ready 只跨事务调用，不跨已完成 step | **保留 Adapter 投影**。这些字段用于构造 descriptor、选择 live/candidate 和配对提交，不得扩张为对象位置、生命周期、contact 或 session mirror。 |
+| Behavior `Package`、`ActiveSet`、Luau VM / coroutine / binding 私有状态 | Script package / Scene Generation | Zig/C++ Luau Adapter 与 Luau VM | 是 | **保留 Zig/C++**。这是 Behavior Instance 的执行状态，不是 Runtime Object/Phase/Gameplay authority；Rust Core 不拥有 VM layout。 |
+| `active_phase`（domain + sequence） | 一次 fixed/frame Phase begin→end | Zig Behavior Adapter 的调用游标；队列、generation 与预算在 Rust Core | 否；成功 step/frame 结束必须清空 | **保留薄游标**。不得增加持久 queue、admission 或 sequence writer。 |
+| callback-local origin/context、Translation/Event/Structural staging | 单次 callback、drain 或 structural flush | Zig Behavior Adapter | 否 | **保留 Zig**。只借用 caller-owned POD 并在同步 seam 提交；不得跨 step 保存 Core state。 |
+| `render_sprites` / `render_count` 与 Renderer2D instance staging | snapshot extract→同帧 render | Rust Core 是 snapshot 内容权威；Zig Host/Renderer 是只读消费者 | 否；buffer 可复用但内容每次 publication 覆盖 | **不迁移**。保持 caller-owned bounded snapshot，禁止反向写回 Core。 |
+| RHI / Vulkan / Renderer pipeline、swapchain、GPU resource、frame token | 设备 / swapchain / frame | Zig RHI 与 Renderer2D | 是 | **保留 Zig**。属于设备状态，不是 Gameplay state。 |
+| Resource async loader、pending job、completion 与 texture refresh candidate | 单次 I/O job 至受控 completion ingestion | Zig Resource；后台执行由独立 Rust Scheduler 拥有 | 可以 | **不迁入 Runtime Core**。Host 选择 ingestion 时机，只有完成后的有界结果可穿过 seam。 |
+| Audio backend、worker、cue queue 与 owned clip | Runtime 进程 / Audio worker | Zig Audio | 是 | **保留 Zig**。只消费 one-shot Outcome，不拥有 outcome sequence 或 GameSession。 |
+| replay recorder、digest、allocation/profile 归因表 | 单次测试 / benchmark workload | Zig evidence Adapter + quality-only Rust counter | 可以；仅证据路径 | **永不成为生产权威**。VS03 复用并扩展 VS02 evidence，不建设第二套 lifecycle driver。 |
+
+迁移结论：剩余 Zig 状态均属于 Host timing、外部设备/I/O、Authoring/VM 专属状态、caller-owned publication 或 phase/callback 薄游标。当前没有新的跨 step Object、Phase 或 Gameplay authority 需要迁移；后续只有发现同一 Runtime 事实被两个 Module 持久写入时，才重开 ownership 迁移。
+
 ---
 
 ## 3. TARGET：Zig Host + Rust Runtime Core（已达成）

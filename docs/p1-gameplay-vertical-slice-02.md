@@ -50,7 +50,7 @@ Hash 只作为“同一 transcript 完全一致”的证据，不代替字段级
 - 只允许优化一个由 profile 证明的热点；若没有明显热点，则记录“不做推测性优化”。
 - RSS 只记录为诊断数据，不设 `256 KiB` 一类不符合完整引擎进程的门槛。
 - gate 关注正确性、确定性、尾延迟、steady-state 分配增长、证据可追溯性与跨平台 smoke。
-- 同场景 active fixed-step 单独采样 256 次，Session 构造与 `on_start` 排除在计数窗口外。当前 Behavior-enabled 路径实测每步 66 次 Rust 分配；门禁固定为每步最多 96 次，并校验总数不超过 `samples × 96`。该上限不可由报告自行放宽。
+- 同场景 active fixed-step 单独采样 256 次，Session 构造与 `on_start` 排除在计数窗口外。2026-08-27 先复现历史基线每步 66 次，再按公开调用归因并只修改确认的 `object_query` 热点；优化后 256/256 样本均为 0，因此门禁按实测基线收紧为每步最多 0 次，并校验总数必须为 0。该上限不可由报告自行放宽。
 - 上述计数与 direct Runtime Core 稳态门禁分开：后者连续 120 万 fixed-step 必须保持 Rust 分配为 0、RSS 增长不超过 64 KiB。两者分别回答“真实 Behavior 步进的稳定分配率”和“Core 是否持续增长”。
 
 ## 2026-08-27 实测与 profile 决策
@@ -75,5 +75,23 @@ Hash 只作为“同一 transcript 完全一致”的证据，不代替字段级
 - digest、字段断言、Outcome 序号与分配计数不变。
 
 尾延迟单次样本仍有调度噪声，因此 gate 采用宽松但明确的绝对上限：p95 ≤ 50 ms、p99 ≤ 100 ms。没有第二个同等可信的热点证据，本切片停止进一步优化。
+
+## 2026-08-27 Behavior 分配归因与基线收紧
+
+本轮没有建立新的 benchmark 或 lifecycle driver，而是在同一 `gameplay-vertical-slice-bench` 计数窗口中增加 quality-only 公开调用标签。优化前 Windows ReleaseSafe 连续 256 个样本均为 66 次，且 66/66 全部归属于 Runtime Core 公开 `object_query`；Phase、Gameplay begin/commit/snapshot 与 `object_mutate` 均为 0。
+
+每个 active fixed-step 的 27 次单项查询分布为：
+
+| query tag | 调用次数 / step | 分配次数 / step | 根因 |
+|---|---:|---:|---|
+| `STATE_INFO` | 1 | 2 | 通用 borrowed-range 与 result plan 使用临时 `Vec` |
+| `FIND_BY_ID` | 12 | 24 | 每次单项查询固定 2 次临时分配 |
+| `RESOLVE_EXACT_REF` | 10 | 20 | 每次单项查询固定 2 次临时分配 |
+| `VISIBLE_OBJECTS` | 4 | 20 | 通用 2 次，加 ordered source/transient 与 caller view staging 3 次 |
+| **合计** | **27** | **66** | `23 × 2 + 4 × 5` |
+
+修复只改确认的热点实现：用 `MAX_OBJECTS` 有界栈上 borrowed-range / result plan 替代通用临时 `Vec`，并以 source-first、transient-serial 的无分配 visitor 直接写 caller-owned view。公开 ABI、查询次数、顺序、fault-before-publication 与 caller output 原子语义不变。
+
+优化后同一机器、同一 ReleaseSafe workload 的 active fixed-step 为 `total=0, max=0, samples=256`；公开查询仍固定为每步 27 次。完整冷生命周期从 909 降至 14 次/样本，但它包含 Scene/VM candidate 生命周期，仍不与 active-step 零分配门禁混用。门槛由上述实测基线收紧到 0，不使用预先拍定的目标数字。
 
 WSL2 的 WSLg 会把 `/tmp/.X11-unix` 只读挂载为 `0777`。Linux smoke 使用私有 user/mount namespace 覆盖为 `1777` tmpfs 后，Xvfb/XCB/Lavapipe/Validation、像素和关闭路径全部 PASS；该环境隔离不进入产品代码。

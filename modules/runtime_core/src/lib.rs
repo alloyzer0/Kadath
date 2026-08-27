@@ -20,28 +20,69 @@ use world::{Bounds, Sprite};
 
 #[cfg(feature = "phase-quality-evidence")]
 mod quality_evidence {
-    use crate::abi;
+    use crate::{abi, QualityPublicCall, QUALITY_PUBLIC_CALL_COUNT};
     use std::{
         alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     pub(crate) struct CountingAllocator;
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+    static CALL_ALLOCATIONS: [AtomicU64; QUALITY_PUBLIC_CALL_COUNT] =
+        [const { AtomicU64::new(0) }; QUALITY_PUBLIC_CALL_COUNT];
+    static CALL_INVOCATIONS: [AtomicU64; QUALITY_PUBLIC_CALL_COUNT] =
+        [const { AtomicU64::new(0) }; QUALITY_PUBLIC_CALL_COUNT];
+    static QUERY_TAG_COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    thread_local! {
+        // Runtime Core 公开调用是单线程、不可重入的；TLS 只负责给分配打当前调用标签。
+        static CURRENT_CALL: Cell<usize> = const { Cell::new(QualityPublicCall::Unknown as usize) };
+    }
+
+    pub(crate) struct PublicCallGuard {
+        previous: usize,
+    }
+
+    impl PublicCallGuard {
+        pub(crate) fn enter(call: QualityPublicCall) -> Self {
+            let previous = CURRENT_CALL.with(|current| current.replace(call as usize));
+            if ENABLED.load(Ordering::Relaxed) {
+                CALL_INVOCATIONS[call as usize].fetch_add(1, Ordering::Relaxed);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for PublicCallGuard {
+        fn drop(&mut self) {
+            CURRENT_CALL.with(|current| current.set(self.previous));
+        }
+    }
+
+    fn record_allocation() {
+        if ENABLED.load(Ordering::Relaxed) {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            CURRENT_CALL.with(|current| {
+                CALL_ALLOCATIONS[current.get()].fetch_add(1, Ordering::Relaxed);
+            });
+        }
+    }
+
+    pub(crate) fn record_query_tag(tag: u32) {
+        if ENABLED.load(Ordering::Relaxed) && (tag as usize) < QUERY_TAG_COUNTS.len() {
+            QUERY_TAG_COUNTS[tag as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if ENABLED.load(Ordering::Relaxed) {
-                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            }
+            record_allocation();
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            if ENABLED.load(Ordering::Relaxed) {
-                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            }
+            record_allocation();
             unsafe { System.alloc_zeroed(layout) }
         }
 
@@ -50,9 +91,7 @@ mod quality_evidence {
         }
 
         unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            if ENABLED.load(Ordering::Relaxed) {
-                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            }
+            record_allocation();
             unsafe { System.realloc(pointer, layout, new_size) }
         }
     }
@@ -60,6 +99,15 @@ mod quality_evidence {
     #[no_mangle]
     pub extern "C" fn kadath_runtime_core_phase_quality_begin_allocation_count() -> i32 {
         ALLOCATIONS.store(0, Ordering::SeqCst);
+        for count in &CALL_ALLOCATIONS {
+            count.store(0, Ordering::SeqCst);
+        }
+        for count in &CALL_INVOCATIONS {
+            count.store(0, Ordering::SeqCst);
+        }
+        for count in &QUERY_TAG_COUNTS {
+            count.store(0, Ordering::SeqCst);
+        }
         ENABLED.store(true, Ordering::SeqCst);
         0
     }
@@ -77,12 +125,100 @@ mod quality_evidence {
         unsafe { out_allocation_count.write(ALLOCATIONS.load(Ordering::SeqCst)) };
         0
     }
+
+    #[no_mangle]
+    pub extern "C" fn kadath_runtime_core_phase_quality_call_allocation_count(
+        call_id: u32,
+        out_allocation_count: *mut u64,
+    ) -> i32 {
+        if call_id as usize >= QUALITY_PUBLIC_CALL_COUNT
+            || out_allocation_count.is_null()
+            || (out_allocation_count as usize) % std::mem::align_of::<u64>() != 0
+        {
+            return abi::KADATH_ERR_INVALID_ARGUMENT as i32;
+        }
+        unsafe {
+            out_allocation_count.write(CALL_ALLOCATIONS[call_id as usize].load(Ordering::SeqCst))
+        };
+        0
+    }
+
+    #[no_mangle]
+    pub extern "C" fn kadath_runtime_core_phase_quality_call_invocation_count(
+        call_id: u32,
+        out_invocation_count: *mut u64,
+    ) -> i32 {
+        if call_id as usize >= QUALITY_PUBLIC_CALL_COUNT
+            || out_invocation_count.is_null()
+            || (out_invocation_count as usize) % std::mem::align_of::<u64>() != 0
+        {
+            return abi::KADATH_ERR_INVALID_ARGUMENT as i32;
+        }
+        unsafe {
+            out_invocation_count.write(CALL_INVOCATIONS[call_id as usize].load(Ordering::SeqCst))
+        };
+        0
+    }
+
+    #[no_mangle]
+    pub extern "C" fn kadath_runtime_core_phase_quality_query_tag_count(
+        query_tag: u32,
+        out_item_count: *mut u64,
+    ) -> i32 {
+        if query_tag as usize >= QUERY_TAG_COUNTS.len()
+            || out_item_count.is_null()
+            || (out_item_count as usize) % std::mem::align_of::<u64>() != 0
+        {
+            return abi::KADATH_ERR_INVALID_ARGUMENT as i32;
+        }
+        unsafe {
+            out_item_count.write(QUERY_TAG_COUNTS[query_tag as usize].load(Ordering::SeqCst))
+        };
+        0
+    }
 }
 
 #[cfg(feature = "phase-quality-evidence")]
 #[global_allocator]
 static PHASE_QUALITY_ALLOCATOR: quality_evidence::CountingAllocator =
     quality_evidence::CountingAllocator;
+
+#[repr(usize)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum QualityPublicCall {
+    Unknown = 0,
+    ObjectCreate,
+    ObjectDestroy,
+    ObjectPrepareScene,
+    ObjectCommitScene,
+    ObjectAbortScene,
+    ObjectQuery,
+    ObjectMutate,
+    PhasePrepareState,
+    PhaseCommitState,
+    PhaseAbortState,
+    PhaseBegin,
+    PhaseSubmitEvents,
+    PhaseDrainEvents,
+    PhaseSubmitStructural,
+    PhaseTakeStructural,
+    PhaseBeginActivation,
+    PhaseSubmitActivation,
+    PhaseCommitActivation,
+    PhaseAbortActivation,
+    PhaseCompleteStructural,
+    PhaseAbortStructural,
+    PhaseEnd,
+    GameplayPrepareState,
+    GameplayBeginFixed,
+    GameplayCommitFixed,
+    GameplayAbortFixed,
+    GameplayPublishSnapshot,
+}
+
+#[cfg(feature = "phase-quality-evidence")]
+const QUALITY_PUBLIC_CALL_COUNT: usize = QualityPublicCall::GameplayPublishSnapshot as usize + 1;
 
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod abi {
@@ -679,7 +815,14 @@ fn mutation_payload_is_well_formed(
 
 struct PlannedQuery {
     result: abi::kadath_runtime_query_result_t,
-    object_output: Option<(*mut u8, usize, Vec<abi::kadath_runtime_object_view_v1_t>)>,
+    object_output: Option<PlannedObjectOutput>,
+}
+
+#[derive(Clone, Copy)]
+struct PlannedObjectOutput {
+    output: *mut u8,
+    stride: usize,
+    active_only: bool,
 }
 
 fn query(
@@ -753,10 +896,9 @@ fn query(
         _ => return Err(abi::KADATH_ERR_INVALID_ARGUMENT),
     }
     .ok_or(abi::KADATH_ERR_RUNTIME_INVALID_STATE)?;
-    let mut borrowed_ranges: Vec<(usize, usize)> = Vec::new();
-    borrowed_ranges
-        .try_reserve_exact(batch.item_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+    // 公共查询上限固定为 MAX_OBJECTS；栈上计划表同时保留失败不写 caller output 的原子语义。
+    let mut borrowed_ranges = [(0usize, 0usize); MAX_OBJECTS];
+    let mut borrowed_range_count = 0usize;
     for index in 0..batch.item_count {
         let item_pointer = unsafe {
             batch
@@ -825,20 +967,19 @@ fn query(
             if ranges_overlap(range, batch_range)
                 || ranges_overlap(range, item_range)
                 || ranges_overlap(range, result_range)
-                || borrowed_ranges
+                || borrowed_ranges[..borrowed_range_count]
                     .iter()
                     .any(|previous| ranges_overlap(*previous, range))
             {
                 return Err(abi::KADATH_ERR_INVALID_ARGUMENT);
             }
-            borrowed_ranges.push(range);
+            borrowed_ranges[borrowed_range_count] = range;
+            borrowed_range_count += 1;
         }
     }
-    let mut plans = Vec::new();
-    plans
-        .try_reserve_exact(batch.item_count)
-        .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
-    for index in 0..batch.item_count {
+    let mut plans: [mem::MaybeUninit<PlannedQuery>; MAX_OBJECTS] =
+        [const { mem::MaybeUninit::uninit() }; MAX_OBJECTS];
+    for (index, plan) in plans.iter_mut().take(batch.item_count).enumerate() {
         let item = unsafe {
             &*batch
                 .items
@@ -846,6 +987,8 @@ fn query(
                 .add(index * batch.item_stride)
                 .cast::<abi::kadath_runtime_query_item_v1_t>()
         };
+        #[cfg(feature = "phase-quality-evidence")]
+        quality_evidence::record_query_tag(item.tag);
         let mut result: abi::kadath_runtime_query_result_t = unsafe { mem::zeroed() };
         result.struct_size = mem::size_of::<abi::kadath_runtime_query_result_t>() as u32;
         result.tag = item.tag;
@@ -865,11 +1008,9 @@ fn query(
             | abi::KADATH_RUNTIME_QUERY_ACTIVE_OBJECTS => {
                 let object_buffer = unsafe { item.payload.object_buffer };
                 let active_only = item.tag == abi::KADATH_RUNTIME_QUERY_ACTIVE_OBJECTS;
-                let records = state
-                    .ordered_records(active_only)
-                    .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
+                let object_count = state.visible_count(active_only);
                 if object_buffer.objects.is_null()
-                    || object_buffer.object_capacity < records.len()
+                    || object_buffer.object_capacity < object_count
                     || object_buffer.object_stride
                         < mem::size_of::<abi::kadath_runtime_object_view_v1_t>()
                     || object_buffer.object_stride
@@ -881,27 +1022,18 @@ fn query(
                 {
                     return Err(abi::KADATH_ERR_BUFFER_TOO_SMALL);
                 }
-                let mut views = Vec::new();
-                views
-                    .try_reserve_exact(records.len())
-                    .map_err(|_| abi::KADATH_ERR_OUT_OF_MEMORY)?;
-                views.extend(
-                    records
-                        .into_iter()
-                        .map(|record| object_view(record, state.world_epoch)),
-                );
                 result.payload = abi::kadath_runtime_query_result_payload_v1_t {
                     snapshot: abi::kadath_runtime_snapshot_result_v1_t {
                         world_epoch: state.world_epoch,
-                        object_count: views.len(),
+                        object_count,
                         reserved: [0; 4],
                     },
                 };
-                object_output = Some((
-                    object_buffer.objects.cast::<u8>(),
-                    object_buffer.object_stride,
-                    views,
-                ));
+                object_output = Some(PlannedObjectOutput {
+                    output: object_buffer.objects.cast::<u8>(),
+                    stride: object_buffer.object_stride,
+                    active_only,
+                });
             }
             abi::KADATH_RUNTIME_QUERY_RESOLVE_EXACT_REF => {
                 let key = read_object_key(unsafe { &item.payload.object_ref })?;
@@ -949,25 +1081,37 @@ fn query(
             }
             _ => return Err(abi::KADATH_ERR_NOT_SUPPORTED),
         }
-        plans.push(PlannedQuery {
+        plan.write(PlannedQuery {
             result,
             object_output,
         });
     }
     trigger_test_fault(core, 2)?;
-    for plan in &plans {
-        if let Some((output, stride, views)) = &plan.object_output {
-            for (index, view) in views.iter().enumerate() {
+    // fault 注入可能需要可变访问 Core；通过预检后再重新借用同一权威状态发布结果。
+    let state = match batch.target {
+        abi::KADATH_RUNTIME_TARGET_LIVE => core.live.as_ref(),
+        abi::KADATH_RUNTIME_TARGET_CANDIDATE => core.candidate.as_ref(),
+        _ => unreachable!("query target passed validation"),
+    }
+    .expect("query state passed validation");
+    for plan in &plans[..batch.item_count] {
+        let plan = unsafe { plan.assume_init_ref() };
+        if let Some(output) = plan.object_output {
+            let mut object_index = 0usize;
+            state.for_each_visible_ordered(output.active_only, |record| {
                 let destination = unsafe {
                     output
-                        .add(index * *stride)
+                        .output
+                        .add(object_index * output.stride)
                         .cast::<abi::kadath_runtime_object_view_v1_t>()
                 };
-                unsafe { ptr::write(destination, *view) };
-            }
+                unsafe { ptr::write(destination, object_view(record, state.world_epoch)) };
+                object_index += 1;
+            });
         }
     }
-    for (index, plan) in plans.into_iter().enumerate() {
+    for (index, plan) in plans[..batch.item_count].iter().enumerate() {
+        let plan = unsafe { plan.assume_init_read() };
         unsafe { ptr::write(results.add(index), plan.result) };
     }
     Ok(())
@@ -977,11 +1121,11 @@ extern "C" fn create_entry(
     desc: *const abi::kadath_runtime_core_create_desc_t,
     out_core: *mut *mut abi::kadath_runtime_core_t,
 ) -> i32 {
-    ffi_result(|| create(desc, out_core))
+    ffi_result_for(QualityPublicCall::ObjectCreate, || create(desc, out_core))
 }
 
 extern "C" fn destroy_entry(in_out_core: *mut *mut abi::kadath_runtime_core_t) -> i32 {
-    ffi_result(|| destroy(in_out_core))
+    ffi_result_for(QualityPublicCall::ObjectDestroy, || destroy(in_out_core))
 }
 
 extern "C" fn prepare_scene_entry(
@@ -989,15 +1133,17 @@ extern "C" fn prepare_scene_entry(
     desc: *const abi::kadath_runtime_scene_prepare_desc_t,
     out_info: *mut abi::kadath_runtime_scene_candidate_info_t,
 ) -> i32 {
-    ffi_result(|| prepare_scene(core, desc, out_info))
+    ffi_result_for(QualityPublicCall::ObjectPrepareScene, || {
+        prepare_scene(core, desc, out_info)
+    })
 }
 
 extern "C" fn commit_scene_entry(core: *mut abi::kadath_runtime_core_t) -> i32 {
-    ffi_result(|| commit_scene(core))
+    ffi_result_for(QualityPublicCall::ObjectCommitScene, || commit_scene(core))
 }
 
 extern "C" fn abort_scene_entry(core: *mut abi::kadath_runtime_core_t) -> i32 {
-    ffi_result(|| abort_scene(core))
+    ffi_result_for(QualityPublicCall::ObjectAbortScene, || abort_scene(core))
 }
 
 extern "C" fn query_entry(
@@ -1006,7 +1152,9 @@ extern "C" fn query_entry(
     results: *mut abi::kadath_runtime_query_result_t,
     result_capacity: usize,
 ) -> i32 {
-    ffi_result(|| query(core, batch, results, result_capacity))
+    ffi_result_for(QualityPublicCall::ObjectQuery, || {
+        query(core, batch, results, result_capacity)
+    })
 }
 
 fn authority_error(value: AuthorityError) -> u32 {
@@ -1465,7 +1613,9 @@ extern "C" fn mutate_entry(
     results: *mut abi::kadath_runtime_mutation_result_t,
     result_capacity: usize,
 ) -> i32 {
-    ffi_result(|| mutate(core, batch, results, result_capacity))
+    ffi_result_for(QualityPublicCall::ObjectMutate, || {
+        mutate(core, batch, results, result_capacity)
+    })
 }
 
 fn ffi_result(operation: impl FnOnce() -> Result<(), u32>) -> i32 {
@@ -1474,6 +1624,17 @@ fn ffi_result(operation: impl FnOnce() -> Result<(), u32>) -> i32 {
         Ok(Err(code)) => error(code),
         Err(_) => error(abi::KADATH_ERR_INTERNAL),
     }
+}
+
+pub(crate) fn ffi_result_for(
+    call: QualityPublicCall,
+    operation: impl FnOnce() -> Result<(), u32>,
+) -> i32 {
+    #[cfg(feature = "phase-quality-evidence")]
+    let _guard = quality_evidence::PublicCallGuard::enter(call);
+    #[cfg(not(feature = "phase-quality-evidence"))]
+    let _ = call;
+    ffi_result(operation)
 }
 
 fn query_interface(
@@ -2323,7 +2484,9 @@ extern "C" fn prepare_gameplay_state_entry(
     desc: *const abi::kadath_runtime_gameplay_desc_v1_t,
     out: *mut abi::kadath_runtime_gameplay_candidate_info_v1_t,
 ) -> i32 {
-    ffi_result(|| prepare_gameplay_state(core, desc, out))
+    ffi_result_for(QualityPublicCall::GameplayPrepareState, || {
+        prepare_gameplay_state(core, desc, out)
+    })
 }
 extern "C" fn begin_gameplay_fixed_entry(
     core: *mut abi::kadath_runtime_core_t,
@@ -2331,7 +2494,9 @@ extern "C" fn begin_gameplay_fixed_entry(
     buffer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
     out: *mut abi::kadath_runtime_gameplay_step_result_v1_t,
 ) -> i32 {
-    ffi_result(|| begin_gameplay_fixed(core, desc, buffer, out))
+    ffi_result_for(QualityPublicCall::GameplayBeginFixed, || {
+        begin_gameplay_fixed(core, desc, buffer, out)
+    })
 }
 extern "C" fn commit_gameplay_fixed_entry(
     core: *mut abi::kadath_runtime_core_t,
@@ -2339,17 +2504,23 @@ extern "C" fn commit_gameplay_fixed_entry(
     buffer: *mut abi::kadath_runtime_gameplay_outcome_buffer_v1_t,
     out: *mut abi::kadath_runtime_gameplay_step_result_v1_t,
 ) -> i32 {
-    ffi_result(|| commit_gameplay_fixed(core, desc, buffer, out))
+    ffi_result_for(QualityPublicCall::GameplayCommitFixed, || {
+        commit_gameplay_fixed(core, desc, buffer, out)
+    })
 }
 extern "C" fn abort_gameplay_fixed_entry(core: *mut abi::kadath_runtime_core_t, token: u64) -> i32 {
-    ffi_result(|| abort_gameplay_fixed(core, token))
+    ffi_result_for(QualityPublicCall::GameplayAbortFixed, || {
+        abort_gameplay_fixed(core, token)
+    })
 }
 extern "C" fn publish_gameplay_snapshot_entry(
     core: *mut abi::kadath_runtime_core_t,
     buffer: *mut abi::kadath_runtime_render_buffer_v1_t,
     out: *mut abi::kadath_runtime_gameplay_snapshot_v1_t,
 ) -> i32 {
-    ffi_result(|| publish_gameplay_snapshot(core, buffer, out))
+    ffi_result_for(QualityPublicCall::GameplayPublishSnapshot, || {
+        publish_gameplay_snapshot(core, buffer, out)
+    })
 }
 
 fn query_gameplay_interface(

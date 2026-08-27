@@ -1,6 +1,6 @@
 use crate::{
-    abi, authority_error, enter_core, ffi_result, object_ref, object_view, ranges_overlap,
-    read_object_key, read_struct_size, reserved_is_zero, strided_range, RuntimeCore,
+    abi, authority_error, enter_core, object_ref, object_view, ranges_overlap, read_object_key,
+    read_struct_size, reserved_is_zero, strided_range, RuntimeCore,
 };
 use crate::{object_authority, world::Sprite};
 use std::{
@@ -2691,9 +2691,9 @@ pub(crate) fn abort_structural(core: &mut RuntimeCore, flush_token: u64) -> Resu
 }
 
 macro_rules! phase_entry {
-    ($name:ident, $function:ident, ($core:ident : *mut abi::kadath_runtime_core_t $(, $arg:ident : $ty:ty)* $(,)?)) => {
+    ($name:ident, $call:expr, $function:ident, ($core:ident : *mut abi::kadath_runtime_core_t $(, $arg:ident : $ty:ty)* $(,)?)) => {
         extern "C" fn $name($core: *mut abi::kadath_runtime_core_t $(, $arg : $ty)*) -> i32 {
-            ffi_result(|| {
+            crate::ffi_result_for($call, || {
                 let (core_ref, _guard) = unsafe { enter_core($core) }?;
                 $function(core_ref $(, $arg)*)
             })
@@ -2701,22 +2701,22 @@ macro_rules! phase_entry {
     };
 }
 
-phase_entry!(prepare_entry, prepare_phase_state, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_state_prepare_desc_v1_t, out: *mut abi::kadath_runtime_phase_state_candidate_info_v1_t));
-phase_entry!(commit_state_entry, commit_phase_state, (core: *mut abi::kadath_runtime_core_t));
-phase_entry!(abort_state_entry, abort_phase_state, (core: *mut abi::kadath_runtime_core_t));
-phase_entry!(begin_phase_v1_entry, begin_phase_v1, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_begin_desc_v1_t, out: *mut abi::kadath_runtime_phase_begin_result_v1_t));
-phase_entry!(begin_phase_v2_entry, begin_phase_v2, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_begin_desc_v1_t, out: *mut abi::kadath_runtime_phase_begin_result_v1_t));
-phase_entry!(submit_events_entry, submit_events, (core: *mut abi::kadath_runtime_core_t, events: *const abi::kadath_runtime_phase_event_v1_t, count: usize, stride: usize, out: *mut abi::kadath_runtime_phase_batch_result_v1_t));
-phase_entry!(drain_events_entry, drain_events, (core: *mut abi::kadath_runtime_core_t, domain: u32, sequence: u64, output: *mut abi::kadath_runtime_phase_event_v1_t, capacity: usize, count: *mut usize));
-phase_entry!(submit_structural_entry, submit_structural, (core: *mut abi::kadath_runtime_core_t, items: *const abi::kadath_runtime_phase_structural_v1_t, count: usize, stride: usize, results: *mut abi::kadath_runtime_phase_request_completion_v1_t, capacity: usize, out: *mut abi::kadath_runtime_phase_batch_result_v1_t));
-phase_entry!(take_structural_entry, take_structural, (core: *mut abi::kadath_runtime_core_t, domain: u32, sequence: u64, flush: *mut abi::kadath_runtime_phase_flush_info_v1_t, output: *mut abi::kadath_runtime_phase_structural_v1_t, capacity: usize, count: *mut usize));
-phase_entry!(begin_activation_entry, begin_activation, (core: *mut abi::kadath_runtime_core_t, flush: u64, root: u64, out: *mut abi::kadath_runtime_phase_transaction_info_v1_t));
-phase_entry!(submit_activation_entry, submit_activation, (core: *mut abi::kadath_runtime_core_t, id: u64, batch: *const abi::kadath_runtime_phase_activation_batch_v1_t));
-phase_entry!(commit_activation_entry, commit_activation, (core: *mut abi::kadath_runtime_core_t, id: u64, out: *mut abi::kadath_runtime_phase_activation_result_v1_t));
-phase_entry!(abort_activation_entry, abort_activation, (core: *mut abi::kadath_runtime_core_t, id: u64));
-phase_entry!(complete_structural_entry, complete_structural, (core: *mut abi::kadath_runtime_core_t, token: u64, items: *const abi::kadath_runtime_phase_request_completion_v1_t, count: usize, reserved: usize));
-phase_entry!(abort_structural_entry, abort_structural, (core: *mut abi::kadath_runtime_core_t, token: u64));
-phase_entry!(end_phase_entry, end_phase, (core: *mut abi::kadath_runtime_core_t, domain: u32, sequence: u64));
+phase_entry!(prepare_entry, crate::QualityPublicCall::PhasePrepareState, prepare_phase_state, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_state_prepare_desc_v1_t, out: *mut abi::kadath_runtime_phase_state_candidate_info_v1_t));
+phase_entry!(commit_state_entry, crate::QualityPublicCall::PhaseCommitState, commit_phase_state, (core: *mut abi::kadath_runtime_core_t));
+phase_entry!(abort_state_entry, crate::QualityPublicCall::PhaseAbortState, abort_phase_state, (core: *mut abi::kadath_runtime_core_t));
+phase_entry!(begin_phase_v1_entry, crate::QualityPublicCall::PhaseBegin, begin_phase_v1, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_begin_desc_v1_t, out: *mut abi::kadath_runtime_phase_begin_result_v1_t));
+phase_entry!(begin_phase_v2_entry, crate::QualityPublicCall::PhaseBegin, begin_phase_v2, (core: *mut abi::kadath_runtime_core_t, desc: *const abi::kadath_runtime_phase_begin_desc_v1_t, out: *mut abi::kadath_runtime_phase_begin_result_v1_t));
+phase_entry!(submit_events_entry, crate::QualityPublicCall::PhaseSubmitEvents, submit_events, (core: *mut abi::kadath_runtime_core_t, events: *const abi::kadath_runtime_phase_event_v1_t, count: usize, stride: usize, out: *mut abi::kadath_runtime_phase_batch_result_v1_t));
+phase_entry!(drain_events_entry, crate::QualityPublicCall::PhaseDrainEvents, drain_events, (core: *mut abi::kadath_runtime_core_t, domain: u32, sequence: u64, output: *mut abi::kadath_runtime_phase_event_v1_t, capacity: usize, count: *mut usize));
+phase_entry!(submit_structural_entry, crate::QualityPublicCall::PhaseSubmitStructural, submit_structural, (core: *mut abi::kadath_runtime_core_t, items: *const abi::kadath_runtime_phase_structural_v1_t, count: usize, stride: usize, results: *mut abi::kadath_runtime_phase_request_completion_v1_t, capacity: usize, out: *mut abi::kadath_runtime_phase_batch_result_v1_t));
+phase_entry!(take_structural_entry, crate::QualityPublicCall::PhaseTakeStructural, take_structural, (core: *mut abi::kadath_runtime_core_t, domain: u32, sequence: u64, flush: *mut abi::kadath_runtime_phase_flush_info_v1_t, output: *mut abi::kadath_runtime_phase_structural_v1_t, capacity: usize, count: *mut usize));
+phase_entry!(begin_activation_entry, crate::QualityPublicCall::PhaseBeginActivation, begin_activation, (core: *mut abi::kadath_runtime_core_t, flush: u64, root: u64, out: *mut abi::kadath_runtime_phase_transaction_info_v1_t));
+phase_entry!(submit_activation_entry, crate::QualityPublicCall::PhaseSubmitActivation, submit_activation, (core: *mut abi::kadath_runtime_core_t, id: u64, batch: *const abi::kadath_runtime_phase_activation_batch_v1_t));
+phase_entry!(commit_activation_entry, crate::QualityPublicCall::PhaseCommitActivation, commit_activation, (core: *mut abi::kadath_runtime_core_t, id: u64, out: *mut abi::kadath_runtime_phase_activation_result_v1_t));
+phase_entry!(abort_activation_entry, crate::QualityPublicCall::PhaseAbortActivation, abort_activation, (core: *mut abi::kadath_runtime_core_t, id: u64));
+phase_entry!(complete_structural_entry, crate::QualityPublicCall::PhaseCompleteStructural, complete_structural, (core: *mut abi::kadath_runtime_core_t, token: u64, items: *const abi::kadath_runtime_phase_request_completion_v1_t, count: usize, reserved: usize));
+phase_entry!(abort_structural_entry, crate::QualityPublicCall::PhaseAbortStructural, abort_structural, (core: *mut abi::kadath_runtime_core_t, token: u64));
+phase_entry!(end_phase_entry, crate::QualityPublicCall::PhaseEnd, end_phase, (core: *mut abi::kadath_runtime_core_t, domain: u32, sequence: u64));
 
 pub(crate) fn query_interface(
     in_out: *mut abi::kadath_runtime_phase_interface_v1_t,
