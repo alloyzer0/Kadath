@@ -121,13 +121,53 @@ bind_report() {
 bind_report "$candidate_payload" "$evidence_root/candidate.report"
 bind_report "$oracle_payload" "$evidence_root/oracle.report"
 
+steady_stdout="$evidence_root/steady-state.stdout"
+steady_stderr="$evidence_root/steady-state.stderr"
+steady_time="$evidence_root/steady-state.time"
+: >"$steady_stdout"
+: >"$steady_stderr"
+for sample in {1..120}; do
+    printf 'steady_sample=%s rss_kb=1000 allocations=0\n' "$sample" >>"$steady_stderr"
+done
+printf 'runtime_core_gameplay_steady_state batches=120 iterations=1200000 first_rss_kb=1000 last_rss_kb=1000 peak_rss_kb=1000 growth_kb=0 peak_growth_kb=0 allocations=0\n' >>"$steady_stderr"
+printf 'Maximum resident set size (kbytes): 1000\n' >"$steady_time"
+steady_payload="$evidence_root/steady-state.payload"
+cat >"$steady_payload" <<EOF
+GAMEPLAY_CANDIDATE_SHA=$candidate_sha
+GAMEPLAY_COMMAND=steady-test-fixture
+GAMEPLAY_STEADY_STATE_STATUS=PASS
+GAMEPLAY_STEADY_STATE_BATCHES=120
+GAMEPLAY_STEADY_STATE_SAMPLE_COUNT=120
+GAMEPLAY_STEADY_STATE_ITERATIONS=1200000
+GAMEPLAY_STEADY_STATE_FIRST_RSS_KB=1000
+GAMEPLAY_STEADY_STATE_LAST_RSS_KB=1000
+GAMEPLAY_STEADY_STATE_PEAK_RSS_KB=1000
+GAMEPLAY_STEADY_STATE_GROWTH_KB=0
+GAMEPLAY_STEADY_STATE_PEAK_GROWTH_KB=0
+GAMEPLAY_STEADY_STATE_ALLOWED_GROWTH_KB=64
+GAMEPLAY_STEADY_STATE_ALLOCATIONS=0
+GAMEPLAY_STEADY_STATE_BENCHMARK=$candidate
+GAMEPLAY_STEADY_STATE_BENCHMARK_SHA256=$(hash "$candidate")
+GAMEPLAY_STEADY_STATE_STDOUT=$steady_stdout
+GAMEPLAY_STEADY_STATE_STDOUT_SHA256=$(hash "$steady_stdout")
+GAMEPLAY_STEADY_STATE_STDERR=$steady_stderr
+GAMEPLAY_STEADY_STATE_STDERR_SHA256=$(hash "$steady_stderr")
+GAMEPLAY_STEADY_STATE_TIME=$steady_time
+GAMEPLAY_STEADY_STATE_TIME_SHA256=$(hash "$steady_time")
+GAMEPLAY_TOOL_ZIG_VERSION=test
+GAMEPLAY_TOOL_GNU_TIME_VERSION=test
+GAMEPLAY_TOOL_HOST=test
+EOF
+bind_report "$steady_payload" "$evidence_root/steady-state.report"
+
 printf 'tampered\n' >>"$evidence_root/candidate-1.stdout"
 set +e
 raw_tamper_output=$("${runner[@]}" \
     --candidate-sha "$candidate_sha" --oracle-sha "$oracle_sha" \
     --candidate-benchmark "$candidate" --candidate-report "$evidence_root/candidate.report" \
     --oracle-benchmark "$oracle" --oracle-report "$evidence_root/oracle.report" \
-    --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" 2>&1)
+    --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" \
+    --steady-state-report "$evidence_root/steady-state.report" 2>&1)
 set -e
 grep -Fq 'performance raw candidate stdout hash mismatch on run 1' <<<"$raw_tamper_output"
 printf 'p95_ns=100\nallocations=0\n' >"$evidence_root/candidate-1.stdout"
@@ -138,7 +178,8 @@ payload_tamper_output=$("${runner[@]}" \
     --candidate-sha "$candidate_sha" --oracle-sha "$oracle_sha" \
     --candidate-benchmark "$candidate" --candidate-report "$evidence_root/candidate.report" \
     --oracle-benchmark "$oracle" --oracle-report "$evidence_root/oracle.report" \
-    --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" 2>&1)
+    --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" \
+    --steady-state-report "$evidence_root/steady-state.report" 2>&1)
 set -e
 grep -Fq 'CANDIDATE report payload hash mismatch' <<<"$payload_tamper_output"
 printf 'GAMEPLAY_QUALITY_GATE_BLOCKED_PATH=PASS\n'

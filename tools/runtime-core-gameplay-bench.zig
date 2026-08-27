@@ -29,6 +29,21 @@ fn percentile(samples: []u64, numerator: usize, denominator: usize) u64 {
     return samples[if (rank == 0) 0 else rank - 1];
 }
 
+fn currentRssKb() !u64 {
+    var usage: std.os.linux.rusage = undefined;
+    if (std.os.linux.getrusage(std.os.linux.rusage.SELF, &usage) != 0) return error.RssUnavailable;
+    // Linux ru_maxrss 的单位是 KB；这里采样同一进程的峰值，不把引擎总 RSS 当作绝对门槛。
+    return @intCast(usage.maxrss);
+}
+
+fn parseSteadyBatches(args: []const [:0]const u8) !?usize {
+    if (args.len == 1) return null;
+    if (args.len != 3 or !std.mem.eql(u8, args[1], "--steady-batches")) return error.InvalidArgument;
+    const batches = try std.fmt.parseInt(usize, args[2], 10);
+    if (batches == 0) return error.InvalidArgument;
+    return batches;
+}
+
 fn initMaxCore() !Fixture {
     var core = try runtime_core.RuntimeCore.init();
     errdefer core.deinit();
@@ -116,8 +131,9 @@ fn runStep(
     std.mem.doNotOptimizeAway(render_items);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     var fixture = try initMaxCore();
     defer fixture.core.deinit();
     var samples: [iterations]u64 = undefined;
@@ -128,6 +144,40 @@ pub fn main() !void {
 
     // 预置32个接触，使每次测量都发布最大成功批次：32 pair * 2 directed event。
     try runStep(&fixture, near_position, &outcome, &events, &render_items);
+
+    if (try parseSteadyBatches(args)) |batches| {
+        const first_rss = try currentRssKb();
+        var last_rss = first_rss;
+        var peak_rss = first_rss;
+        var total_allocations: u64 = 0;
+        var total_iterations: usize = 0;
+        for (0..batches) |batch| {
+            if (c.kadath_runtime_core_phase_quality_begin_allocation_count() != c.KADATH_OK) {
+                return error.AllocationCounterUnavailable;
+            }
+            for (0..iterations) |index| {
+                const position = if ((batch * iterations + index) % 2 == 0) far_position else near_position;
+                try runStep(&fixture, position, &outcome, &events, &render_items);
+            }
+            var allocations: u64 = 0;
+            if (c.kadath_runtime_core_phase_quality_end_allocation_count(&allocations) != c.KADATH_OK) {
+                return error.AllocationCounterUnavailable;
+            }
+            total_allocations += allocations;
+            total_iterations += iterations;
+            last_rss = try currentRssKb();
+            if (last_rss > peak_rss) peak_rss = last_rss;
+            std.debug.print("steady_sample={d} rss_kb={d} allocations={d}\n", .{ batch + 1, last_rss, allocations });
+        }
+        const growth = last_rss - first_rss;
+        const peak_growth = peak_rss - first_rss;
+        if (total_allocations != 0) return error.SteadyStateGameplayAllocated;
+        std.debug.print(
+            "runtime_core_gameplay_steady_state batches={d} iterations={d} first_rss_kb={d} last_rss_kb={d} peak_rss_kb={d} growth_kb={d} peak_growth_kb={d} allocations={d}\n",
+            .{ batches, total_iterations, first_rss, last_rss, peak_rss, growth, peak_growth, total_allocations },
+        );
+        return;
+    }
 
     if (c.kadath_runtime_core_phase_quality_begin_allocation_count() != c.KADATH_OK) {
         return error.AllocationCounterUnavailable;

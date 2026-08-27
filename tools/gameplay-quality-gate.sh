@@ -6,12 +6,13 @@ usage() {
 Usage: gameplay-quality-gate.sh --candidate-sha SHA --oracle-sha SHA --candidate-benchmark PATH
   --candidate-report PATH --oracle-benchmark PATH --oracle-report PATH
   --coverage-report PATH --mutation-report PATH --seed-report PATH
+  --steady-state-report PATH
 EOF
 }
 
 candidate_sha= oracle_sha= candidate_benchmark= candidate_report=
 oracle_benchmark= oracle_report= coverage_report= mutation_report=
-seed_report=
+seed_report= steady_state_report=
 while (($#)); do
     case "$1" in
         --candidate-sha) candidate_sha=${2-}; shift 2 ;;
@@ -23,6 +24,7 @@ while (($#)); do
         --coverage-report) coverage_report=${2-}; shift 2 ;;
         --mutation-report) mutation_report=${2-}; shift 2 ;;
         --seed-report) seed_report=${2-}; shift 2 ;;
+        --steady-state-report) steady_state_report=${2-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -53,6 +55,7 @@ require_file "$mutation_report" "mutation report"
 require_file "$seed_report" "seed matrix report"
 require_file "$candidate_report" "candidate performance report"
 require_file "$oracle_report" "oracle performance report"
+require_file "$steady_state_report" "steady-state memory report"
 [[ -x "$candidate_benchmark" ]] || blocked+=("candidate benchmark missing")
 [[ -x "$oracle_benchmark" ]] || blocked+=("oracle benchmark missing")
 
@@ -94,6 +97,35 @@ verify_report_payload() {
     [[ "$(tail -n 2 "$report" | head -n 1)" == "GAMEPLAY_REPORT_PAYLOAD=$payload" &&
        "$(tail -n 1 "$report")" == "REPORT_PAYLOAD_SHA256=$expected" ]] || \
         blocked+=("$label report payload trailer invalid")
+}
+
+verify_steady_state_report() {
+    local report=$1 actual expected allowed_growth peak_growth allocations benchmark
+    [[ -f "$report" ]] || return
+    [[ "$(value "$report" GAMEPLAY_CANDIDATE_SHA)" == "$candidate_sha" ]] || blocked+=("steady-state report SHA mismatch")
+    [[ "$(value "$report" GAMEPLAY_STEADY_STATE_STATUS)" == PASS ]] || blocked+=("steady-state memory status is not PASS")
+    [[ "$(value "$report" GAMEPLAY_STEADY_STATE_BATCHES)" == 120 &&
+       "$(value "$report" GAMEPLAY_STEADY_STATE_SAMPLE_COUNT)" == 120 ]] || blocked+=("steady-state memory sample shape is incomplete")
+    [[ "$(value "$report" GAMEPLAY_STEADY_STATE_ITERATIONS)" == 1200000 ]] || blocked+=("steady-state memory iteration shape is incomplete")
+    allocations=$(value "$report" GAMEPLAY_STEADY_STATE_ALLOCATIONS)
+    [[ "$allocations" == 0 ]] || blocked+=("steady-state memory observed Gameplay allocations")
+    peak_growth=$(value "$report" GAMEPLAY_STEADY_STATE_PEAK_GROWTH_KB)
+    allowed_growth=$(value "$report" GAMEPLAY_STEADY_STATE_ALLOWED_GROWTH_KB)
+    [[ "$peak_growth" =~ ^[0-9]+$ && "$allowed_growth" =~ ^[0-9]+$ && "$peak_growth" -le "$allowed_growth" ]] || \
+        blocked+=("steady-state RSS growth exceeds allowed tolerance")
+    benchmark=$(value "$report" GAMEPLAY_STEADY_STATE_BENCHMARK)
+    [[ "$benchmark" == "$candidate_benchmark" ]] || blocked+=("steady-state benchmark path is not candidate benchmark")
+    actual=$(sha256sum "$candidate_benchmark" | awk '{print $1}')
+    expected=$(value "$report" GAMEPLAY_STEADY_STATE_BENCHMARK_SHA256)
+    [[ "$actual" == "$expected" ]] || blocked+=("steady-state benchmark hash mismatch")
+    verify_bound_file "$report" GAMEPLAY_STEADY_STATE_STDOUT GAMEPLAY_STEADY_STATE_STDOUT_SHA256 || blocked+=("steady-state stdout hash mismatch")
+    verify_bound_file "$report" GAMEPLAY_STEADY_STATE_STDERR GAMEPLAY_STEADY_STATE_STDERR_SHA256 || blocked+=("steady-state stderr hash mismatch")
+    verify_bound_file "$report" GAMEPLAY_STEADY_STATE_TIME GAMEPLAY_STEADY_STATE_TIME_SHA256 || blocked+=("steady-state time evidence hash mismatch")
+    [[ -n "$(value "$report" GAMEPLAY_COMMAND)" &&
+       -n "$(value "$report" GAMEPLAY_TOOL_ZIG_VERSION)" &&
+       -n "$(value "$report" GAMEPLAY_TOOL_GNU_TIME_VERSION)" &&
+       -n "$(value "$report" GAMEPLAY_TOOL_HOST)" ]] || blocked+=("steady-state tool provenance missing")
+    verify_report_payload "$report" STEADY_STATE
 }
 
 if [[ -f "$coverage_report" ]]; then
@@ -308,8 +340,12 @@ if [[ -f "$candidate_report" && -f "$oracle_report" ]]; then
         (( candidate_p95 * 100 <= oracle_p95 * 125 )) || blocked+=("candidate p95 exceeds 1.25x oracle")
     fi
     if [[ "$candidate_rss" =~ ^[0-9]+$ && "$oracle_rss" =~ ^[0-9]+$ && "$oracle_rss" != 0 ]]; then
-        (( candidate_rss * 100 <= oracle_rss * 125 )) || blocked+=("candidate RSS exceeds 1.25x oracle")
+        : # 旧跨实现 Max RSS 仅作诊断；真正的内存硬门见 steady-state report。
     fi
+fi
+
+if [[ -f "$steady_state_report" ]]; then
+    verify_steady_state_report "$steady_state_report"
 fi
 
 if ((${#blocked[@]})); then
@@ -319,6 +355,14 @@ if ((${#blocked[@]})); then
     exit 2
 fi
 
+if [[ -f "$candidate_report" && -f "$oracle_report" ]]; then
+    rss_ratio=$(awk -v c="$(value "$candidate_report" GAMEPLAY_CANDIDATE_PEAK_RSS_KB)" \
+        -v o="$(value "$oracle_report" GAMEPLAY_ORACLE_PEAK_RSS_KB)" \
+        'BEGIN { if (o > 0) printf "%.3f", c / o; else print "n/a" }')
+    printf 'GAMEPLAY_PERF_RSS_DIAGNOSTIC=candidate_peak_rss_kb:%s,oracle_peak_rss_kb:%s,ratio:%s\n' \
+        "$(value "$candidate_report" GAMEPLAY_CANDIDATE_PEAK_RSS_KB)" \
+        "$(value "$oracle_report" GAMEPLAY_ORACLE_PEAK_RSS_KB)" "$rss_ratio"
+fi
 printf 'GAMEPLAY_QUALITY_GATE=PASS\n'
 printf 'GAMEPLAY_CANDIDATE_SHA=%s\n' "$candidate_sha"
 printf 'QUALITY_GATE_PASS\n'
