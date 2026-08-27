@@ -790,7 +790,10 @@ typedef struct kadath_runtime_gameplay_interface_v1_t {
         kadath_runtime_render_buffer_v1_t* render_buffer,
         kadath_runtime_gameplay_snapshot_v1_t* out_snapshot);
     /* V2：显式发布“已准备但不启用 Gameplay”的 private candidate。
-     * V1 查询返回 NULL；该槽位来自旧 reserved[0]，函数表总尺寸保持不变。 */
+     * Mode D opaque Core；没有 caller-owned input/output，也不跨调用借用额外指针。
+     * Single-thread: owner thread。Reentrant: no。成功仅替换 private candidate；
+     * 失败保持 candidate 与 live state 不变。V1 查询返回 NULL；该槽位来自旧
+     * reserved[0]，函数表总尺寸保持不变。 */
     int32_t (*prepare_no_gameplay_state)(kadath_runtime_core_t* core);
     uint64_t reserved[7];
 } kadath_runtime_gameplay_interface_v1_t;

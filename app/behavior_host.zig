@@ -196,9 +196,36 @@ pub const Runtime = struct {
     ) !void {
         if (batch.event_count == 0) return;
         const session = try self.beginPhase(generation, .frame);
+        var phase_closed = false;
+        errdefer if (!phase_closed) self.closeFailedPhase(generation, session);
         _ = try generation.core.submitPhaseEvents(batch.events[0..batch.event_count]);
         try self.settlePhase(generation, session, .{});
         try self.endPhase(generation, session);
+        phase_closed = true;
+    }
+
+    /// Scene/Behavior 已经完成权威切换后，startup event 只是 post-commit 副作用；
+    /// 它失败时记录并隔离，不能再把已提交事务对外误报为 rejected。
+    pub fn publishCommittedStartupEvents(
+        self: *Runtime,
+        generation: *scene_generation_api.SceneGeneration,
+        batch: *const TranslationBatch,
+    ) void {
+        self.publishStartupEvents(generation, batch) catch |err| {
+            std.log.warn("Committed startup event publication failed; active Scene retained: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn closeFailedPhase(
+        self: *Runtime,
+        generation: *scene_generation_api.SceneGeneration,
+        session: PhaseSession,
+    ) void {
+        const active = self.active_phase orelse return;
+        if (active.domain != session.domain or active.sequence != session.sequence) return;
+        self.endPhase(generation, session) catch |err| {
+            std.log.err("Failed to close Behavior phase after startup event error: {s}", .{@errorName(err)});
+        };
     }
 
     pub fn runFixed(

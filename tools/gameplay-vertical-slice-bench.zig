@@ -111,7 +111,7 @@ const Session = struct {
         transferred = true;
         previous_generation.deinit();
         previous_runtime.deinit();
-        try self.runtime.publishStartupEvents(&self.generation, &startup);
+        self.runtime.publishCommittedStartupEvents(&self.generation, &startup);
     }
 
     fn reload(self: *Session, reload_source: []const u8) !void {
@@ -138,7 +138,7 @@ const Session = struct {
         transferred = true;
         previous_generation.deinit();
         previous_runtime.deinit();
-        try self.runtime.publishStartupEvents(&self.generation, &startup);
+        self.runtime.publishCommittedStartupEvents(&self.generation, &startup);
     }
 };
 

@@ -1004,6 +1004,47 @@ test "event payload values cross the Core Phase seam without losing type or iden
     try std.testing.expectApproxEqAbs(@as(f32, 15), (try fixture.generation.objectPosition(1))[0], 0.0001);
 }
 
+test "committed startup event failure is isolated and releases the frame phase" {
+    const startup_manifest =
+        \\{"schemaVersion":2,"scripts":[
+        \\{"scriptId":1,"source":"scripts/startup.luau"},
+        \\{"scriptId":2,"source":"scripts/no-op.luau"}]}
+    ;
+    const startup_source =
+        \\--!strict
+        \\return { on_start = function(self: Kadath.Object)
+        \\    local goal = kadath.scene.find("goal")
+        \\    if not goal then error("missing goal") end
+        \\    kadath.event.post(goal, "startup")
+        \\end }
+    ;
+    const startup_scene =
+        \\{"schemaVersion":5,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
+        \\{"objectId":"goal","kind":"goal","transform":{"position":[10,20]},"sprite":{"size":[3,4],"color":[1,1,1,1],"textureId":1},"behaviors":[]},
+        \\{"objectId":"player","kind":"player","transform":{"position":[1,2]},"sprite":{"size":[8,9],"color":[1,1,1,1],"textureId":1},"player":{"moveSpeed":10},"behaviors":[{"scriptId":1,"parameters":{}}]},
+        \\{"objectId":"hazard-1","kind":"patrol_hazard","transform":{"position":[30,40]},"sprite":{"size":[5,6],"color":[1,0,0,1],"textureId":1},"behaviors":[{"scriptId":2,"parameters":{}}]}]}
+    ;
+    var fixture = try makeRuntimeFixture(
+        startup_manifest,
+        &.{
+            .{ .path = "scripts/startup.luau", .source = startup_source },
+            .{ .path = "scripts/no-op.luau", .source = no_op_source },
+        },
+        startup_scene,
+    );
+    defer fixture.deinit();
+
+    var startup = try fixture.runtime.onStart(&fixture.generation);
+    try std.testing.expectEqual(@as(usize, 1), startup.event_count);
+    // 注入 Core 拒绝的 generation，模拟 Scene 已 commit 后的事件发布故障。
+    startup.events[0].generation = runtime_core.max_phase_generation + 1;
+    fixture.runtime.publishCommittedStartupEvents(&fixture.generation, &startup);
+
+    // wrapper 必须吞掉 post-commit 故障并清理 frame phase，下一帧仍可进入/退出。
+    try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
+    try fixture.runtime.finishFrame(&fixture.generation, .{});
+}
+
 test "failed event handler keeps prior writes and later handlers continue" {
     const handler_manifest =
         \\{"schemaVersion":2,"scripts":[
@@ -1288,7 +1329,7 @@ fn restartVerticalFixture(fixture: *RuntimeFixture) !void {
     transferred = true;
     previous_generation.deinit();
     previous_runtime.deinit();
-    try fixture.runtime.publishStartupEvents(&fixture.generation, &startup);
+    fixture.runtime.publishCommittedStartupEvents(&fixture.generation, &startup);
 }
 
 fn reloadVerticalFixture(fixture: *RuntimeFixture) !void {
@@ -1315,7 +1356,7 @@ fn reloadVerticalFixture(fixture: *RuntimeFixture) !void {
     transferred = true;
     previous_generation.deinit();
     previous_runtime.deinit();
-    try fixture.runtime.publishStartupEvents(&fixture.generation, &startup);
+    fixture.runtime.publishCommittedStartupEvents(&fixture.generation, &startup);
 }
 
 fn runInitialVerticalSlice(first_move_y: i8) !InitialVerticalEvidence {

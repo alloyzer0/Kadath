@@ -464,7 +464,7 @@ pub const Host = struct {
             var previous = self.behavior_runtime;
             self.behavior_runtime = candidate;
             previous.deinit();
-            try self.behavior_runtime.publishStartupEvents(&self.generation, &batch);
+            self.behavior_runtime.publishCommittedStartupEvents(&self.generation, &batch);
             std.log.info("Behavior package reloaded explicitly", .{});
             return;
         }
@@ -561,7 +561,7 @@ pub const Host = struct {
         previous_generation.deinit();
         previous_registry.deinit(&self.rhi);
         previous_behavior.deinit();
-        if (candidate_startup) |*startup| try self.behavior_runtime.publishStartupEvents(&self.generation, startup);
+        if (candidate_startup) |*startup| self.behavior_runtime.publishCommittedStartupEvents(&self.generation, startup);
         if (candidate.gameplayEnabled()) {
             std.log.info("Scene reloaded explicitly: objects={d}, player={d}, goal={d}", .{
                 candidate.objects.count,
@@ -605,7 +605,7 @@ pub const Host = struct {
             self.behavior_runtime = candidate;
             previous_generation.deinit();
             previous_behavior.deinit();
-            try self.behavior_runtime.publishStartupEvents(&self.generation, &batch);
+            self.behavior_runtime.publishCommittedStartupEvents(&self.generation, &batch);
         } else {
             try self.generation.reset();
             self.resetScript() catch |err| self.disableScript(err);
