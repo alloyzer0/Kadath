@@ -167,17 +167,28 @@ pub const RuntimeTextureRegistry = struct {
 
 const UploadResult = union(enum) { loaded: [max_texture_count]rhi.TextureHandle, failed: struct { ordinal: usize, err: anyerror } };
 
-fn uploadTexture(allocator: std.mem.Allocator, renderer: *renderer2d.Renderer2D, backend: *rhi.Rhi, texture: *const resource.TextureData) !rhi.TextureHandle {
+fn uploadTexture(
+    allocator: std.mem.Allocator,
+    renderer: *renderer2d.Renderer2D,
+    backend: *rhi.Rhi,
+    texture: *const resource.TextureData,
+    sampling_profile: scene.TextureSamplingProfile,
+) !rhi.TextureHandle {
     const upload_mips = try allocator.alloc(rhi.TextureMipUpload, texture.mip_levels.len);
     defer allocator.free(upload_mips);
     for (texture.mip_levels, 0..) |level, index| upload_mips[index] = .{ .width = level.width, .height = level.height, .rgba8 = level.pixels_rgba8 };
-    return renderer.createTexture(backend, .{ .width = texture.width, .height = texture.height, .rgba8 = texture.pixels_rgba8, .mip_levels = upload_mips }, .smooth_mipmap_anisotropic);
+    return renderer.createTexture(backend, .{ .width = texture.width, .height = texture.height, .rgba8 = texture.pixels_rgba8, .mip_levels = upload_mips }, switch (sampling_profile) {
+        .pixel_art => .pixel_art,
+        .smooth_linear => .smooth_linear,
+        .smooth_mipmap => .smooth_mipmap,
+        .smooth_mipmap_anisotropic => .smooth_mipmap_anisotropic,
+    });
 }
 
 fn uploadTextureSet(allocator: std.mem.Allocator, renderer: *renderer2d.Renderer2D, backend: *rhi.Rhi, specs: []const scene.TextureSpec, textures: []const *const resource.TextureData) UploadResult {
     var handles = [_]rhi.TextureHandle{rhi.invalid_texture} ** max_texture_count;
-    for (specs, textures, 0..) |_, texture, ordinal| {
-        handles[ordinal] = uploadTexture(allocator, renderer, backend, texture) catch |err| {
+    for (specs, textures, 0..) |spec, texture, ordinal| {
+        handles[ordinal] = uploadTexture(allocator, renderer, backend, texture, spec.samplingProfile) catch |err| {
             for (handles[0..ordinal]) |handle| backend.destroyTexture(handle);
             return .{ .failed = .{ .ordinal = ordinal, .err = err } };
         };
@@ -205,6 +216,32 @@ fn mapResourceStage(stage: resource.AsyncTextureFailureStage) TextureRefreshFail
 
 fn testTextureData(allocator: std.mem.Allocator, rgba: [4]u8) !resource.TextureData {
     return .{ .width = 1, .height = 1, .pixels_rgba8 = try allocator.dupe(u8, &rgba) };
+}
+
+test "scene texture sampling profiles reach the RHI adapter" {
+    var backend = try rhi.Rhi.init(.{ .width = 64, .height = 64 });
+    defer backend.deinit();
+    const shader = [_]u8{ 0, 0, 0, 0 };
+    const pipeline = try backend.createGraphicsPipeline(.{ .vertex_shader = &shader, .fragment_shader = &shader, .push_constant_size = 48, .uses_texture = true });
+    var renderer = renderer2d.Renderer2D{ .pipeline = pipeline };
+    defer renderer.deinit(&backend);
+    var prepared = PreparedTextureSet{ .allocator = std.testing.allocator, .count = 2 };
+    prepared.specs[0] = scene.default_scene.textures.entries[0];
+    prepared.specs[0].samplingProfile = .pixel_art;
+    prepared.specs[1] = scene.default_scene.textures.entries[1];
+    prepared.specs[1].samplingProfile = .smooth_linear;
+    prepared.textures[0] = try testTextureData(std.testing.allocator, .{ 1, 2, 3, 255 });
+    prepared.textures[1] = try testTextureData(std.testing.allocator, .{ 4, 5, 6, 255 });
+    defer prepared.deinit();
+
+    var registry = try initPreparedWithoutRefresh(std.testing.allocator, &renderer, &backend, &prepared);
+    defer registry.deinit(&backend);
+    const stats = backend.stats();
+    try std.testing.expectEqualSlices(
+        rhi.TextureSamplerProfile,
+        &.{ .pixel_nearest, .smooth_linear },
+        stats.texture_sampler_trace[0..stats.texture_sampler_trace_len],
+    );
 }
 
 test "three scene textures publish and resolve" {

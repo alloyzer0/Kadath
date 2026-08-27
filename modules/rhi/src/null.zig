@@ -5,6 +5,7 @@ const max_pipelines: usize = 8;
 const max_textures: usize = 8;
 const max_texture_mip_levels: usize = 32;
 const max_draw_texture_trace: usize = 256;
+const max_instance_data_trace: usize = 4096;
 
 pub const Extent2D = types.Extent2D;
 pub const FrameOutcome = types.FrameOutcome;
@@ -12,6 +13,7 @@ pub const PipelineHandle = types.PipelineHandle;
 pub const invalid_pipeline = types.invalid_pipeline;
 pub const TextureHandle = types.TextureHandle;
 pub const invalid_texture = types.invalid_texture;
+pub const max_instance_data_bytes_per_binding = types.max_instance_data_bytes_per_binding;
 pub const max_instance_data_bytes_per_frame = types.max_instance_data_bytes_per_frame;
 pub const max_instance_data_bindings_per_frame = types.max_instance_data_bindings_per_frame;
 pub const TextureSamplerProfile = types.TextureSamplerProfile;
@@ -25,6 +27,7 @@ const PipelineSlot = struct {
 
 const TextureSlot = struct {
     live: bool = false,
+    sampler_profile: types.TextureSamplerProfile = .smooth_mipmap,
 };
 
 /// Null 只记录可观察的命令数量；这些信息不从生产 RHI 模块导出。
@@ -34,6 +37,8 @@ pub const NullStats = struct {
     push_constant_writes: u32 = 0,
     instance_data_binds: u32 = 0,
     instance_data_bytes: u32 = 0,
+    instance_data_trace: [max_instance_data_trace]u8 = [_]u8{0} ** max_instance_data_trace,
+    instance_data_trace_len: usize = 0,
     draws: u32 = 0,
     instances_drawn: u32 = 0,
     frames_finished: u32 = 0,
@@ -42,6 +47,8 @@ pub const NullStats = struct {
     textures_created: u32 = 0,
     textures_destroyed: u32 = 0,
     textures_live: u32 = 0,
+    texture_sampler_trace: [max_textures]types.TextureSamplerProfile = [_]types.TextureSamplerProfile{.smooth_mipmap} ** max_textures,
+    texture_sampler_trace_len: usize = 0,
     draw_texture_trace: [max_draw_texture_trace]types.TextureHandle = [_]types.TextureHandle{types.invalid_texture} ** max_draw_texture_trace,
     draw_texture_trace_len: usize = 0,
 };
@@ -96,6 +103,7 @@ pub const FrameEncoder = struct {
         if (desc.instance_data_stride == 0) return error.InstanceDataBindingUnsupported;
         const stride: usize = @intCast(desc.instance_data_stride);
         if (bytes.len == 0 or bytes.len % stride != 0) return error.InvalidInstanceDataSize;
+        if (bytes.len > types.max_instance_data_bytes_per_binding) return error.InstanceDataBindingSizeLimitReached;
         if (self.instance_data_binding_count >= types.max_instance_data_bindings_per_frame) {
             return error.InstanceDataBindingLimitReached;
         }
@@ -108,6 +116,13 @@ pub const FrameEncoder = struct {
         self.bound_instance_capacity = @intCast(bytes.len / stride);
         self.rhi.stats_value.instance_data_binds += 1;
         self.rhi.stats_value.instance_data_bytes += @intCast(bytes.len);
+        const trace_remaining = max_instance_data_trace - self.rhi.stats_value.instance_data_trace_len;
+        const trace_bytes = @min(trace_remaining, bytes.len);
+        if (trace_bytes != 0) {
+            const trace_start = self.rhi.stats_value.instance_data_trace_len;
+            @memcpy(self.rhi.stats_value.instance_data_trace[trace_start .. trace_start + trace_bytes], bytes[0..trace_bytes]);
+            self.rhi.stats_value.instance_data_trace_len += trace_bytes;
+        }
     }
 
     pub fn draw(self: *FrameEncoder, vertex_count: u32) !void {
@@ -211,7 +226,7 @@ pub const Rhi = struct {
             return error.InvalidShaderCode;
         }
         if (desc.instance_data_stride != 0 and
-            (desc.instance_data_stride % 4 != 0 or desc.instance_data_stride > types.max_instance_data_bytes_per_frame))
+            (desc.instance_data_stride % 4 != 0 or desc.instance_data_stride > types.max_instance_data_bytes_per_binding))
         {
             return error.InvalidInstanceDataStride;
         }
@@ -234,9 +249,13 @@ pub const Rhi = struct {
         _ = try textureUploadBytes(desc);
         for (&self.texture_slots, 0..) |*slot, index| {
             if (!slot.live) {
-                slot.live = true;
+                slot.* = .{ .live = true, .sampler_profile = desc.sampler_profile };
                 self.stats_value.textures_created += 1;
                 self.stats_value.textures_live += 1;
+                if (self.stats_value.texture_sampler_trace_len < max_textures) {
+                    self.stats_value.texture_sampler_trace[self.stats_value.texture_sampler_trace_len] = desc.sampler_profile;
+                    self.stats_value.texture_sampler_trace_len += 1;
+                }
                 return @intCast(index + 1);
             }
         }
@@ -585,7 +604,7 @@ test "null adapter separates ordinary and instanced pipeline contracts" {
     encoder.consumeFailedFrame();
 }
 
-test "null adapter enforces per-frame instance byte and binding budgets" {
+test "null adapter enforces per-frame instance binding count budget" {
     var rhi = try Rhi.init(.{ .width = 32, .height = 32 });
     defer rhi.deinit();
     const shader = [_]u8{ 0, 0, 0, 0 };
@@ -596,18 +615,8 @@ test "null adapter enforces per-frame instance byte and binding budgets" {
         .instance_data_stride = 4,
     });
 
-    const first = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
-    var byte_limited = switch (first) {
-        .ready => |value| value,
-        else => return error.TestUnexpectedResult,
-    };
-    try byte_limited.bindPipeline(pipeline);
-    try byte_limited.bindInstanceData(&([_]u8{0} ** types.max_instance_data_bytes_per_frame));
-    try std.testing.expectError(error.InstanceDataFrameLimitReached, byte_limited.bindInstanceData(&([_]u8{0} ** 4)));
-    byte_limited.consumeFailedFrame();
-
-    const second = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
-    var binding_limited = switch (second) {
+    const begin = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
+    var binding_limited = switch (begin) {
         .ready => |value| value,
         else => return error.TestUnexpectedResult,
     };
@@ -617,4 +626,33 @@ test "null adapter enforces per-frame instance byte and binding budgets" {
     }
     try std.testing.expectError(error.InstanceDataBindingLimitReached, binding_limited.bindInstanceData(&([_]u8{0} ** 4)));
     binding_limited.consumeFailedFrame();
+}
+
+test "null adapter separates per-binding and per-frame instance budgets" {
+    var rhi = try Rhi.init(.{ .width = 32, .height = 32 });
+    defer rhi.deinit();
+    const shader = [_]u8{ 0, 0, 0, 0 };
+    const pipeline = try rhi.createGraphicsPipeline(.{
+        .vertex_shader = &shader,
+        .fragment_shader = &shader,
+        .push_constant_size = 48,
+        .instance_data_stride = 48,
+    });
+
+    const begin = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
+    var encoder = switch (begin) {
+        .ready => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try encoder.bindPipeline(pipeline);
+    try std.testing.expectError(
+        error.InstanceDataBindingSizeLimitReached,
+        encoder.bindInstanceData(&([_]u8{0} ** (types.max_instance_data_bytes_per_binding + 48))),
+    );
+    for (0..10) |_| {
+        try encoder.bindInstanceData(&([_]u8{0} ** types.max_instance_data_bytes_per_binding));
+    }
+    try encoder.bindInstanceData(&([_]u8{0} ** 4080));
+    try std.testing.expectError(error.InstanceDataFrameLimitReached, encoder.bindInstanceData(&([_]u8{0} ** 48)));
+    encoder.consumeFailedFrame();
 }

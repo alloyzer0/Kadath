@@ -259,9 +259,14 @@ public sealed record ProjectModelScene(
     string GameplayProfile = "goal_hazard_v1",
     double? GameplayTimeLimitSeconds = null,
     // Prototype 不是 Scene Object；通过独立只读集合公开，不能投影为 Hierarchy node。
-    IReadOnlyList<ProjectModelScenePrototype>? Prototypes = null);
+    IReadOnlyList<ProjectModelScenePrototype>? Prototypes = null,
+    // Tilemap 是独立的静态背景创作域，不进入 Scene Object / Hierarchy 身份域。
+    IReadOnlyList<ProjectModelSceneTilemap>? Tilemaps = null);
 
-public sealed record ProjectModelTexture(uint TextureId, string Artifact);
+public sealed record ProjectModelTexture(
+    uint TextureId,
+    string Artifact,
+    string SamplingProfile = "smooth_mipmap_anisotropic");
 
 public sealed record ProjectModelSceneBehaviorParameter(string Name, double Value);
 
@@ -289,6 +294,17 @@ public sealed record ProjectModelScenePrototype(
     double[] Color,
     uint TextureId,
     IReadOnlyList<ProjectModelSceneBehaviorBinding>? Behaviors = null);
+
+public sealed record ProjectModelSceneTilemap(
+    string TilemapId,
+    double[] Origin,
+    double[] TileSize,
+    int Columns,
+    int Rows,
+    uint TextureId,
+    int AtlasColumns,
+    int AtlasRows,
+    IReadOnlyList<int> Cells);
 
 public sealed record ProjectModelScriptDependency(uint ScriptId, string Source);
 
@@ -394,7 +410,8 @@ public sealed record TextureImportResult(
 
 public sealed record SceneTextureAssignment(
     uint TextureId,
-    string AssetId);
+    string AssetId,
+    string SamplingProfile = "smooth_mipmap_anisotropic");
 
 public sealed record SceneObjectDefinition(
     string ObjectId,
@@ -417,6 +434,17 @@ public sealed record ScenePrototypeDefinition(
     uint TextureId,
     IReadOnlyList<SceneBehaviorBindingDefinition>? Behaviors = null);
 
+public sealed record SceneTilemapDefinition(
+    string TilemapId,
+    double[] Origin,
+    double[] TileSize,
+    int Columns,
+    int Rows,
+    uint TextureId,
+    int AtlasColumns,
+    int AtlasRows,
+    IReadOnlyList<int> Cells);
+
 public sealed record SceneBehaviorBindingDefinition(
     uint ScriptId,
     IReadOnlyDictionary<string, double>? Parameters = null);
@@ -432,7 +460,8 @@ public sealed record AuthoringPatch(
     IReadOnlyList<SceneObjectDefinition>? SceneObjects = null,
     string? SceneGameplayProfile = null,
     double? SceneGameplayTimeLimitSeconds = null,
-    IReadOnlyList<ScenePrototypeDefinition>? ScenePrototypes = null);
+    IReadOnlyList<ScenePrototypeDefinition>? ScenePrototypes = null,
+    IReadOnlyList<SceneTilemapDefinition>? SceneTilemaps = null);
 
 public sealed record AuthoringApplyParameters(
     string? ProjectName,

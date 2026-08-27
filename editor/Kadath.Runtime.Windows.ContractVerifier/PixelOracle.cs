@@ -36,25 +36,29 @@ internal static class PixelOracle
     private static readonly double[] ClearLinear = [0.035, 0.10, 0.22];
     private static readonly double[] WhiteTint = [1.0, 1.0, 1.0, 1.0];
     private static readonly double[] GoalTint = [1.0, 0.75, 0.1, 1.0];
-    private static readonly double[] DecorationTint = [0.45, 0.65, 1.0, 0.8];
 
     private static readonly (string Name, int X, int Y)[] LogicalPoints =
     [
-        ("Background", 100, 100),
+        // Tilemap 内部、重复 Tile 与相邻边缘均取样；边缘点能直接捕获线性采样串色。
+        ("OutsideMap", 900, 100),
+        ("Tile1", 100, 100),
+        ("Tile2", 200, 100),
+        ("Tile2Repeat", 800, 100),
+        ("Tile3", 100, 240),
+        ("TileEmpty", 200, 240),
+        ("Tile4", 280, 240),
+        ("Tile2Edge", 449, 100),
+        ("Tile1Edge", 451, 100),
         ("Alpha0", 392, 190),
         ("Alpha64", 552, 190),
         ("Alpha128", 392, 310),
         ("Alpha255", 552, 310),
-        ("GoalBR", 772, 272),
-        ("DecorationTL", 120, 440),
-        ("DecorationTR", 160, 440),
-        ("DecorationBL", 120, 480),
-        ("DecorationBR", 160, 480)
+        ("GoalBR", 772, 272)
     ];
 
     public static PixelMapping CreateMapping(int clientWidth, int clientHeight, int renderWidth, int renderHeight)
     {
-        if (renderWidth <= 772 || renderHeight <= 480)
+        if (renderWidth <= 900 || renderHeight <= 310)
             throw Product($"Runtime render extent is too small for frozen logical samples: {renderWidth}x{renderHeight}");
         var scaleX = clientWidth / (double)renderWidth;
         var scaleY = clientHeight / (double)renderHeight;
@@ -96,18 +100,23 @@ internal static class PixelOracle
 
         var expected = new Dictionary<string, Rgb>(StringComparer.Ordinal)
         {
-            ["Background"] = Composite([0, 0, 0, 0], WhiteTint, swapchainFormat),
-            ["Alpha0"] = Composite(PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
-            ["Alpha64"] = Composite(PrimaryBase.AsSpan(4, 4), WhiteTint, swapchainFormat),
-            ["Alpha128"] = Composite(PrimaryBase.AsSpan(8, 4), WhiteTint, swapchainFormat),
-            ["Alpha255"] = Composite(PrimaryBase.AsSpan(12, 4), WhiteTint, swapchainFormat),
-            ["GoalBR"] = Composite(GoalBase.AsSpan(12, 4), GoalTint, swapchainFormat),
-            ["DecorationTL"] = Composite(GoalBase.AsSpan(0, 4), DecorationTint, swapchainFormat),
-            ["DecorationTR"] = Composite(GoalBase.AsSpan(4, 4), DecorationTint, swapchainFormat),
-            ["DecorationBL"] = Composite(GoalBase.AsSpan(8, 4), DecorationTint, swapchainFormat),
-            ["DecorationBR"] = Composite(GoalBase.AsSpan(12, 4), DecorationTint, swapchainFormat)
+            ["OutsideMap"] = Composite(PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
+            ["Tile1"] = Composite(PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
+            ["Tile2"] = Composite(PrimaryBase.AsSpan(4, 4), WhiteTint, swapchainFormat),
+            ["Tile2Repeat"] = Composite(PrimaryBase.AsSpan(4, 4), WhiteTint, swapchainFormat),
+            ["Tile3"] = Composite(PrimaryBase.AsSpan(8, 4), WhiteTint, swapchainFormat),
+            ["TileEmpty"] = Composite(PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
+            ["Tile4"] = Composite(PrimaryBase.AsSpan(12, 4), WhiteTint, swapchainFormat),
+            ["Tile2Edge"] = Composite(PrimaryBase.AsSpan(4, 4), WhiteTint, swapchainFormat),
+            ["Tile1Edge"] = Composite(PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
+            // Player 在 Tilemap 之后绘制；半透明 texel 必须与各自背景 Tile 做二层合成。
+            ["Alpha0"] = CompositeOver(PrimaryBase.AsSpan(0, 4), WhiteTint, PrimaryBase.AsSpan(8, 4), WhiteTint, swapchainFormat),
+            ["Alpha64"] = CompositeOver(PrimaryBase.AsSpan(4, 4), WhiteTint, PrimaryBase.AsSpan(12, 4), WhiteTint, swapchainFormat),
+            ["Alpha128"] = CompositeOver(PrimaryBase.AsSpan(8, 4), WhiteTint, PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
+            ["Alpha255"] = CompositeOver(PrimaryBase.AsSpan(12, 4), WhiteTint, PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
+            ["GoalBR"] = CompositeOver(GoalBase.AsSpan(12, 4), GoalTint, PrimaryBase.AsSpan(12, 4), WhiteTint, swapchainFormat)
         };
-        AssertFrozenGoalOracle(expected, swapchainFormat);
+        AssertFrozenDynamicOracle(expected, swapchainFormat);
 
         var points = new Dictionary<string, PixelPointEvidence>(StringComparer.Ordinal);
         foreach (var (name, coordinates) in mapping.Points)
@@ -124,14 +133,18 @@ internal static class PixelOracle
                 actual.MaximumChannelDifference(expectedValue)));
         }
 
-        var compositeMaximum = new[] { "Background", "Alpha0", "Alpha64", "Alpha128", "Alpha255" }
+        var compositeMaximum = new[]
+            { "OutsideMap", "Tile1", "Tile2", "Tile2Repeat", "Tile3", "TileEmpty", "Tile4", "Tile2Edge", "Tile1Edge" }
             .Max(name => points[name].MaximumChannelError);
-        // GoalBR 冻结目标实体的 tint/placement；固定 decoration 复用同一 texture，提供无遮挡的完整四 texel oracle。
-        var goalMaximum = new[]
-            { "GoalBR", "DecorationTL", "DecorationTR", "DecorationBL", "DecorationBR" }
+        // Player 的四个 texel同时冻结背景优先顺序；GoalBR 保留第二纹理与 tint 回归。
+        var goalMaximum = new[] { "Alpha0", "Alpha64", "Alpha128", "Alpha255", "GoalBR" }
             .Max(name => points[name].MaximumChannelError);
-        var coarseAlpha = points["Alpha0"].Actual.MaximumChannelDifference(points["Background"].Actual) <= 24
-            && points["Alpha255"].Actual is { R: >= 230, G: >= 230, B: >= 230 };
+        var atlasSeams = points["Tile1"].Actual.MaximumChannelDifference(points["OutsideMap"].Actual) <= 8
+            && points["TileEmpty"].Actual.MaximumChannelDifference(points["OutsideMap"].Actual) <= 8
+            && points["Tile2Repeat"].Actual.MaximumChannelDifference(points["Tile2"].Actual) <= 8
+            && points["Tile2Edge"].Actual.MaximumChannelDifference(points["Tile2"].Actual) <= 8
+            && points["Tile1Edge"].Actual.MaximumChannelDifference(points["Tile1"].Actual) <= 8
+            && points["Tile4"].Actual is { R: >= 230, G: >= 230, B: >= 230 };
 
         var colors = new HashSet<int>();
         long nonBlack = 0;
@@ -146,7 +159,7 @@ internal static class PixelOracle
         var nonEmpty = colors.Count >= 8 && nonBlack >= 1_000;
         return new PixelEvidence
         {
-            Passed = nonEmpty && coarseAlpha && compositeMaximum <= 8 && goalMaximum <= 24,
+            Passed = nonEmpty && atlasSeams && compositeMaximum <= 8 && goalMaximum <= 24,
             NonEmpty = nonEmpty,
             DistinctColorCount = colors.Count,
             NonBlackPixelCount = nonBlack,
@@ -189,13 +202,41 @@ internal static class PixelOracle
     }
 
     private static Rgb Composite(ReadOnlySpan<byte> source, double[] tint, uint format)
+        => CompositeLayers(source, tint, default, default, format, hasBackgroundLayer: false);
+
+    private static Rgb CompositeOver(
+        ReadOnlySpan<byte> source,
+        double[] tint,
+        ReadOnlySpan<byte> backgroundSource,
+        double[] backgroundTint,
+        uint format)
+        => CompositeLayers(source, tint, backgroundSource, backgroundTint, format, hasBackgroundLayer: true);
+
+    private static Rgb CompositeLayers(
+        ReadOnlySpan<byte> source,
+        double[] tint,
+        ReadOnlySpan<byte> backgroundSource,
+        double[]? backgroundTint,
+        uint format,
+        bool hasBackgroundLayer)
     {
+        Span<double> backgroundLinear = stackalloc double[3];
+        ClearLinear.CopyTo(backgroundLinear);
+        if (hasBackgroundLayer)
+        {
+            var backgroundAlpha = backgroundSource[3] / 255.0 * backgroundTint![3];
+            for (var channel = 0; channel < 3; channel++)
+            {
+                backgroundLinear[channel] = SrgbByteToLinear(backgroundSource[channel]) * backgroundTint[channel] * backgroundAlpha
+                    + backgroundLinear[channel] * (1.0 - backgroundAlpha);
+            }
+        }
         var alpha = source[3] / 255.0 * tint[3];
         Span<int> output = stackalloc int[3];
         for (var channel = 0; channel < 3; channel++)
         {
             var sourceLinear = SrgbByteToLinear(source[channel]) * tint[channel];
-            var outputLinear = sourceLinear * alpha + ClearLinear[channel] * (1.0 - alpha);
+            var outputLinear = sourceLinear * alpha + backgroundLinear[channel] * (1.0 - alpha);
             output[channel] = format == 50
                 ? LinearToSrgbByte(outputLinear)
                 : (int)Math.Round(255.0 * Math.Clamp(outputLinear, 0.0, 1.0), MidpointRounding.AwayFromZero);
@@ -220,24 +261,24 @@ internal static class PixelOracle
         return (int)Math.Round(255.0 * encoded, MidpointRounding.AwayFromZero);
     }
 
-    private static void AssertFrozenGoalOracle(IReadOnlyDictionary<string, Rgb> expected, uint format)
+    private static void AssertFrozenDynamicOracle(IReadOnlyDictionary<string, Rgb> expected, uint format)
     {
         var frozen = format == 50
             ? new Dictionary<string, Rgb>
             {
                 ["GoalBR"] = new(255, 225, 89),
-                ["DecorationTL"] = new(163, 39, 237),
-                ["DecorationTR"] = new(20, 194, 237),
-                ["DecorationBL"] = new(20, 39, 59),
-                ["DecorationBR"] = new(163, 194, 237)
+                ["Alpha0"] = new(36, 63, 205),
+                ["Alpha64"] = new(224, 255, 224),
+                ["Alpha128"] = new(36, 63, 205),
+                ["Alpha255"] = new(255, 255, 255)
             }
             : new Dictionary<string, Rgb>
             {
                 ["GoalBR"] = new(255, 191, 26),
-                ["DecorationTL"] = new(94, 5, 215),
-                ["DecorationTR"] = new(2, 138, 215),
-                ["DecorationBL"] = new(2, 5, 11),
-                ["DecorationBR"] = new(94, 138, 215)
+                ["Alpha0"] = new(4, 13, 156),
+                ["Alpha64"] = new(191, 255, 191),
+                ["Alpha128"] = new(4, 13, 156),
+                ["Alpha255"] = new(255, 255, 255)
             };
         foreach (var (name, color) in frozen)
         {

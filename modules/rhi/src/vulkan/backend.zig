@@ -10,6 +10,7 @@ const api_version: u32 = 1 << 22;
 const max_pipelines: usize = 8;
 const max_textures: usize = 8;
 const max_texture_mip_levels: usize = 32;
+const max_instance_data_bytes_per_binding = types.max_instance_data_bytes_per_binding;
 const max_instance_data_bytes_per_frame = types.max_instance_data_bytes_per_frame;
 const max_instance_data_bindings_per_frame = types.max_instance_data_bindings_per_frame;
 
@@ -145,6 +146,7 @@ pub const FrameEncoder = struct {
         if (desc.instance_data_stride == 0) return error.InstanceDataBindingUnsupported;
         const stride: usize = @intCast(desc.instance_data_stride);
         if (bytes.len == 0 or bytes.len % stride != 0) return error.InvalidInstanceDataSize;
+        if (bytes.len > max_instance_data_bytes_per_binding) return error.InstanceDataBindingSizeLimitReached;
         if (self.instance_data_binding_count >= max_instance_data_bindings_per_frame) {
             return error.InstanceDataBindingLimitReached;
         }
@@ -155,7 +157,7 @@ pub const FrameEncoder = struct {
         const mapped: [*]u8 = @ptrCast(self.rhi.instance_data_mapped orelse return error.InstanceDataUnavailable);
         // 同一 command buffer 的后续上传不能覆盖先前 draw；每批使用独立且设备对齐的 dynamic offset。
         const offset = std.mem.alignForward(usize, self.instance_data_cursor, self.rhi.instance_data_alignment);
-        if (offset + max_instance_data_bytes_per_frame > self.rhi.instance_data_arena_bytes) {
+        if (offset + max_instance_data_bytes_per_binding > self.rhi.instance_data_arena_bytes) {
             return error.InstanceDataArenaExhausted;
         }
         @memcpy(mapped[offset .. offset + bytes.len], bytes);
@@ -338,7 +340,7 @@ pub const Rhi = struct {
             return error.InvalidShaderCode;
         }
         if (desc.instance_data_stride != 0 and
-            (desc.instance_data_stride % 4 != 0 or desc.instance_data_stride > max_instance_data_bytes_per_frame))
+            (desc.instance_data_stride % 4 != 0 or desc.instance_data_stride > max_instance_data_bytes_per_binding))
         {
             return error.InvalidInstanceDataStride;
         }
@@ -991,11 +993,8 @@ pub const Rhi = struct {
         ));
         // beginFrame 等待唯一 in-flight fence，故 arena 可跨帧复用；帧内则为每次 bind 预留 alignment padding。
         const padding = try std.math.mul(usize, max_instance_data_bindings_per_frame, alignment);
-        const arena_bytes = try std.math.add(
-            usize,
-            max_instance_data_bytes_per_frame * 2,
-            padding,
-        );
+        const raw_and_tail = try std.math.add(usize, max_instance_data_bytes_per_frame, max_instance_data_bytes_per_binding);
+        const arena_bytes = try std.math.add(usize, raw_and_tail, padding);
 
         const allocation = try self.createBuffer(
             arena_bytes,
@@ -1031,7 +1030,7 @@ pub const Rhi = struct {
         descriptor_buffer.buffer = allocation.buffer;
         descriptor_buffer.offset = 0;
         // 固定 range 让任一 dynamic offset 都可读取完整单批；arena 尾部额外预留同等范围。
-        descriptor_buffer.range = max_instance_data_bytes_per_frame;
+        descriptor_buffer.range = max_instance_data_bytes_per_binding;
         var write = std.mem.zeroes(c.VkWriteDescriptorSet);
         write.sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = descriptor_set;

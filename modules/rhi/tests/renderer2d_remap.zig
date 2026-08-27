@@ -10,9 +10,9 @@ test "Renderer2D compiles and renders through the Null RHI module remap" {
     const pipeline = try backend.createGraphicsPipeline(.{
         .vertex_shader = &shader,
         .fragment_shader = &shader,
-        .push_constant_size = 32,
+        .push_constant_size = 48,
         .uses_texture = true,
-        .instance_data_stride = 32,
+        .instance_data_stride = 48,
     });
     const pixels = [_]u8{ 255, 255, 255, 255 };
     const texture = try backend.createTexture(.{ .width = 1, .height = 1, .rgba8 = &pixels });

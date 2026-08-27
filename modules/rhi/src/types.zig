@@ -15,9 +15,10 @@ pub const invalid_pipeline: PipelineHandle = 0;
 pub const TextureHandle = u32;
 pub const invalid_texture: TextureHandle = 0;
 
-/// 单帧实例上传保持有界；当前 128 个 Renderer2D Sprite × 32 bytes 正好填满。
-pub const max_instance_data_bytes_per_frame: usize = 4096;
-pub const max_instance_data_bindings_per_frame: usize = 128;
+/// 每次绑定最多携带 128 个 48-byte Quad instance；整帧容量同时覆盖 1024 Tile 与 128 Sprite。
+pub const max_instance_data_bytes_per_binding: usize = 6144;
+pub const max_instance_data_bytes_per_frame: usize = 65536;
+pub const max_instance_data_bindings_per_frame: usize = 256;
 
 pub const TextureSamplerProfile = enum {
     pixel_nearest,

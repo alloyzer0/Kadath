@@ -527,7 +527,7 @@ internal static class ProjectLifecycleVerifier
         var created = await lifecycle.CreateAsync(new ProjectCreateParameters(packageRoot, "behavior-created"), default);
         var createdDependencyPath = Path.Combine(created.ProjectDirectory, "scripts", "patrol.luau");
         var createdPlayerControllerPath = Path.Combine(created.ProjectDirectory, "scripts", "player_controller.luau");
-        Require(File.ReadAllBytes(created.ScenePath).AsSpan().SequenceEqual(scene), "Behavior Create did not preserve the Scene v6 template.");
+        Require(File.ReadAllBytes(created.ScenePath).AsSpan().SequenceEqual(scene), "Behavior Create did not preserve the Scene v8 template.");
         Require(File.ReadAllBytes(created.ScriptPath).AsSpan().SequenceEqual(script), "Behavior Create did not preserve the Script v2 manifest.");
         Require(File.ReadAllBytes(createdDependencyPath).AsSpan().SequenceEqual(patrol), "Behavior Create did not copy the declared Luau dependency.");
         Require(File.ReadAllBytes(createdPlayerControllerPath).AsSpan().SequenceEqual(playerController),
@@ -535,20 +535,25 @@ internal static class ProjectLifecycleVerifier
         Require(!File.Exists(Path.Combine(created.ProjectDirectory, ".kadath-create-claim")), "Behavior Create left an ownership claim.");
         using (var document = JsonDocument.Parse(File.ReadAllBytes(created.ScenePath)))
         {
-            Require(document.RootElement.GetProperty("schemaVersion").GetInt32() == 6, "Behavior Create did not produce Scene v6.");
+            Require(document.RootElement.GetProperty("schemaVersion").GetInt32() == 8, "Behavior Create did not produce Scene v8.");
             Require(document.RootElement.GetProperty("prototypes").EnumerateArray().Single().GetProperty("prototypeId").GetString() == "runtime-orb",
-                "Behavior Create did not preserve the Scene v6 prototype.");
+                "Behavior Create did not preserve the Scene v8 prototype.");
+            Require(document.RootElement.GetProperty("tilemaps").EnumerateArray().Single().GetProperty("tilemapId").GetString() == "background",
+                "Behavior Create did not preserve the Scene v8 Tilemap.");
         }
         var sceneArtifact = WorkspaceSceneCodec.EncodeSource(File.ReadAllBytes(created.ScenePath));
         var sceneInfo = WorkspaceSceneCodec.ValidateArtifact(sceneArtifact);
-        Require(sceneInfo.Format == "KSCN-SCENE-V6" && sceneInfo.ImporterVersion == 6 && sceneInfo.BakerVersion == 6,
-            "Behavior Create Scene did not encode as KSCN v6.");
+        Require(sceneInfo.Format == "KSCN-SCENE-V8" && sceneInfo.ImporterVersion == 8 && sceneInfo.BakerVersion == 8,
+            "Behavior Create Scene did not encode as KSCN v8.");
         Require(WorkspaceScriptDependencySet.ComputeRevision(created.ScriptPath).Length == 64,
             "Behavior Create Script dependency revision is invalid.");
         var readModel = new WorkspaceReadModel();
         var snapshot = await readModel.ReadProjectAsync(created, default);
-        Require(snapshot.Scene.SchemaVersion == 6 && snapshot.Script.SchemaVersion == 2,
-            "Behavior ReadModel did not preserve v6/v2 schema versions.");
+        Require(snapshot.Scene.SchemaVersion == 8 && snapshot.Script.SchemaVersion == 2,
+            "Behavior ReadModel did not preserve v8/v2 schema versions.");
+        Require(snapshot.Scene.Tilemaps is [{ TilemapId: "background", Columns: 8, Rows: 5 }]
+            && snapshot.Scene.Textures?[0].SamplingProfile == "pixel_art",
+            "Behavior ReadModel did not expose the Scene v8 Tilemap/profile.");
         Require(snapshot.Script.Dependencies?.Select(value => (value.ScriptId, value.Source))
                 .SequenceEqual([(1u, "scripts/patrol.luau"), (2u, "scripts/player_controller.luau")]) == true,
             "Behavior ReadModel did not expose Script dependency metadata.");
@@ -585,7 +590,7 @@ internal static class ProjectLifecycleVerifier
                 .ToArray();
             var nonBehaviorEdit = await authoring.ApplyAsync(created, snapshot.AuthoringRevision,
                 new AuthoringPatch(SceneObjects: nonBehaviorObjects), default);
-            Require(nonBehaviorEdit.State == "succeeded", "Scene v6 non-behavior edit incorrectly required the Behavior Tool.");
+            Require(nonBehaviorEdit.State == "succeeded", "Scene v8 non-behavior edit incorrectly required the Behavior Tool.");
             var nonBehaviorUndo = await authoring.UndoAsync(created, nonBehaviorEdit.Revision, nonBehaviorEdit.UndoToken!, default);
             snapshot = nonBehaviorUndo.ProjectSnapshot;
 
@@ -596,7 +601,7 @@ internal static class ProjectLifecycleVerifier
             var nonBehaviorPrototypeEdit = await authoring.ApplyAsync(created, snapshot.AuthoringRevision,
                 new AuthoringPatch(ScenePrototypes: nonBehaviorPrototypes), default);
             Require(nonBehaviorPrototypeEdit.State == "succeeded",
-                "Scene v6 non-behavior Prototype edit incorrectly required the Behavior Tool.");
+                "Scene v8 non-behavior Prototype edit incorrectly required the Behavior Tool.");
             var nonBehaviorPrototypeUndo = await authoring.UndoAsync(
                 created,
                 nonBehaviorPrototypeEdit.Revision,
@@ -657,16 +662,18 @@ internal static class ProjectLifecycleVerifier
             .ToArray();
         var edit = await authoring.ApplyAsync(created, snapshot.AuthoringRevision,
             new AuthoringPatch(SceneObjects: editedObjects), default);
-        Require(edit.State == "succeeded" && edit.ProjectSnapshot.Scene.SchemaVersion == 6
+        Require(edit.State == "succeeded" && edit.ProjectSnapshot.Scene.SchemaVersion == 8
             && edit.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == "hazard-1").Behaviors!.Single(value => value.ScriptId == 1).Parameters!.Single(value => value.Name == "speed").Value == 96,
-            "Behavior Authoring did not preserve and update Scene v6 binding parameters.");
+            "Behavior Authoring did not preserve and update Scene v8 binding parameters.");
         using (var editedScene = JsonDocument.Parse(File.ReadAllBytes(created.ScenePath)))
         {
-            Require(editedScene.RootElement.GetProperty("schemaVersion").GetInt32() == 6
+            Require(editedScene.RootElement.GetProperty("schemaVersion").GetInt32() == 8
                 && editedScene.RootElement.GetProperty("objects")[2].GetProperty("behaviors")[0].GetProperty("parameters").GetProperty("speed").GetDouble() == 96,
-                "Behavior Authoring serialized an invalid Scene v6 document.");
+                "Behavior Authoring serialized an invalid Scene v8 document.");
             Require(editedScene.RootElement.GetProperty("prototypes").EnumerateArray().Single().GetProperty("prototypeId").GetString() == "runtime-orb",
-                "Behavior Authoring dropped the Scene v6 prototype.");
+                "Behavior Authoring dropped the Scene v8 prototype.");
+            Require(editedScene.RootElement.GetProperty("tilemaps").EnumerateArray().Single().GetProperty("cells").GetArrayLength() == 40,
+                "Behavior Authoring dropped the Scene v8 Tilemap.");
         }
         var undo = await authoring.UndoAsync(created, edit.Revision, edit.UndoToken!, default);
         Require(undo.State == "succeeded" && undo.ProjectSnapshot.Scene.Objects!.Single(value => value.ObjectId == "hazard-1").Behaviors!.Single(value => value.ScriptId == 1).Parameters!.Single(value => value.Name == "speed").Value == 80,

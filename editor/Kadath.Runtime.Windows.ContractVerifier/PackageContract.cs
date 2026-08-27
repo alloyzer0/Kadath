@@ -71,7 +71,7 @@ internal sealed class PackageContract
             ValidateScriptContract(
                 paths["bin/assets/scripts/preview.script.json"],
                 paths["bin/assets/scripts/player_controller.luau"]);
-            ValidateArtifactHeader(paths["bin/assets/scenes/preview.scene"], "KSCN", 6, 6, "Scene artifact");
+            ValidateArtifactHeader(paths["bin/assets/scenes/preview.scene"], "KSCN", 8, 8, "Scene artifact");
             ValidateBehaviorArtifactHeader(paths["bin/assets/scripts/preview.script"]);
             ValidateFrozenTextures(paths);
             ValidateCanonicalAudio(paths, "won", "Won audio");
@@ -161,11 +161,11 @@ internal sealed class PackageContract
         var root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object
             || !root.TryGetProperty("schemaVersion", out var schema)
-            || schema.GetInt32() != 6
+            || schema.GetInt32() != 8
             || !root.TryGetProperty("objects", out var objects)
             || objects.ValueKind != JsonValueKind.Array)
         {
-            throw Product("Scene source must be schema v6 with an objects array.");
+            throw Product("Scene source must be schema v8 with an objects array.");
         }
 
         JsonElement? player = null;
@@ -182,13 +182,31 @@ internal sealed class PackageContract
             || !behaviors.EnumerateArray().Any(value =>
                 value.TryGetProperty("scriptId", out var scriptId) && scriptId.TryGetUInt32(out var id) && id == 2))
         {
-            throw Product("Scene v6 must bind Player movement to behavior scriptId 2 and contain one Goal.");
+            throw Product("Scene v8 must bind Player movement to behavior scriptId 2 and contain one Goal.");
         }
         if (!root.TryGetProperty("prototypes", out var prototypes)
             || prototypes.ValueKind != JsonValueKind.Array
             || !prototypes.EnumerateArray().Any(value =>
                 value.TryGetProperty("prototypeId", out var prototypeId) && prototypeId.GetString() == "runtime-orb"))
-            throw Product("Scene v6 must contain the runtime-orb spawn prototype.");
+            throw Product("Scene v8 must contain the runtime-orb spawn prototype.");
+
+        if (!root.TryGetProperty("textures", out var textures)
+            || textures.ValueKind != JsonValueKind.Array
+            || !textures.EnumerateArray().Any(value =>
+                value.GetProperty("textureId").GetUInt32() == 1
+                && value.GetProperty("samplingProfile").GetString() == "pixel_art"))
+            throw Product("Scene v8 must expose the pixel_art atlas texture profile.");
+        if (!root.TryGetProperty("tilemaps", out var tilemaps)
+            || tilemaps.ValueKind != JsonValueKind.Array
+            || tilemaps.EnumerateArray().SingleOrDefault() is not { ValueKind: JsonValueKind.Object } tilemap
+            || tilemap.GetProperty("tilemapId").GetString() != "background"
+            || tilemap.GetProperty("columns").GetInt32() != 8
+            || tilemap.GetProperty("rows").GetInt32() != 5
+            || tilemap.GetProperty("atlasColumns").GetInt32() != 2
+            || tilemap.GetProperty("atlasRows").GetInt32() != 2
+            || tilemap.GetProperty("cells").GetArrayLength() != 40
+            || !tilemap.GetProperty("cells").EnumerateArray().Any(value => value.GetInt32() == 0))
+            throw Product("Scene v8 must contain the frozen 8x5 background Tilemap with empty cells.");
     }
 
     private static void ValidateScriptContract(string manifestPath, string playerSourcePath)

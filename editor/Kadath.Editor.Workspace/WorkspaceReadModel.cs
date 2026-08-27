@@ -257,7 +257,7 @@ public sealed class WorkspaceReadModel
         var scriptVersion = RequireInt32(script, "schemaVersion", "Script");
         var previewVersion = RequireInt32(preview, "schemaVersion", "Preview");
         if (scriptVersion is not (1 or 2) || previewVersion != 1) throw Input("Snapshot project/model schema version is unsupported.");
-        var textures = scene.Textures.Select(value => new ProjectModelTexture(value.TextureId, value.Artifact)).ToArray();
+        var textures = scene.Textures.Select(value => new ProjectModelTexture(value.TextureId, value.Artifact, value.SamplingProfile)).ToArray();
         var objects = scene.Objects.Select(value => value.ToProjectModel()).ToArray();
         var player = scene.Player;
         var goal = scene.Goal;
@@ -298,7 +298,8 @@ public sealed class WorkspaceReadModel
                 objects,
                 scene.Gameplay.Profile,
                 scene.Gameplay.IsEnabled ? scene.Gameplay.TimeLimitSeconds : null,
-                scene.Prototypes.Select(prototype => prototype.ToProjectModel()).ToArray()),
+                scene.Prototypes.Select(prototype => prototype.ToProjectModel()).ToArray(),
+                scene.Tilemaps.Select(tilemap => tilemap.ToProjectModel()).ToArray()),
             new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity, dependencies), new ProjectModelPreview(previewVersion));
     }
 

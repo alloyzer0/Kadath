@@ -20,8 +20,9 @@ kadath.exe
 -----------------
 
 - `bin\assets\scenes\preview.scene.json` 是 Scene authoring 源，
-  `bin\assets\scenes\preview.scene` 是 Runtime 消费的 KSCN v6 artifact；默认场景携带只读
-  `runtime-orb` Spawn Prototype，用于验证瞬态对象生命周期。
+  `bin\assets\scenes\preview.scene` 是 Runtime 消费的 KSCN v8 artifact；默认场景携带
+  `pixel_art` 2×2 Atlas、8×5 静态背景 Tilemap（含空 Cell 与重复 Tile）以及只读
+  `runtime-orb` Spawn Prototype，用于同时验证 Tilemap 背景顺序、无串色采样与瞬态对象生命周期。
 - `bin\assets\scripts\preview.script.json` 声明 Script v2 项目，
   `bin\assets\scripts\preview.script` 是 Runtime 消费的 KSCP v2 artifact。
 - KSCP v2 固定使用 Host Interface v4。包中保留两个参与构建的 Luau 源：
@@ -131,8 +132,9 @@ zig build archive-windows-runtime -Doptimize=ReleaseSafe --prefix <package-root>
 zig build verify-windows-runtime -Doptimize=ReleaseSafe --prefix <package-root> --cache-dir <local-cache> --global-cache-dir <global-cache> -Druntime-preflight-sidecar=<sidecar> -Dwindows-runtime-evidence-dir=<new-evidence-dir>
 ```
 
-该入口用于检查真实窗口启动、像素、输入、Restart、Player 脚本移动、Won、Audio Cue、关闭
-与有界清理；环境是否满足和验证是否成功，以当次退出码及 evidence 目录为准。
+该入口用于检查真实窗口启动、Tilemap Atlas/边缘/空 Cell/动态覆盖像素、输入、Restart、
+Player 脚本移动、Won、Audio Cue、关闭与有界清理；环境是否满足和验证是否成功，以当次
+退出码及 evidence 目录为准。
 
 Editor 与 Toolchain 原生 .NET ContractVerifier
 ---------------------------------------------

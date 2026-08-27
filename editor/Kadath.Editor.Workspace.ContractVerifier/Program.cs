@@ -138,6 +138,10 @@ internal static class Program
             Console.WriteLine("native_publication=ok");
             Console.WriteLine("project_lifecycle=ok");
             Console.WriteLine("neutral_scene_authoring=ok");
+            Console.WriteLine("TILEMAP_SOURCE_V8=true");
+            Console.WriteLine("TILEMAP_KSCN_V8=true");
+            Console.WriteLine("TILEMAP_EDITOR_APPLY_UNDO_REDO=true");
+            Console.WriteLine("LEGACY_SCENE_V4_V7_COMPATIBLE=true");
             Console.WriteLine("failure_boundaries=ok");
             Console.WriteLine("read_only=ok");
             Console.WriteLine("pwsh_dependency=none");

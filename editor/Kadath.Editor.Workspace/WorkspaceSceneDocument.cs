@@ -6,7 +6,10 @@ using Kadath.Editor.Protocol;
 
 namespace Kadath.Editor.Workspace;
 
-internal sealed record WorkspaceSceneTexture(uint TextureId, string Artifact);
+internal sealed record WorkspaceSceneTexture(
+    uint TextureId,
+    string Artifact,
+    string SamplingProfile = WorkspaceSceneDocumentCodec.SmoothMipmapAnisotropicProfile);
 
 internal sealed record WorkspaceSceneBehaviorParameter(string Name, double Value);
 
@@ -53,6 +56,40 @@ internal sealed record WorkspaceScenePrototype(
                 StringComparer.Ordinal))).ToArray());
 }
 
+internal sealed record WorkspaceSceneTilemap(
+    string TilemapId,
+    double[] Origin,
+    double[] TileSize,
+    int Columns,
+    int Rows,
+    uint TextureId,
+    int AtlasColumns,
+    int AtlasRows,
+    int[] Cells)
+{
+    internal ProjectModelSceneTilemap ToProjectModel() => new(
+        TilemapId,
+        Origin.ToArray(),
+        TileSize.ToArray(),
+        Columns,
+        Rows,
+        TextureId,
+        AtlasColumns,
+        AtlasRows,
+        Cells.ToArray());
+
+    internal SceneTilemapDefinition ToDefinition() => new(
+        TilemapId,
+        Origin.ToArray(),
+        TileSize.ToArray(),
+        Columns,
+        Rows,
+        TextureId,
+        AtlasColumns,
+        AtlasRows,
+        Cells.ToArray());
+}
+
 internal sealed record WorkspaceSceneObject(
     string ObjectId,
     string Kind,
@@ -86,7 +123,8 @@ internal sealed record WorkspaceSceneDocument(
     WorkspaceSceneTexture[] Textures,
     WorkspaceSceneObject[] Objects,
     WorkspaceScenePrototype[] Prototypes,
-    WorkspaceSceneGameplay Gameplay)
+    WorkspaceSceneGameplay Gameplay,
+    WorkspaceSceneTilemap[] Tilemaps)
 {
     internal WorkspaceSceneObject? Player => Objects.SingleOrDefault(value => value.Kind == WorkspaceSceneDocumentCodec.PlayerKind);
     internal WorkspaceSceneObject? Goal => Objects.SingleOrDefault(value => value.Kind == WorkspaceSceneDocumentCodec.GoalKind);
@@ -98,7 +136,8 @@ internal static partial class WorkspaceSceneDocumentCodec
     internal const int LegacySchemaVersion = 4;
     internal const int BehaviorSchemaVersion = 5;
     internal const int PrototypeSchemaVersion = 6;
-    internal const int CurrentSchemaVersion = 7;
+    internal const int GameplaySchemaVersion = 7;
+    internal const int CurrentSchemaVersion = 8;
     internal const int MinNeutralObjectCount = 1;
     internal const int MinObjectCount = 3;
     internal const int MaxObjectCount = 64;
@@ -108,12 +147,22 @@ internal static partial class WorkspaceSceneDocumentCodec
     internal const int MaxBehaviorParameterNameBytes = 63;
     internal const int MaxPrototypeCount = 32;
     internal const int MaxPrototypeBehaviorBindingCount = 128;
+    internal const int MaxTilemapCount = 1;
+    internal const int MaxTilemapColumns = 32;
+    internal const int MaxTilemapRows = 32;
+    internal const int MaxTilemapCells = MaxTilemapColumns * MaxTilemapRows;
+    internal const int MaxTilemapAtlasDimension = 256;
+    internal const int MaxTilemapAtlasTiles = ushort.MaxValue;
     internal const string SpriteKind = "sprite";
     internal const string PlayerKind = "player";
     internal const string GoalKind = "goal";
     internal const string PatrolHazardKind = "patrol_hazard";
     internal const string NoGameplayProfile = "none";
     internal const string GoalHazardGameplayProfile = "goal_hazard_v1";
+    internal const string PixelArtProfile = "pixel_art";
+    internal const string SmoothLinearProfile = "smooth_linear";
+    internal const string SmoothMipmapProfile = "smooth_mipmap";
+    internal const string SmoothMipmapAnisotropicProfile = "smooth_mipmap_anisotropic";
 
     internal static readonly WorkspaceSceneGameplay NeutralGameplay = new(NoGameplayProfile, 0);
     internal static readonly WorkspaceSceneGameplay LegacyGameplay = new(GoalHazardGameplayProfile, 3);
@@ -144,20 +193,24 @@ internal static partial class WorkspaceSceneDocumentCodec
                 LegacySchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects"], [], "Scene"),
                 BehaviorSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects"], [], "Scene"),
                 PrototypeSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], [], "Scene"),
-                CurrentSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], ["gameplay"], "Scene"),
+                GameplaySchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], ["gameplay"], "Scene"),
+                CurrentSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes", "tilemaps"], ["gameplay"], "Scene"),
                 _ => throw Failure("Unsupported Scene schemaVersion.")
             };
-            var textures = ReadTextures(properties["textures"]);
+            var textures = ReadTextures(properties["textures"], schemaVersion == CurrentSchemaVersion);
             var objects = schemaVersion == 3 ? ReadLegacyObjects(properties) : ReadObjects(properties["objects"], schemaVersion);
-            var prototypes = schemaVersion is PrototypeSchemaVersion or CurrentSchemaVersion
+            var prototypes = schemaVersion >= PrototypeSchemaVersion
                 ? ReadPrototypes(properties["prototypes"])
                 : Array.Empty<WorkspaceScenePrototype>();
             // v4-v6 wire 没有 profile；读取时统一归一为旧演示 Gameplay。
-            var gameplay = schemaVersion == CurrentSchemaVersion
+            var gameplay = schemaVersion >= GameplaySchemaVersion
                 ? properties.TryGetValue("gameplay", out var gameplayValue) ? ReadGameplay(gameplayValue) : NeutralGameplay
                 : LegacyGameplay;
-            Validate(textures, objects, prototypes, schemaVersion == 3 ? LegacySchemaVersion : schemaVersion, gameplay);
-            return new WorkspaceSceneDocument(schemaVersion, textures, objects, prototypes, gameplay);
+            var tilemaps = schemaVersion == CurrentSchemaVersion
+                ? ReadTilemaps(properties["tilemaps"])
+                : Array.Empty<WorkspaceSceneTilemap>();
+            Validate(textures, objects, prototypes, schemaVersion == 3 ? LegacySchemaVersion : schemaVersion, gameplay, tilemaps);
+            return new WorkspaceSceneDocument(schemaVersion, textures, objects, prototypes, gameplay, tilemaps);
         }
         catch (JsonException exception)
         {
@@ -219,8 +272,21 @@ internal static partial class WorkspaceSceneDocumentCodec
                 binding.ScriptId,
                 binding.Parameters?.Select(parameter => new WorkspaceSceneBehaviorParameter(
                     parameter.Key,
-                    parameter.Value)).ToArray() ?? [])).ToArray() ?? [])).ToArray();
+                parameter.Value)).ToArray() ?? [])).ToArray() ?? [])).ToArray();
     }
+
+    internal static WorkspaceSceneTilemap[] NormalizeTilemapDefinitions(
+        IReadOnlyList<SceneTilemapDefinition> definitions) =>
+        definitions.Select(value => new WorkspaceSceneTilemap(
+            value.TilemapId,
+            CopyVector(value.Origin, 2, $"Scene.tilemaps[{value.TilemapId}].origin"),
+            CopyVector(value.TileSize, 2, $"Scene.tilemaps[{value.TilemapId}].tileSize"),
+            value.Columns,
+            value.Rows,
+            value.TextureId,
+            value.AtlasColumns,
+            value.AtlasRows,
+            value.Cells.ToArray())).ToArray();
 
     internal static void ValidateNormalized(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects) =>
         Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacySchemaVersion, LegacyGameplay);
@@ -246,6 +312,15 @@ internal static partial class WorkspaceSceneDocumentCodec
         WorkspaceSceneGameplay gameplay) =>
         Validate(textures, objects, prototypes, schemaVersion, gameplay);
 
+    internal static void ValidateNormalized(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        int schemaVersion,
+        WorkspaceSceneGameplay gameplay,
+        IReadOnlyList<WorkspaceSceneTilemap> tilemaps) =>
+        Validate(textures, objects, prototypes, schemaVersion, gameplay, tilemaps);
+
     internal static byte[] SerializeV4(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects)
         => Serialize(LegacySchemaVersion, textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacyGameplay);
 
@@ -263,16 +338,26 @@ internal static partial class WorkspaceSceneDocumentCodec
         IReadOnlyList<WorkspaceSceneObject> objects,
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
         WorkspaceSceneGameplay gameplay)
-        => Serialize(CurrentSchemaVersion, textures, objects, prototypes, gameplay);
+        => Serialize(GameplaySchemaVersion, textures, objects, prototypes, gameplay);
+
+    internal static byte[] SerializeV8(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        WorkspaceSceneGameplay gameplay,
+        IReadOnlyList<WorkspaceSceneTilemap> tilemaps)
+        => Serialize(CurrentSchemaVersion, textures, objects, prototypes, gameplay, tilemaps);
 
     private static byte[] Serialize(
         int schemaVersion,
         IReadOnlyList<WorkspaceSceneTexture> textures,
         IReadOnlyList<WorkspaceSceneObject> objects,
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
-        WorkspaceSceneGameplay gameplay)
+        WorkspaceSceneGameplay gameplay,
+        IReadOnlyList<WorkspaceSceneTilemap>? tilemaps = null)
     {
-        Validate(textures, objects, prototypes, schemaVersion, gameplay);
+        tilemaps ??= Array.Empty<WorkspaceSceneTilemap>();
+        Validate(textures, objects, prototypes, schemaVersion, gameplay, tilemaps);
         var buffer = new ArrayBufferWriter<byte>();
         using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
         {
@@ -285,6 +370,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                 writer.WriteStartObject();
                 writer.WriteNumber("textureId", texture.TextureId);
                 writer.WriteString("artifact", texture.Artifact);
+                if (schemaVersion == CurrentSchemaVersion) writer.WriteString("samplingProfile", texture.SamplingProfile);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
@@ -363,13 +449,36 @@ internal static partial class WorkspaceSceneDocumentCodec
                 }
                 writer.WriteEndArray();
             }
-            if (schemaVersion == CurrentSchemaVersion && gameplay.IsEnabled)
+            if (schemaVersion >= GameplaySchemaVersion && gameplay.IsEnabled)
             {
                 writer.WritePropertyName("gameplay");
                 writer.WriteStartObject();
                 writer.WriteString("profile", gameplay.Profile);
                 writer.WriteNumber("timeLimitSeconds", gameplay.TimeLimitSeconds);
                 writer.WriteEndObject();
+            }
+            if (schemaVersion == CurrentSchemaVersion)
+            {
+                writer.WritePropertyName("tilemaps");
+                writer.WriteStartArray();
+                foreach (var tilemap in tilemaps)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("tilemapId", tilemap.TilemapId);
+                    WriteVector(writer, "origin", tilemap.Origin);
+                    WriteVector(writer, "tileSize", tilemap.TileSize);
+                    writer.WriteNumber("columns", tilemap.Columns);
+                    writer.WriteNumber("rows", tilemap.Rows);
+                    writer.WriteNumber("textureId", tilemap.TextureId);
+                    writer.WriteNumber("atlasColumns", tilemap.AtlasColumns);
+                    writer.WriteNumber("atlasRows", tilemap.AtlasRows);
+                    writer.WritePropertyName("cells");
+                    writer.WriteStartArray();
+                    foreach (var cell in tilemap.Cells) writer.WriteNumberValue(cell);
+                    writer.WriteEndArray();
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndArray();
             }
             writer.WriteEndObject();
         }
@@ -380,17 +489,24 @@ internal static partial class WorkspaceSceneDocumentCodec
         return bytes;
     }
 
-    private static WorkspaceSceneTexture[] ReadTextures(JsonElement value)
+    private static WorkspaceSceneTexture[] ReadTextures(JsonElement value, bool readSamplingProfile)
     {
         RequireArray(value, "Scene.textures");
         if (value.GetArrayLength() is < 1 or > 4) throw Failure("Scene.textures must contain 1 to 4 entries.");
         var textures = new List<WorkspaceSceneTexture>();
         foreach (var element in value.EnumerateArray())
         {
-            var properties = ReadProperties(element, ["textureId", "artifact"], [], "Scene.textures[]");
+            var properties = ReadProperties(
+                element,
+                readSamplingProfile ? ["textureId", "artifact", "samplingProfile"] : ["textureId", "artifact"],
+                [],
+                "Scene.textures[]");
             textures.Add(new WorkspaceSceneTexture(
                 RequireUInt32(properties["textureId"], "Scene.textures[].textureId"),
-                RequireString(properties["artifact"], "Scene.textures[].artifact")));
+                RequireString(properties["artifact"], "Scene.textures[].artifact"),
+                readSamplingProfile
+                    ? RequireString(properties["samplingProfile"], "Scene.textures[].samplingProfile")
+                    : SmoothMipmapAnisotropicProfile));
         }
         return textures.ToArray();
     }
@@ -398,7 +514,7 @@ internal static partial class WorkspaceSceneDocumentCodec
     private static WorkspaceSceneObject[] ReadObjects(JsonElement value, int schemaVersion)
     {
         RequireArray(value, "Scene.objects");
-        var minimum = schemaVersion == CurrentSchemaVersion ? MinNeutralObjectCount : MinObjectCount;
+        var minimum = schemaVersion >= GameplaySchemaVersion ? MinNeutralObjectCount : MinObjectCount;
         if (value.GetArrayLength() < minimum || value.GetArrayLength() > MaxObjectCount) throw Failure($"Scene.objects must contain {minimum} to {MaxObjectCount} entries.");
         var objects = new List<WorkspaceSceneObject>();
         var index = 0;
@@ -484,6 +600,42 @@ internal static partial class WorkspaceSceneDocumentCodec
         return prototypes.ToArray();
     }
 
+    private static WorkspaceSceneTilemap[] ReadTilemaps(JsonElement value)
+    {
+        RequireArray(value, "Scene.tilemaps");
+        if (value.GetArrayLength() > MaxTilemapCount) throw Failure("Scene.tilemaps exceeds the single-layer limit.");
+        var tilemaps = new List<WorkspaceSceneTilemap>();
+        var index = 0;
+        foreach (var element in value.EnumerateArray())
+        {
+            var owner = $"Scene.tilemaps[{index}]";
+            var properties = ReadProperties(element,
+                ["tilemapId", "origin", "tileSize", "columns", "rows", "textureId", "atlasColumns", "atlasRows", "cells"],
+                [], owner);
+            var cellsElement = properties["cells"];
+            RequireArray(cellsElement, $"{owner}.cells");
+            var cells = new List<int>();
+            foreach (var cell in cellsElement.EnumerateArray())
+            {
+                if (cell.ValueKind != JsonValueKind.Number || !cell.TryGetInt32(out var cellValue))
+                    throw Failure($"{owner}.cells must contain integer Tile indices.");
+                cells.Add(cellValue);
+            }
+            tilemaps.Add(new WorkspaceSceneTilemap(
+                RequireString(properties["tilemapId"], $"{owner}.tilemapId"),
+                RequireVector(properties["origin"], 2, $"{owner}.origin"),
+                RequireVector(properties["tileSize"], 2, $"{owner}.tileSize"),
+                RequireInt32(element, "columns", owner),
+                RequireInt32(element, "rows", owner),
+                RequireUInt32(properties["textureId"], $"{owner}.textureId"),
+                RequireInt32(element, "atlasColumns", owner),
+                RequireInt32(element, "atlasRows", owner),
+                cells.ToArray()));
+            index++;
+        }
+        return tilemaps.ToArray();
+    }
+
     private static WorkspaceSceneGameplay ReadGameplay(JsonElement value)
     {
         var properties = ReadProperties(value, ["profile", "timeLimitSeconds"], [], "Scene.gameplay");
@@ -559,10 +711,19 @@ internal static partial class WorkspaceSceneDocumentCodec
         IReadOnlyList<WorkspaceSceneObject> objects,
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
         int schemaVersion,
-        WorkspaceSceneGameplay gameplay)
+        WorkspaceSceneGameplay gameplay) =>
+        Validate(textures, objects, prototypes, schemaVersion, gameplay, Array.Empty<WorkspaceSceneTilemap>());
+
+    private static void Validate(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        int schemaVersion,
+        WorkspaceSceneGameplay gameplay,
+        IReadOnlyList<WorkspaceSceneTilemap> tilemaps)
     {
-        if (schemaVersion is not (LegacySchemaVersion or BehaviorSchemaVersion or PrototypeSchemaVersion or CurrentSchemaVersion)) throw Failure("Unsupported Scene schemaVersion.");
-        if (schemaVersion != CurrentSchemaVersion && gameplay.Profile != GoalHazardGameplayProfile)
+        if (schemaVersion is not (LegacySchemaVersion or BehaviorSchemaVersion or PrototypeSchemaVersion or GameplaySchemaVersion or CurrentSchemaVersion)) throw Failure("Unsupported Scene schemaVersion.");
+        if (schemaVersion < GameplaySchemaVersion && gameplay.Profile != GoalHazardGameplayProfile)
             throw Failure("Scene v4-v6 must normalize to goal_hazard_v1 Gameplay.");
         if (gameplay.Profile == NoGameplayProfile)
         {
@@ -583,6 +744,9 @@ internal static partial class WorkspaceSceneDocumentCodec
         {
             if (texture.TextureId == 0 || !textureIds.Add(texture.TextureId)) throw Failure("Scene.textures textureId must be unique non-zero u32.");
             if (!WorkspaceProjectValidator.IsTextureArtifactPath(texture.Artifact)) throw Failure("Scene.textures artifact path is invalid.");
+            if (!IsSamplingProfile(texture.SamplingProfile)) throw Failure("Scene.textures samplingProfile is invalid.");
+            if (schemaVersion < CurrentSchemaVersion && texture.SamplingProfile != SmoothMipmapAnisotropicProfile)
+                throw Failure("Scene v4-v7 textures must preserve the legacy sampling profile.");
         }
         var minimum = MinimumObjectCount(schemaVersion, gameplay);
         if (objects.Count < minimum || objects.Count > MaxObjectCount) throw Failure($"Scene.objects must contain {minimum} to {MaxObjectCount} entries.");
@@ -644,7 +808,7 @@ internal static partial class WorkspaceSceneDocumentCodec
         }
         if (gameplay.IsEnabled && (playerCount != 1 || goalCount != 1 || hazardCount < 1))
             throw Failure("Gameplay Scene must contain exactly one player, exactly one goal, and at least one patrol_hazard.");
-        if (!SchemaHasPrototypes(schemaVersion) && prototypes.Count != 0) throw Failure("Scene prototypes require schema v6 or v7.");
+        if (!SchemaHasPrototypes(schemaVersion) && prototypes.Count != 0) throw Failure("Scene prototypes require schema v6 or later.");
         if (prototypes.Count > MaxPrototypeCount) throw Failure("Scene prototype budget exceeded.");
         var prototypeIds = new HashSet<string>(StringComparer.Ordinal);
         var prototypeBehaviorCount = 0;
@@ -659,17 +823,41 @@ internal static partial class WorkspaceSceneDocumentCodec
             prototypeBehaviorCount = checked(prototypeBehaviorCount + prototype.Behaviors.Length);
             if (prototypeBehaviorCount > MaxPrototypeBehaviorBindingCount) throw Failure("Scene prototype behavior binding budget exceeded.");
         }
+        if (schemaVersion != CurrentSchemaVersion && tilemaps.Count != 0) throw Failure("Scene tilemaps require schema v8.");
+        if (tilemaps.Count > MaxTilemapCount) throw Failure("Scene.tilemaps exceeds the single-layer limit.");
+        var tilemapIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var tilemap in tilemaps)
+        {
+            var owner = $"Scene.tilemaps[{tilemap.TilemapId}]";
+            if (!IsObjectId(tilemap.TilemapId) || !tilemapIds.Add(tilemap.TilemapId)) throw Failure("Scene TilemapId must be unique and valid.");
+            ValidateVector(tilemap.Origin, 2, $"{owner}.origin", positive: false, color: false);
+            ValidateVector(tilemap.TileSize, 2, $"{owner}.tileSize", positive: true, color: false);
+            if (tilemap.Columns is < 1 or > MaxTilemapColumns || tilemap.Rows is < 1 or > MaxTilemapRows)
+                throw Failure($"{owner} dimensions exceed the 32x32 limit.");
+            if (tilemap.AtlasColumns is < 1 or > MaxTilemapAtlasDimension || tilemap.AtlasRows is < 1 or > MaxTilemapAtlasDimension)
+                throw Failure($"{owner} Atlas dimensions are invalid.");
+            var atlasTiles = checked(tilemap.AtlasColumns * tilemap.AtlasRows);
+            if (atlasTiles > MaxTilemapAtlasTiles) throw Failure($"{owner} Atlas exceeds the u16 Tile index limit.");
+            if (tilemap.Cells.Length != checked(tilemap.Columns * tilemap.Rows)) throw Failure($"{owner}.cells length does not match rows*columns.");
+            if (tilemap.Cells.Any(cell => cell < 0 || cell > atlasTiles)) throw Failure($"{owner}.cells contains an invalid Atlas Tile index.");
+            var texture = textures.SingleOrDefault(value => value.TextureId == tilemap.TextureId)
+                ?? throw Failure($"{owner}.textureId is not declared by Scene.textures.");
+            if (texture.SamplingProfile != PixelArtProfile) throw Failure($"{owner} Atlas texture must use pixel_art sampling.");
+        }
     }
 
     private static WorkspaceSceneGameplay GameplayForSchema(int schemaVersion) =>
-        schemaVersion == CurrentSchemaVersion ? NeutralGameplay : LegacyGameplay;
+        schemaVersion >= GameplaySchemaVersion ? NeutralGameplay : LegacyGameplay;
 
     private static int MinimumObjectCount(int schemaVersion, WorkspaceSceneGameplay gameplay) =>
-        schemaVersion == CurrentSchemaVersion && !gameplay.IsEnabled ? MinNeutralObjectCount : MinObjectCount;
+        schemaVersion >= GameplaySchemaVersion && !gameplay.IsEnabled ? MinNeutralObjectCount : MinObjectCount;
 
     private static bool SchemaHasBehaviorBindings(int schemaVersion) => schemaVersion >= BehaviorSchemaVersion;
 
     private static bool SchemaHasPrototypes(int schemaVersion) => schemaVersion >= PrototypeSchemaVersion;
+
+    private static bool IsSamplingProfile(string profile) =>
+        profile is PixelArtProfile or SmoothLinearProfile or SmoothMipmapProfile or SmoothMipmapAnisotropicProfile;
 
     private static void WriteBehaviorBindings(Utf8JsonWriter writer, IReadOnlyList<WorkspaceSceneBehaviorBinding> behaviors)
     {

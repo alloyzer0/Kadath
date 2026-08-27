@@ -1,9 +1,9 @@
 {
-  "schemaVersion": 6,
+  "schemaVersion": 8,
   "textures": [
-    { "textureId": 1, "artifact": "assets/renderer2d/test.texture" },
-    { "textureId": 2, "artifact": "assets/renderer2d/goal.texture" },
-    { "textureId": 3, "artifact": "assets/renderer2d/goal.texture" }
+    { "textureId": 1, "artifact": "assets/renderer2d/test.texture", "samplingProfile": "pixel_art" },
+    { "textureId": 2, "artifact": "assets/renderer2d/goal.texture", "samplingProfile": "smooth_mipmap_anisotropic" },
+    { "textureId": 3, "artifact": "assets/renderer2d/goal.texture", "samplingProfile": "smooth_mipmap_anisotropic" }
   ],
   "objects": [
     {
@@ -110,6 +110,26 @@
           "scriptId": 2,
           "parameters": { "speed": 180.0 }
         }
+      ]
+    }
+  ],
+  "gameplay": { "profile": "goal_hazard_v1", "timeLimitSeconds": 3.0 },
+  "tilemaps": [
+    {
+      "tilemapId": "background",
+      "origin": [50.0, 60.0],
+      "tileSize": [100.0, 120.0],
+      "columns": 8,
+      "rows": 5,
+      "textureId": 1,
+      "atlasColumns": 2,
+      "atlasRows": 2,
+      "cells": [
+        1, 2, 1, 2, 1, 2, 1, 2,
+        3, 0, 4, 3, 0, 4, 3, 4,
+        1, 4, 2, 0, 3, 1, 4, 2,
+        3, 2, 0, 4, 1, 3, 2, 4,
+        1, 2, 3, 4, 1, 0, 3, 4
       ]
     }
   ]

@@ -590,13 +590,17 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 var gameplayEnabled = sceneModel?.GameplayProfile == "goal_hazard_v1";
                 var gameplayContractValid = sceneModel is not null && sceneModel.GameplayProfile switch
                 {
-                    "none" => sceneModel.SchemaVersion == 7 && sceneModel.GameplayTimeLimitSeconds is null,
+                    "none" => sceneModel.SchemaVersion is 7 or 8 && sceneModel.GameplayTimeLimitSeconds is null,
                     "goal_hazard_v1" => (sceneModel.SchemaVersion <= 6 && sceneModel.GameplayTimeLimitSeconds is null)
                         || (sceneModel.GameplayTimeLimitSeconds is double limit && limit > 0 && double.IsFinite(limit)),
                     _ => false
                 };
                 var textureSetValid = sceneModel is not null && textures is { Count: >= 1 and <= 4 }
-                    && textures.All(texture => texture.TextureId != 0 && IsTextureArtifactPath(texture.Artifact))
+                    && textures.All(texture => texture.TextureId != 0
+                        && IsTextureArtifactPath(texture.Artifact)
+                        && (sceneModel.SchemaVersion < 8
+                            ? texture.SamplingProfile == "smooth_mipmap_anisotropic"
+                            : IsTextureSamplingProfile(texture.SamplingProfile)))
                     && textures.Select(texture => texture.TextureId).Distinct().Count() == textures.Count
                     && (!gameplayEnabled
                         || textures.Any(texture => texture.TextureId == sceneModel.PlayerTextureId)
@@ -614,10 +618,11 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion is not (3 or 4 or 5 or 6 or 7)
+                    || model.Scene.SchemaVersion is not (3 or 4 or 5 or 6 or 7 or 8)
                     || !gameplayContractValid
                     || !textureSetValid
                     || !ValidateSceneObjects(objects, textures!, sceneModel!, behaviorDependencySetValid ? scriptDependencies!.Select(dependency => dependency.ScriptId).ToHashSet() : null)
+                    || !ValidateSceneTilemaps(sceneModel!.Tilemaps, textures!, sceneModel.SchemaVersion)
                     || model.Script.SchemaVersion is not (1 or 2)
                     || model.Preview.SchemaVersion != 1
                     || !string.Equals(model.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
@@ -709,6 +714,36 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         return artifact.Split('/').All(segment => segment.Length > 0 && segment is not "." and not "..");
     }
 
+    private static bool IsTextureSamplingProfile(string value) => value is
+        "pixel_art" or "smooth_linear" or "smooth_mipmap" or "smooth_mipmap_anisotropic";
+
+    private static bool ValidateSceneTilemaps(
+        IReadOnlyList<ProjectModelSceneTilemap>? tilemaps,
+        IReadOnlyList<ProjectModelTexture> textures,
+        int schemaVersion)
+    {
+        if (tilemaps is null) return false;
+        if (schemaVersion < 8) return tilemaps.Count == 0;
+        if (tilemaps.Count > 1) return false;
+        var textureProfiles = textures.ToDictionary(value => value.TextureId, value => value.SamplingProfile);
+        foreach (var tilemap in tilemaps)
+        {
+            if (!IsObjectId(tilemap.TilemapId)
+                || tilemap.Origin is not { Length: 2 }
+                || tilemap.TileSize is not { Length: 2 }
+                || !tilemap.Origin.Concat(tilemap.TileSize).All(number => double.IsFinite(number) && float.IsFinite((float)number))
+                || tilemap.TileSize.Any(number => number <= 0)
+                || tilemap.Columns is < 1 or > 32 || tilemap.Rows is < 1 or > 32
+                || tilemap.AtlasColumns is < 1 or > 256 || tilemap.AtlasRows is < 1 or > 256
+                || tilemap.AtlasColumns * tilemap.AtlasRows > ushort.MaxValue
+                || tilemap.Cells is null || tilemap.Cells.Count != tilemap.Columns * tilemap.Rows
+                || tilemap.Cells.Any(value => value < 0 || value > tilemap.AtlasColumns * tilemap.AtlasRows)
+                || !textureProfiles.TryGetValue(tilemap.TextureId, out var samplingProfile)
+                || samplingProfile != "pixel_art") return false;
+        }
+        return true;
+    }
+
     private static bool IsScriptSourcePath(string source)
     {
         if (string.IsNullOrEmpty(source) || System.Text.Encoding.UTF8.GetByteCount(source) > 1024
@@ -728,7 +763,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         IReadOnlySet<uint>? behaviorScriptIds)
     {
         var gameplayEnabled = scene.GameplayProfile == "goal_hazard_v1";
-        var minimumObjectCount = scene.SchemaVersion == 7 && !gameplayEnabled ? 1 : 3;
+        var minimumObjectCount = scene.SchemaVersion is 7 or 8 && !gameplayEnabled ? 1 : 3;
         if (objects is null || objects.Count < minimumObjectCount || objects.Count > 64) return false;
         var textureIds = textures.Select(value => value.TextureId).ToHashSet();
         var objectIds = new HashSet<string>(StringComparer.Ordinal);
@@ -752,7 +787,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 if (value.MoveSpeed is null || value.MoveSpeed < 0 || !double.IsFinite(value.MoveSpeed.Value)
                     || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null) return false;
             }
-            if (scene.SchemaVersion is 5 or 6 or 7)
+            if (scene.SchemaVersion is 5 or 6 or 7 or 8)
             {
                 if (value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null
                     || value.Behaviors is null || value.Behaviors.Count > 4)

@@ -18,7 +18,6 @@ const initial_width: u16 = 960;
 const initial_height: u16 = 540;
 const primary_fixture = Color{ .r = 32, .g = 220, .b = 80 };
 const secondary_fixture = Color{ .r = 220, .g = 80, .b = 240 };
-const package_primary_expected = Color{ .r = 97, .g = 104, .b = 124 };
 const sample_tolerance: u8 = 14;
 const package_sample_tolerance: u8 = 20;
 
@@ -363,6 +362,10 @@ fn printVerificationSuccess(
     try stdout.print("linux_primary_texture_pixels=ok\n", .{});
     try stdout.print("linux_secondary_texture_pixels=ok\n", .{});
     if (asset_mode != .package_root) try stdout.print("linux_scene_texture_binding=ok\n", .{});
+    if (asset_mode == .package_root) {
+        try stdout.print("TILEMAP_ATLAS_PIXEL_ORACLE=true\n", .{});
+        try stdout.print("TILEMAP_BACKGROUND_ORDER=true\n", .{});
+    }
     try stdout.print("linux_two_frame_evidence=ok\n", .{});
     if (asset_mode == .neutral_fixture) {
         // 这些字段只在对应产品观察全部通过后输出；VS02 gate 独立输出第九个兼容性字段。
@@ -914,8 +917,7 @@ fn waitForRenderedFrame(
             .generated_fixture => colorNear(background, expected_background, sample_tolerance) and
                 colorNear(primary, expected_primary, sample_tolerance) and
                 colorNear(secondary, expected_secondary, sample_tolerance),
-            .package_root => colorNear(background, expected_background, sample_tolerance) and
-                colorNear(primary, package_primary_expected, package_sample_tolerance) and
+            .package_root => hasPackageTilemapSignature(capture) and
                 hasPackageGoalSignature(capture, package_goal_left, package_goal_right),
             .neutral_fixture => colorNear(background, expected_background, sample_tolerance) and
                 colorNear(capture.sample(450, 350), neutral_backdrop, package_sample_tolerance) and
@@ -945,6 +947,34 @@ fn waitForRenderedFrame(
         );
     }
     return error.RuntimePixelEvidenceTimeout;
+}
+
+fn hasPackageTilemapSignature(capture: Capture) bool {
+    const clear = Color{ .r = 53, .g = 89, .b = 129 };
+    const tile_two = Color{ .r = 45, .g = 155, .b = 113 };
+    const tile_three = Color{ .r = 36, .g = 63, .b = 205 };
+    const tile_four = Color{ .r = 255, .g = 255, .b = 255 };
+    const player_over_white = Color{ .r = 224, .g = 255, .b = 224 };
+    const goal_over_tile = Color{ .r = 255, .g = 225, .b = 89 };
+    const tolerance: u8 = 8;
+
+    // Atlas 四格、重复格、空 Cell 和相邻边缘共同证明 pixel_art 采样无串色。
+    if (!colorNear(capture.sample(900, 100), clear, tolerance) or
+        !colorNear(capture.sample(100, 100), clear, tolerance) or
+        !colorNear(capture.sample(200, 100), tile_two, tolerance) or
+        !colorNear(capture.sample(800, 100), tile_two, tolerance) or
+        !colorNear(capture.sample(100, 240), tile_three, tolerance) or
+        !colorNear(capture.sample(200, 240), clear, tolerance) or
+        !colorNear(capture.sample(280, 240), tile_four, tolerance) or
+        !colorNear(capture.sample(449, 100), tile_two, tolerance) or
+        !colorNear(capture.sample(451, 100), clear, tolerance)) return false;
+
+    // Player 的半透明 texel 必须合成在 Tilemap 之上，不能被背景批次覆盖。
+    return colorNear(capture.sample(392, 190), tile_three, package_sample_tolerance) and
+        colorNear(capture.sample(552, 190), player_over_white, package_sample_tolerance) and
+        colorNear(capture.sample(392, 310), tile_three, package_sample_tolerance) and
+        colorNear(capture.sample(552, 310), tile_four, package_sample_tolerance) and
+        colorNear(capture.sample(772, 272), goal_over_tile, package_sample_tolerance);
 }
 
 const ColorStats = struct {
@@ -1456,7 +1486,7 @@ fn validateRuntimeLogs(
             "Runtime host initialized with Vulkan RHI scene objects=3",
         },
         .package_root => &.{
-            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=6",
+            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=8",
             "Runtime host initialized with Vulkan RHI scene objects=5",
         },
         .neutral_fixture => &.{

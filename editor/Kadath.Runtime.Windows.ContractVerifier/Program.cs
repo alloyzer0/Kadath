@@ -34,6 +34,11 @@ internal static class Program
             Console.WriteLine($"manifest_path={outcome.ManifestPath}");
             if (!string.IsNullOrWhiteSpace(outcome.FirstError))
                 Console.Error.WriteLine($"first_error={outcome.FirstError}");
+            if (outcome.Status == VerificationStatus.Pass)
+            {
+                Console.WriteLine("TILEMAP_ATLAS_PIXEL_ORACLE=true");
+                Console.WriteLine("TILEMAP_BACKGROUND_ORDER=true");
+            }
             Console.WriteLine(outcome.Status == VerificationStatus.Pass
                 ? "verification=ok"
                 : outcome.Status == VerificationStatus.BlockedEnvironment

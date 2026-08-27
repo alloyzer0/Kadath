@@ -69,7 +69,7 @@
 - Service Contract Verifier：`verification=ok`
 - Native/Behavior Runtime contract 已覆盖 Tooling 类型可见、顶层调用失败、`on_start=0,0`、null/越界输入零输出、同一步多 Binding 共享输入、失败 Hook 上下文清理、Host v2 artifact 拒绝，以及 Scene reload/restart 的 World epoch 边界。
 - Player movement ownership contract 已覆盖 Scene v4、Scene v5 无 Player Binding、Scene v5 任意 Player Binding 三条路由；多 Binding 继续按 Scene 顺序产生 additive translation，脚本失败保持 fail-closed。
-- 默认产品使用两个 Script v2 dependency、Scene/KSCN v6 和 Host Interface v4；`player_controller.luau` 除既有 Player fixed movement、decoration frame update 与 contact/custom event 外，还通过 `runtime-orb` Prototype 证明 transient spawn、动态 `on_start`、后续 callback 与 destroy/stale 生命周期。
+- 默认产品使用两个 Script v2 dependency、Scene/KSCN v8 和 Host Interface v4；Scene v8 在保留全部 Behavior/Prototype 语义的同时增加静态背景 Tilemap。`player_controller.luau` 除既有 Player fixed movement、decoration frame update 与 contact/custom event 外，还通过 `runtime-orb` Prototype 证明 transient spawn、动态 `on_start`、后续 callback 与 destroy/stale 生命周期。
 - Workspace、真实 stdio Service、Client、Avalonia headless 与 Xvfb 工作流均按 `scriptId/sourcePath` 选择两个 Behavior Contract；Player Controller 源码读取、in-use 删除保护、下一资产 ID `3` 和绑定保留均已验证。
 - 行为项目创建后可被 `ReadProjectAsync` 和 `ReadHierarchyAsync` 读取。
 - Hierarchy 会展示 `ScriptDependency`、`SceneBehavior` 和 `BehaviorParameter` 节点。

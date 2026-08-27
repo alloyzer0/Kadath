@@ -5,6 +5,7 @@ pub const PipelineHandle = types.PipelineHandle;
 pub const invalid_pipeline = types.invalid_pipeline;
 pub const TextureHandle = types.TextureHandle;
 pub const invalid_texture = types.invalid_texture;
+pub const max_instance_data_bytes_per_binding = types.max_instance_data_bytes_per_binding;
 pub const max_instance_data_bytes_per_frame = types.max_instance_data_bytes_per_frame;
 pub const max_instance_data_bindings_per_frame = types.max_instance_data_bindings_per_frame;
 pub const TextureSamplerProfile = types.TextureSamplerProfile;

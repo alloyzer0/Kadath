@@ -21,15 +21,15 @@
 
 本文同时记录：
 
-- **CURRENT**：截至 Inner `25d1c25` 的实现事实；
+- **CURRENT**：截至本地 `codex/p1-renderer2d-tilemap-01` 候选（集成基线 `752f299`）的实现事实；
 - **TARGET**：`ADR-0009` 冻结的长期 ownership 边界；当前三个迁移增量已经达到该边界；
 - **MIGRATION**：从历史基线 `bfc5504` 到当前固定点的已完成迁移记录。
 
-图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。历史章节中的 TARGET 措辞只描述候选合并前的状态；当前应以 `25d1c25` 及本文 CURRENT 为准。
+图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。历史章节中的 TARGET 措辞只描述候选合并前的状态；当前应以本地 Tilemap 候选及本文 CURRENT 为准。
 
 ---
 
-## 2. CURRENT：`25d1c25` 当前实现
+## 2. CURRENT：本地 Tilemap 集成候选
 
 ```mermaid
 graph TD
@@ -46,7 +46,7 @@ graph TD
         ZigPlatform["Zig Platform / Input / Clock"]
         ZigMemory["Zig Memory / Allocator Policy"]
         ZigResource["Zig Resource / Artifact Adapter"]
-        ZigScene["Zig Scene v7 / KSCN v7 / KSCP Adapter"]
+        ZigScene["Zig Scene v8 / KSCN v8 / KSCP Adapter"]
         ZigLuauAdapter["Zig / C++ Luau Adapter"]
         ZigCoreAdapter["Zig Runtime Core Adapter<br/>稳定 C ABI + 版本化接口描述符"]
         RustCore["Rust Runtime Core<br/>Object Authority / Phase Commit / Optional Gameplay"]
@@ -86,10 +86,10 @@ graph TD
 - `Zig Host` 是实际组合根，拥有 Platform pump、Clock、fixed accumulator、阶段调用时机、reload/restart 外层事务和产品生命周期；
 - `Zig Scene/Behavior Adapter` 负责 Scene/KSCN/KSCP 解码、Luau VM callback、caller-owned POD 转换、调用编排和错误映射，不保存跨 step 的对象、阶段或 Gameplay authority；
 - `Rust Runtime Core` 通过同一 opaque Core 后的 versioned Object、Phase 与 Gameplay Interface，唯一拥有 ObjectId/Entity/generation/stale、对象生命周期、阶段队列/预算以及启用时的 collision/contact、GameSession、outcome；Gameplay candidate 明确区分未准备、中立和 `goal_hazard_v1`；
-- `Renderer2D`、Audio 与日志只消费 Runtime Core 的 caller-owned snapshot/outcome，不反向写入 Core 状态；
+- `Renderer2D` 先消费 Scene v8 的静态 Tilemap，再消费 Runtime Core 的 caller-owned snapshot；Audio 与日志只消费 outcome，三者均不反向写入 Core 状态；
 - `Rust Scheduler` 是隔离的异步读取 Module，不拥有主线程 Runtime 推进；
 - `Zig Memory / Allocator Policy` 保留原 C4 的底层内存职责；当前实现可以分散使用显式 allocator，不宣称已经存在一个成熟的独立 Memory Module；
-- `C# Editor`、Asset Tool pipeline 与 `Luau Behavior` 已是实际产品入口；Editor 可读取、编辑、字节级 Undo/Redo、烘焙和预览 Scene v7 中立场景。
+- `C# Editor`、Asset Tool pipeline 与 `Luau Behavior` 已是实际产品入口；Editor 可读取、编辑、字节级 Undo/Redo、烘焙和预览 Scene v8 Tilemap，并兼容 Scene v4—v7。
 
 ### 2.2 迁移收口判断
 
@@ -125,7 +125,15 @@ Runtime ownership 迁移完成后，Scene 曾继续强制一个 Player、一个 
 - 旧 Scene v4—v6 通过 Scene Adapter 归一化为兼容 `goal_hazard_v1` Gameplay Profile，产品行为不变；
 - Zig Host 只根据已解码 profile 选择调用顺序；Neutral fixed-step 执行 Behavior/Phase settle/end，不调用 Gameplay begin/commit、Outcome 或 Audio；
 - Render publication 复用 Object Authority `ACTIVE_OBJECTS` 的同一 ordered read view，经 Zig Adapter 写入 caller-owned `RenderSnapshot`，没有新增第二套 C Interface、缓存或排序权威；
-- C# Editor/Workspace 已贯通 v7 投影、通用 Object authoring、字节级 Undo/Redo、KSCN v7 Bake、Live Bake Preview 与真实产品 fixture。
+- C# Editor/Workspace 已贯通 v8 投影、通用 Object/Prototype/Tilemap authoring、字节级 Undo/Redo、KSCN v8 Bake、Live Bake Preview 与真实产品 fixture。
+
+### 2.5 静态 Tilemap 渲染边界
+
+- Scene v8 以最多一个 32×32 row-major Tilemap 保存静态背景；Cell `0` 为空，非零值是一基 Atlas 索引；
+- Atlas Texture 必须声明 `pixel_art`，旧 Scene v4—v7 归一为空 Tilemap与原有平滑采样；
+- Host 只把已验证的 Cell slice 与 TextureHandle 借给 `Renderer2D.renderFrame`；Renderer 隐藏 UV 展开、零 Cell 跳过和每 128 instance 分块；
+- RHI 仍只接收 48-byte opaque Quad instance，不理解 Tilemap、Atlas 或 Scene 类型；per-binding 为 6144 bytes，per-frame 为 65536 bytes；
+- Tilemap 不进入 Runtime Object、Behavior、Gameplay、collision/contact、spawn/destroy 或 Rust Core snapshot authority。
 
 ---
 
@@ -253,7 +261,9 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 - `b3073b6`：Runtime Core 显式 PreparedNone Gameplay candidate 与 C ABI v2；
 - `f3109b0`：复用 Object Authority ordered read view 发布中立 Render Snapshot；
 - `a11e4dc`：SceneGeneration、Behavior 与 Host 中立 fixed-step 生命周期；
-- `25d1c25`：Editor Authoring/Bake/Undo/Redo/Preview 与产品 fixture；当前 C4 的 CURRENT 图以此为准。
+- `25d1c25`：Editor Authoring/Bake/Undo/Redo/Preview 与产品 fixture 的历史固定点；
+- `752f299`：Renderer2D Instance Batching 与 Spawn Prototype Authoring 的本地集成基线；
+- `codex/p1-renderer2d-tilemap-01`：Scene/KSCN v8、静态 Tilemap、Atlas sampling、Editor 创作与双平台产品证据；当前 C4 的 CURRENT 图以此候选为准。
 
 ### 6.2 迁移顺序
 

@@ -50,6 +50,190 @@ fn expectNoRecordingDelta(before: rhi.NullStats, after: rhi.NullStats) !void {
     try expectRecordingDelta(before, after, 0, 0, 0, 0, 0);
 }
 
+fn traceF32(bytes: []const u8, offset: usize) f32 {
+    const bits = @as(u32, bytes[offset]) |
+        (@as(u32, bytes[offset + 1]) << 8) |
+        (@as(u32, bytes[offset + 2]) << 16) |
+        (@as(u32, bytes[offset + 3]) << 24);
+    return @bitCast(bits);
+}
+
+test "Renderer2D renders bounded tilemap before dynamic sprites in one frame" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    const cells = [_]u16{ 1, 0, 6, 16 };
+    const tilemaps = [_]renderer2d.TilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .tile_size = .{ 16, 16 },
+        .columns = 2,
+        .rows = 2,
+        .atlas_columns = 4,
+        .atlas_rows = 4,
+        .texture = texture,
+        .cells = &cells,
+    }};
+    const sprites = [_]renderer2d.SpriteInstance{sprite(8, 8, texture)};
+
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .tilemaps = &tilemaps,
+        .sprites = &sprites,
+    }));
+    const after = backend.stats();
+    try expectRecordingDelta(before, after, 1, 2, 2, 2, 4);
+    try std.testing.expectEqualSlices(
+        rhi.TextureHandle,
+        &.{ texture, texture },
+        after.draw_texture_trace[before.draw_texture_trace_len..after.draw_texture_trace_len],
+    );
+}
+
+test "Renderer2D expands one-based atlas indices into stable UV rectangles" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    const cells = [_]u16{ 1, 6 };
+    const tilemaps = [_]renderer2d.TilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .tile_size = .{ 16, 16 },
+        .columns = 2,
+        .rows = 1,
+        .atlas_columns = 4,
+        .atlas_rows = 4,
+        .texture = texture,
+        .cells = &cells,
+    }};
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+
+    const stats = backend.stats();
+    try std.testing.expectEqual(@as(usize, 96), stats.instance_data_trace_len);
+    // 48-byte instance 的 uv_rect 位于 32..48；Tile 1 为 (0,0)，Tile 6 为 (1,1)。
+    try std.testing.expectApproxEqAbs(@as(f32, 0), traceF32(&stats.instance_data_trace, 32), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), traceF32(&stats.instance_data_trace, 36), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 40), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 44), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 80), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 84), 0.0001);
+}
+
+test "Renderer2D splits a full 32 by 32 tilemap into eight bounded draws" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    const cells = [_]u16{1} ** renderer2d.max_tilemap_cells_per_frame;
+    const tilemaps = [_]renderer2d.TilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .tile_size = .{ 8, 8 },
+        .columns = 32,
+        .rows = 32,
+        .atlas_columns = 1,
+        .atlas_rows = 1,
+        .texture = texture,
+        .cells = &cells,
+    }};
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try expectRecordingDelta(before, backend.stats(), 1, 1, 8, 8, 1024);
+}
+
+test "Renderer2D skips empty cells and splits 129 visible tiles" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    var cells = [_]u16{0} ** 160;
+    const tilemaps = [_]renderer2d.TilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .tile_size = .{ 8, 8 },
+        .columns = 32,
+        .rows = 5,
+        .atlas_columns = 1,
+        .atlas_rows = 1,
+        .texture = texture,
+        .cells = &cells,
+    }};
+    var before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try expectNoRecordingDelta(before, backend.stats());
+
+    @memset(cells[0..129], 1);
+    before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try expectRecordingDelta(before, backend.stats(), 1, 1, 2, 2, 129);
+}
+
+test "Renderer2D accepts the frozen 1024 tile plus 128 sprite frame budget" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    const cells = [_]u16{1} ** renderer2d.max_tilemap_cells_per_frame;
+    const tilemaps = [_]renderer2d.TilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .tile_size = .{ 8, 8 },
+        .columns = 32,
+        .rows = 32,
+        .atlas_columns = 1,
+        .atlas_rows = 1,
+        .texture = texture,
+        .cells = &cells,
+    }};
+    var sprites: [renderer2d.max_sprites_per_frame]renderer2d.SpriteInstance = undefined;
+    for (&sprites, 0..) |*item, index| item.* = sprite(@floatFromInt(index), 4, texture);
+
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .tilemaps = &tilemaps,
+        .sprites = &sprites,
+    }));
+    // Tilemap 与动态 Sprite 是两个语义段，即便 Texture 相同也不能跨边界重排/合批。
+    try expectRecordingDelta(before, backend.stats(), 1, 2, 9, 9, 1152);
+    std.debug.print("TILEMAP_BATCH_1024=true\n", .{});
+}
+
+test "Renderer2D rejects malformed tilemap before beginning a frame" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    const cells = [_]u16{1};
+    const tilemaps = [_]renderer2d.TilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .tile_size = .{ 8, 8 },
+        .columns = 2,
+        .rows = 2,
+        .atlas_columns = 1,
+        .atlas_rows = 1,
+        .texture = texture,
+        .cells = &cells,
+    }};
+    const before = backend.stats();
+    try std.testing.expectError(error.InvalidTilemapCellCount, renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try expectNoRecordingDelta(before, backend.stats());
+}
+
 test "Renderer2D init and deinit use the existing RHI seam" {
     var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();

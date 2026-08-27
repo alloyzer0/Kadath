@@ -26,6 +26,9 @@ internal static class NeutralSceneVerifier
                 && initial.Scene.Prototypes[0].Color.SequenceEqual([0.25, 0.5, 0.75, 1])
                 && initial.Scene.Prototypes[0].Behaviors is { Count: 0 },
                 "Project Snapshot did not expose the ordered Spawn Prototype read model.");
+            Require(initial.Scene.Tilemaps is { Count: 0 }
+                && initial.Scene.Textures is [{ SamplingProfile: "smooth_mipmap_anisotropic" }],
+                "Scene v7 compatibility did not project empty Tilemaps and legacy sampling.");
             var initialHierarchy = await readModel.ReadHierarchyAsync(project, default);
             Require(!initialHierarchy.Nodes.Any(node => node.Id.Contains("prototype", StringComparison.OrdinalIgnoreCase)
                     || node.Kind.Contains("prototype", StringComparison.OrdinalIgnoreCase)),
@@ -34,9 +37,86 @@ internal static class NeutralSceneVerifier
             var originalScene = File.ReadAllBytes(project.ScenePath);
             var decor = initial.Scene.Objects![0];
             var authoring = new WorkspaceAuthoringModel();
-            var prototypeCommit = await authoring.ApplyAsync(
+            var tilemapCommit = await authoring.ApplyAsync(
                 project,
                 initial.AuthoringRevision,
+                new AuthoringPatch(
+                    SceneTextures:
+                    [
+                        new SceneTextureAssignment(1, "asset://renderer2d/test.texture", "pixel_art")
+                    ],
+                    SceneTilemaps:
+                    [
+                        new SceneTilemapDefinition(
+                            "background",
+                            [0, 0],
+                            [32, 32],
+                            2,
+                            2,
+                            1,
+                            4,
+                            4,
+                            [1, 0, 6, 16])
+                    ]),
+                default);
+            Require(tilemapCommit.ChangedFields.SequenceEqual(["scene.textures", "scene.tilemaps"])
+                && tilemapCommit.ProjectSnapshot.Scene.SchemaVersion == 8
+                && tilemapCommit.ProjectSnapshot.Scene.Tilemaps is [{ TilemapId: "background", TextureId: 1 }]
+                && tilemapCommit.ProjectSnapshot.Scene.Tilemaps[0].Cells.SequenceEqual([1, 0, 6, 16]),
+                "Tilemap v7 to v8 authoring commit mismatch.");
+            var tilemapScene = File.ReadAllBytes(project.ScenePath);
+            var tilemapUndone = await authoring.UndoAsync(
+                project,
+                tilemapCommit.Revision,
+                tilemapCommit.UndoToken!,
+                default);
+            Require(tilemapUndone.ProjectSnapshot.Scene.SchemaVersion == 7
+                && tilemapUndone.ProjectSnapshot.Scene.Tilemaps is { Count: 0 }
+                && File.ReadAllBytes(project.ScenePath).AsSpan().SequenceEqual(originalScene),
+                "Tilemap v7 to v8 upgrade undo was not byte-exact.");
+            var tilemapRedone = await authoring.UndoAsync(
+                project,
+                tilemapUndone.Revision,
+                tilemapUndone.UndoToken!,
+                default);
+            Require(tilemapRedone.ProjectSnapshot.Scene.SchemaVersion == 8
+                && tilemapRedone.ProjectSnapshot.Scene.Tilemaps is [{ TilemapId: "background" }]
+                && File.ReadAllBytes(project.ScenePath).AsSpan().SequenceEqual(tilemapScene),
+                "Tilemap v8 redo was not byte-exact.");
+            var tilemapRestored = await authoring.UndoAsync(
+                project,
+                tilemapRedone.Revision,
+                tilemapRedone.UndoToken!,
+                default);
+            Require(tilemapRestored.ProjectSnapshot.Scene.SchemaVersion == 7
+                && File.ReadAllBytes(project.ScenePath).AsSpan().SequenceEqual(originalScene),
+                "Tilemap redo cleanup did not restore the original Scene.");
+            var tilemapDefinition = new SceneTilemapDefinition(
+                "background", [0, 0], [32, 32], 2, 2, 1, 4, 4, [1, 0, 6, 16]);
+            await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(
+                project,
+                tilemapRestored.Revision,
+                new AuthoringPatch(SceneTilemaps: [tilemapDefinition]),
+                default));
+            await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(
+                project,
+                tilemapRestored.Revision,
+                new AuthoringPatch(
+                    SceneTextures: [new SceneTextureAssignment(1, "asset://renderer2d/test.texture", "pixel_art")],
+                    SceneTilemaps: [tilemapDefinition with { Cells = [1, 2, 3] }]),
+                default));
+            await ExpectAuthoringFailureAsync(() => authoring.ApplyAsync(
+                project,
+                tilemapRestored.Revision,
+                new AuthoringPatch(
+                    SceneTextures: [new SceneTextureAssignment(1, "asset://renderer2d/test.texture", "pixel_art")],
+                    SceneTilemaps: [tilemapDefinition, tilemapDefinition with { TilemapId = "foreground" }]),
+                default));
+            Require(File.ReadAllBytes(project.ScenePath).AsSpan().SequenceEqual(originalScene),
+                "Rejected Tilemap candidates changed Scene source bytes.");
+            var prototypeCommit = await authoring.ApplyAsync(
+                project,
+                tilemapRestored.Revision,
                 new AuthoringPatch(ScenePrototypes:
                 [
                     new ScenePrototypeDefinition(

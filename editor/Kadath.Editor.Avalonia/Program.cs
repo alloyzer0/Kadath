@@ -90,7 +90,7 @@ internal static class Program
         var expectedAssetCount = Directory.EnumerateFiles(Path.Combine(packageRoot, "bin", "assets"), "*", SearchOption.AllDirectories).Count();
         var openedHierarchy = workspace.HierarchySnapshot.Value ?? throw new InvalidOperationException("Opened hierarchy snapshot is missing.");
         var expectedOpenedHierarchyCount = openedHierarchy.ProjectModelVersion == EditorSnapshotVersions.ProjectModel
-            && workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6
+            && workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8
             ? openedHierarchy.Nodes.Length
             : 13;
         Require(avaloniaViewModel.HierarchyItems.Count == expectedOpenedHierarchyCount
@@ -109,7 +109,40 @@ internal static class Program
         Console.WriteLine("workflow_project_open=ok");
 
         var openedProject = workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Opened project snapshot is missing.");
-        if (openedProject.Scene.SchemaVersion is 5 or 6)
+        if (openedProject.Scene.SchemaVersion is 7 or 8)
+        {
+            Require(avaloniaViewModel.SupportsSceneTilemapAuthoring,
+                "Avalonia did not expose Tilemap authoring for Scene v7/v8");
+            if (avaloniaViewModel.SceneTilemapDraft is null) avaloniaViewModel.AddSceneTilemapDraft();
+            var tilemapDraft = avaloniaViewModel.SceneTilemapDraft
+                ?? throw new InvalidOperationException("Avalonia did not create a Tilemap draft");
+            // 同一事务同时切换 Atlas Texture/profile，覆盖 Workspace 的跨字段 candidate 校验。
+            var atlasTextureSlot = avaloniaViewModel.SceneTextureAssignments[1];
+            atlasTextureSlot.SamplingProfile = "pixel_art";
+            tilemapDraft.TextureIdText = atlasTextureSlot.TextureIdText;
+            tilemapDraft.Columns = "2";
+            tilemapDraft.Rows = "2";
+            tilemapDraft.AtlasColumns = "4";
+            tilemapDraft.AtlasRows = "4";
+            tilemapDraft.ResizeCells();
+            Require(tilemapDraft.GridColumns == 2 && tilemapDraft.Cells.Count == 4,
+                "Avalonia Tilemap grid did not preserve the authored row/column shape");
+            foreach (var cell in tilemapDraft.Cells) cell.Value = 0;
+            tilemapDraft.SelectedTileIndex = "6";
+            tilemapDraft.PaintCell(2);
+            var tilemapEdited = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(tilemapEdited.ChangedFields.SequenceEqual(["scene.textures", "scene.tilemaps"])
+                && tilemapEdited.ProjectSnapshot.Scene.SchemaVersion == 8
+                && tilemapEdited.ProjectSnapshot.Scene.Tilemaps is [{ TilemapId: "background" }]
+                && tilemapEdited.ProjectSnapshot.Scene.Tilemaps[0].Cells.SequenceEqual([0, 0, 6, 0]),
+                "Avalonia did not commit the Tilemap draft through the existing authoring seam");
+            var tilemapRestored = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(tilemapRestored.ProjectSnapshot.Scene.SchemaVersion == openedProject.Scene.SchemaVersion,
+                "Avalonia Tilemap Undo did not restore the original Scene schema");
+            openedProject = workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Tilemap Undo snapshot is missing.");
+            Console.WriteLine("workflow_tilemap_authoring=ok");
+        }
+        if (openedProject.Scene.SchemaVersion is 5 or 6 or 7 or 8)
         {
             var expectedBehaviors = CaptureBehaviorSignatures(openedProject);
             var hazardDraft = avaloniaViewModel.SceneObjectDrafts.First(draft => draft.Kind == "patrol_hazard");
@@ -137,7 +170,7 @@ internal static class Program
             Require(avaloniaViewModel.IsBehaviorContractReady
                 && avaloniaViewModel.AvailableBehaviorContracts.Count == 2,
                 "Avalonia did not project the Behavior Contract catalog");
-            if (openedProject.Scene.SchemaVersion == 6)
+            if (openedProject.Scene.SchemaVersion is 6 or 7 or 8)
             {
                 Require(avaloniaViewModel.ScenePrototypeDrafts is [{ PrototypeId: "runtime-orb" }]
                     && !workspace.HierarchySnapshot.Value!.Nodes.Any(node =>
@@ -576,12 +609,12 @@ internal static class Program
             && created.ProjectName == createdProjectName
             && workspace.ProjectSnapshot.Value?.ProjectName == createdProjectName
             && workspace.HierarchySnapshot.Value?.ProjectName == createdProjectName
-            && avaloniaViewModel.HierarchyItems.Count == (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6
+            && avaloniaViewModel.HierarchyItems.Count == (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8
                 ? workspace.HierarchySnapshot.Value?.Nodes.Length
                 : 13)
             && avaloniaViewModel.AssetItems.Count == expectedAssetCount
             && avaloniaViewModel.SceneObjectDrafts.Count == 5
-            && (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is not 6
+            && (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is not (6 or 7 or 8)
                 || avaloniaViewModel.ScenePrototypeDrafts is [{ PrototypeId: "runtime-orb" }])
             && avaloniaViewModel.InspectorText.Contains("scene.objects[goal]", StringComparison.Ordinal),
             "Avalonia public Create did not project the new Session snapshots after atomic cache invalidation");

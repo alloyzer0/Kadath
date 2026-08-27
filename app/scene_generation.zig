@@ -419,7 +419,7 @@ pub const SceneGeneration = struct {
             };
         }
         try self.core.prepareGameplay(
-            if (self.scene.schemaVersion == scene_api.current_schema_version) self.scene.gameplay.timeLimitSeconds else 3.0,
+            if (self.scene.schemaVersion >= scene_api.gameplay_schema_version) self.scene.gameplay.timeLimitSeconds else 3.0,
             objectRefAtSource(visible, @as(usize, self.player_index orelse return error.UnknownSceneObject)) orelse return error.UnknownSceneObject,
             objectRefAtSource(visible, @as(usize, self.goal_index orelse return error.UnknownSceneObject)) orelse return error.UnknownSceneObject,
             hazards[0..self.hazard_count],
@@ -610,6 +610,22 @@ test "SceneGeneration prepares and renders one-object neutral scene without Game
     }
     var outcome: runtime_core.GameplayOutcome = undefined;
     try std.testing.expectError(error.InvalidGameplayState, generation.beginGameplayFixed(0.0, &outcome));
+}
+
+test "SceneGeneration preserves a Scene v7 explicit Gameplay time limit" {
+    var value = scene_api.default_scene;
+    value.schemaVersion = scene_api.gameplay_schema_version;
+    value.gameplay = .{ .profile = .goal_hazard_v1, .timeLimitSeconds = 9 };
+    for (value.objects.mutableSlice()) |*object| {
+        if (object.kind != .patrol_hazard) continue;
+        object.behaviors.count = 1;
+        object.behaviors.entries[0].scriptId = 1;
+    }
+    var generation = try SceneGeneration.prepare(&value, .{ .width = 1024, .height = 720 });
+    defer generation.deinit();
+    var sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
+    const snapshot = try (try generation.extractSprites(&sprites)).gameplaySnapshot();
+    try std.testing.expectEqual(@as(f32, 9), snapshot.time_remaining_seconds);
 }
 
 test "SceneGeneration activates and despawns transient prototype objects without exposing pending state" {

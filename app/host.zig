@@ -22,12 +22,14 @@ const rhi = @import("rhi");
 const Rhi = rhi.Rhi;
 const Renderer2D = @import("renderer2d").Renderer2D;
 const SpriteInstance = @import("renderer2d").SpriteInstance;
+const TilemapLayerView = @import("renderer2d").TilemapLayerView;
 
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
 fn validateSceneTextureBindings(registry: *const runtime_texture_registry.RuntimeTextureRegistry, scene: *const scene_api.Scene) !void {
     for (scene.objects.slice()) |object| _ = try registry.resolve(object.sprite.textureId);
     for (scene.prototypes.slice()) |prototype| _ = try registry.resolve(prototype.sprite.textureId);
+    for (scene.tilemaps.slice()) |tilemap| _ = try registry.resolve(tilemap.textureId);
 }
 
 fn sceneHasBehaviors(scene: *const scene_api.Scene) bool {
@@ -318,10 +320,26 @@ pub const Host = struct {
                 .texture = try self.texture_registry.resolve(sprite.texture_id),
             };
         }
-        const outcome = try self.renderer2d.renderSprites(
+        var tilemaps: [scene_api.max_tilemap_count]TilemapLayerView = undefined;
+        for (self.scene.tilemaps.slice(), 0..) |tilemap, index| {
+            tilemaps[index] = .{
+                .origin = tilemap.origin,
+                .tile_size = tilemap.tileSize,
+                .columns = tilemap.columns,
+                .rows = tilemap.rows,
+                .atlas_columns = tilemap.atlasColumns,
+                .atlas_rows = tilemap.atlasRows,
+                .texture = try self.texture_registry.resolve(tilemap.textureId),
+                .cells = tilemap.cellSlice(),
+            };
+        }
+        const outcome = try self.renderer2d.renderFrame(
             &self.rhi,
             .{ .width = extent.width, .height = extent.height },
-            instances[0..self.render_count],
+            .{
+                .tilemaps = tilemaps[0..self.scene.tilemaps.count],
+                .sprites = instances[0..self.render_count],
+            },
         );
         if (outcome == .recreated) {
             std.log.debug("Renderer2D swapchain recreation completed", .{});
@@ -815,6 +833,14 @@ test "scene texture bindings must resolve before world replacement" {
     var scene = scene_api.default_scene;
     try validateSceneTextureBindings(&registry, &scene);
     scene.objects.entries[0].sprite.textureId = 4;
+    try std.testing.expectError(error.UnknownWorldTexture, validateSceneTextureBindings(&registry, &scene));
+    scene.objects.entries[0].sprite.textureId = 1;
+    scene.schemaVersion = scene_api.current_schema_version;
+    scene.tilemaps.count = 1;
+    scene.tilemaps.entries[0] = .{
+        .tilemapId = try scene_api.TilemapId.init("background"),
+        .textureId = 4,
+    };
     try std.testing.expectError(error.UnknownWorldTexture, validateSceneTextureBindings(&registry, &scene));
 }
 

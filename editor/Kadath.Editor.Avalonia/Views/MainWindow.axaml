@@ -388,15 +388,89 @@
                   <ItemsControl ItemsSource="{Binding SceneTextureAssignments}">
                     <ItemsControl.ItemTemplate>
                       <DataTemplate>
-                        <Grid ColumnDefinitions="Auto,68,Auto,*" ColumnSpacing="4" Margin="0,0,0,4">
+                        <Grid ColumnDefinitions="Auto,68,Auto,*,Auto,180" ColumnSpacing="4" Margin="0,0,0,4">
                           <TextBlock VerticalAlignment="Center" Text="{Binding SlotLabel}" />
                           <TextBox Grid.Column="1" Text="{Binding TextureIdText}" />
                           <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Asset" />
                           <ComboBox Grid.Column="3" ItemsSource="{Binding AssetItems}" SelectedItem="{Binding SelectedAssetItem}" />
+                          <TextBlock Grid.Column="4" VerticalAlignment="Center" Text="Sampling" />
+                          <ComboBox Grid.Column="5" ItemsSource="{Binding SamplingProfiles}" SelectedItem="{Binding SamplingProfile}" />
                         </Grid>
                       </DataTemplate>
                     </ItemsControl.ItemTemplate>
                   </ItemsControl>
+                </StackPanel>
+              </Border>
+
+              <Border IsVisible="{Binding SupportsSceneTilemapAuthoring}" Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="6">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock FontWeight="SemiBold" Text="Static background Tilemap" />
+                    <TextBlock Grid.Column="1" FontSize="11" Foreground="#AEBAC8" Text="{Binding SceneTilemapStatus}" />
+                  </Grid>
+                  <StackPanel Orientation="Horizontal" Spacing="5">
+                    <Button Command="{Binding AddSceneTilemapCommand}" Content="添加 Tilemap" />
+                    <Button Command="{Binding DeleteSceneTilemapCommand}" Content="删除 Tilemap" />
+                  </StackPanel>
+                  <Border IsVisible="{Binding HasSceneTilemapDraft}" Padding="7" Background="#1C222A" CornerRadius="4">
+                    <StackPanel Spacing="5">
+                      <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                        <TextBlock VerticalAlignment="Center" Text="TilemapId" />
+                        <TextBox Grid.Column="1" Text="{Binding SceneTilemapDraft.TilemapId}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*" ColumnSpacing="5">
+                        <TextBlock VerticalAlignment="Center" Text="Origin X" />
+                        <TextBox Grid.Column="1" Text="{Binding SceneTilemapDraft.OriginX}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Y" />
+                        <TextBox Grid.Column="3" Text="{Binding SceneTilemapDraft.OriginY}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*" ColumnSpacing="5">
+                        <TextBlock VerticalAlignment="Center" Text="Tile size X" />
+                        <TextBox Grid.Column="1" Text="{Binding SceneTilemapDraft.TileSizeX}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Y" />
+                        <TextBox Grid.Column="3" Text="{Binding SceneTilemapDraft.TileSizeY}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*,Auto" ColumnSpacing="5">
+                        <TextBlock VerticalAlignment="Center" Text="Columns" />
+                        <TextBox Grid.Column="1" Text="{Binding SceneTilemapDraft.Columns}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Rows" />
+                        <TextBox Grid.Column="3" Text="{Binding SceneTilemapDraft.Rows}" />
+                        <Button Grid.Column="4" Command="{Binding ResizeSceneTilemapCommand}" Content="调整 Cell" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,*,Auto,*,Auto,*" ColumnSpacing="5">
+                        <TextBlock VerticalAlignment="Center" Text="Atlas texture" />
+                        <ComboBox Grid.Column="1" ItemsSource="{Binding SceneTilemapDraft.TextureIds}" SelectedItem="{Binding SceneTilemapDraft.TextureIdText}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Cols" />
+                        <TextBox Grid.Column="3" Text="{Binding SceneTilemapDraft.AtlasColumns}" />
+                        <TextBlock Grid.Column="4" VerticalAlignment="Center" Text="Rows" />
+                        <TextBox Grid.Column="5" Text="{Binding SceneTilemapDraft.AtlasRows}" />
+                      </Grid>
+                      <Grid ColumnDefinitions="Auto,100,*" ColumnSpacing="5">
+                        <TextBlock VerticalAlignment="Center" Text="选中图块" />
+                        <TextBox Grid.Column="1" Text="{Binding SceneTilemapDraft.SelectedTileIndex}" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" FontSize="11" Foreground="#D7B46A"
+                                   Text="左键按钮绘制，× 擦除；0 保留为空。Atlas 纹理必须选择 pixel_art。" TextWrapping="Wrap" />
+                      </Grid>
+                      <ScrollViewer MaxHeight="260" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+                        <ItemsControl DataContext="{Binding SceneTilemapDraft}" ItemsSource="{Binding Cells}">
+                          <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                              <UniformGrid Columns="{Binding GridColumns}" />
+                            </ItemsPanelTemplate>
+                          </ItemsControl.ItemsPanel>
+                          <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                              <StackPanel Width="48" Margin="2" Spacing="2">
+                                <TextBlock HorizontalAlignment="Center" FontSize="9" Foreground="#8F9CAB" Text="{Binding Index}" />
+                                <Button Command="{Binding PaintCommand}" Content="{Binding Display}" />
+                                <Button Command="{Binding EraseCommand}" Content="×" FontSize="10" />
+                              </StackPanel>
+                            </DataTemplate>
+                          </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                      </ScrollViewer>
+                    </StackPanel>
+                  </Border>
                 </StackPanel>
               </Border>
 

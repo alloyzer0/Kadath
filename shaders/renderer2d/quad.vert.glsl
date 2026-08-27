@@ -3,6 +3,7 @@
 struct SpriteInstance {
     vec4 rect_ndc;
     vec4 color;
+    vec4 uv_rect;
 };
 
 layout(std430, set = 1, binding = 0) readonly buffer SpriteInstances {
@@ -30,6 +31,6 @@ void main() {
     );
     // Vulkan 使用正高度 viewport：只翻转 clip-space Y，保持 PNG UV 自上而下。
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
-    out_uv = local;
+    out_uv = instance.uv_rect.xy + local * instance.uv_rect.zw;
     out_color = instance.color;
 }
