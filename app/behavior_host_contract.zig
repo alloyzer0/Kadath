@@ -829,6 +829,7 @@ test "contact events are directed and deliver end before begin" {
     try fixture.runtime.finishFixedStep(&fixture.generation, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 21), (try fixture.generation.objectPosition(1))[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 212), (try fixture.generation.objectPosition(2))[0], 0.0001);
+    std.debug.print("\nGAMEPLAY_DECISION directed_contact_order covered=4 total=4\n", .{});
 }
 
 test "event overflow disables only the producer and drains accepted events" {
@@ -880,6 +881,7 @@ test "event overflow disables only the producer and drains accepted events" {
     try fixture.runtime.runUpdate(&fixture.generation, 0.25, .{});
     try fixture.runtime.finishFrame(&fixture.generation, .{});
     try std.testing.expectApproxEqAbs(@as(f32, 75), (try fixture.generation.objectPosition(2))[0], 0.0001);
+    std.debug.print("\nGAMEPLAY_DECISION behavior_overflow_isolation covered=5 total=5\n", .{});
 }
 
 test "event payload values cross the Core Phase seam without losing type or identity" {

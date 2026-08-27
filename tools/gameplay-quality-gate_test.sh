@@ -39,4 +39,106 @@ if [[ $status -eq 0 ]] || grep -Fq QUALITY_GATE_PASS <<<"$output"; then
     exit 1
 fi
 grep -Fq QUALITY_GATE_BLOCKED <<<"$output"
+
+# 构造可由 gate 解析的五次 raw provenance，分别证明 raw 与 payload 篡改都会产生明确 blocker。
+candidate_sha=$(git -C "$script_dir/.." rev-parse HEAD)
+oracle_sha=f114d755a927acd202872bb3468a1d9e7b87decb
+hash() { sha256sum "$1" | awk '{print $1}'; }
+candidate_build_stdout="$evidence_root/candidate-build.stdout"; : >"$candidate_build_stdout"
+candidate_build_stderr="$evidence_root/candidate-build.stderr"; : >"$candidate_build_stderr"
+oracle_build_stdout="$evidence_root/oracle-build.stdout"; : >"$oracle_build_stdout"
+oracle_build_stderr="$evidence_root/oracle-build.stderr"; : >"$oracle_build_stderr"
+command_manifest="$evidence_root/performance-commands.tsv"
+printf 'kind\trun\tcommand\n' >"$command_manifest"
+performance_manifest="$evidence_root/performance-manifest.tsv"
+printf 'run\tcandidate_stdout\tcandidate_stdout_sha256\tcandidate_stderr\tcandidate_stderr_sha256\tcandidate_time\tcandidate_time_sha256\toracle_stdout\toracle_stdout_sha256\toracle_stderr\toracle_stderr_sha256\toracle_time\toracle_time_sha256\n' >"$performance_manifest"
+for run in 1 2 3 4 5; do
+    candidate_stdout="$evidence_root/candidate-$run.stdout"; candidate_stderr="$evidence_root/candidate-$run.stderr"; candidate_time="$evidence_root/candidate-$run.time"
+    oracle_stdout="$evidence_root/oracle-$run.stdout"; oracle_stderr="$evidence_root/oracle-$run.stderr"; oracle_time="$evidence_root/oracle-$run.time"
+    printf 'p95_ns=100\nallocations=0\n' >"$candidate_stdout"; : >"$candidate_stderr"
+    printf 'Maximum resident set size (kbytes): 1000\n' >"$candidate_time"
+    printf 'p95_ns=100\n' >"$oracle_stdout"; : >"$oracle_stderr"
+    printf 'Maximum resident set size (kbytes): 1000\n' >"$oracle_time"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$run" "$candidate_stdout" "$(hash "$candidate_stdout")" "$candidate_stderr" "$(hash "$candidate_stderr")" \
+        "$candidate_time" "$(hash "$candidate_time")" "$oracle_stdout" "$(hash "$oracle_stdout")" \
+        "$oracle_stderr" "$(hash "$oracle_stderr")" "$oracle_time" "$(hash "$oracle_time")" >>"$performance_manifest"
+done
+candidate_payload="$evidence_root/candidate.payload"
+cat >"$candidate_payload" <<EOF
+GAMEPLAY_CANDIDATE_SHA=$candidate_sha
+GAMEPLAY_COMMAND=paired-test-fixture
+GAMEPLAY_TOOL_ZIG_VERSION=test
+GAMEPLAY_TOOL_GNU_TIME_VERSION=test
+GAMEPLAY_TOOL_HOST=test
+GAMEPLAY_CANDIDATE_BENCHMARK=$candidate
+GAMEPLAY_CANDIDATE_BENCHMARK_SHA256=$(hash "$candidate")
+GAMEPLAY_CANDIDATE_BUILD_STDOUT=$candidate_build_stdout
+GAMEPLAY_CANDIDATE_BUILD_STDOUT_SHA256=$(hash "$candidate_build_stdout")
+GAMEPLAY_CANDIDATE_BUILD_STDERR=$candidate_build_stderr
+GAMEPLAY_CANDIDATE_BUILD_STDERR_SHA256=$(hash "$candidate_build_stderr")
+GAMEPLAY_CANDIDATE_ITERATIONS=10000
+GAMEPLAY_CANDIDATE_ACTIVE_OBJECTS=128
+GAMEPLAY_CANDIDATE_DIRECTED_EVENTS=64
+GAMEPLAY_CANDIDATE_RENDER_ITEMS=128
+GAMEPLAY_CANDIDATE_P95_NS=100
+GAMEPLAY_CANDIDATE_PEAK_RSS_KB=1000
+GAMEPLAY_CANDIDATE_ALLOCATIONS=0
+GAMEPLAY_PERF_MANIFEST=$performance_manifest
+GAMEPLAY_PERF_MANIFEST_SHA256=$(hash "$performance_manifest")
+GAMEPLAY_PERF_COMMAND_MANIFEST=$command_manifest
+GAMEPLAY_PERF_COMMAND_MANIFEST_SHA256=$(hash "$command_manifest")
+EOF
+oracle_payload="$evidence_root/oracle.payload"
+cat >"$oracle_payload" <<EOF
+GAMEPLAY_ORACLE_SHA=$oracle_sha
+GAMEPLAY_COMMAND=paired-test-fixture
+GAMEPLAY_TOOL_ZIG_VERSION=test
+GAMEPLAY_TOOL_GNU_TIME_VERSION=test
+GAMEPLAY_TOOL_HOST=test
+GAMEPLAY_ORACLE_BENCHMARK=$oracle
+GAMEPLAY_ORACLE_BENCHMARK_SHA256=$(hash "$oracle")
+GAMEPLAY_ORACLE_BUILD_STDOUT=$oracle_build_stdout
+GAMEPLAY_ORACLE_BUILD_STDOUT_SHA256=$(hash "$oracle_build_stdout")
+GAMEPLAY_ORACLE_BUILD_STDERR=$oracle_build_stderr
+GAMEPLAY_ORACLE_BUILD_STDERR_SHA256=$(hash "$oracle_build_stderr")
+GAMEPLAY_ORACLE_ITERATIONS=10000
+GAMEPLAY_ORACLE_ACTIVE_OBJECTS=128
+GAMEPLAY_ORACLE_DIRECTED_EVENTS=64
+GAMEPLAY_ORACLE_RENDER_ITEMS=128
+GAMEPLAY_ORACLE_P95_NS=100
+GAMEPLAY_ORACLE_PEAK_RSS_KB=1000
+GAMEPLAY_PERF_MANIFEST=$performance_manifest
+GAMEPLAY_PERF_MANIFEST_SHA256=$(hash "$performance_manifest")
+GAMEPLAY_PERF_COMMAND_MANIFEST=$command_manifest
+GAMEPLAY_PERF_COMMAND_MANIFEST_SHA256=$(hash "$command_manifest")
+EOF
+bind_report() {
+    local payload=$1 report=$2
+    cat "$payload" >"$report"
+    printf 'GAMEPLAY_REPORT_PAYLOAD=%s\nREPORT_PAYLOAD_SHA256=%s\n' "$payload" "$(hash "$payload")" >>"$report"
+}
+bind_report "$candidate_payload" "$evidence_root/candidate.report"
+bind_report "$oracle_payload" "$evidence_root/oracle.report"
+
+printf 'tampered\n' >>"$evidence_root/candidate-1.stdout"
+set +e
+raw_tamper_output=$("${runner[@]}" \
+    --candidate-sha "$candidate_sha" --oracle-sha "$oracle_sha" \
+    --candidate-benchmark "$candidate" --candidate-report "$evidence_root/candidate.report" \
+    --oracle-benchmark "$oracle" --oracle-report "$evidence_root/oracle.report" \
+    --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" 2>&1)
+set -e
+grep -Fq 'performance raw candidate stdout hash mismatch on run 1' <<<"$raw_tamper_output"
+printf 'p95_ns=100\nallocations=0\n' >"$evidence_root/candidate-1.stdout"
+
+printf 'tampered-payload\n' >>"$candidate_payload"
+set +e
+payload_tamper_output=$("${runner[@]}" \
+    --candidate-sha "$candidate_sha" --oracle-sha "$oracle_sha" \
+    --candidate-benchmark "$candidate" --candidate-report "$evidence_root/candidate.report" \
+    --oracle-benchmark "$oracle" --oracle-report "$evidence_root/oracle.report" \
+    --coverage-report "$evidence_root/coverage.report" --mutation-report "$evidence_root/mutation.report" 2>&1)
+set -e
+grep -Fq 'CANDIDATE report payload hash mismatch' <<<"$payload_tamper_output"
 printf 'GAMEPLAY_QUALITY_GATE_BLOCKED_PATH=PASS\n'

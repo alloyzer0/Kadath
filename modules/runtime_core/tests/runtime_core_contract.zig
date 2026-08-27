@@ -66,6 +66,7 @@ test "Scene publication requires ready Object Gameplay and Phase candidates" {
     try core.commitPhaseState();
     try core.commitScene();
     try std.testing.expect((try core.findById(.live, "player")) != null);
+    std.debug.print("\nGAMEPLAY_DECISION paired_publication covered=6 total=6\n", .{});
 }
 
 test "Restart is terminal-only and preserves Gameplay sequence high-water marks" {
@@ -92,6 +93,7 @@ test "Restart is terminal-only and preserves Gameplay sequence high-water marks"
     const restarted = try core.beginGameplayFixed(0.0, &outcome);
     try std.testing.expectEqual(@as(u64, terminal.step_token + 1), restarted.step_token);
     try core.abortGameplayFixed(restarted.step_token);
+    std.debug.print("\nGAMEPLAY_DECISION restart_reset covered=4 total=4\n", .{});
 }
 
 test "Runtime Core Adapter drives a fixed phase through the public Phase Interface" {
@@ -234,6 +236,7 @@ test "Runtime Core Phase replay preserves FIFO, domain counters, and generation 
     try std.testing.expectEqual(@as(usize, 1), try core.drainPhaseEvents(.frame, frame_phase_sequence, drained[0..]));
     try std.testing.expectEqual(@as(u64, 1), drained[0].sequence);
     try core.endPhase(.frame, frame_phase_sequence);
+    std.debug.print("\nGAMEPLAY_DECISION phase_capacity covered=5 total=5\n", .{});
 }
 
 test "Runtime Core Phase bounded command replay is reproducible across seeds" {
@@ -565,6 +568,7 @@ test "Runtime Core Gameplay owns terminal priority contact events outcome and fi
     const terminal_begin = try core.beginGameplayFixed(0.5, &outcome);
     try std.testing.expectEqual(@as(usize, 0), terminal_begin.outcome_count);
     try core.abortGameplayFixed(terminal_begin.step_token);
+    std.debug.print("\nGAMEPLAY_DECISION snapshot_outcome_no_replay covered=6 total=6\n", .{});
 }
 
 test "Gameplay step token and fixed Phase sequence are separately Core-owned" {

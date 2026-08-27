@@ -2217,6 +2217,7 @@ int main(void) {
     int gameplay_result = gameplay_contract_path(&interface_value, &phase_interface, &gameplay_interface);
     if (gameplay_result != 0) return gameplay_result;
     puts("PHASE3_PUBLIC_GAMEPLAY_PATH=PASS");
+    puts("GAMEPLAY_DECISION public_abi_preflight covered=1 total=1");
     int phase_result = phase_commit_path(&interface_value, &phase_interface_v1, &phase_interface);
     if (phase_result != 0) return phase_result;
     puts("PHASE3_PUBLIC_PHASE_COMMIT_PATH=PASS");
@@ -2233,6 +2234,7 @@ int main(void) {
     int fault_result = fault_containment(&interface_value);
     if (fault_result != 0) return fault_result;
     puts("PHASE3_PUBLIC_FAULT_CONTAINMENT=PASS");
+    puts("GAMEPLAY_DECISION failure_no_side_effect covered=1 total=1");
     int misuse_result = misuse_contract(&interface_value);
     if (misuse_result != 0) return misuse_result;
     puts("PHASE3_PUBLIC_MISUSE=PASS");

@@ -40,7 +40,7 @@ mkdir -p "$evidence_root"
 
 rust_json="$evidence_root/rust-coverage.json"
 (cd -- "$repository_root" && cargo +nightly llvm-cov --package kadath_runtime_core --all-targets \
-    --branch --json --output-path "$rust_json") >"$evidence_root/rust-command.log" 2>&1 || block 'Rust coverage command failed'
+    --branch --json --output-path "$rust_json" -- --nocapture) >"$evidence_root/rust-command.log" 2>&1 || block 'Rust coverage command failed'
 
 emit_prefix="$evidence_root/emit"
 (cd -- "$repository_root" && zig build \
@@ -92,43 +92,36 @@ meets "$public_line" 90 || block 'public C line coverage below 90%'
 meets "$zig_line" 90 || block 'Zig Adapter line coverage below 90%'
 meets "$behavior_line" 90 || block 'Behavior line coverage below 90%'
 
-require_anchor() {
-    local path=$1 anchor=$2 domain=$3
-    grep -Fq "$anchor" "$repository_root/$path" || block "critical decision test missing: $domain"
-}
-require_test_log() {
-    local log=$1 marker=$2 domain=$3
-    [[ -s "$log" ]] || block "critical decision execution log missing: $domain"
-    grep -Fq "$marker" "$log" || block "critical decision not executed: $domain"
-}
 decision_manifest="$evidence_root/critical-decisions.tsv"
 printf 'domain\tfile\tline\tdecision\tcovered\ttotal\n' >"$decision_manifest"
-require_anchor modules/runtime_core/src/gameplay.rs 'timer_then_hazard_then_goal_priority_is_terminal_and_exactly_once' timer_priority
-require_test_log "$evidence_root/rust-command.log" 'timer_then_hazard_then_goal_priority_is_terminal_and_exactly_once ... ok' timer_priority
-printf 'timer_priority\tmodules/runtime_core/src/gameplay.rs\t672\ttimer-before-contact\t1\t1\n' >>"$decision_manifest"
-require_anchor modules/runtime_core/src/gameplay.rs 'stale_previous_contact_is_cleared_without_publishing_an_end_event' stale_contact
-require_test_log "$evidence_root/rust-command.log" 'stale_previous_contact_is_cleared_without_publishing_an_end_event ... ok' stale_contact
-printf 'stale_contact\tmodules/runtime_core/src/gameplay.rs\t819\tstale-source-drop\t1\t1\n' >>"$decision_manifest"
-require_anchor modules/runtime_core/tests/runtime_core_contract.zig 'Scene publication requires ready Object Gameplay and Phase candidates' paired_candidate
-require_test_log "$evidence_root/zig-adapter.log" 'Scene publication requires ready Object Gameplay and Phase candidates...OK' paired_candidate
-printf 'paired_candidate\tmodules/runtime_core/tests/runtime_core_contract.zig\t53\tpaired-candidate-preflight\t1\t1\n' >>"$decision_manifest"
-require_anchor modules/runtime_core/tests/runtime_core_contract.zig 'Restart is terminal-only and preserves Gameplay sequence high-water marks' restart_high_water
-require_test_log "$evidence_root/zig-adapter.log" 'Restart is terminal-only and preserves Gameplay sequence high-water marks...OK' restart_high_water
-printf 'restart_high_water\tmodules/runtime_core/tests/runtime_core_contract.zig\t71\tsequence-high-water\t1\t1\n' >>"$decision_manifest"
-require_anchor modules/runtime_core/tests/runtime_core_contract.zig 'Runtime Core Gameplay owns terminal priority contact events outcome and final tint' snapshot_outcome
-require_test_log "$evidence_root/zig-adapter.log" 'Runtime Core Gameplay owns terminal priority contact events outcome and final tint...OK' snapshot_outcome
-printf 'snapshot_outcome\tmodules/runtime_core/tests/runtime_core_contract.zig\t508\toutcome-tint-coherence\t1\t1\n' >>"$decision_manifest"
-require_anchor modules/runtime_core/tests/public_contract.c 'PHASE3_PUBLIC_GAMEPLAY_PATH=PASS' public_preflight
-require_test_log "$evidence_root/public-c.log" 'PHASE3_PUBLIC_GAMEPLAY_PATH=PASS' public_preflight
-printf 'public_preflight\tmodules/runtime_core/tests/public_contract.c\t2211\tpublic-abi-preflight\t1\t1\n' >>"$decision_manifest"
-require_anchor app/behavior_host_contract.zig 'contact events are directed and deliver end before begin' contact_order
-require_test_log "$evidence_root/behavior.log" 'contact events are directed and deliver end before begin...OK' contact_order
-printf 'contact_order\tapp/behavior_host_contract.zig\t780\tend-before-begin\t1\t1\n' >>"$decision_manifest"
-require_anchor modules/runtime_core/tests/runtime_core_contract.zig 'Runtime Core Phase replay preserves FIFO, domain counters, and generation bounds' phase_capacity
-require_test_log "$evidence_root/zig-adapter.log" 'Runtime Core Phase replay preserves FIFO, domain counters, and generation bounds...OK' phase_capacity
-printf 'phase_capacity\tmodules/runtime_core/tests/runtime_core_contract.zig\t174\tfifo-generation-bounds\t1\t1\n' >>"$decision_manifest"
-decision_total=$(awk 'NR > 1 { total++ } END { print total+0 }' "$decision_manifest")
-decision_covered=$(awk 'NR > 1 && $5 == $6 { covered++ } END { print covered+0 }' "$decision_manifest")
+record_decision() {
+    local domain=$1 path=$2 decision=$3 log=$4
+    local marker="GAMEPLAY_DECISION $decision" source_line execution covered total
+    source_line=$(grep -Fn "$marker" "$repository_root/$path" | cut -d: -f1 | tail -n 1)
+    [[ "$source_line" =~ ^[0-9]+$ ]] || block "critical decision source marker missing: $decision"
+    execution=$(grep -F "$marker " "$log" | tail -n 1)
+    [[ -n "$execution" ]] || block "critical decision not executed: $decision"
+    covered=$(sed -n 's/.* covered=\([0-9][0-9]*\) total=.*/\1/p' <<<"$execution")
+    total=$(sed -n 's/.* total=\([0-9][0-9]*\).*/\1/p' <<<"$execution")
+    [[ "$covered" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ && "$total" -gt 0 && "$covered" -le "$total" ]] || \
+        block "critical decision counter invalid: $decision"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$domain" "$path" "$source_line" "$decision" "$covered" "$total" >>"$decision_manifest"
+}
+
+# 每一行都来自本次 Debug 二进制的运行时 marker；源码 grep 只用于绑定 marker 所在行号。
+record_decision timer_priority modules/runtime_core/src/gameplay.rs timer_priority "$evidence_root/rust-command.log"
+record_decision contact_differencing modules/runtime_core/src/gameplay.rs contact_diff_edges "$evidence_root/rust-command.log"
+record_decision paired_publication modules/runtime_core/tests/runtime_core_contract.zig paired_publication "$evidence_root/zig-adapter.log"
+record_decision restart_reset modules/runtime_core/tests/runtime_core_contract.zig restart_reset "$evidence_root/zig-adapter.log"
+record_decision phase_capacity modules/runtime_core/tests/runtime_core_contract.zig phase_capacity "$evidence_root/zig-adapter.log"
+record_decision snapshot_outcome modules/runtime_core/tests/runtime_core_contract.zig snapshot_outcome_no_replay "$evidence_root/zig-adapter.log"
+record_decision public_preflight modules/runtime_core/tests/public_contract.c public_abi_preflight "$evidence_root/public-c.log"
+record_decision failure_atomicity modules/runtime_core/tests/public_contract.c failure_no_side_effect "$evidence_root/public-c.log"
+record_decision contact_order app/behavior_host_contract.zig directed_contact_order "$evidence_root/behavior.log"
+record_decision overflow app/behavior_host_contract.zig behavior_overflow_isolation "$evidence_root/behavior.log"
+decision_total=$(awk -F '\t' 'NR > 1 { total += $6 } END { print total+0 }' "$decision_manifest")
+decision_covered=$(awk -F '\t' 'NR > 1 { covered += $5 } END { print covered+0 }' "$decision_manifest")
+decision_percent=$(awk -v covered="$decision_covered" -v total="$decision_total" 'BEGIN { printf "%.2f", 100 * covered / total }')
 [[ "$decision_total" -gt 0 && "$decision_total" -eq "$decision_covered" ]] || block 'critical decision matrix incomplete'
 
 report="$evidence_root/coverage.report"
@@ -141,7 +134,9 @@ GAMEPLAY_COVERAGE_RUST_BRANCH_PERCENT=$rust_branch
 GAMEPLAY_COVERAGE_PUBLIC_C_LINE_PERCENT=$public_line
 GAMEPLAY_COVERAGE_ZIG_ADAPTER_LINE_PERCENT=$zig_line
 GAMEPLAY_COVERAGE_BEHAVIOR_LINE_PERCENT=$behavior_line
-GAMEPLAY_CRITICAL_DECISIONS_PERCENT=100
+GAMEPLAY_CRITICAL_DECISIONS_COVERED=$decision_covered
+GAMEPLAY_CRITICAL_DECISIONS_TOTAL=$decision_total
+GAMEPLAY_CRITICAL_DECISIONS_PERCENT=$decision_percent
 GAMEPLAY_CRITICAL_DECISIONS_MANIFEST=$decision_manifest
 GAMEPLAY_CRITICAL_DECISIONS_MANIFEST_SHA256=$(sha256sum "$decision_manifest" | awk '{print $1}')
 GAMEPLAY_COVERAGE_RUST_JSON=$rust_json

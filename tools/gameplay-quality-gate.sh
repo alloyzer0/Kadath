@@ -76,6 +76,26 @@ verify_bound_file() {
     [[ "$actual" == "$expected" ]]
 }
 
+verify_report_payload() {
+    local report=$1 label=$2 payload expected actual payload_lines report_lines
+    payload=$(value "$report" GAMEPLAY_REPORT_PAYLOAD)
+    expected=$(value "$report" REPORT_PAYLOAD_SHA256)
+    if [[ ! -f "$payload" || ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        blocked+=("$label report payload binding missing")
+        return
+    fi
+    actual=$(sha256sum "$payload" | awk '{print $1}')
+    [[ "$actual" == "$expected" ]] || blocked+=("$label report payload hash mismatch")
+    payload_lines=$(wc -l <"$payload")
+    report_lines=$(wc -l <"$report")
+    if (( report_lines != payload_lines + 2 )) || ! cmp -s <(head -n "$payload_lines" "$report") "$payload"; then
+        blocked+=("$label report body does not match payload")
+    fi
+    [[ "$(tail -n 2 "$report" | head -n 1)" == "GAMEPLAY_REPORT_PAYLOAD=$payload" &&
+       "$(tail -n 1 "$report")" == "REPORT_PAYLOAD_SHA256=$expected" ]] || \
+        blocked+=("$label report payload trailer invalid")
+}
+
 if [[ -f "$coverage_report" ]]; then
     candidate_report_bound "$coverage_report" || blocked+=("coverage report SHA mismatch")
     [[ -n "$(value "$coverage_report" GAMEPLAY_COMMAND)" ]] || blocked+=("coverage command provenance missing")
@@ -88,7 +108,19 @@ if [[ -f "$coverage_report" ]]; then
         metric=$(value "$coverage_report" "GAMEPLAY_COVERAGE_${key}_PERCENT")
         awk -v n="$metric" 'BEGIN { exit !(n+0 >= 85) }' || blocked+=("$key branch coverage below 85%")
     done
-    [[ "$(value "$coverage_report" GAMEPLAY_CRITICAL_DECISIONS_PERCENT)" == 100 ]] || blocked+=("critical decision coverage below 100%")
+    decision_manifest=$(value "$coverage_report" GAMEPLAY_CRITICAL_DECISIONS_MANIFEST)
+    decision_covered=$(value "$coverage_report" GAMEPLAY_CRITICAL_DECISIONS_COVERED)
+    decision_total=$(value "$coverage_report" GAMEPLAY_CRITICAL_DECISIONS_TOTAL)
+    decision_percent=$(value "$coverage_report" GAMEPLAY_CRITICAL_DECISIONS_PERCENT)
+    if [[ -f "$decision_manifest" ]]; then
+        manifest_covered=$(awk -F '\t' 'NR > 1 { covered += $5 } END { print covered+0 }' "$decision_manifest")
+        manifest_total=$(awk -F '\t' 'NR > 1 { total += $6 } END { print total+0 }' "$decision_manifest")
+        awk -F '\t' 'NR == 1 { next } NF != 6 || $5 !~ /^[0-9]+$/ || $6 !~ /^[0-9]+$/ || $6 == 0 || $5 != $6 { invalid=1 } END { exit (invalid || NR <= 1) }' \
+            "$decision_manifest" || blocked+=("critical decision manifest has uncovered or invalid rows")
+        [[ "$decision_covered" == "$manifest_covered" && "$decision_total" == "$manifest_total" ]] || \
+            blocked+=("critical decision report totals mismatch manifest")
+    fi
+    awk -v n="$decision_percent" 'BEGIN { exit !(n+0 == 100) }' || blocked+=("critical decision coverage below 100%")
     verify_bound_file "$coverage_report" GAMEPLAY_COVERAGE_RUST_JSON GAMEPLAY_COVERAGE_RUST_JSON_SHA256 || blocked+=("Rust coverage artifact hash mismatch")
     verify_bound_file "$coverage_report" GAMEPLAY_COVERAGE_RUNTIME_BINARY GAMEPLAY_COVERAGE_RUNTIME_BINARY_SHA256 || blocked+=("runtime coverage binary hash mismatch")
     verify_bound_file "$coverage_report" GAMEPLAY_COVERAGE_PUBLIC_BINARY GAMEPLAY_COVERAGE_PUBLIC_BINARY_SHA256 || blocked+=("public C coverage binary hash mismatch")
@@ -138,9 +170,115 @@ check_benchmark() {
     expected=$(value "$report" "GAMEPLAY_${prefix}_BENCHMARK_SHA256")
     [[ "$actual" == "$expected" ]] || blocked+=("$prefix benchmark hash mismatch")
     verify_bound_file "$report" GAMEPLAY_PERF_MANIFEST GAMEPLAY_PERF_MANIFEST_SHA256 || blocked+=("$prefix performance manifest hash mismatch")
+    verify_bound_file "$report" GAMEPLAY_PERF_COMMAND_MANIFEST GAMEPLAY_PERF_COMMAND_MANIFEST_SHA256 || blocked+=("$prefix performance command manifest hash mismatch")
+    [[ -n "$(value "$report" GAMEPLAY_TOOL_ZIG_VERSION)" &&
+       -n "$(value "$report" GAMEPLAY_TOOL_GNU_TIME_VERSION)" &&
+       -n "$(value "$report" GAMEPLAY_TOOL_HOST)" ]] || blocked+=("$prefix performance tool provenance missing")
+    verify_bound_file "$report" "GAMEPLAY_${prefix}_BUILD_STDOUT" "GAMEPLAY_${prefix}_BUILD_STDOUT_SHA256" || blocked+=("$prefix build stdout hash mismatch")
+    verify_bound_file "$report" "GAMEPLAY_${prefix}_BUILD_STDERR" "GAMEPLAY_${prefix}_BUILD_STDERR_SHA256" || blocked+=("$prefix build stderr hash mismatch")
+    verify_bound_file "$report" "GAMEPLAY_${prefix}_P95_SAMPLES" "GAMEPLAY_${prefix}_P95_SAMPLES_SHA256" || blocked+=("$prefix p95 samples hash mismatch")
 }
+verify_report_payload "$candidate_report" CANDIDATE
+verify_report_payload "$oracle_report" ORACLE
 check_benchmark "$candidate_benchmark" "$candidate_report" CANDIDATE
 check_benchmark "$oracle_benchmark" "$oracle_report" ORACLE
+
+verify_performance_raw_evidence() {
+    local manifest header expected_header row_count expected_run
+    local run candidate_stdout candidate_stdout_hash candidate_stderr candidate_stderr_hash candidate_time candidate_time_hash
+    local oracle_stdout oracle_stdout_hash oracle_stderr oracle_stderr_hash oracle_time oracle_time_hash
+    manifest=$(value "$candidate_report" GAMEPLAY_PERF_MANIFEST)
+    [[ -f "$manifest" ]] || return
+    [[ "$manifest" == "$(value "$oracle_report" GAMEPLAY_PERF_MANIFEST)" &&
+       "$(value "$candidate_report" GAMEPLAY_PERF_MANIFEST_SHA256)" == "$(value "$oracle_report" GAMEPLAY_PERF_MANIFEST_SHA256)" ]] || \
+        blocked+=("candidate/oracle raw manifests differ")
+    expected_header=$'run\tcandidate_stdout\tcandidate_stdout_sha256\tcandidate_stderr\tcandidate_stderr_sha256\tcandidate_time\tcandidate_time_sha256\toracle_stdout\toracle_stdout_sha256\toracle_stderr\toracle_stderr_sha256\toracle_time\toracle_time_sha256'
+    header=$(head -n 1 "$manifest")
+    [[ "$header" == "$expected_header" ]] || blocked+=("performance raw manifest header invalid")
+    row_count=0
+    expected_run=1
+    while IFS=$'\t' read -r run candidate_stdout candidate_stdout_hash candidate_stderr candidate_stderr_hash candidate_time candidate_time_hash \
+        oracle_stdout oracle_stdout_hash oracle_stderr oracle_stderr_hash oracle_time oracle_time_hash; do
+        row_count=$((row_count + 1))
+        [[ "$run" == "$expected_run" ]] || blocked+=("performance raw manifest run order invalid")
+        expected_run=$((expected_run + 1))
+        for bound in \
+            "$candidate_stdout|$candidate_stdout_hash|candidate stdout" \
+            "$candidate_stderr|$candidate_stderr_hash|candidate stderr" \
+            "$candidate_time|$candidate_time_hash|candidate time" \
+            "$oracle_stdout|$oracle_stdout_hash|oracle stdout" \
+            "$oracle_stderr|$oracle_stderr_hash|oracle stderr" \
+            "$oracle_time|$oracle_time_hash|oracle time"; do
+            IFS='|' read -r path expected label <<<"$bound"
+            if [[ ! -f "$path" || ! "$expected" =~ ^[0-9a-f]{64}$ || "$(sha256sum "$path" | awk '{print $1}')" != "$expected" ]]; then
+                blocked+=("performance raw $label hash mismatch on run $run")
+            fi
+        done
+    done < <(tail -n +2 "$manifest")
+    [[ "$row_count" == 5 ]] || blocked+=("performance raw manifest must contain five paired runs")
+}
+
+raw_metric() {
+    local key=$1 stdout=$2 stderr=$3
+    sed -n "s/.*${key}=\([0-9][0-9]*\).*/\1/p" "$stdout" "$stderr" | tail -n 1
+}
+
+verify_performance_metrics() {
+    local manifest run candidate_stdout candidate_stdout_hash candidate_stderr candidate_stderr_hash candidate_time candidate_time_hash
+    local oracle_stdout oracle_stdout_hash oracle_stderr oracle_stderr_hash oracle_time oracle_time_hash
+    local cp95 op95 crss orss allocations candidate_median oracle_median candidate_rss=0 oracle_rss=0 candidate_allocations=0
+    local candidate_values=() oracle_values=()
+    manifest=$(value "$candidate_report" GAMEPLAY_PERF_MANIFEST)
+    [[ -f "$manifest" ]] || return
+    while IFS=$'\t' read -r run candidate_stdout candidate_stdout_hash candidate_stderr candidate_stderr_hash candidate_time candidate_time_hash \
+        oracle_stdout oracle_stdout_hash oracle_stderr oracle_stderr_hash oracle_time oracle_time_hash; do
+        [[ -f "$candidate_stdout" && -f "$candidate_stderr" && -f "$candidate_time" && -f "$oracle_stdout" && -f "$oracle_stderr" && -f "$oracle_time" ]] || continue
+        cp95=$(raw_metric p95_ns "$candidate_stdout" "$candidate_stderr")
+        op95=$(raw_metric p95_ns "$oracle_stdout" "$oracle_stderr")
+        crss=$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes):[[:space:]]*//p' "$candidate_time" | tail -n 1)
+        orss=$(sed -n 's/^[[:space:]]*Maximum resident set size (kbytes):[[:space:]]*//p' "$oracle_time" | tail -n 1)
+        allocations=$(raw_metric allocations "$candidate_stdout" "$candidate_stderr")
+        [[ "$cp95" =~ ^[0-9]+$ && "$op95" =~ ^[0-9]+$ && "$crss" =~ ^[0-9]+$ && "$orss" =~ ^[0-9]+$ && "$allocations" =~ ^[0-9]+$ ]] || {
+            blocked+=("performance raw metrics missing on run $run")
+            continue
+        }
+        candidate_values+=("$cp95"); oracle_values+=("$op95")
+        ((crss > candidate_rss)) && candidate_rss=$crss
+        ((orss > oracle_rss)) && oracle_rss=$orss
+        ((allocations > candidate_allocations)) && candidate_allocations=$allocations
+    done < <(tail -n +2 "$manifest")
+    if ((${#candidate_values[@]} == 5 && ${#oracle_values[@]} == 5)); then
+        candidate_median=$(printf '%s\n' "${candidate_values[@]}" | sort -n | sed -n '3p')
+        oracle_median=$(printf '%s\n' "${oracle_values[@]}" | sort -n | sed -n '3p')
+        [[ "$candidate_median" == "$(value "$candidate_report" GAMEPLAY_CANDIDATE_P95_NS)" ]] || blocked+=("candidate p95 does not match raw runs")
+        [[ "$oracle_median" == "$(value "$oracle_report" GAMEPLAY_ORACLE_P95_NS)" ]] || blocked+=("oracle p95 does not match raw runs")
+        [[ "$candidate_rss" == "$(value "$candidate_report" GAMEPLAY_CANDIDATE_PEAK_RSS_KB)" ]] || blocked+=("candidate RSS does not match raw time files")
+        [[ "$oracle_rss" == "$(value "$oracle_report" GAMEPLAY_ORACLE_PEAK_RSS_KB)" ]] || blocked+=("oracle RSS does not match raw time files")
+        [[ "$candidate_allocations" == "$(value "$candidate_report" GAMEPLAY_CANDIDATE_ALLOCATIONS)" ]] || blocked+=("candidate allocations do not match raw runs")
+    fi
+}
+
+verify_performance_raw_evidence
+verify_performance_metrics
+
+verify_performance_commands() {
+    local manifest header row_count
+    manifest=$(value "$candidate_report" GAMEPLAY_PERF_COMMAND_MANIFEST)
+    [[ -f "$manifest" ]] || return
+    [[ "$manifest" == "$(value "$oracle_report" GAMEPLAY_PERF_COMMAND_MANIFEST)" &&
+       "$(value "$candidate_report" GAMEPLAY_PERF_COMMAND_MANIFEST_SHA256)" == "$(value "$oracle_report" GAMEPLAY_PERF_COMMAND_MANIFEST_SHA256)" ]] || \
+        blocked+=("candidate/oracle command manifests differ")
+    header=$(head -n 1 "$manifest")
+    [[ "$header" == $'kind\trun\tcommand' ]] || blocked+=("performance command manifest header invalid")
+    awk -F '\t' 'NR == 1 { next } NF != 3 || $1 == "" || $2 !~ /^[0-9]+$/ || $3 == "" { invalid=1 } END { exit (invalid || NR != 13) }' \
+        "$manifest" || blocked+=("performance command manifest rows invalid")
+    [[ "$(awk -F '\t' '$1 == "candidate_build" { n++ } END { print n+0 }' "$manifest")" == 1 &&
+       "$(awk -F '\t' '$1 == "oracle_build" { n++ } END { print n+0 }' "$manifest")" == 1 &&
+       "$(awk -F '\t' '$1 == "candidate_run" { n++ } END { print n+0 }' "$manifest")" == 5 &&
+       "$(awk -F '\t' '$1 == "oracle_run" { n++ } END { print n+0 }' "$manifest")" == 5 ]] || \
+        blocked+=("performance command manifest is not five paired runs")
+}
+verify_performance_commands
 
 if [[ -f "$candidate_report" && -f "$oracle_report" ]]; then
     candidate_p95=$(value "$candidate_report" GAMEPLAY_CANDIDATE_P95_NS)
