@@ -13,12 +13,23 @@
       "behaviors": []
     },
     {
-      "objectId": "marker",
+      "objectId": "mover",
       "kind": "sprite",
-      "transform": { "position": [400, 300] },
+      "transform": { "position": [240, 300] },
       "sprite": { "size": [72, 72], "color": [0.95, 0.82, 0.28, 1], "textureId": 2 },
-      "behaviors": []
+      "behaviors": [
+        { "scriptId": 1, "parameters": {} }
+      ]
     }
   ],
-  "prototypes": []
+  "prototypes": [
+    {
+      "prototypeId": "runtime-marker",
+      "kind": "sprite",
+      "sprite": { "size": [44, 44], "color": [0.30, 0.90, 0.95, 1], "textureId": 2 },
+      "behaviors": [
+        { "scriptId": 1, "parameters": {} }
+      ]
+    }
+  ]
 }

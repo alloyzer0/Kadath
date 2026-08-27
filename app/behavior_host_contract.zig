@@ -124,15 +124,25 @@ test "neutral scene runs Behavior fixed Phase without Gameplay lifecycle" {
     ;
     const mover_source =
         \\--!strict
+        \\local spawned = false
         \\return { fixed_update = function(self: Kadath.Object, dt: number)
-        \\    local move_x, move_y = kadath.input.move_axis()
-        \\    self:translate(move_x, move_y + dt * 10)
+        \\    if self:id() == "decor" then
+        \\        local move_x, move_y = kadath.input.move_axis()
+        \\        self:translate(move_x, move_y + dt * 10)
+        \\        if not spawned then
+        \\            local marker = kadath.scene.spawn("runtime-marker", 30, 40)
+        \\            marker:translate(1, 2)
+        \\            spawned = true
+        \\        end
+        \\    elseif string.sub(self:id(), 1, 8) == "runtime-" then
+        \\        self:destroy()
+        \\    end
         \\end }
     ;
     const neutral_scene =
         \\{"schemaVersion":7,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture"}],"objects":[
         \\{"objectId":"decor","kind":"sprite","transform":{"position":[10,20]},"sprite":{"size":[16,16],"color":[1,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]}
-        \\],"prototypes":[]}
+        \\],"prototypes":[{"prototypeId":"runtime-marker","kind":"sprite","sprite":{"size":[4,4],"color":[0,1,1,1],"textureId":1},"behaviors":[{"scriptId":1,"parameters":{}}]}]}
     ;
     var fixture = try makeRuntimeFixture(neutral_manifest, &.{.{ .path = "scripts/mover.luau", .source = mover_source }}, neutral_scene);
     defer fixture.deinit();
@@ -143,9 +153,19 @@ test "neutral scene runs Behavior fixed Phase without Gameplay lifecycle" {
     try std.testing.expectEqual([2]f32{ 11, 24 }, try fixture.generation.objectPosition(decor));
 
     var render_items: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined;
-    const publication = try fixture.generation.extractSprites(&render_items);
-    try std.testing.expectEqual(@as(usize, 1), publication.sprites.len);
-    switch (publication.observation) {
+    const spawned_publication = try fixture.generation.extractSprites(&render_items);
+    // Structural settle 后，瞬态对象必须在同一 fixed-step 的 Neutral Render publication 中可见。
+    try std.testing.expectEqual(@as(usize, 2), spawned_publication.sprites.len);
+    switch (spawned_publication.observation) {
+        .neutral => {},
+        .gameplay => return error.UnexpectedGameplayObservation,
+    }
+
+    try fixture.runtime.runFixed(&fixture.generation, 0.5, .{});
+    try fixture.runtime.finishFixedStep(&fixture.generation, .{});
+    const destroyed_publication = try fixture.generation.extractSprites(&render_items);
+    try std.testing.expectEqual(@as(usize, 1), destroyed_publication.sprites.len);
+    switch (destroyed_publication.observation) {
         .neutral => {},
         .gameplay => return error.UnexpectedGameplayObservation,
     }
