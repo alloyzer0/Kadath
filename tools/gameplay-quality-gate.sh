@@ -183,7 +183,7 @@ verify_performance_raw_evidence() {
     local run candidate_stdout candidate_stdout_hash candidate_stderr candidate_stderr_hash candidate_time candidate_time_hash
     local oracle_stdout oracle_stdout_hash oracle_stderr oracle_stderr_hash oracle_time oracle_time_hash
     manifest=$(value "$candidate_report" GAMEPLAY_PERF_MANIFEST)
-    [[ -f "$manifest" ]] || return
+    [[ -f "$manifest" ]] || return 0
     [[ "$manifest" == "$(value "$oracle_report" GAMEPLAY_PERF_MANIFEST)" &&
        "$(value "$candidate_report" GAMEPLAY_PERF_MANIFEST_SHA256)" == "$(value "$oracle_report" GAMEPLAY_PERF_MANIFEST_SHA256)" ]] || \
         blocked+=("candidate/oracle raw manifests differ")
@@ -224,7 +224,7 @@ verify_performance_metrics() {
     local cp95 op95 crss orss allocations candidate_median oracle_median candidate_rss=0 oracle_rss=0 candidate_allocations=0
     local candidate_values=() oracle_values=()
     manifest=$(value "$candidate_report" GAMEPLAY_PERF_MANIFEST)
-    [[ -f "$manifest" ]] || return
+    [[ -f "$manifest" ]] || return 0
     while IFS=$'\t' read -r run candidate_stdout candidate_stdout_hash candidate_stderr candidate_stderr_hash candidate_time candidate_time_hash \
         oracle_stdout oracle_stdout_hash oracle_stderr oracle_stderr_hash oracle_time oracle_time_hash; do
         [[ -f "$candidate_stdout" && -f "$candidate_stderr" && -f "$candidate_time" && -f "$oracle_stdout" && -f "$oracle_stderr" && -f "$oracle_time" ]] || continue
@@ -256,7 +256,7 @@ verify_performance_metrics() {
 verify_performance_commands() {
     local manifest header row_count
     manifest=$(value "$candidate_report" GAMEPLAY_PERF_COMMAND_MANIFEST)
-    [[ -f "$manifest" ]] || return
+    [[ -f "$manifest" ]] || return 0
     [[ "$manifest" == "$(value "$oracle_report" GAMEPLAY_PERF_COMMAND_MANIFEST)" &&
        "$(value "$candidate_report" GAMEPLAY_PERF_COMMAND_MANIFEST_SHA256)" == "$(value "$oracle_report" GAMEPLAY_PERF_COMMAND_MANIFEST_SHA256)" ]] || \
         blocked+=("candidate/oracle command manifests differ")
