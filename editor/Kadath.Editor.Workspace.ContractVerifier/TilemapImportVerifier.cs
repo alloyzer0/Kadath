@@ -8,9 +8,11 @@ internal static class TilemapImportVerifier
 {
     internal static async Task<string> EmitRuntimeFixtureAsync(string packageRoot, string sourceKind)
     {
-        if (sourceKind is not ("tiled" or "ldtk")) throw new ArgumentException("sourceKind must be tiled or ldtk.");
+        if (sourceKind is not ("tiled" or "ldtk" or "showcase"))
+            throw new ArgumentException("sourceKind must be tiled, ldtk, or showcase.");
         if (Directory.Exists(packageRoot) && Directory.EnumerateFileSystemEntries(packageRoot).Any())
             throw new InvalidOperationException("Runtime fixture output directory must be empty.");
+        var showcase = sourceKind == "showcase";
 
         var projectDirectory = Path.Combine(packageRoot, "bin", "projects", "map-demo");
         var rendererAssets = Path.Combine(packageRoot, "bin", "assets", "renderer2d");
@@ -18,29 +20,46 @@ internal static class TilemapImportVerifier
         Directory.CreateDirectory(rendererAssets);
         File.WriteAllBytes(Path.Combine(packageRoot, VerifierPlatform.RuntimeRelativePath), [0]);
 
-        // 两张小图同时承担跨语言格式验证和肉眼可辨的 atlas 采样验证。
-        File.WriteAllBytes(Path.Combine(rendererAssets, "ground.texture"), BuildTextureArtifact(2, 2,
-        [
-            255, 0, 0, 255,   0, 255, 0, 255,
-            0, 0, 255, 255,   255, 255, 0, 255
-        ]));
-        File.WriteAllBytes(Path.Combine(rendererAssets, "decor.texture"), BuildTextureArtifact(2, 1,
-        [
-            255, 0, 255, 255,  0, 255, 255, 255
-        ]));
+        if (showcase)
+        {
+            File.WriteAllBytes(Path.Combine(rendererAssets, "ground.texture"), BuildTextureArtifact(
+                MetroidvaniaShowcaseFixture.AtlasSize,
+                MetroidvaniaShowcaseFixture.AtlasSize,
+                MetroidvaniaShowcaseFixture.BuildAtlas(decor: false)));
+            File.WriteAllBytes(Path.Combine(rendererAssets, "decor.texture"), BuildTextureArtifact(
+                MetroidvaniaShowcaseFixture.AtlasSize,
+                MetroidvaniaShowcaseFixture.AtlasSize,
+                MetroidvaniaShowcaseFixture.BuildAtlas(decor: true)));
+        }
+        else
+        {
+            // 两张小图承担基础跨语言格式验证和肉眼可辨的 atlas 采样验证。
+            File.WriteAllBytes(Path.Combine(rendererAssets, "ground.texture"), BuildTextureArtifact(2, 2,
+            [
+                255, 0, 0, 255,   0, 255, 0, 255,
+                0, 0, 255, 255,   255, 255, 0, 255
+            ]));
+            File.WriteAllBytes(Path.Combine(rendererAssets, "decor.texture"), BuildTextureArtifact(2, 1,
+            [
+                255, 0, 255, 255,  0, 255, 255, 255
+            ]));
+        }
 
         var scenePath = Path.Combine(projectDirectory, "scene.json");
         var scriptPath = Path.Combine(projectDirectory, "script.json");
         var previewPath = Path.Combine(projectDirectory, "preview.json");
-        File.WriteAllText(scenePath,
-            """
+        var sceneJson = """
             {"schemaVersion":9,"textures":[
               {"textureId":1,"artifact":"assets/renderer2d/ground.texture","samplingProfile":"smooth_mipmap_anisotropic"},
               {"textureId":2,"artifact":"assets/renderer2d/decor.texture","samplingProfile":"smooth_mipmap_anisotropic"}],
              "objects":[{"objectId":"sentinel","kind":"sprite","transform":{"position":[1000,1000]},
                "sprite":{"size":[1,1],"color":[1,1,1,1],"textureId":1},"behaviors":[]}],
-             "prototypes":[],"tilemaps":[],"camera":{"origin":[-2,-2],"zoom":8}}
-            """);
+             "prototypes":[],"tilemaps":[],"camera":CAMERA_PLACEHOLDER}
+            """;
+        sceneJson = sceneJson.Replace("CAMERA_PLACEHOLDER", showcase
+            ? "{\"origin\":[-64,0],\"zoom\":1.75}"
+            : "{\"origin\":[-2,-2],\"zoom\":8}", StringComparison.Ordinal);
+        File.WriteAllText(scenePath, sceneJson);
         File.WriteAllText(scriptPath,
             """{"schemaVersion":1,"instructions":[{"hook":"on_start","op":"set_goal_position","value":[0,0]},{"hook":"fixed_update","op":"move_goal_velocity","value":[0,0]}]}""");
         File.WriteAllText(previewPath,
@@ -48,10 +67,13 @@ internal static class TilemapImportVerifier
 
         var project = new ProjectSessionInfo(packageRoot, "map-demo", projectDirectory, scenePath, scriptPath, previewPath, 1);
         var snapshot = await new WorkspaceReadModel().ReadProjectAsync(project, default);
-        var mapPath = Path.GetFullPath(sourceKind == "tiled"
-            ? "tools/fixtures/tilemap-chunked-layers-02/world.tmj"
-            : "tools/fixtures/tilemap-chunked-layers-02/world.ldtk");
-        var textureIds = sourceKind == "tiled" ? new uint[] { 1, 2 } : [1];
+        var mapPath = Path.GetFullPath(sourceKind switch
+        {
+            "tiled" => "tools/fixtures/tilemap-chunked-layers-02/world.tmj",
+            "ldtk" => "tools/fixtures/tilemap-chunked-layers-02/world.ldtk",
+            _ => "tools/fixtures/tilemap-chunked-layers-02/metroidvania-showcase/clockwork-prison.tmj"
+        });
+        var textureIds = sourceKind == "ldtk" ? new uint[] { 1 } : [1, 2];
         var result = await new WorkspaceTilemapImportModel().ImportAsync(project, new TilemapImportParameters(
             null,
             snapshot.AuthoringRevision,
@@ -60,7 +82,8 @@ internal static class TilemapImportVerifier
             "world",
             textureIds,
             sourceKind == "ldtk" ? "level-0-iid" : null), default);
-        if (result.State != "succeeded" || result.SourceKind != sourceKind)
+        var expectedSourceKind = sourceKind == "ldtk" ? "ldtk" : "tiled";
+        if (result.State != "succeeded" || result.SourceKind != expectedSourceKind)
             throw new InvalidOperationException("Runtime Tilemap fixture import did not succeed.");
 
         var runtimeScenePath = Path.Combine(projectDirectory, "runtime.scene");
@@ -79,6 +102,7 @@ internal static class TilemapImportVerifier
             VerifyTiled(root);
             VerifyLdtk(root);
             VerifyRepositoryFixtures();
+            VerifyShowcaseDeterminism(root);
             await VerifyWorkspaceImportAsync(root);
         }
         finally
@@ -307,6 +331,31 @@ internal static class TilemapImportVerifier
             && ldtk.Asset.Layers.Length == 2
             && ldtk.Diagnostics.Any(value => value.Code == "LDTK_INTGRID_NOT_CONSUMED"),
             "repository LDtk external Level fixture did not cover Layers and diagnostics");
+        var showcase = WorkspaceMapImport.Import(new WorkspaceMapImportRequest(
+            Path.Combine(root, "metroidvania-showcase", "clockwork-prison.tmj"), [1, 2]));
+        Require(showcase.Asset.TileSources.Length == 2
+            && showcase.Asset.Layers.Length == 4
+            && showcase.Asset.Layers.Sum(layer => layer.Chunks.Sum(chunk => chunk.Cells.Length)) > 2500
+            && showcase.Asset.Layers.SelectMany(layer => layer.Chunks).Any(chunk => chunk.X < 0)
+            && showcase.Diagnostics.Any(value => value.Code == "TILED_LAYER_NOT_IMPORTED"),
+            "metroidvania showcase did not cover multi-source, four Layers, negative Chunks, and diagnostics");
+    }
+
+    private static void VerifyShowcaseDeterminism(string temporaryRoot)
+    {
+        var regenerated = Path.Combine(temporaryRoot, "metroidvania-showcase-regenerated");
+        _ = MetroidvaniaShowcaseFixture.Write(regenerated);
+        var frozen = Path.GetFullPath("tools/fixtures/tilemap-chunked-layers-02/metroidvania-showcase");
+        foreach (var name in new[]
+        {
+            "clockwork-prison.tmj", "prison-terrain.png", "prison-decor.png",
+            "prison-terrain.svg", "prison-decor.svg", "prison-terrain.tsj", "prison-decor.tsj", "README.md"
+        })
+        {
+            Require(File.ReadAllBytes(Path.Combine(regenerated, name)).AsSpan()
+                    .SequenceEqual(File.ReadAllBytes(Path.Combine(frozen, name))),
+                $"metroidvania showcase generator drifted: {name}");
+        }
     }
 
     private static byte[] BuildTextureArtifact(int width, int height, byte[] basePixels)

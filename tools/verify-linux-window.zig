@@ -27,6 +27,7 @@ const AssetMode = enum {
     neutral_fixture,
     chunked_tiled_fixture,
     chunked_ldtk_fixture,
+    chunked_showcase_fixture,
 };
 
 const AudioExpectation = enum {
@@ -149,12 +150,15 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
             .chunked_tiled_fixture
         else if (std.mem.eql(u8, args[6], "chunked-ldtk-fixture"))
             .chunked_ldtk_fixture
+        else if (std.mem.eql(u8, args[6], "chunked-showcase-fixture"))
+            .chunked_showcase_fixture
         else
             return error.InvalidVerifierArguments,
         else => unreachable,
     };
     const package_root = if (asset_mode == .package_root) args[4] else null;
-    const chunked_fixture_root = if (asset_mode == .chunked_tiled_fixture or asset_mode == .chunked_ldtk_fixture)
+    const chunked_fixture_root = if (asset_mode == .chunked_tiled_fixture or
+        asset_mode == .chunked_ldtk_fixture or asset_mode == .chunked_showcase_fixture)
         args[4]
     else
         null;
@@ -383,9 +387,16 @@ fn printVerificationSuccess(
         try stdout.print("TILEMAP_BACKGROUND_ORDER=true\n", .{});
         try stdout.print("CAMERA_PIXEL_ORACLE=true\n", .{});
     }
-    if (asset_mode == .chunked_tiled_fixture or asset_mode == .chunked_ldtk_fixture) {
+    if (asset_mode == .chunked_tiled_fixture or asset_mode == .chunked_ldtk_fixture or
+        asset_mode == .chunked_showcase_fixture)
+    {
         try stdout.print("TILEMAP_CHUNKED_PRODUCT_PIXEL_ORACLE=true\n", .{});
-        try stdout.print("TILEMAP_CHUNKED_PRODUCT_SOURCE={s}\n", .{if (asset_mode == .chunked_tiled_fixture) "tiled" else "ldtk"});
+        try stdout.print("TILEMAP_CHUNKED_PRODUCT_SOURCE={s}\n", .{switch (asset_mode) {
+            .chunked_tiled_fixture => "tiled",
+            .chunked_ldtk_fixture => "ldtk",
+            .chunked_showcase_fixture => "showcase",
+            else => unreachable,
+        }});
     }
     try stdout.print("linux_two_frame_evidence=ok\n", .{});
     if (asset_mode == .neutral_fixture) {
@@ -706,7 +717,7 @@ fn spawnRuntime(
             .generated_fixture => &fixture_argv,
             .package_root => &package_argv,
             .neutral_fixture => &neutral_argv,
-            .chunked_tiled_fixture, .chunked_ldtk_fixture => &chunked_argv,
+            .chunked_tiled_fixture, .chunked_ldtk_fixture, .chunked_showcase_fixture => &chunked_argv,
         },
         .cwd = .{ .path = fixture_root },
         .environ_map = environment,
@@ -949,6 +960,7 @@ fn waitForRenderedFrame(
                 colorStats(capture, neutral_marker, package_sample_tolerance).count >= 128,
             .chunked_tiled_fixture => hasChunkedTilemapSignature(capture, 3, 256),
             .chunked_ldtk_fixture => hasChunkedTilemapSignature(capture, 2, 128),
+            .chunked_showcase_fixture => hasMetroidvaniaShowcaseSignature(capture),
         };
         if (pixels_match) {
             if (last_capture) |*previous| previous.deinit(allocator);
@@ -973,6 +985,34 @@ fn waitForRenderedFrame(
         );
     }
     return error.RuntimePixelEvidenceTimeout;
+}
+
+fn hasMetroidvaniaShowcaseSignature(capture: Capture) bool {
+    const clear = Color{ .r = 53, .g = 89, .b = 129 };
+    var map_pixels: usize = 0;
+    var dark_stone: usize = 0;
+    var teal_detail: usize = 0;
+    var warm_detail: usize = 0;
+    var bins: [64]bool = @splat(false);
+    var y: u16 = 0;
+    while (y < capture.height) : (y += 1) {
+        var x: u16 = 0;
+        while (x < capture.width) : (x += 1) {
+            const pixel = capture.sample(x, y);
+            if (colorNear(pixel, clear, 10)) continue;
+            map_pixels += 1;
+            dark_stone += @intFromBool(pixel.r < 95 and pixel.g < 110 and pixel.b < 130);
+            teal_detail += @intFromBool(@as(u16, pixel.g) > @as(u16, pixel.r) + 25 and
+                @as(u16, pixel.b) > @as(u16, pixel.r) + 20 and pixel.g > 95);
+            warm_detail += @intFromBool(pixel.r > 135 and pixel.r > pixel.b + 35 and pixel.g > 55);
+            const bin = (@as(usize, pixel.r >> 6) << 4) | (@as(usize, pixel.g >> 6) << 2) | (pixel.b >> 6);
+            bins[bin] = true;
+        }
+    }
+    var distinct_bins: usize = 0;
+    for (bins) |present| distinct_bins += @intFromBool(present);
+    return map_pixels > 250_000 and dark_stone > 120_000 and teal_detail > 300 and
+        warm_detail > 150 and distinct_bins >= 12;
 }
 
 fn hasChunkedTilemapSignature(capture: Capture, minimum_color_families: usize, minimum_pixels: usize) bool {
@@ -1555,7 +1595,7 @@ fn validateRuntimeLogs(
             "Runtime host initialized with Vulkan RHI neutral scene objects=2",
             "Neutral scene reloaded explicitly: objects=2",
         },
-        .chunked_tiled_fixture, .chunked_ldtk_fixture => &.{
+        .chunked_tiled_fixture, .chunked_ldtk_fixture, .chunked_showcase_fixture => &.{
             "Loaded preview scene artifact: projects/map-demo/runtime.scene, artifact_version=10",
             "Runtime host initialized with Vulkan RHI neutral scene objects=1",
         },

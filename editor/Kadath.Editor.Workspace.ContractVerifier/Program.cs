@@ -12,6 +12,20 @@ internal static class Program
 {
     public static async Task<int> Main(string[] args)
     {
+        if (args is ["--emit-metroidvania-showcase", var showcaseRoot])
+        {
+            try
+            {
+                var mapPath = MetroidvaniaShowcaseFixture.Write(Path.GetFullPath(showcaseRoot));
+                Console.WriteLine($"showcase_map={mapPath}");
+                return 0;
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"showcase=failed: {exception}");
+                return 1;
+            }
+        }
         if (args.Length is 2 or 3 && string.Equals(args[0], "--emit-tilemap-runtime-fixture", StringComparison.Ordinal))
         {
             try
@@ -32,7 +46,7 @@ internal static class Program
         }
         if (args.Length != 0)
         {
-            Console.Error.WriteLine("usage: --emit-tilemap-runtime-fixture <output-root> [tiled|ldtk]");
+            Console.Error.WriteLine("usage: --emit-metroidvania-showcase <output-root> | --emit-tilemap-runtime-fixture <output-root> [tiled|ldtk|showcase]");
             return 2;
         }
 
