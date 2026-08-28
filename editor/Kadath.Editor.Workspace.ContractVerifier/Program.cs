@@ -12,12 +12,15 @@ internal static class Program
 {
     public static async Task<int> Main(string[] args)
     {
-        if (args is ["--emit-tilemap-runtime-fixture", var outputRoot])
+        if (args.Length is 2 or 3 && string.Equals(args[0], "--emit-tilemap-runtime-fixture", StringComparison.Ordinal))
         {
             try
             {
-                var scenePath = await TilemapImportVerifier.EmitRuntimeFixtureAsync(Path.GetFullPath(outputRoot));
-                Console.WriteLine($"fixture_root={Path.GetFullPath(outputRoot)}");
+                var outputRoot = Path.GetFullPath(args[1]);
+                var sourceKind = args.Length == 3 ? args[2] : "tiled";
+                var scenePath = await TilemapImportVerifier.EmitRuntimeFixtureAsync(outputRoot, sourceKind);
+                Console.WriteLine($"fixture_root={outputRoot}");
+                Console.WriteLine($"source_kind={sourceKind}");
                 Console.WriteLine($"scene_path={scenePath}");
                 return 0;
             }
@@ -29,7 +32,7 @@ internal static class Program
         }
         if (args.Length != 0)
         {
-            Console.Error.WriteLine("usage: --emit-tilemap-runtime-fixture <output-root>");
+            Console.Error.WriteLine("usage: --emit-tilemap-runtime-fixture <output-root> [tiled|ldtk]");
             return 2;
         }
 

@@ -6,8 +6,9 @@ namespace Kadath.Editor.Workspace.ContractVerifier;
 
 internal static class TilemapImportVerifier
 {
-    internal static async Task<string> EmitRuntimeFixtureAsync(string packageRoot)
+    internal static async Task<string> EmitRuntimeFixtureAsync(string packageRoot, string sourceKind)
     {
+        if (sourceKind is not ("tiled" or "ldtk")) throw new ArgumentException("sourceKind must be tiled or ldtk.");
         if (Directory.Exists(packageRoot) && Directory.EnumerateFileSystemEntries(packageRoot).Any())
             throw new InvalidOperationException("Runtime fixture output directory must be empty.");
 
@@ -47,10 +48,20 @@ internal static class TilemapImportVerifier
 
         var project = new ProjectSessionInfo(packageRoot, "map-demo", projectDirectory, scenePath, scriptPath, previewPath, 1);
         var snapshot = await new WorkspaceReadModel().ReadProjectAsync(project, default);
-        var mapPath = Path.GetFullPath("tools/fixtures/tilemap-chunked-layers-02/world.tmj");
+        var mapPath = Path.GetFullPath(sourceKind == "tiled"
+            ? "tools/fixtures/tilemap-chunked-layers-02/world.tmj"
+            : "tools/fixtures/tilemap-chunked-layers-02/world.ldtk");
+        var textureIds = sourceKind == "tiled" ? new uint[] { 1, 2 } : [1];
         var result = await new WorkspaceTilemapImportModel().ImportAsync(project, new TilemapImportParameters(
-            null, snapshot.AuthoringRevision, mapPath, "world", "world", [1, 2]), default);
-        if (result.State != "succeeded") throw new InvalidOperationException("Runtime Tilemap fixture import did not succeed.");
+            null,
+            snapshot.AuthoringRevision,
+            mapPath,
+            $"world-{sourceKind}",
+            "world",
+            textureIds,
+            sourceKind == "ldtk" ? "level-0-iid" : null), default);
+        if (result.State != "succeeded" || result.SourceKind != sourceKind)
+            throw new InvalidOperationException("Runtime Tilemap fixture import did not succeed.");
 
         var runtimeScenePath = Path.Combine(projectDirectory, "runtime.scene");
         File.WriteAllBytes(runtimeScenePath, WorkspaceSceneCodec.EncodeSource(File.ReadAllBytes(scenePath)));

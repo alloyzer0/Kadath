@@ -25,6 +25,8 @@ const AssetMode = enum {
     generated_fixture,
     package_root,
     neutral_fixture,
+    chunked_tiled_fixture,
+    chunked_ldtk_fixture,
 };
 
 const AudioExpectation = enum {
@@ -141,10 +143,22 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     const asset_mode: AssetMode = switch (args.len) {
         4 => .generated_fixture,
         5, 6 => .package_root,
-        7 => if (std.mem.eql(u8, args[6], "neutral-fixture")) .neutral_fixture else return error.InvalidVerifierArguments,
+        7 => if (std.mem.eql(u8, args[6], "neutral-fixture"))
+            .neutral_fixture
+        else if (std.mem.eql(u8, args[6], "chunked-tiled-fixture"))
+            .chunked_tiled_fixture
+        else if (std.mem.eql(u8, args[6], "chunked-ldtk-fixture"))
+            .chunked_ldtk_fixture
+        else
+            return error.InvalidVerifierArguments,
         else => unreachable,
     };
     const package_root = if (asset_mode == .package_root) args[4] else null;
+    const chunked_fixture_root = if (asset_mode == .chunked_tiled_fixture or asset_mode == .chunked_ldtk_fixture)
+        args[4]
+    else
+        null;
+    const chunked_scene_path = if (chunked_fixture_root != null) args[5] else null;
     const neutral_scene_path = if (asset_mode == .neutral_fixture)
         try std.Io.Dir.cwd().realPathFileAlloc(io, args[4], allocator)
     else
@@ -172,7 +186,7 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
     errdefer allocator.free(evidence_root);
     try std.Io.Dir.cwd().createDirPath(io, evidence_root);
 
-    if (asset_mode != .package_root) {
+    if (asset_mode == .generated_fixture or asset_mode == .neutral_fixture) {
         const fixture_assets = try std.fs.path.join(allocator, &.{ evidence_root, "fixture", "assets", "renderer2d" });
         defer allocator.free(fixture_assets);
         try std.Io.Dir.cwd().createDirPath(io, fixture_assets);
@@ -259,10 +273,11 @@ fn runVerifier(init: std.process.Init, owned_children: *OwnedChildren) !Verifier
         allocator,
         io,
         runtime_path,
-        package_root orelse evidence_root,
+        package_root orelse chunked_fixture_root orelse evidence_root,
         asset_mode,
         neutral_scene_path,
         neutral_script_path,
+        chunked_scene_path,
         &environment,
         runtime_stdout,
         runtime_stderr,
@@ -361,11 +376,16 @@ fn printVerificationSuccess(
     try stdout.print("linux_background_pixels=ok\n", .{});
     try stdout.print("linux_primary_texture_pixels=ok\n", .{});
     try stdout.print("linux_secondary_texture_pixels=ok\n", .{});
-    if (asset_mode != .package_root) try stdout.print("linux_scene_texture_binding=ok\n", .{});
+    if (asset_mode == .generated_fixture or asset_mode == .neutral_fixture)
+        try stdout.print("linux_scene_texture_binding=ok\n", .{});
     if (asset_mode == .package_root) {
         try stdout.print("TILEMAP_ATLAS_PIXEL_ORACLE=true\n", .{});
         try stdout.print("TILEMAP_BACKGROUND_ORDER=true\n", .{});
         try stdout.print("CAMERA_PIXEL_ORACLE=true\n", .{});
+    }
+    if (asset_mode == .chunked_tiled_fixture or asset_mode == .chunked_ldtk_fixture) {
+        try stdout.print("TILEMAP_CHUNKED_PRODUCT_PIXEL_ORACLE=true\n", .{});
+        try stdout.print("TILEMAP_CHUNKED_PRODUCT_SOURCE={s}\n", .{if (asset_mode == .chunked_tiled_fixture) "tiled" else "ldtk"});
     }
     try stdout.print("linux_two_frame_evidence=ok\n", .{});
     if (asset_mode == .neutral_fixture) {
@@ -651,6 +671,7 @@ fn spawnRuntime(
     asset_mode: AssetMode,
     neutral_scene_path: ?[]const u8,
     neutral_script_path: ?[]const u8,
+    chunked_scene_path: ?[]const u8,
     environment: *const std.process.Environ.Map,
     stdout_path: []const u8,
     stderr_path: []const u8,
@@ -659,7 +680,7 @@ fn spawnRuntime(
     defer stdout_file.close(io);
     var stderr_file = try std.Io.Dir.cwd().createFile(io, stderr_path, .{});
     defer stderr_file.close(io);
-    const fixture_root = if (asset_mode != .package_root)
+    const fixture_root = if (asset_mode == .generated_fixture or asset_mode == .neutral_fixture)
         try std.fs.path.join(allocator, &.{ working_root, "fixture" })
     else
         try allocator.dupe(u8, working_root);
@@ -679,11 +700,13 @@ fn spawnRuntime(
         "--script",
         neutral_script_path orelse "",
     };
+    const chunked_argv = [_][]const u8{ runtime_path, "--scene", chunked_scene_path orelse "" };
     return try std.process.spawn(io, .{
         .argv = switch (asset_mode) {
             .generated_fixture => &fixture_argv,
             .package_root => &package_argv,
             .neutral_fixture => &neutral_argv,
+            .chunked_tiled_fixture, .chunked_ldtk_fixture => &chunked_argv,
         },
         .cwd = .{ .path = fixture_root },
         .environ_map = environment,
@@ -924,6 +947,8 @@ fn waitForRenderedFrame(
                 colorNear(capture.sample(450, 350), neutral_backdrop, package_sample_tolerance) and
                 colorStats(capture, neutral_mover, package_sample_tolerance).count >= 256 and
                 colorStats(capture, neutral_marker, package_sample_tolerance).count >= 128,
+            .chunked_tiled_fixture => hasChunkedTilemapSignature(capture, 3, 256),
+            .chunked_ldtk_fixture => hasChunkedTilemapSignature(capture, 2, 128),
         };
         if (pixels_match) {
             if (last_capture) |*previous| previous.deinit(allocator);
@@ -948,6 +973,36 @@ fn waitForRenderedFrame(
         );
     }
     return error.RuntimePixelEvidenceTimeout;
+}
+
+fn hasChunkedTilemapSignature(capture: Capture, minimum_color_families: usize, minimum_pixels: usize) bool {
+    const clear = Color{ .r = 53, .g = 89, .b = 129 };
+    var colored_pixels: usize = 0;
+    var red = false;
+    var green = false;
+    var blue = false;
+    var yellow = false;
+    var magenta = false;
+    var cyan = false;
+    var y: u16 = 0;
+    while (y < capture.height) : (y += 1) {
+        var x: u16 = 0;
+        while (x < capture.width) : (x += 1) {
+            const pixel = capture.sample(x, y);
+            if (colorNear(pixel, clear, 12)) continue;
+            if (@max(pixel.r, pixel.g, pixel.b) < 150) continue;
+            colored_pixels += 1;
+            red = red or (pixel.r > 180 and pixel.g < 100 and pixel.b < 100);
+            green = green or (pixel.g > 180 and pixel.r < 100 and pixel.b < 100);
+            blue = blue or (pixel.b > 180 and pixel.r < 100 and pixel.g < 100);
+            yellow = yellow or (pixel.r > 180 and pixel.g > 180 and pixel.b < 100);
+            magenta = magenta or (pixel.r > 180 and pixel.b > 180 and pixel.g < 100);
+            cyan = cyan or (pixel.g > 180 and pixel.b > 180 and pixel.r < 100);
+        }
+    }
+    const family_count = @as(usize, @intFromBool(red)) + @intFromBool(green) + @intFromBool(blue) +
+        @intFromBool(yellow) + @intFromBool(magenta) + @intFromBool(cyan);
+    return colored_pixels >= minimum_pixels and family_count >= minimum_color_families;
 }
 
 fn hasPackageTilemapSignature(capture: Capture) bool {
@@ -1499,6 +1554,10 @@ fn validateRuntimeLogs(
             "Behavior on_start hooks applied to neutral scene objects=2",
             "Runtime host initialized with Vulkan RHI neutral scene objects=2",
             "Neutral scene reloaded explicitly: objects=2",
+        },
+        .chunked_tiled_fixture, .chunked_ldtk_fixture => &.{
+            "Loaded preview scene artifact: projects/map-demo/runtime.scene, artifact_version=10",
+            "Runtime host initialized with Vulkan RHI neutral scene objects=1",
         },
     };
     for (scene_required) |needle| {
