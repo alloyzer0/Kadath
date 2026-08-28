@@ -32,6 +32,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
         && SupportsCommand("script_asset_delete")
         && SupportsCommand("script_asset_undo");
     public bool CanImportTexture => SupportsCommand("texture_import");
+    public bool CanImportTilemap => SupportsCommand("tilemap_import");
     public bool CanApplyAuthoring => SupportsCommand("authoring_apply");
     public bool CanUndoAuthoring => SupportsCommand("authoring_undo");
     public bool CanRedoAuthoring => SupportsCommand("authoring_redo");
@@ -69,6 +70,7 @@ public sealed class EditorCapabilitiesViewModel : ObservableObject
         RaisePropertyChanged(nameof(CanUndoScriptSource));
         RaisePropertyChanged(nameof(CanManageScriptAssets));
         RaisePropertyChanged(nameof(CanImportTexture));
+        RaisePropertyChanged(nameof(CanImportTilemap));
         RaisePropertyChanged(nameof(CanApplyAuthoring));
         RaisePropertyChanged(nameof(CanUndoAuthoring));
         RaisePropertyChanged(nameof(CanRedoAuthoring));

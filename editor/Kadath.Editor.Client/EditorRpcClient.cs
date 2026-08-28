@@ -61,6 +61,7 @@ public interface IEditorRpcClient : IAsyncDisposable
     Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(BehaviorContractSnapshotParameters parameters, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken = default);
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, CancellationToken cancellationToken = default);
+    Task<TilemapImportResult> ImportTilemapAsync(TilemapImportParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> RedoAuthoringAsync(AuthoringRedoParameters parameters, CancellationToken cancellationToken = default);
@@ -163,6 +164,9 @@ public sealed class EditorRpcClient : IEditorRpcClient
 
     public Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<TextureImportParameters, TextureImportResult>("texture_import", parameters, cancellationToken);
+
+    public Task<TilemapImportResult> ImportTilemapAsync(TilemapImportParameters parameters, CancellationToken cancellationToken = default) =>
+        RequestAsync<TilemapImportParameters, TilemapImportResult>("tilemap_import", parameters, cancellationToken);
 
     public Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, CancellationToken cancellationToken = default) =>
         RequestAsync<AuthoringApplyParameters, AuthoringMutationResult>("authoring_apply", parameters, cancellationToken);

@@ -149,6 +149,9 @@ internal sealed class EditorRpcHost
                 case "texture_import":
                     await WriteResponseAsync(request.Id, true, await _session.ImportTextureAsync(DeserializeParams<TextureImportParameters>(request), request.Id), null);
                     break;
+                case "tilemap_import":
+                    await WriteResponseAsync(request.Id, true, await _session.ImportTilemapAsync(DeserializeParams<TilemapImportParameters>(request), request.Id), null);
+                    break;
                 case "script_source_read":
                     await WriteResponseAsync(request.Id, true, await _session.GetScriptSourceAsync(DeserializeParams<ScriptSourceQueryParameters>(request), request.Id), null);
                     break;

@@ -39,6 +39,12 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private string _textureImportSourcePath = string.Empty;
     private string _textureImportAssetName = "imported";
     private string _textureImportProfile = "debug";
+    private string _tilemapImportSourcePath = string.Empty;
+    private string _tilemapImportAssetName = "world";
+    private string _tilemapImportId = "world";
+    private string _tilemapImportTextureIds = "1";
+    private string _tilemapImportLevelIid = string.Empty;
+    private bool _tilemapImportStrict;
     private string _scriptAssetPath = "scripts/new_behavior.luau";
     private string? _selectedHierarchyItem;
     private string? _selectedAssetItem;
@@ -90,6 +96,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         _workspace.HierarchySnapshot.PropertyChanged += OnNestedPropertyChanged;
         _workspace.AssetCatalogSnapshot.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Publication.PropertyChanged += OnNestedPropertyChanged;
+        _workspace.TilemapImport.PropertyChanged += OnNestedPropertyChanged;
         _workspace.Authoring.PropertyChanged += OnNestedPropertyChanged;
         _workspace.ScriptSource.PropertyChanged += OnNestedPropertyChanged;
         _workspace.ScriptAssetLifecycle.PropertyChanged += OnNestedPropertyChanged;
@@ -128,6 +135,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         StartPreviewCommand = AddCommand(new AsyncUiCommand(StartPreviewAsync, () => IsProjectOpen && CanStartPreview && !IsPreviewRunning && !IsBusy, HandleCommandError));
         StopPreviewCommand = AddCommand(new AsyncUiCommand(StopPreviewAsync, () => CanRequestPreviewStop && !IsBusy, HandleCommandError));
         ImportTextureCommand = AddCommand(new AsyncUiCommand(ImportTextureAsync, () => CanImportTexture, HandleCommandError));
+        ImportTilemapCommand = AddCommand(new AsyncUiCommand(ImportTilemapAsync, () => CanImportTilemap, HandleCommandError));
         AddDecorativeSpriteCommand = AddCommand(new DelegateUiCommand(AddDecorativeSpriteDraft, () => CanAddSceneObject));
         AddPatrolHazardCommand = AddCommand(new DelegateUiCommand(AddPatrolHazardDraft, () => CanAddPatrolHazard));
         DeleteSceneObjectCommand = AddCommand(new DelegateUiCommand(DeleteSelectedSceneObjectDraft, () => CanDeleteSelectedSceneObject));
@@ -182,6 +190,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ICommand StartPreviewCommand { get; }
     public ICommand StopPreviewCommand { get; }
     public ICommand ImportTextureCommand { get; }
+    public ICommand ImportTilemapCommand { get; }
     public ICommand AddDecorativeSpriteCommand { get; }
     public ICommand AddPatrolHazardCommand { get; }
     public ICommand DeleteSceneObjectCommand { get; }
@@ -211,6 +220,12 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public string TextureImportSourcePath { get => _textureImportSourcePath; set { if (SetProperty(ref _textureImportSourcePath, value)) { RaiseAll(); } } }
     public string TextureImportAssetName { get => _textureImportAssetName; set { if (SetProperty(ref _textureImportAssetName, value)) { RaiseAll(); } } }
     public string TextureImportProfile { get => _textureImportProfile; set { if (SetProperty(ref _textureImportProfile, value)) { RaiseAll(); } } }
+    public string TilemapImportSourcePath { get => _tilemapImportSourcePath; set { if (SetProperty(ref _tilemapImportSourcePath, value)) RaiseAll(); } }
+    public string TilemapImportAssetName { get => _tilemapImportAssetName; set { if (SetProperty(ref _tilemapImportAssetName, value)) RaiseAll(); } }
+    public string TilemapImportId { get => _tilemapImportId; set { if (SetProperty(ref _tilemapImportId, value)) RaiseAll(); } }
+    public string TilemapImportTextureIds { get => _tilemapImportTextureIds; set { if (SetProperty(ref _tilemapImportTextureIds, value)) RaiseAll(); } }
+    public string TilemapImportLevelIid { get => _tilemapImportLevelIid; set { if (SetProperty(ref _tilemapImportLevelIid, value)) RaiseAll(); } }
+    public bool TilemapImportStrict { get => _tilemapImportStrict; set { if (SetProperty(ref _tilemapImportStrict, value)) RaiseAll(); } }
     public string ScriptAssetPath { get => _scriptAssetPath; set { if (SetProperty(ref _scriptAssetPath, value)) { RaiseAll(); } } }
     public string? SelectedHierarchyItem
     {
@@ -510,6 +525,20 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             return "从 Assets 面板导入外部纹理文件。";
         }
     }
+    public string TilemapImportStatus => _workspace.TilemapImport.State switch
+    {
+        EditorTilemapImportState.Running => "外部地图导入中…",
+        EditorTilemapImportState.Succeeded => $"地图导入成功 · {_workspace.TilemapImport.RelativePath ?? "unknown"}",
+        EditorTilemapImportState.Failed => $"地图导入失败 · {_workspace.TilemapImport.ErrorCode ?? "unknown"}",
+        _ => "地图导入空闲"
+    };
+    public string TilemapImportDetails => _workspace.TilemapImport.State switch
+    {
+        EditorTilemapImportState.Succeeded => string.Join(Environment.NewLine,
+            new[] { _workspace.TilemapImport.Summary, _workspace.TilemapImport.Diagnostics }.Where(value => !string.IsNullOrWhiteSpace(value))),
+        EditorTilemapImportState.Failed => _workspace.TilemapImport.ErrorMessage ?? "导入失败",
+        _ => "支持 Tiled TMJ/TSJ 与 LDtk 1.5.3；TextureId 按来源 Tileset 顺序绑定。"
+    };
     public string SurfaceMode => _workspace.Preview.SurfaceMode ?? "external-window（独立 Runtime 窗口）";
     public string SurfaceDetails => _workspace.Preview.Surface is { } surface
         ? $"class={surface.WindowClass}; pid={surface.ProcessId?.ToString() ?? "pending"}"
@@ -699,7 +728,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && prototypeIndex < ScenePrototypeDrafts.Count - 1;
     public string ScenePrototypeCountStatus => $"原型 {ScenePrototypeDrafts.Count}/32";
     public bool SupportsSceneTilemapAuthoring => SceneSchemaSupportsTilemapAuthoring(ActiveSceneSchema);
-    public bool SupportsSceneCameraAuthoring => ActiveSceneSchema is 8 or 9;
+    public bool SupportsSceneCameraAuthoring => ActiveSceneSchema is >= 8 and <= 10;
     public bool HasSceneTilemapDraft => SceneTilemapDraft is not null;
     public bool CanAddSceneTilemap => SupportsSceneTilemapAuthoring
         && SceneTilemapDraft is null
@@ -708,7 +737,16 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && !IsBusy;
     public bool CanDeleteSceneTilemap => SupportsSceneTilemapAuthoring && SceneTilemapDraft is not null && !IsBusy;
     public bool CanResizeSceneTilemap => SupportsSceneTilemapAuthoring && SceneTilemapDraft is not null && !IsBusy;
-    public string SceneTilemapStatus => SceneTilemapDraft is null ? "背景 Tilemap 0/1" : $"背景 Tilemap 1/1 · {SceneTilemapDraft.CellCountStatus}";
+    public string SceneTilemapStatus
+    {
+        get
+        {
+            var chunked = _workspace.ProjectSnapshot.Value?.Scene.ChunkedTilemaps ?? [];
+            if (chunked.Count != 0)
+                return $"Chunked Tilemap {chunked.Count}/4 · layers={chunked.Sum(value => value.LayerCount)} · chunks={chunked.Sum(value => value.ChunkCount)} · cells={chunked.Sum(value => value.CellCount)}";
+            return SceneTilemapDraft is null ? "背景 Tilemap 0/1" : $"背景 Tilemap 1/1 · {SceneTilemapDraft.CellCountStatus}";
+        }
+    }
     public bool CanRefreshSnapshots => IsProjectOpen
         && _workspace.Capabilities.CanReadProjectSnapshot
         && _workspace.Capabilities.CanReadHierarchySnapshot
@@ -719,6 +757,14 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && !IsBusy
         && !string.IsNullOrWhiteSpace(TextureImportSourcePath)
         && !string.IsNullOrWhiteSpace(TextureImportAssetName);
+    public bool CanImportTilemap => IsProjectOpen
+        && _workspace.Capabilities.CanImportTilemap
+        && !IsBusy
+        && ActiveSceneSchema is >= 7 and <= 10
+        && !string.IsNullOrWhiteSpace(TilemapImportSourcePath)
+        && !string.IsNullOrWhiteSpace(TilemapImportAssetName)
+        && !string.IsNullOrWhiteSpace(TilemapImportId)
+        && TryParseTilemapTextureIds(out _);
     public bool CanBakeChanges => IsProjectOpen && CanBake && _workspace.Capabilities.CanReadPublicationSnapshot && _workspace.Publication.RecommendedBakeTarget is not null && !IsWatching && !IsPreviewAutoSync && !IsBusy;
     public bool CanStartWatch => _workspace.Capabilities.CanStartWatch && !IsPreviewAutoSync;
     public bool CanStopWatch => _workspace.Capabilities.CanStopWatch;
@@ -883,6 +929,30 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             SelectedAssetItem = label;
         }
         AddLog("texture_import", $"{result.RelativePath}; profile={result.Profile}; format={result.ArtifactFormat}", null, 0);
+        RaiseAll();
+        return result;
+    }
+
+    public async Task<TilemapImportResult> ImportTilemapForCurrentProjectAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureConnectedAsync();
+        var session = _workspace.Project.Session ?? throw new EditorRpcException("project_not_open", "请先打开项目。");
+        var project = _workspace.ProjectSnapshot.Value ?? throw new EditorRpcException("snapshot_missing", "Project snapshot is not loaded.");
+        if (!TryParseTilemapTextureIds(out var textureIds))
+            throw new EditorRpcException("tilemap_import_texture_binding_invalid", "TextureId 顺序必须是逗号分隔的非零 u32。");
+        var result = await _workspace.ImportTilemapAsync(new TilemapImportParameters(
+            session.ProjectName,
+            project.AuthoringRevision,
+            TilemapImportSourcePath,
+            TilemapImportAssetName,
+            TilemapImportId,
+            textureIds,
+            string.IsNullOrWhiteSpace(TilemapImportLevelIid) ? null : TilemapImportLevelIid.Trim(),
+            TilemapImportStrict), cancellationToken == default ? _lifetime.Token : cancellationToken);
+        ApplySnapshotProjection(session);
+        RefreshAssetProjection();
+        if (_assetLabelsByRelativePath.TryGetValue(result.RelativePath, out var label)) SelectedAssetItem = label;
+        AddLog("tilemap_import", $"{result.SourceKind} {result.SourceVersion}; layers={result.LayerCount}; chunks={result.ChunkCount}; cells={result.CellCount}; warnings={result.Diagnostics.Count}", null, 0);
         RaiseAll();
         return result;
     }
@@ -1881,6 +1951,19 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     }
     private async Task StopPreviewAsync() { await _workspace.StopPreviewAsync(_lifetime.Token); RaiseAll(); }
     private async Task ImportTextureAsync() { await ImportTextureForCurrentProjectAsync(_lifetime.Token); }
+    private async Task ImportTilemapAsync() { await ImportTilemapForCurrentProjectAsync(_lifetime.Token); }
+
+    private bool TryParseTilemapTextureIds(out uint[] values)
+    {
+        var tokens = TilemapImportTextureIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        values = new uint[tokens.Length];
+        if (tokens.Length == 0 || tokens.Length > 16) return false;
+        for (var index = 0; index < tokens.Length; index++)
+        {
+            if (!uint.TryParse(tokens[index], out values[index]) || values[index] == 0) return false;
+        }
+        return values.Distinct().Count() == values.Length;
+    }
 
     private static string ShortRevision(string? revision) => revision is { Length: >= 12 } ? $"{revision[..12]}…" : "—";
 
@@ -2098,6 +2181,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(RuntimeSyncStatus));
         OnPropertyChanged(nameof(TextureImportStatus));
         OnPropertyChanged(nameof(TextureImportDetails));
+        OnPropertyChanged(nameof(TilemapImportStatus));
+        OnPropertyChanged(nameof(TilemapImportDetails));
         OnPropertyChanged(nameof(SurfaceMode));
         OnPropertyChanged(nameof(SurfaceDetails));
         OnPropertyChanged(nameof(SnapshotStatus));
@@ -2180,6 +2265,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanRefreshSnapshots));
         OnPropertyChanged(nameof(CanBake));
         OnPropertyChanged(nameof(CanImportTexture));
+        OnPropertyChanged(nameof(CanImportTilemap));
         OnPropertyChanged(nameof(CanBakeChanges));
         OnPropertyChanged(nameof(CanStartWatch));
         OnPropertyChanged(nameof(CanStopWatch));

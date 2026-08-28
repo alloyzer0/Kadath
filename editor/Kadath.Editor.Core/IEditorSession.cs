@@ -24,6 +24,7 @@ public interface IEditorSessionBackend : IAsyncDisposable
     Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(ProjectSessionInfo project, BehaviorContractSnapshotParameters parameters, CancellationToken cancellationToken);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(ProjectSessionInfo project, PublicationSnapshotQueryParameters parameters, CancellationToken cancellationToken);
     Task<TextureImportResult> ImportTextureAsync(ProjectSessionInfo project, TextureImportParameters parameters, CancellationToken cancellationToken);
+    Task<TilemapImportResult> ImportTilemapAsync(ProjectSessionInfo project, TilemapImportParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> UndoAuthoringAsync(ProjectSessionInfo project, AuthoringUndoParameters parameters, CancellationToken cancellationToken);
     Task<AuthoringMutationResult> RedoAuthoringAsync(ProjectSessionInfo project, AuthoringRedoParameters parameters, CancellationToken cancellationToken);
@@ -58,6 +59,7 @@ public interface IEditorSession : IAsyncDisposable
     Task<BehaviorContractSnapshotResult> GetBehaviorContractSnapshotAsync(BehaviorContractSnapshotParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<PublicationSnapshot> GetPublicationSnapshotAsync(PublicationSnapshotQueryParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<TextureImportResult> ImportTextureAsync(TextureImportParameters parameters, string? requestId, CancellationToken cancellationToken = default);
+    Task<TilemapImportResult> ImportTilemapAsync(TilemapImportParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> ApplyAuthoringAsync(AuthoringApplyParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> UndoAuthoringAsync(AuthoringUndoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
     Task<AuthoringMutationResult> RedoAuthoringAsync(AuthoringRedoParameters parameters, string? requestId, CancellationToken cancellationToken = default);
@@ -89,6 +91,7 @@ public sealed class EditorSession : IEditorSession
         "script_source_analyze",
         "behavior_contract_snapshot",
         "texture_import",
+        "tilemap_import",
         "authoring_apply",
         "authoring_undo",
         "authoring_redo",
@@ -324,6 +327,36 @@ public sealed class EditorSession : IEditorSession
             catch (EditorOperationException exception)
             {
                 await EmitAsync("texture_import_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
+                throw;
+            }
+        }
+        finally { _projectMutationGate.Release(); }
+    }
+
+    public async Task<TilemapImportResult> ImportTilemapAsync(TilemapImportParameters parameters, string? requestId, CancellationToken cancellationToken = default)
+    {
+        await _projectMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            var project = RequireProject(parameters.ProjectName);
+            await EmitAsync("tilemap_import_started", new
+            {
+                projectName = project.ProjectName,
+                sourcePath = parameters.SourcePath,
+                assetName = parameters.AssetName,
+                tilemapId = parameters.TilemapId,
+                levelIid = parameters.LevelIid,
+                strict = parameters.Strict
+            }, requestId);
+            try
+            {
+                var result = await _backend.ImportTilemapAsync(project, parameters, cancellationToken);
+                await EmitAsync("tilemap_import_completed", result, requestId);
+                return result;
+            }
+            catch (EditorOperationException exception)
+            {
+                await EmitAsync("tilemap_import_failed", new { errorCode = exception.Code, message = exception.Message }, requestId);
                 throw;
             }
         }

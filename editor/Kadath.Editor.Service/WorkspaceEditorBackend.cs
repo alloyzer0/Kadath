@@ -11,6 +11,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private readonly WorkspaceAuthoringModel _authoringModel;
     private readonly WorkspacePublicationModel _publicationModel;
     private readonly WorkspaceTextureImportModel _textureImportModel;
+    private readonly WorkspaceTilemapImportModel _tilemapImportModel;
     private readonly WorkspaceScriptSourceAuthoringModel _scriptSourceAuthoringModel;
     private readonly WorkspaceScriptAssetLifecycleModel _scriptAssetLifecycleModel;
     private readonly WorkspaceScriptDiagnosticsModel _scriptDiagnosticsModel;
@@ -45,6 +46,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         _authoringModel = authoringModel;
         _publicationModel = publicationModel;
         _textureImportModel = textureImportModel;
+        _tilemapImportModel = new WorkspaceTilemapImportModel(authoringModel);
         _scriptSourceAuthoringModel = scriptSourceAuthoringModel ?? new WorkspaceScriptSourceAuthoringModel();
         _scriptAssetLifecycleModel = scriptAssetLifecycleModel ?? new WorkspaceScriptAssetLifecycleModel();
         _scriptDiagnosticsModel = scriptDiagnosticsModel ?? new WorkspaceScriptDiagnosticsModel();
@@ -177,6 +179,30 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             };
             throw new EditorOperationException(code, exception.Message);
         }
+    }
+
+    public async Task<TilemapImportResult> ImportTilemapAsync(ProjectSessionInfo project, TilemapImportParameters parameters, CancellationToken cancellationToken)
+    {
+        await _authoringGate.WaitAsync(cancellationToken);
+        try
+        {
+            try
+            {
+                var commit = await _tilemapImportModel.ImportWithUndoAsync(project, parameters, cancellationToken);
+                ValidateSnapshot(project, commit.Result.ProjectSnapshot);
+                ValidateSnapshot(project, commit.Result.HierarchySnapshot);
+                ValidateSnapshot(project, commit.Result.AssetCatalogSnapshot);
+                _authoringHistory.Add(new AuthoringUndoRecord(project.ProjectName, commit.Result.Revision, ["scene.textures", "scene.tilemaps"], commit.UndoToken));
+                if (_authoringHistory.Count > MaxAuthoringHistory) _authoringHistory.RemoveAt(0);
+                _authoringRedoHistory.Clear();
+                return commit.Result;
+            }
+            catch (WorkspaceTilemapImportException exception)
+            {
+                throw new EditorOperationException(exception.Code, exception.Message);
+            }
+        }
+        finally { _authoringGate.Release(); }
     }
 
     public async Task<AuthoringMutationResult> ApplyAuthoringAsync(ProjectSessionInfo project, AuthoringApplyParameters parameters, CancellationToken cancellationToken)
@@ -623,6 +649,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     || !textureSetValid
                     || !ValidateSceneObjects(objects, textures!, sceneModel!, behaviorDependencySetValid ? scriptDependencies!.Select(dependency => dependency.ScriptId).ToHashSet() : null)
                     || !ValidateSceneTilemaps(sceneModel!.Tilemaps, textures!, sceneModel.SchemaVersion)
+                    || !ValidateSceneChunkedTilemaps(sceneModel.ChunkedTilemaps, sceneModel.SchemaVersion)
                     || !ValidateSceneCamera(sceneModel.Camera, sceneModel.SchemaVersion)
                     || model.Script.SchemaVersion is not (1 or 2)
                     || model.Preview.SchemaVersion != 1
@@ -718,9 +745,9 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private static bool IsTextureSamplingProfile(string value) => value is
         "pixel_art" or "smooth_linear" or "smooth_mipmap" or "smooth_mipmap_anisotropic";
 
-    private static bool IsSupportedSceneSchema(int schemaVersion) => schemaVersion is >= 3 and <= 9;
-    private static bool SceneSchemaHasExplicitGameplay(int schemaVersion) => schemaVersion is >= 7 and <= 9;
-    private static bool SceneSchemaHasBehaviorBindings(int schemaVersion) => schemaVersion is >= 5 and <= 9;
+    private static bool IsSupportedSceneSchema(int schemaVersion) => schemaVersion is >= 3 and <= 10;
+    private static bool SceneSchemaHasExplicitGameplay(int schemaVersion) => schemaVersion is >= 7 and <= 10;
+    private static bool SceneSchemaHasBehaviorBindings(int schemaVersion) => schemaVersion is >= 5 and <= 10;
 
     private static bool ValidateSceneTilemaps(
         IReadOnlyList<ProjectModelSceneTilemap>? tilemaps,
@@ -728,7 +755,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         int schemaVersion)
     {
         if (tilemaps is null) return false;
-        if (schemaVersion < 8) return tilemaps.Count == 0;
+        if (schemaVersion is < 8 or > 9) return tilemaps.Count == 0;
         if (tilemaps.Count > 1) return false;
         var textureProfiles = textures.ToDictionary(value => value.TextureId, value => value.SamplingProfile);
         foreach (var tilemap in tilemaps)
@@ -749,6 +776,40 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         return true;
     }
 
+    private static bool ValidateSceneChunkedTilemaps(
+        IReadOnlyList<ProjectModelSceneChunkedTilemap>? tilemaps,
+        int schemaVersion)
+    {
+        // 新增尾字段不能破坏旧 RPC 调用方；v3-v9 的缺省值与空集合等价。
+        if (tilemaps is null) return schemaVersion != 10;
+        if (schemaVersion != 10) return tilemaps.Count == 0;
+        if (tilemaps.Count > 4 || tilemaps.Sum(value => value.LayerCount) > 4) return false;
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var tilemap in tilemaps)
+        {
+            if (!IsObjectId(tilemap.TilemapId) || !ids.Add(tilemap.TilemapId)
+                || tilemap.Origin is not { Length: 2 }
+                || !tilemap.Origin.All(number => double.IsFinite(number) && float.IsFinite((float)number))
+                || string.IsNullOrEmpty(tilemap.Artifact)
+                || !tilemap.Artifact.StartsWith("assets/tilemaps/", StringComparison.Ordinal)
+                || !tilemap.Artifact.EndsWith(".tilemap", StringComparison.Ordinal)
+                || tilemap.Artifact.Contains('\\')
+                || tilemap.Artifact.Split('/').Any(segment => segment.Length == 0 || segment is "." or "..")
+                || tilemap.ArtifactRevision.Length != 64
+                || tilemap.ArtifactRevision.Any(character => character is not (>= '0' and <= '9' or >= 'a' and <= 'f'))
+                || tilemap.ArtifactBytes is <= 0 or > 64L * 1024 * 1024
+                || tilemap.TileSourceCount is < 1 or > 16
+                || tilemap.LayerCount is < 1 or > 4
+                || tilemap.ChunkCount < 0 || tilemap.CellCount < 0
+                || tilemap.Layers is null || tilemap.Layers.Count != tilemap.LayerCount
+                || tilemap.Layers.Any(layer => !IsObjectId(layer.LayerId)
+                    || !double.IsFinite(layer.Opacity) || layer.Opacity is < 0 or > 1
+                    || layer.ChunkCount < 0 || layer.CellCount < 0))
+                return false;
+        }
+        return true;
+    }
+
     private static bool ValidateSceneCamera(ProjectModelSceneCamera? camera, int schemaVersion)
     {
         // 旧协议调用方可省略 Camera；在 v3-v8 中它等价于恒等视图。
@@ -757,7 +818,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
             || !camera.Origin.All(number => double.IsFinite(number) && float.IsFinite((float)number))
             || !double.IsFinite(camera.Zoom) || !float.IsFinite((float)camera.Zoom)
             || camera.Zoom is < 0.125 or > 8) return false;
-        return schemaVersion == 9
+        return schemaVersion is 9 or 10
             || camera.Origin.SequenceEqual([0d, 0d]) && camera.Zoom == 1;
     }
 

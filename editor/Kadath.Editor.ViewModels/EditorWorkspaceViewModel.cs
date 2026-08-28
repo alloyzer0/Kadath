@@ -45,6 +45,7 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
     public EditorSnapshotViewModel<BehaviorContractSnapshotResult> BehaviorContract { get; } = new();
     public EditorPublicationViewModel Publication { get; } = new();
     public EditorTextureImportViewModel TextureImport { get; } = new();
+    public EditorTilemapImportViewModel TilemapImport { get; } = new();
     public EditorAuthoringViewModel Authoring { get; } = new();
     public EditorBakeViewModel Bake { get; } = new();
     public EditorWatchViewModel Watch { get; } = new();
@@ -577,6 +578,30 @@ public sealed class EditorWorkspaceViewModel : ObservableObject, IAsyncDisposabl
         catch (Exception exception)
         {
             await ApplyTextureImportExceptionAsync(exception).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async Task<TilemapImportResult> ImportTilemapAsync(TilemapImportParameters parameters, CancellationToken cancellationToken = default)
+    {
+        EnsureCommand(Capabilities.CanImportTilemap, "tilemap_import");
+        await _dispatcher.InvokeAsync(TilemapImport.Begin).ConfigureAwait(false);
+        try
+        {
+            var result = await Client.ImportTilemapAsync(parameters, cancellationToken).ConfigureAwait(false);
+            await _dispatcher.InvokeAsync(() =>
+            {
+                TilemapImport.ApplyCompleted(result);
+                ProjectSnapshot.Apply(result.ProjectSnapshot);
+                HierarchySnapshot.Apply(result.HierarchySnapshot);
+                AssetCatalogSnapshot.Apply(result.AssetCatalogSnapshot);
+            }).ConfigureAwait(false);
+            await RefreshPublicationAfterOperationAsync(result.ProjectName, Publication.Profile, cancellationToken).ConfigureAwait(false);
+            return result;
+        }
+        catch (Exception exception)
+        {
+            await ApplyExceptionAsync(exception, "tilemap_import_failed", TilemapImport.ApplyFailed).ConfigureAwait(false);
             throw;
         }
     }
