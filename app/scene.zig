@@ -1,12 +1,14 @@
 const std = @import("std");
 const content_identity = @import("content_identity.zig");
 
-pub const current_schema_version: u32 = 8;
+pub const current_schema_version: u32 = 9;
+pub const tilemap_schema_version: u32 = 8;
 pub const gameplay_schema_version: u32 = 7;
 pub const prototype_schema_version: u32 = 6;
 pub const behavior_schema_version: u32 = 5;
 pub const legacy_object_schema_version: u32 = 4;
-pub const scene_artifact_version: u32 = 8;
+pub const scene_artifact_version: u32 = 9;
+pub const tilemap_artifact_version: u32 = 8;
 pub const gameplay_artifact_version: u32 = 7;
 pub const prototype_artifact_version: u32 = 6;
 pub const behavior_artifact_version: u32 = 5;
@@ -279,6 +281,12 @@ pub const TilemapSet = struct {
     }
 };
 
+pub const Camera2DConfig = struct {
+    // 相机原点是视口左上角对应的世界坐标；默认值保持 v4-v8 的像素输出不变。
+    origin: [2]f32 = .{ 0.0, 0.0 },
+    zoom: f32 = 1.0,
+};
+
 // 旧 Demo 玩法的显式配置；v7 夹具和调用方不能再借 schema 版本隐式启用 Gameplay。
 pub const goal_hazard_v1_gameplay = GameplayConfig{
     .profile = .goal_hazard_v1,
@@ -292,6 +300,7 @@ pub const Scene = struct {
     prototypes: SpawnPrototypeSet = .{},
     gameplay: GameplayConfig = .{},
     tilemaps: TilemapSet = .{},
+    camera: Camera2DConfig = .{},
 
     pub fn gameplayProfile(self: *const Scene) GameplayProfile {
         // v4-v6 的 wire 没有显式 profile；兼容 Adapter 必须保持旧 Demo 语义。
@@ -464,6 +473,21 @@ const WireSceneV8 = struct {
     tilemaps: []const WireTilemap,
 };
 
+const WireCamera2D = struct {
+    origin: [2]f32,
+    zoom: f32,
+};
+
+const WireSceneV9 = struct {
+    schemaVersion: u32,
+    textures: []const WireTextureSpecV8,
+    objects: []const WireSceneObjectV5,
+    prototypes: []const WireSpawnPrototype,
+    gameplay: ?WireGameplayConfig = null,
+    tilemaps: []const WireTilemap,
+    camera: WireCamera2D,
+};
+
 const SchemaProbe = struct {
     schemaVersion: u32,
 };
@@ -611,7 +635,8 @@ fn parseInto(allocator: std.mem.Allocator, contents: []const u8, output: *Scene)
         behavior_schema_version => try parseSourceV5Into(allocator, contents, output),
         prototype_schema_version => try parseSourceV6Into(allocator, contents, output),
         gameplay_schema_version => try parseSourceV7Into(allocator, contents, output),
-        current_schema_version => try parseSourceV8Into(allocator, contents, output),
+        tilemap_schema_version => try parseSourceV8Into(allocator, contents, output),
+        current_schema_version => try parseSourceV9Into(allocator, contents, output),
         else => return error.UnsupportedSceneSchema,
     }
 }
@@ -752,6 +777,39 @@ fn parseSourceV7Into(allocator: std.mem.Allocator, contents: []const u8, output:
 fn parseSourceV8Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
     const parsed = try std.json.parseFromSlice(WireSceneV8, allocator, contents, .{});
     defer parsed.deinit();
+    if (parsed.value.schemaVersion != tilemap_schema_version) return error.UnsupportedSceneSchema;
+    const gameplay = if (parsed.value.gameplay) |wire|
+        GameplayConfig{ .profile = wire.profile, .timeLimitSeconds = wire.timeLimitSeconds }
+    else
+        GameplayConfig{};
+    output.* = .{
+        .schemaVersion = tilemap_schema_version,
+        .textures = try normalizeTexturesV8(parsed.value.textures),
+        .objects = undefined,
+        .gameplay = gameplay,
+    };
+    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, min_neutral_scene_object_count, &output.objects);
+    if (parsed.value.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
+    output.prototypes.count = @intCast(parsed.value.prototypes.len);
+    for (parsed.value.prototypes, 0..) |wire, index| {
+        output.prototypes.entries[index] = .{
+            .prototypeId = try PrototypeId.init(wire.prototypeId),
+            .kind = wire.kind,
+            .sprite = .{
+                .size = wire.sprite.size,
+                .color = wire.sprite.color,
+                .textureId = wire.sprite.textureId,
+            },
+            .behaviors = try normalizeBehaviorBindings(wire.behaviors),
+        };
+    }
+    try normalizeTilemapsInto(parsed.value.tilemaps, &output.tilemaps);
+    try validate(output);
+}
+
+fn parseSourceV9Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
+    const parsed = try std.json.parseFromSlice(WireSceneV9, allocator, contents, .{});
+    defer parsed.deinit();
     if (parsed.value.schemaVersion != current_schema_version) return error.UnsupportedSceneSchema;
     const gameplay = if (parsed.value.gameplay) |wire|
         GameplayConfig{ .profile = wire.profile, .timeLimitSeconds = wire.timeLimitSeconds }
@@ -762,6 +820,7 @@ fn parseSourceV8Into(allocator: std.mem.Allocator, contents: []const u8, output:
         .textures = try normalizeTexturesV8(parsed.value.textures),
         .objects = undefined,
         .gameplay = gameplay,
+        .camera = .{ .origin = parsed.value.camera.origin, .zoom = parsed.value.camera.zoom },
     };
     try normalizeBehaviorSceneObjectsInto(parsed.value.objects, min_neutral_scene_object_count, &output.objects);
     if (parsed.value.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
@@ -956,7 +1015,7 @@ pub fn artifactByteCount(value: *const Scene) !usize {
     var payload_bytes: usize = 4;
     for (value.textures.slice()) |texture| {
         payload_bytes = try std.math.add(usize, payload_bytes, 8 + texture.artifact().len);
-        if (value.schemaVersion == current_schema_version) {
+        if (schemaHasTextureSamplingProfiles(value.schemaVersion)) {
             payload_bytes = try std.math.add(usize, payload_bytes, 4);
         }
     }
@@ -976,13 +1035,17 @@ pub fn artifactByteCount(value: *const Scene) !usize {
         // KSCN v7 尾部显式保存 profile 与 time limit，Runtime 不再从角色表猜测模式。
         payload_bytes = try std.math.add(usize, payload_bytes, 8);
     }
-    if (value.schemaVersion == current_schema_version) {
+    if (schemaHasTilemaps(value.schemaVersion)) {
         payload_bytes = try std.math.add(usize, payload_bytes, 4);
         for (value.tilemaps.slice()) |tilemap| {
             const cell_bytes = try std.math.mul(usize, tilemap.cellSlice().len, @sizeOf(u16));
             payload_bytes = try std.math.add(usize, payload_bytes, 4 + tilemap.tilemapId.slice().len + 8 + 8 + 24);
             payload_bytes = try std.math.add(usize, payload_bytes, cell_bytes);
         }
+    }
+    if (value.schemaVersion == current_schema_version) {
+        // KSCN v9 在 v8 Tilemap 尾部后追加 Camera2D：origin f32[2] + zoom f32。
+        payload_bytes = try std.math.add(usize, payload_bytes, 3 * @sizeOf(f32));
     }
     return try std.math.add(usize, scene_artifact_header_bytes, payload_bytes);
 }
@@ -1005,7 +1068,7 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
         cursor += 8;
         @memcpy(output[cursor .. cursor + texture.artifactBytes], texture.artifact());
         cursor += texture.artifactBytes;
-        if (value.schemaVersion == current_schema_version) {
+        if (schemaHasTextureSamplingProfiles(value.schemaVersion)) {
             writeLittleU32(output[cursor..][0..4], @intFromEnum(texture.samplingProfile));
             cursor += 4;
         }
@@ -1072,7 +1135,7 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
         writeLittleF32(output[cursor + 4 ..][0..4], value.gameplay.timeLimitSeconds);
         cursor += 8;
     }
-    if (value.schemaVersion == current_schema_version) {
+    if (schemaHasTilemaps(value.schemaVersion)) {
         writeLittleU32(output[cursor..][0..4], value.tilemaps.count);
         cursor += 4;
         for (value.tilemaps.slice()) |tilemap| {
@@ -1097,6 +1160,12 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
             }
         }
     }
+    if (value.schemaVersion == current_schema_version) {
+        writeLittleF32(output[cursor..][0..4], value.camera.origin[0]);
+        writeLittleF32(output[cursor + 4 ..][0..4], value.camera.origin[1]);
+        writeLittleF32(output[cursor + 8 ..][0..4], value.camera.zoom);
+        cursor += 12;
+    }
     std.debug.assert(cursor == output.len);
     return output;
 }
@@ -1107,6 +1176,7 @@ fn artifactVersionForSchema(schema_version: u32) !u32 {
         behavior_schema_version => behavior_artifact_version,
         prototype_schema_version => prototype_artifact_version,
         gameplay_schema_version => gameplay_artifact_version,
+        tilemap_schema_version => tilemap_artifact_version,
         current_schema_version => scene_artifact_version,
         else => error.UnsupportedSceneSchema,
     };
@@ -1167,17 +1237,29 @@ fn schemaHasBehaviorBindings(schema_version: u32) bool {
     return schema_version == behavior_schema_version or
         schema_version == prototype_schema_version or
         schema_version == gameplay_schema_version or
+        schema_version == tilemap_schema_version or
         schema_version == current_schema_version;
 }
 
 fn schemaHasSpawnPrototypes(schema_version: u32) bool {
     return schema_version == prototype_schema_version or
         schema_version == gameplay_schema_version or
+        schema_version == tilemap_schema_version or
         schema_version == current_schema_version;
 }
 
 fn schemaHasExplicitGameplay(schema_version: u32) bool {
-    return schema_version == gameplay_schema_version or schema_version == current_schema_version;
+    return schema_version == gameplay_schema_version or
+        schema_version == tilemap_schema_version or
+        schema_version == current_schema_version;
+}
+
+fn schemaHasTextureSamplingProfiles(schema_version: u32) bool {
+    return schema_version == tilemap_schema_version or schema_version == current_schema_version;
+}
+
+fn schemaHasTilemaps(schema_version: u32) bool {
+    return schema_version == tilemap_schema_version or schema_version == current_schema_version;
 }
 
 fn parseArtifact(source: []const u8) !Scene {
@@ -1207,6 +1289,10 @@ fn parseArtifactInto(source: []const u8, output: *Scene) !void {
         gameplay_artifact_version => {
             if (schema_version != gameplay_schema_version) return error.UnsupportedSceneSchema;
             try parseArtifactBehaviorSceneInto(source, gameplay_schema_version, true, true, false, false, output);
+        },
+        tilemap_artifact_version => {
+            if (schema_version != tilemap_schema_version) return error.UnsupportedSceneSchema;
+            try parseArtifactBehaviorSceneInto(source, tilemap_schema_version, true, true, true, true, output);
         },
         scene_artifact_version => {
             if (schema_version != current_schema_version) return error.UnsupportedSceneSchema;
@@ -1417,6 +1503,11 @@ fn parseArtifactBehaviorSceneInto(
             for (tilemap.cells[0..cell_count]) |*cell| cell.* = try reader.readU16();
         }
     }
+    if (schema_version == current_schema_version) {
+        // v9 Camera2D 尾部必须完整存在；截断和额外字节均由 ByteReader 拒绝。
+        output.camera.origin = .{ try reader.readF32(), try reader.readF32() };
+        output.camera.zoom = try reader.readF32();
+    }
     if (!reader.atEnd()) return error.InvalidSceneArtifact;
     try validate(output);
 }
@@ -1509,6 +1600,7 @@ pub fn validate(value: *const Scene) !void {
         value.schemaVersion != behavior_schema_version and
         value.schemaVersion != prototype_schema_version and
         value.schemaVersion != gameplay_schema_version and
+        value.schemaVersion != tilemap_schema_version and
         value.schemaVersion != current_schema_version)
     {
         return error.UnsupportedSceneSchema;
@@ -1611,13 +1703,26 @@ pub fn validate(value: *const Scene) !void {
         }
     }
 
-    if (value.schemaVersion != current_schema_version) {
+    if (!schemaHasTilemaps(value.schemaVersion)) {
         if (value.tilemaps.count != 0) return error.LegacySceneTilemap;
+    } else {
+        if (value.tilemaps.count > max_tilemap_count) return error.TilemapCountExceeded;
+        for (value.tilemaps.slice()) |tilemap| {
+            try validateTilemap(value, &tilemap);
+        }
+    }
+
+    if (value.schemaVersion != current_schema_version) {
+        if (value.camera.origin[0] != 0 or value.camera.origin[1] != 0 or value.camera.zoom != 1) {
+            return error.LegacySceneCamera;
+        }
         return;
     }
-    if (value.tilemaps.count > max_tilemap_count) return error.TilemapCountExceeded;
-    for (value.tilemaps.slice()) |tilemap| {
-        try validateTilemap(value, &tilemap);
+    for (value.camera.origin) |number| {
+        if (!std.math.isFinite(number)) return error.InvalidCameraOrigin;
+    }
+    if (!std.math.isFinite(value.camera.zoom) or value.camera.zoom < 0.125 or value.camera.zoom > 8.0) {
+        return error.InvalidCameraZoom;
     }
 }
 
@@ -1836,6 +1941,50 @@ const scene_v8_source =
     \\{"tilemapId":"background","origin":[0,0],"tileSize":[32,32],"columns":2,"rows":2,"textureId":1,"atlasColumns":4,"atlasRows":4,"cells":[1,0,6,16]}]}
 ;
 
+const scene_v9_source =
+    \\{"schemaVersion":9,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture","samplingProfile":"pixel_art"}],"objects":[
+    \\{"objectId":"decor","kind":"sprite","transform":{"position":[10,20]},"sprite":{"size":[16,16],"color":[1,1,1,1],"textureId":1},"behaviors":[]}
+    \\],"prototypes":[],"tilemaps":[
+    \\{"tilemapId":"background","origin":[0,0],"tileSize":[32,32],"columns":2,"rows":2,"textureId":1,"atlasColumns":4,"atlasRows":4,"cells":[1,0,6,16]}],
+    \\ "camera":{"origin":[200,120],"zoom":2}}
+;
+
+test "scene v9 parses authored Camera2D while v8 normalizes identity" {
+    const value = try parse(std.testing.allocator, scene_v9_source);
+    try std.testing.expectEqual(@as(u32, 9), value.schemaVersion);
+    try std.testing.expectEqualSlices(f32, &.{ 200, 120 }, &value.camera.origin);
+    try std.testing.expectEqual(@as(f32, 2), value.camera.zoom);
+
+    const legacy = try parse(std.testing.allocator, scene_v8_source);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, &legacy.camera.origin);
+    try std.testing.expectEqual(@as(f32, 1), legacy.camera.zoom);
+}
+
+test "scene v9 rejects non-finite origin and zoom outside the contract" {
+    var value = try parse(std.testing.allocator, scene_v9_source);
+    value.camera.origin[0] = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidCameraOrigin, validate(&value));
+
+    value.camera.origin[0] = 0;
+    value.camera.zoom = 0.124;
+    try std.testing.expectError(error.InvalidCameraZoom, validate(&value));
+    value.camera.zoom = 8.001;
+    try std.testing.expectError(error.InvalidCameraZoom, validate(&value));
+}
+
+test "KSCN v9 round trips Camera2D and rejects truncated camera tail" {
+    const source = try parse(std.testing.allocator, scene_v9_source);
+    const artifact = try encodeArtifact(std.testing.allocator, &source);
+    defer std.testing.allocator.free(artifact);
+    try std.testing.expectEqual(@as(u32, 9), readLittleU32(artifact[4..8]));
+    try std.testing.expectEqual(@as(u32, 9), readLittleU32(artifact[8..12]));
+
+    const decoded = try parseArtifact(artifact);
+    try std.testing.expectEqualSlices(f32, &.{ 200, 120 }, &decoded.camera.origin);
+    try std.testing.expectEqual(@as(f32, 2), decoded.camera.zoom);
+    try std.testing.expectError(error.InvalidSceneArtifact, parseArtifact(artifact[0 .. artifact.len - 1]));
+}
+
 test "scene v8 parses bounded atlas tilemap and sampling profile" {
     const value = try parse(std.testing.allocator, scene_v8_source);
     try std.testing.expectEqual(@as(u32, 8), value.schemaVersion);
@@ -1851,8 +2000,8 @@ test "KSCN v8 round trips texture sampling and tilemap cells" {
     const source = try parse(std.testing.allocator, scene_v8_source);
     const artifact = try encodeArtifact(std.testing.allocator, &source);
     defer std.testing.allocator.free(artifact);
-    try std.testing.expectEqual(scene_artifact_version, readLittleU32(artifact[4..8]));
-    try std.testing.expectEqual(current_schema_version, readLittleU32(artifact[8..12]));
+    try std.testing.expectEqual(tilemap_artifact_version, readLittleU32(artifact[4..8]));
+    try std.testing.expectEqual(tilemap_schema_version, readLittleU32(artifact[8..12]));
 
     const decoded = try parseArtifact(artifact);
     try std.testing.expectEqual(TextureSamplingProfile.pixel_art, decoded.textures.entries[0].samplingProfile);
