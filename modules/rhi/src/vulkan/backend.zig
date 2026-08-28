@@ -427,6 +427,11 @@ pub const Rhi = struct {
         }
         self.destroyTextureSlot(slot);
     }
+
+    pub fn validateTextureHandle(self: *Rhi, handle: types.TextureHandle) !void {
+        // 与 Null Adapter 保持同一 opaque handle 预检；不暴露 TextureSlot 或 Camera 领域类型。
+        _ = self.textureSlot(handle) orelse return error.InvalidTexture;
+    }
     pub fn beginFrame(
         self: *Rhi,
         requested_extent: types.Extent2D,

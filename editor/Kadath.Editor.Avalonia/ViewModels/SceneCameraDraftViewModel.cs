@@ -38,5 +38,6 @@ public sealed class SceneCameraDraftViewModel : ObservableObject
         Zoom = "1";
     }
 
-    private static string Format(double value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+    // 使用 round-trip 格式，未编辑的合法 f32 值不能因 UI 投影而被静默截断。
+    private static string Format(double value) => value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
 }

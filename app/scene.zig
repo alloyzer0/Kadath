@@ -778,54 +778,36 @@ fn parseSourceV8Into(allocator: std.mem.Allocator, contents: []const u8, output:
     const parsed = try std.json.parseFromSlice(WireSceneV8, allocator, contents, .{});
     defer parsed.deinit();
     if (parsed.value.schemaVersion != tilemap_schema_version) return error.UnsupportedSceneSchema;
-    const gameplay = if (parsed.value.gameplay) |wire|
-        GameplayConfig{ .profile = wire.profile, .timeLimitSeconds = wire.timeLimitSeconds }
-    else
-        GameplayConfig{};
-    output.* = .{
-        .schemaVersion = tilemap_schema_version,
-        .textures = try normalizeTexturesV8(parsed.value.textures),
-        .objects = undefined,
-        .gameplay = gameplay,
-    };
-    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, min_neutral_scene_object_count, &output.objects);
-    if (parsed.value.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
-    output.prototypes.count = @intCast(parsed.value.prototypes.len);
-    for (parsed.value.prototypes, 0..) |wire, index| {
-        output.prototypes.entries[index] = .{
-            .prototypeId = try PrototypeId.init(wire.prototypeId),
-            .kind = wire.kind,
-            .sprite = .{
-                .size = wire.sprite.size,
-                .color = wire.sprite.color,
-                .textureId = wire.sprite.textureId,
-            },
-            .behaviors = try normalizeBehaviorBindings(wire.behaviors),
-        };
-    }
-    try normalizeTilemapsInto(parsed.value.tilemaps, &output.tilemaps);
-    try validate(output);
+    try normalizeTilemapSceneSourceInto(parsed.value, tilemap_schema_version, .{}, output);
 }
 
 fn parseSourceV9Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
     const parsed = try std.json.parseFromSlice(WireSceneV9, allocator, contents, .{});
     defer parsed.deinit();
     if (parsed.value.schemaVersion != current_schema_version) return error.UnsupportedSceneSchema;
-    const gameplay = if (parsed.value.gameplay) |wire|
+    try normalizeTilemapSceneSourceInto(parsed.value, current_schema_version, .{
+        .origin = parsed.value.camera.origin,
+        .zoom = parsed.value.camera.zoom,
+    }, output);
+}
+
+fn normalizeTilemapSceneSourceInto(wire_scene: anytype, schema_version: u32, camera: Camera2DConfig, output: *Scene) !void {
+    // v8 与 v9 共享全部 Tilemap-era 归一化；Camera 只通过显式参数形成版本差异。
+    const gameplay = if (wire_scene.gameplay) |wire|
         GameplayConfig{ .profile = wire.profile, .timeLimitSeconds = wire.timeLimitSeconds }
     else
         GameplayConfig{};
     output.* = .{
-        .schemaVersion = current_schema_version,
-        .textures = try normalizeTexturesV8(parsed.value.textures),
+        .schemaVersion = schema_version,
+        .textures = try normalizeTexturesV8(wire_scene.textures),
         .objects = undefined,
         .gameplay = gameplay,
-        .camera = .{ .origin = parsed.value.camera.origin, .zoom = parsed.value.camera.zoom },
+        .camera = camera,
     };
-    try normalizeBehaviorSceneObjectsInto(parsed.value.objects, min_neutral_scene_object_count, &output.objects);
-    if (parsed.value.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
-    output.prototypes.count = @intCast(parsed.value.prototypes.len);
-    for (parsed.value.prototypes, 0..) |wire, index| {
+    try normalizeBehaviorSceneObjectsInto(wire_scene.objects, min_neutral_scene_object_count, &output.objects);
+    if (wire_scene.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
+    output.prototypes.count = @intCast(wire_scene.prototypes.len);
+    for (wire_scene.prototypes, 0..) |wire, index| {
         output.prototypes.entries[index] = .{
             .prototypeId = try PrototypeId.init(wire.prototypeId),
             .kind = wire.kind,
@@ -837,7 +819,7 @@ fn parseSourceV9Into(allocator: std.mem.Allocator, contents: []const u8, output:
             .behaviors = try normalizeBehaviorBindings(wire.behaviors),
         };
     }
-    try normalizeTilemapsInto(parsed.value.tilemaps, &output.tilemaps);
+    try normalizeTilemapsInto(wire_scene.tilemaps, &output.tilemaps);
     try validate(output);
 }
 

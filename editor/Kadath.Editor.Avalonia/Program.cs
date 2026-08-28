@@ -150,6 +150,15 @@ internal static class Program
                 && double.Parse(avaloniaViewModel.SceneCameraDraft.OriginY, CultureInfo.InvariantCulture) == originalCamera.Origin[1]
                 && double.Parse(avaloniaViewModel.SceneCameraDraft.Zoom, CultureInfo.InvariantCulture) == originalCamera.Zoom,
                 "Avalonia did not project the Camera2D draft");
+            avaloniaViewModel.SceneCameraDraft.Zoom = "1e100";
+            Require(!avaloniaViewModel.CanApplyAuthoring,
+                "Avalonia enabled Apply for a Camera zoom outside the finite f32 domain");
+            avaloniaViewModel.SceneCameraDraft.Reset();
+            Require(avaloniaViewModel.SceneCameraDraft.OriginX == "0"
+                && avaloniaViewModel.SceneCameraDraft.OriginY == "0"
+                && avaloniaViewModel.SceneCameraDraft.Zoom == "1",
+                "Avalonia Camera identity Reset did not reset all fields");
+            avaloniaViewModel.SceneCameraDraft.Load(originalCamera);
             avaloniaViewModel.SceneCameraDraft.OriginX = "240";
             avaloniaViewModel.SceneCameraDraft.OriginY = "140";
             avaloniaViewModel.SceneCameraDraft.Zoom = "2";

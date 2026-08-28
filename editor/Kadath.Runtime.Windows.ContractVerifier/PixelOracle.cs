@@ -42,13 +42,15 @@ internal static class PixelOracle
         // Tilemap 内部、重复 Tile 与相邻边缘均取样；边缘点能直接捕获线性采样串色。
         ("OutsideMap", 900, 100),
         ("Tile1", 100, 100),
+        // Camera X=1 后第二格从 x=149 开始；identity Renderer 在此仍是透明 Tile1。
+        ("CameraShift", 149, 100),
         ("Tile2", 200, 100),
         ("Tile2Repeat", 800, 100),
         ("Tile3", 100, 240),
         ("TileEmpty", 200, 240),
         ("Tile4", 280, 240),
-        ("Tile2Edge", 449, 100),
-        ("Tile1Edge", 451, 100),
+        ("Tile2Edge", 448, 100),
+        ("Tile1Edge", 450, 100),
         ("Alpha0", 392, 190),
         ("Alpha64", 552, 190),
         ("Alpha128", 392, 310),
@@ -102,6 +104,7 @@ internal static class PixelOracle
         {
             ["OutsideMap"] = Composite(PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
             ["Tile1"] = Composite(PrimaryBase.AsSpan(0, 4), WhiteTint, swapchainFormat),
+            ["CameraShift"] = Composite(PrimaryBase.AsSpan(4, 4), WhiteTint, swapchainFormat),
             ["Tile2"] = Composite(PrimaryBase.AsSpan(4, 4), WhiteTint, swapchainFormat),
             ["Tile2Repeat"] = Composite(PrimaryBase.AsSpan(4, 4), WhiteTint, swapchainFormat),
             ["Tile3"] = Composite(PrimaryBase.AsSpan(8, 4), WhiteTint, swapchainFormat),
@@ -141,6 +144,9 @@ internal static class PixelOracle
             .Max(name => points[name].MaximumChannelError);
         var atlasSeams = points["Tile1"].Actual.MaximumChannelDifference(points["OutsideMap"].Actual) <= 8
             && points["TileEmpty"].Actual.MaximumChannelDifference(points["OutsideMap"].Actual) <= 8
+            // CameraShift 位于几何边界，高 DPI 映射允许一个物理像素的覆盖混合；identity 输出仍会等于清屏色。
+            && points["CameraShift"].Actual.MaximumChannelDifference(points["Tile2"].Actual) <= 20
+            && points["CameraShift"].Actual.MaximumChannelDifference(points["OutsideMap"].Actual) > 24
             && points["Tile2Repeat"].Actual.MaximumChannelDifference(points["Tile2"].Actual) <= 8
             && points["Tile2Edge"].Actual.MaximumChannelDifference(points["Tile2"].Actual) <= 8
             && points["Tile1Edge"].Actual.MaximumChannelDifference(points["Tile1"].Actual) <= 8

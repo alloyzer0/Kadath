@@ -170,6 +170,13 @@ test "Renderer2D rejects invalid invisible camera and sprite data before beginFr
     before = backend.stats();
     try std.testing.expectError(error.InvalidTexture, renderer.renderFrame(&backend, extent, .{ .sprites = &invalid_sprites }));
     try expectNoRecordingDelta(before, backend.stats());
+
+    const stale = try makeTexture(&backend, &renderer);
+    backend.destroyTexture(stale);
+    const stale_invisible = [_]renderer2d.SpriteInstance{sprite(128, 4, stale)};
+    before = backend.stats();
+    try std.testing.expectError(error.InvalidTexture, renderer.renderFrame(&backend, extent, .{ .sprites = &stale_invisible }));
+    try expectNoRecordingDelta(before, backend.stats());
 }
 
 test "Renderer2D renders bounded tilemap before dynamic sprites in one frame" {
@@ -488,7 +495,7 @@ test "Renderer2D preserves minimized and recreated outcomes without recording" {
     try std.testing.expectEqual(@as(u32, 1), backend.stats().draws - after.draws);
 }
 
-test "Renderer2D consumes a failed frame and can present the next frame" {
+test "Renderer2D rejects a stale texture before beginFrame and can present the next frame" {
     var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
@@ -509,21 +516,11 @@ test "Renderer2D consumes a failed frame and can present the next frame" {
         renderer.renderSprites(&backend, extent, &invalid_sprites),
     );
     const after_failure = backend.stats();
-    try std.testing.expectEqual(@as(u32, 1), after_failure.pipeline_binds - before.pipeline_binds);
-    try std.testing.expectEqual(@as(u32, 1), after_failure.texture_binds - before.texture_binds);
-    try std.testing.expectEqual(@as(u32, 1), after_failure.instance_data_binds - before.instance_data_binds);
-    try std.testing.expectEqual(@as(u32, 0), after_failure.push_constant_writes - before.push_constant_writes);
-    try std.testing.expectEqual(@as(u32, 1), after_failure.draws - before.draws);
-    try std.testing.expectEqual(@as(u32, 1), after_failure.instances_drawn - before.instances_drawn);
-    try std.testing.expectEqual(@as(u32, 1), after_failure.failed_frames_consumed - before.failed_frames_consumed);
-    try std.testing.expectEqual(@as(u32, 0), after_failure.frames_finished - before.frames_finished);
-    try std.testing.expectEqualSlices(
-        rhi.TextureHandle,
-        &.{primary},
-        after_failure.draw_texture_trace[before.draw_texture_trace_len..after_failure.draw_texture_trace_len],
-    );
+    try expectNoRecordingDelta(before, after_failure);
+    try std.testing.expectEqual(before.failed_frames_consumed, after_failure.failed_frames_consumed);
+    try std.testing.expectEqual(before.frames_finished, after_failure.frames_finished);
 
-    // 失败路径的 errdefer 必须消费 active token，否则这一帧会被错误卡在 FrameAlreadyActive。
+    // 帧前拒绝不能留下 active token；替换为有效 handle 后下一帧必须可正常提交。
     const replacement = try makeTexture(&backend, &renderer);
     defer backend.destroyTexture(replacement);
     const valid_sprites = [_]renderer2d.SpriteInstance{

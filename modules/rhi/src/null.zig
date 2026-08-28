@@ -269,6 +269,11 @@ pub const Rhi = struct {
         self.stats_value.textures_live -= 1;
     }
 
+    pub fn validateTextureHandle(self: *Rhi, handle: types.TextureHandle) !void {
+        // 只验证 opaque handle 生命周期；Renderer 可在 beginFrame 前完成整帧输入预检。
+        _ = self.textureSlot(handle) orelse return error.InvalidTexture;
+    }
+
     pub fn beginFrame(self: *Rhi, requested_extent: types.Extent2D, clear_color: [4]f32) !BeginFrameResult {
         _ = clear_color;
         if (self.active_frame_token != null) return error.FrameAlreadyActive;

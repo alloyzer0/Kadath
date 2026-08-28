@@ -590,7 +590,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 var gameplayEnabled = sceneModel?.GameplayProfile == "goal_hazard_v1";
                 var gameplayContractValid = sceneModel is not null && sceneModel.GameplayProfile switch
                 {
-                    "none" => sceneModel.SchemaVersion is 7 or 8 or 9 && sceneModel.GameplayTimeLimitSeconds is null,
+                    "none" => SceneSchemaHasExplicitGameplay(sceneModel.SchemaVersion) && sceneModel.GameplayTimeLimitSeconds is null,
                     "goal_hazard_v1" => (sceneModel.SchemaVersion <= 6 && sceneModel.GameplayTimeLimitSeconds is null)
                         || (sceneModel.GameplayTimeLimitSeconds is double limit && limit > 0 && double.IsFinite(limit)),
                     _ => false
@@ -618,7 +618,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion is not (3 or 4 or 5 or 6 or 7 or 8 or 9)
+                    || !IsSupportedSceneSchema(model.Scene.SchemaVersion)
                     || !gameplayContractValid
                     || !textureSetValid
                     || !ValidateSceneObjects(objects, textures!, sceneModel!, behaviorDependencySetValid ? scriptDependencies!.Select(dependency => dependency.ScriptId).ToHashSet() : null)
@@ -718,6 +718,10 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
     private static bool IsTextureSamplingProfile(string value) => value is
         "pixel_art" or "smooth_linear" or "smooth_mipmap" or "smooth_mipmap_anisotropic";
 
+    private static bool IsSupportedSceneSchema(int schemaVersion) => schemaVersion is >= 3 and <= 9;
+    private static bool SceneSchemaHasExplicitGameplay(int schemaVersion) => schemaVersion is >= 7 and <= 9;
+    private static bool SceneSchemaHasBehaviorBindings(int schemaVersion) => schemaVersion is >= 5 and <= 9;
+
     private static bool ValidateSceneTilemaps(
         IReadOnlyList<ProjectModelSceneTilemap>? tilemaps,
         IReadOnlyList<ProjectModelTexture> textures,
@@ -776,7 +780,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         IReadOnlySet<uint>? behaviorScriptIds)
     {
         var gameplayEnabled = scene.GameplayProfile == "goal_hazard_v1";
-        var minimumObjectCount = scene.SchemaVersion is 7 or 8 or 9 && !gameplayEnabled ? 1 : 3;
+        var minimumObjectCount = SceneSchemaHasExplicitGameplay(scene.SchemaVersion) && !gameplayEnabled ? 1 : 3;
         if (objects is null || objects.Count < minimumObjectCount || objects.Count > 64) return false;
         var textureIds = textures.Select(value => value.TextureId).ToHashSet();
         var objectIds = new HashSet<string>(StringComparer.Ordinal);
@@ -800,7 +804,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 if (value.MoveSpeed is null || value.MoveSpeed < 0 || !double.IsFinite(value.MoveSpeed.Value)
                     || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null) return false;
             }
-            if (scene.SchemaVersion is 5 or 6 or 7 or 8 or 9)
+            if (SceneSchemaHasBehaviorBindings(scene.SchemaVersion))
             {
                 if (value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null
                     || value.Behaviors is null || value.Behaviors.Count > 4)

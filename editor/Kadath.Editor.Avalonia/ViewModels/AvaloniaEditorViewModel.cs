@@ -630,8 +630,14 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         { ErrorCode: { } code } => $"行为契约不可用 · {code}",
         _ => "行为契约不可用。"
     };
-    public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8 or 9;
-    public bool SupportsGameplayProfileAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 7 or 8 or 9;
+    private int? ActiveSceneSchema => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion;
+    private static bool SceneSchemaSupportsBehaviorBindings(int? schemaVersion) => schemaVersion is >= 5 and <= 9;
+    private static bool SceneSchemaSupportsPrototypes(int? schemaVersion) => schemaVersion is >= 6 and <= 9;
+    private static bool SceneSchemaSupportsGameplay(int? schemaVersion) => schemaVersion is >= 7 and <= 9;
+    private static bool SceneSchemaSupportsTilemapAuthoring(int? schemaVersion) => schemaVersion is >= 7 and <= 9;
+
+    public bool UsesBehaviorBindingAuthoring => SceneSchemaSupportsBehaviorBindings(ActiveSceneSchema);
+    public bool SupportsGameplayProfileAuthoring => SceneSchemaSupportsGameplay(ActiveSceneSchema);
     public bool HasSelectedBehaviorBinding => SelectedBehaviorBinding is not null;
     public bool CanAddBehaviorBinding => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
@@ -674,7 +680,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool CanMoveSelectedSceneObjectDown => SelectedSceneObject is { } selected && !IsBusy
         && SceneObjectDrafts.IndexOf(selected) is var index && index >= 0 && index < SceneObjectDrafts.Count - 1;
     public string SceneObjectCountStatus => $"对象 {SceneObjectDrafts.Count}/64 · Hazard {SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard")}";
-    public bool SupportsScenePrototypeAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 6 or 7 or 8 or 9;
+    public bool SupportsScenePrototypeAuthoring => SceneSchemaSupportsPrototypes(ActiveSceneSchema);
     public bool CanAddScenePrototype => SupportsScenePrototypeAuthoring
         && CanApplyAuthoring
         && ScenePrototypeDrafts.Count < 32
@@ -692,8 +698,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && prototypeIndex >= 0
         && prototypeIndex < ScenePrototypeDrafts.Count - 1;
     public string ScenePrototypeCountStatus => $"原型 {ScenePrototypeDrafts.Count}/32";
-    public bool SupportsSceneTilemapAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 7 or 8 or 9;
-    public bool SupportsSceneCameraAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 8 or 9;
+    public bool SupportsSceneTilemapAuthoring => SceneSchemaSupportsTilemapAuthoring(ActiveSceneSchema);
+    public bool SupportsSceneCameraAuthoring => ActiveSceneSchema is 8 or 9;
     public bool HasSceneTilemapDraft => SceneTilemapDraft is not null;
     public bool CanAddSceneTilemap => SupportsSceneTilemapAuthoring
         && SceneTilemapDraft is null
@@ -806,7 +812,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         var allowedTextureIds = sceneTextures?.Select(texture => texture.TextureId).ToHashSet()
             ?? (project.Scene.Textures ?? []).Select(texture => texture.TextureId).ToHashSet();
         var editsHookScript = project.Script.SchemaVersion == 1;
-        var editsGameplay = project.Scene.SchemaVersion is 7 or 8 or 9;
+        var editsGameplay = SupportsGameplayProfileAuthoring;
         var patch = new AuthoringPatch(
             ScriptGoalPosition: editsHookScript ? ParseVector(ScriptGoalX, ScriptGoalY, "script.goal.position") : null,
             ScriptGoalVelocity: editsHookScript ? ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity") : null,
@@ -816,10 +822,10 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             SceneGameplayTimeLimitSeconds: editsGameplay && IsGameplayEnabled
                 ? ParsePositiveNumber(SceneGameplayTimeLimitSeconds, "scene.gameplay.timeLimitSeconds")
                 : null,
-            ScenePrototypes: project.Scene.SchemaVersion is 6 or 7 or 8 or 9
+            ScenePrototypes: SupportsScenePrototypeAuthoring
                 ? ParseScenePrototypeDrafts(allowedTextureIds)
                 : null,
-            SceneTilemaps: project.Scene.SchemaVersion is 7 or 8 or 9
+            SceneTilemaps: SupportsSceneTilemapAuthoring
                 ? ParseSceneTilemapDrafts(allowedTextureIds)
                 : null,
             SceneCamera: SupportsSceneCameraAuthoring ? ParseSceneCameraDraft() : null);
@@ -1583,7 +1589,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                     || draft.Behaviors.Count > 4
                     || draft.Behaviors.Select(binding => binding.ScriptId).Distinct().Count() != draft.Behaviors.Count)
                     return false;
-                if (IsGameplayEnabled && project.Scene.SchemaVersion is 5 or 6 or 7 or 8 or 9
+                if (IsGameplayEnabled && UsesBehaviorBindingAuthoring
                     && draft.IsPatrolHazard && draft.Behaviors.Count == 0) return false;
                 if (project.Scene.SchemaVersion is 5 or 6 && draft.IsPatrolHazard && draft.UsesNativePatrol) return false;
             }
@@ -1665,7 +1671,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             System.Globalization.NumberStyles.Float,
             System.Globalization.CultureInfo.InvariantCulture,
             out parsed)
-        && double.IsFinite(parsed);
+        && double.IsFinite(parsed)
+        && float.IsFinite((float)parsed);
 
     private static double ParseFiniteNumber(string value, string field)
     {

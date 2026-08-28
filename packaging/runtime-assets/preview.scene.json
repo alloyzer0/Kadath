@@ -117,7 +117,7 @@
   "tilemaps": [
     {
       "tilemapId": "background",
-      "origin": [51.0, 60.0],
+      "origin": [50.0, 60.0],
       "tileSize": [100.0, 120.0],
       "columns": 12,
       "rows": 6,

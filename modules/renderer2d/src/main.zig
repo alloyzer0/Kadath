@@ -147,7 +147,7 @@ pub const Renderer2D = struct {
         extent: rhi.Extent2D,
         frame: Frame2D,
     ) !rhi.FrameOutcome {
-        const instance_count = try validateFrame(frame);
+        const instance_count = try validateFrame(backend, frame);
         const begin = try backend.beginFrame(extent, .{ 0.035, 0.10, 0.22, 1.0 });
         switch (begin) {
             .skipped_minimized => return .skipped_minimized,
@@ -168,7 +168,7 @@ pub const Renderer2D = struct {
     }
 };
 
-fn validateFrame(frame: Frame2D) !usize {
+fn validateFrame(backend: *rhi.Rhi, frame: Frame2D) !usize {
     for (frame.view.origin) |number| {
         if (!std.math.isFinite(number)) return error.InvalidCameraOrigin;
     }
@@ -178,7 +178,10 @@ fn validateFrame(frame: Frame2D) !usize {
     if (frame.sprites.len > max_sprites_per_frame) return error.SpriteLimitExceeded;
     if (frame.tilemaps.len > max_tilemap_layers_per_frame) return error.TilemapLayerLimitExceeded;
     var total_instances = frame.sprites.len;
-    for (frame.sprites) |sprite| try validateSprite(sprite);
+    for (frame.sprites) |sprite| {
+        try validateSprite(sprite);
+        try backend.validateTextureHandle(sprite.texture);
+    }
     for (frame.tilemaps) |tilemap| {
         if (tilemap.columns == 0 or tilemap.columns > max_tilemap_columns or
             tilemap.rows == 0 or tilemap.rows > max_tilemap_rows)
@@ -204,7 +207,7 @@ fn validateFrame(frame: Frame2D) !usize {
         for (tilemap.tile_size) |number| {
             if (!std.math.isFinite(number) or number <= 0) return error.InvalidTilemapSize;
         }
-        if (tilemap.texture == rhi.invalid_texture) return error.InvalidTexture;
+        try backend.validateTextureHandle(tilemap.texture);
         for (tilemap.cells) |cell| {
             if (cell > atlas_tiles) return error.InvalidTilemapCell;
             if (cell != 0) total_instances = try std.math.add(usize, total_instances, 1);

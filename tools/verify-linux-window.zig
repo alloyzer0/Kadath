@@ -962,13 +962,15 @@ fn hasPackageTilemapSignature(capture: Capture) bool {
     // Atlas 四格、重复格、空 Cell 和相邻边缘共同证明 pixel_art 采样无串色。
     if (!colorNear(capture.sample(900, 100), clear, tolerance) or
         !colorNear(capture.sample(100, 100), clear, tolerance) or
+        // Camera X=1 后第二格从 x=149 开始；identity Renderer 在此仍为透明 Tile1。
+        !colorNear(capture.sample(149, 100), tile_two, tolerance) or
         !colorNear(capture.sample(200, 100), tile_two, tolerance) or
         !colorNear(capture.sample(800, 100), tile_two, tolerance) or
         !colorNear(capture.sample(100, 240), tile_three, tolerance) or
         !colorNear(capture.sample(200, 240), clear, tolerance) or
         !colorNear(capture.sample(280, 240), tile_four, tolerance) or
-        !colorNear(capture.sample(449, 100), tile_two, tolerance) or
-        !colorNear(capture.sample(451, 100), clear, tolerance)) return false;
+        !colorNear(capture.sample(448, 100), tile_two, tolerance) or
+        !colorNear(capture.sample(450, 100), clear, tolerance)) return false;
 
     // Player 的半透明 texel 必须合成在 Tilemap 之上，不能被背景批次覆盖。
     return colorNear(capture.sample(392, 190), tile_three, package_sample_tolerance) and
