@@ -38,6 +38,7 @@ internal static class Program
             {
                 Console.WriteLine("TILEMAP_ATLAS_PIXEL_ORACLE=true");
                 Console.WriteLine("TILEMAP_BACKGROUND_ORDER=true");
+                Console.WriteLine("CAMERA_PIXEL_ORACLE=true");
             }
             Console.WriteLine(outcome.Status == VerificationStatus.Pass
                 ? "verification=ok"

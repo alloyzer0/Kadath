@@ -12,7 +12,7 @@ internal sealed partial class WindowsRuntimeProductVerifier
     [
         "Platform window created (960x540)",
         "Vulkan RHI initialized",
-        "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=8",
+        "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=9",
         "Loaded behavior package: assets/scripts/preview.script, artifact_version=2",
         "Behavior on_start hooks applied",
         "Runtime host initialized with Vulkan RHI scene objects=5",

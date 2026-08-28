@@ -132,7 +132,7 @@ internal static class Program
             tilemapDraft.PaintCell(2);
             var tilemapEdited = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
             Require(tilemapEdited.ChangedFields.SequenceEqual(["scene.textures", "scene.tilemaps"])
-                && tilemapEdited.ProjectSnapshot.Scene.SchemaVersion == 8
+                && tilemapEdited.ProjectSnapshot.Scene.SchemaVersion == Math.Max(8, openedProject.Scene.SchemaVersion)
                 && tilemapEdited.ProjectSnapshot.Scene.Tilemaps is [{ TilemapId: "background" }]
                 && tilemapEdited.ProjectSnapshot.Scene.Tilemaps[0].Cells.SequenceEqual([0, 0, 6, 0]),
                 "Avalonia did not commit the Tilemap draft through the existing authoring seam");
@@ -144,24 +144,25 @@ internal static class Program
         }
         if (openedProject.Scene.SchemaVersion is 8 or 9)
         {
+            var originalCamera = openedProject.Scene.Camera ?? new ProjectModelSceneCamera([0, 0], 1);
             Require(avaloniaViewModel.SupportsSceneCameraAuthoring
-                && avaloniaViewModel.SceneCameraDraft.OriginX == "0"
-                && avaloniaViewModel.SceneCameraDraft.OriginY == "0"
-                && avaloniaViewModel.SceneCameraDraft.Zoom == "1",
-                "Avalonia did not project the identity Camera2D draft");
-            avaloniaViewModel.SceneCameraDraft.OriginX = "200";
-            avaloniaViewModel.SceneCameraDraft.OriginY = "120";
+                && double.Parse(avaloniaViewModel.SceneCameraDraft.OriginX, CultureInfo.InvariantCulture) == originalCamera.Origin[0]
+                && double.Parse(avaloniaViewModel.SceneCameraDraft.OriginY, CultureInfo.InvariantCulture) == originalCamera.Origin[1]
+                && double.Parse(avaloniaViewModel.SceneCameraDraft.Zoom, CultureInfo.InvariantCulture) == originalCamera.Zoom,
+                "Avalonia did not project the Camera2D draft");
+            avaloniaViewModel.SceneCameraDraft.OriginX = "240";
+            avaloniaViewModel.SceneCameraDraft.OriginY = "140";
             avaloniaViewModel.SceneCameraDraft.Zoom = "2";
             var cameraEdited = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
             Require(cameraEdited.ChangedFields.SequenceEqual(["scene.camera"])
                 && cameraEdited.ProjectSnapshot.Scene.SchemaVersion == 9
-                && cameraEdited.ProjectSnapshot.Scene.Camera is { Origin: [200, 120], Zoom: 2 },
+                && cameraEdited.ProjectSnapshot.Scene.Camera is { Origin: [240, 140], Zoom: 2 },
                 "Avalonia did not commit Camera2D through the complete authoring patch seam");
             var cameraRestored = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
             Require(cameraRestored.ProjectSnapshot.Scene.SchemaVersion == openedProject.Scene.SchemaVersion
-                && avaloniaViewModel.SceneCameraDraft.OriginX == "0"
-                && avaloniaViewModel.SceneCameraDraft.OriginY == "0"
-                && avaloniaViewModel.SceneCameraDraft.Zoom == "1",
+                && double.Parse(avaloniaViewModel.SceneCameraDraft.OriginX, CultureInfo.InvariantCulture) == originalCamera.Origin[0]
+                && double.Parse(avaloniaViewModel.SceneCameraDraft.OriginY, CultureInfo.InvariantCulture) == originalCamera.Origin[1]
+                && double.Parse(avaloniaViewModel.SceneCameraDraft.Zoom, CultureInfo.InvariantCulture) == originalCamera.Zoom,
                 "Avalonia Camera2D Undo did not restore the projected draft");
             openedProject = workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Camera Undo snapshot is missing.");
             Console.WriteLine("workflow_camera_authoring=ok");

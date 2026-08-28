@@ -58,6 +58,30 @@ fn traceF32(bytes: []const u8, offset: usize) f32 {
     return @bitCast(bits);
 }
 
+test "Renderer2D explicit identity Camera2D preserves the instance byte trace" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+    const sprites = [_]renderer2d.SpriteInstance{sprite(20, 12, texture)};
+
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .sprites = &sprites }));
+    const first = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .origin = .{ 0, 0 }, .zoom = 1 },
+        .sprites = &sprites,
+    }));
+    const second = backend.stats();
+    try std.testing.expectEqualSlices(
+        u8,
+        first.instance_data_trace[0..48],
+        second.instance_data_trace[48..96],
+    );
+    std.debug.print("CAMERA_IDENTITY_COMPATIBLE=true\n", .{});
+}
+
 test "Renderer2D applies Camera2D origin and zoom before NDC conversion" {
     var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
@@ -105,6 +129,7 @@ test "Renderer2D culls Tilemap with half-open visible row and column ranges" {
     }));
     // 可见世界矩形为 [16,48) x [16,48)，精确排除只接触边界的 Tile。
     try expectRecordingDelta(before, backend.stats(), 1, 1, 1, 1, 4);
+    std.debug.print("CAMERA_TILEMAP_CULLING=true\n", .{});
 }
 
 test "Renderer2D culls sprites and merges visible texture runs across invisible separators" {
@@ -126,6 +151,7 @@ test "Renderer2D culls sprites and merges visible texture runs across invisible 
     const before = backend.stats();
     try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .sprites = &sprites }));
     try expectRecordingDelta(before, backend.stats(), 1, 1, 1, 1, 2);
+    std.debug.print("CAMERA_SPRITE_CULLING=true\n", .{});
 }
 
 test "Renderer2D rejects invalid invisible camera and sprite data before beginFrame" {

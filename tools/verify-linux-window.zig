@@ -365,6 +365,7 @@ fn printVerificationSuccess(
     if (asset_mode == .package_root) {
         try stdout.print("TILEMAP_ATLAS_PIXEL_ORACLE=true\n", .{});
         try stdout.print("TILEMAP_BACKGROUND_ORDER=true\n", .{});
+        try stdout.print("CAMERA_PIXEL_ORACLE=true\n", .{});
     }
     try stdout.print("linux_two_frame_evidence=ok\n", .{});
     if (asset_mode == .neutral_fixture) {
@@ -1486,7 +1487,7 @@ fn validateRuntimeLogs(
             "Runtime host initialized with Vulkan RHI scene objects=3",
         },
         .package_root => &.{
-            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=8",
+            "Loaded preview scene artifact: assets/scenes/preview.scene, artifact_version=9",
             "Runtime host initialized with Vulkan RHI scene objects=5",
         },
         .neutral_fixture => &.{

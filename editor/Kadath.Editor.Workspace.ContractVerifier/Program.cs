@@ -141,6 +141,9 @@ internal static class Program
             Console.WriteLine("TILEMAP_SOURCE_V8=true");
             Console.WriteLine("TILEMAP_KSCN_V8=true");
             Console.WriteLine("TILEMAP_EDITOR_APPLY_UNDO_REDO=true");
+            Console.WriteLine("CAMERA_SOURCE_V9=true");
+            Console.WriteLine("CAMERA_KSCN_V9=true");
+            Console.WriteLine("CAMERA_EDITOR_APPLY_UNDO_REDO=true");
             Console.WriteLine("LEGACY_SCENE_V4_V7_COMPATIBLE=true");
             Console.WriteLine("failure_boundaries=ok");
             Console.WriteLine("read_only=ok");
