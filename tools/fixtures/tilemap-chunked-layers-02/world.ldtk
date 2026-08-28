@@ -1,0 +1,33 @@
+{
+  "jsonVersion": "1.5.3",
+  "worlds": [],
+  "defs": {
+    "tilesets": [
+      {
+        "uid": 1,
+        "identifier": "World",
+        "relPath": "ground.ppm",
+        "tileGridSize": 1,
+        "padding": 0,
+        "spacing": 0,
+        "pxWid": 2,
+        "pxHei": 2,
+        "__cWid": 2,
+        "__cHei": 2
+      }
+    ],
+    "enums": [{ "identifier": "Biome" }],
+    "externalEnums": []
+  },
+  "levels": [
+    {
+      "identifier": "Level_0",
+      "iid": "level-0-iid",
+      "worldX": 0,
+      "worldY": 0,
+      "worldDepth": 0,
+      "externalRelPath": "Level_0.ldtkl",
+      "layerInstances": null
+    }
+  ]
+}

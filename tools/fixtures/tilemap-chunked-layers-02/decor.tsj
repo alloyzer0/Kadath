@@ -1,0 +1,13 @@
+{
+  "type": "tileset",
+  "version": "1.12",
+  "tiledversion": "1.12.2",
+  "name": "Decor",
+  "tilewidth": 1,
+  "tileheight": 1,
+  "tilecount": 2,
+  "columns": 2,
+  "image": "decor.ppm",
+  "imagewidth": 2,
+  "imageheight": 1
+}

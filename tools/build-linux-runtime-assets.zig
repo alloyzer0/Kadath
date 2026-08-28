@@ -217,14 +217,15 @@ test "Linux product scene and behavior package preserve their frozen disk ABI" {
     defer std.testing.allocator.free(scene);
     const script = try buildScriptArtifact(std.testing.io, std.testing.allocator, script_json);
     defer std.testing.allocator.free(script);
-    // 默认产品 fixture 仍是 v6 compatibility oracle；Scene v7 由 Neutral fixture 独立覆盖。
-    try std.testing.expectEqual(scene_api.prototype_artifact_version, readU32(scene[4..8]));
-    try std.testing.expectEqual(scene_api.prototype_schema_version, readU32(scene[8..12]));
+    // 默认产品 fixture 已升级到 Camera v9；旧版本兼容由 Scene codec 契约独立覆盖。
+    try std.testing.expectEqual(scene_api.camera_artifact_version, readU32(scene[4..8]));
+    try std.testing.expectEqual(scene_api.camera_schema_version, readU32(scene[8..12]));
     try std.testing.expectEqual(@as(u32, 3), readU32(scene[16..20]));
     var cursor: usize = 20;
     for (0..3) |_| {
         const artifact_bytes = readU32(scene[cursor + 4 ..][0..4]);
-        cursor += 8 + artifact_bytes;
+        // v8+ 的每个 Texture 条目在路径后追加 samplingProfile(u32)。
+        cursor += 8 + artifact_bytes + 4;
     }
     try std.testing.expectEqual(@as(u32, 5), readU32(scene[cursor..][0..4]));
     cursor += 4;

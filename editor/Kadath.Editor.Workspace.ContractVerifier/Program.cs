@@ -10,8 +10,29 @@ namespace Kadath.Editor.Workspace.ContractVerifier;
 
 internal static class Program
 {
-    public static async Task<int> Main()
+    public static async Task<int> Main(string[] args)
     {
+        if (args is ["--emit-tilemap-runtime-fixture", var outputRoot])
+        {
+            try
+            {
+                var scenePath = await TilemapImportVerifier.EmitRuntimeFixtureAsync(Path.GetFullPath(outputRoot));
+                Console.WriteLine($"fixture_root={Path.GetFullPath(outputRoot)}");
+                Console.WriteLine($"scene_path={scenePath}");
+                return 0;
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"fixture=failed: {exception}");
+                return 1;
+            }
+        }
+        if (args.Length != 0)
+        {
+            Console.Error.WriteLine("usage: --emit-tilemap-runtime-fixture <output-root>");
+            return 2;
+        }
+
         var root = Path.Combine(Path.GetTempPath(), $"kadath-workspace-read-model-{Guid.NewGuid():N}");
         try
         {

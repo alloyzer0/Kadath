@@ -1,0 +1,57 @@
+{
+  "type": "map",
+  "version": "1.12",
+  "tiledversion": "1.12.2",
+  "orientation": "orthogonal",
+  "renderorder": "right-down",
+  "tilewidth": 1,
+  "tileheight": 1,
+  "infinite": true,
+  "tilesets": [
+    { "firstgid": 1, "source": "ground.tsj" },
+    { "firstgid": 5, "source": "decor.tsj" }
+  ],
+  "layers": [
+    {
+      "id": 1,
+      "name": "Ground",
+      "type": "tilelayer",
+      "visible": true,
+      "opacity": 1,
+      "chunks": [
+        {
+          "x": -32,
+          "y": -1,
+          "width": 4,
+          "height": 2,
+          "data": [1, 2, 3, 4, 2147483649, 1073741826, 536870915, 3758096388]
+        },
+        {
+          "x": 0,
+          "y": 0,
+          "width": 4,
+          "height": 2,
+          "data": [1, 5, 2, 6, 3, 5, 4, 6]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Foreground",
+      "type": "tilelayer",
+      "visible": true,
+      "opacity": 0.65,
+      "offsetx": 1,
+      "offsety": 0,
+      "chunks": [
+        { "x": 0, "y": 0, "width": 4, "height": 1, "data": [0, 5, 0, 6] }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "GameplayObjects",
+      "type": "objectgroup",
+      "objects": [{ "id": 1, "name": "spawn", "type": "spawn", "x": 1, "y": 1 }]
+    }
+  ]
+}

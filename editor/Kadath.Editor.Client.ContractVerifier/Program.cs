@@ -1340,6 +1340,7 @@ internal static class Program
         Assert(workspace.ConnectionState == EditorConnectionState.Ready, "workspace did not become ready");
         Assert(workspace.Capabilities.CanBake, "bake capability was not exposed");
         Assert(workspace.Capabilities.CanImportTexture, "texture_import capability was not exposed");
+        Assert(workspace.Capabilities.CanImportTilemap, "tilemap_import capability was not exposed");
         Assert(workspace.Capabilities.CanStartPreview, "external-window preview capability was not exposed");
         Assert(!workspace.Capabilities.CanUseSharedTexture, "unimplemented shared texture capability was enabled");
         Assert(!workspace.Capabilities.CanUseFrameStream, "unimplemented frame stream capability was enabled");
@@ -1358,6 +1359,19 @@ internal static class Program
             && workspace.TextureImport.AssetId == importedTexture.AssetId
             && workspace.AssetCatalogSnapshot.Value?.Items.Any(item => item.AssetId == importedTexture.AssetId) == true,
             "texture_import did not refresh workspace asset catalog projection");
+
+        var importedTilemap = await workspace.ImportTilemapAsync(new TilemapImportParameters(
+            "demo",
+            workspace.ProjectSnapshot.Value!.AuthoringRevision,
+            "C:/external/world.tmj",
+            "world",
+            "world",
+            [1, 2]));
+        Assert(importedTilemap.AssetId == "asset://tilemaps/world.tilemap"
+            && workspace.TilemapImport.State == EditorTilemapImportState.Succeeded
+            && workspace.TilemapImport.Summary?.Contains("2 layers", StringComparison.Ordinal) == true
+            && workspace.AssetCatalogSnapshot.Value?.Items.Any(item => item.AssetId == importedTilemap.AssetId) == true,
+            "tilemap_import did not refresh workspace projections");
 
         // 任一侧缺失都代表 pair 不完整，前端必须选择 Both，避免只修复表面上 dirty 的一侧。
         var currentPublication = workspace.Publication.Snapshot ?? throw new InvalidOperationException("publication snapshot missing");
@@ -1754,6 +1768,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
     private string _activeProjectName = "demo";
     private bool _publicationDirty;
     private bool _textureImported;
+    private bool _tilemapImported;
     private bool _failNextPreviewStop;
     private bool _returnUnavailableBehaviorContract;
     private bool _returnStaleBehaviorContract;
@@ -1979,6 +1994,34 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
                 await EmitEventAsync("texture_import_completed", imported, id).ConfigureAwait(false);
                 await SendResponseAsync(id, imported).ConfigureAwait(false);
                 break;
+            case "tilemap_import":
+                _tilemapImported = true;
+                var tilemapCatalog = NewAssetCatalogSnapshot();
+                var tilemapSnapshot = NewProjectSnapshot(_activeProjectName, _activePackageRoot);
+                var tilemapHierarchy = NewHierarchySnapshot(_activeProjectName);
+                var importedTilemap = new TilemapImportResult(
+                    "succeeded",
+                    _activeProjectName,
+                    tilemapSnapshot.AuthoringRevision,
+                    new string('d', 64),
+                    "tiled",
+                    "1.12",
+                    "asset://tilemaps/world.tilemap",
+                    "assets/tilemaps/world.tilemap",
+                    new string('e', 64),
+                    1024,
+                    2,
+                    2,
+                    3,
+                    17,
+                    [new TilemapImportDiagnostic("warning", "TILED_LAYER_NOT_IMPORTED", "C:/external/world.tmj", "$.layers[2]", "Object Layer 未导入。")],
+                    tilemapSnapshot,
+                    tilemapHierarchy,
+                    tilemapCatalog);
+                await EmitEventAsync("tilemap_import_started", new { projectName = _activeProjectName }, id).ConfigureAwait(false);
+                await EmitEventAsync("tilemap_import_completed", importedTilemap, id).ConfigureAwait(false);
+                await SendResponseAsync(id, importedTilemap).ConfigureAwait(false);
+                break;
             case "authoring_apply":
                 _publicationDirty = true;
                 LastAuthoringApplyRequest = request.Clone();
@@ -2150,7 +2193,7 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
         {
             "project_open", "project_validate", "project_snapshot", "hierarchy_snapshot", "asset_catalog_snapshot", "behavior_contract_snapshot",
             "publication_snapshot", "script_source_read", "script_source_edit", "script_source_undo",
-            "script_asset_create", "script_asset_rename", "script_asset_delete", "texture_import",
+            "script_asset_create", "script_asset_rename", "script_asset_delete", "texture_import", "tilemap_import",
             "authoring_apply", "authoring_undo", "bake_start", "watch_start", "watch_stop",
             "preview_start", "preview_stop", "shutdown"
         };
@@ -2498,11 +2541,13 @@ internal sealed class ScriptedTransport : IEditorRpcTransport
             "assets/renderer2d/test.png", "assets/renderer2d/test.texture",
             "assets/scenes/preview.scene", "assets/scenes/preview.scene.json",
             "assets/scripts/preview.script", "assets/scripts/preview.script.json"
-        }.Concat(_textureImported ? ["assets/renderer2d/imported.texture"] : Array.Empty<string>());
+        }.Concat(_textureImported ? ["assets/renderer2d/imported.texture"] : Array.Empty<string>())
+            .Concat(_tilemapImported ? ["assets/tilemaps/world.tilemap"] : Array.Empty<string>());
         var items = paths.Select(path =>
         {
             var category = path.Contains("/audio/", StringComparison.Ordinal) ? "Audio"
                 : path.Contains("/renderer2d/", StringComparison.Ordinal) ? "Texture"
+                : path.Contains("/tilemaps/", StringComparison.Ordinal) ? "Tilemap"
                 : path.Contains("/scenes/", StringComparison.Ordinal) ? "Scene"
                 : "Script";
             var name = path[(path.LastIndexOf('/') + 1)..];

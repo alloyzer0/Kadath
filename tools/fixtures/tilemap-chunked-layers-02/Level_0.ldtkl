@@ -1,0 +1,60 @@
+{
+  "identifier": "Level_0",
+  "iid": "level-0-iid",
+  "worldX": 0,
+  "worldY": 0,
+  "worldDepth": 0,
+  "layerInstances": [
+    {
+      "__identifier": "Foreground",
+      "iid": "foreground-iid",
+      "__type": "Tiles",
+      "__gridSize": 1,
+      "__tilesetDefUid": 1,
+      "__opacity": 0.75,
+      "__pxTotalOffsetX": 0,
+      "__pxTotalOffsetY": 0,
+      "visible": true,
+      "gridTiles": [
+        { "px": [1, 0], "src": [1, 0], "t": 1, "a": 1, "f": 3 }
+      ]
+    },
+    {
+      "__identifier": "Ground",
+      "iid": "ground-iid",
+      "__type": "AutoLayer",
+      "__gridSize": 1,
+      "__tilesetDefUid": 1,
+      "__opacity": 1,
+      "__pxTotalOffsetX": -1,
+      "__pxTotalOffsetY": 1,
+      "visible": true,
+      "autoLayerTiles": [
+        { "px": [0, 0], "src": [0, 0], "t": 0, "a": 1, "f": 0 },
+        { "px": [1, 0], "src": [1, 0], "t": 1, "a": 1, "f": 1 },
+        { "px": [0, 1], "src": [0, 1], "t": 2, "a": 1, "f": 2 },
+        { "px": [1, 1], "src": [1, 1], "t": 3, "a": 1, "f": 3 }
+      ]
+    },
+    {
+      "__identifier": "Collision",
+      "iid": "collision-iid",
+      "__type": "IntGrid",
+      "__gridSize": 1,
+      "__tilesetDefUid": null,
+      "__cWid": 2,
+      "__cHei": 2,
+      "intGridCsv": [1, 1, 0, 1]
+    },
+    {
+      "__identifier": "Entities",
+      "iid": "entities-iid",
+      "__type": "Entities",
+      "__gridSize": 1,
+      "__tilesetDefUid": null,
+      "entityInstances": [
+        { "__identifier": "Spawn", "iid": "spawn-iid" }
+      ]
+    }
+  ]
+}
