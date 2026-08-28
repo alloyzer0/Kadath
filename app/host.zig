@@ -21,6 +21,7 @@ const InputSnapshot = @import("platform").InputSnapshot;
 const rhi = @import("rhi");
 const Rhi = rhi.Rhi;
 const Renderer2D = @import("renderer2d").Renderer2D;
+const Camera2DView = @import("renderer2d").Camera2DView;
 const SpriteInstance = @import("renderer2d").SpriteInstance;
 const TilemapLayerView = @import("renderer2d").TilemapLayerView;
 
@@ -30,6 +31,11 @@ fn validateSceneTextureBindings(registry: *const runtime_texture_registry.Runtim
     for (scene.objects.slice()) |object| _ = try registry.resolve(object.sprite.textureId);
     for (scene.prototypes.slice()) |prototype| _ = try registry.resolve(prototype.sprite.textureId);
     for (scene.tilemaps.slice()) |tilemap| _ = try registry.resolve(tilemap.textureId);
+}
+
+fn rendererViewForScene(scene: *const scene_api.Scene) Camera2DView {
+    // Host 不维护第二份动态相机状态；reload/restart 始终借用当前已提交 Scene 的配置。
+    return .{ .origin = scene.camera.origin, .zoom = scene.camera.zoom };
 }
 
 fn sceneHasBehaviors(scene: *const scene_api.Scene) bool {
@@ -337,6 +343,7 @@ pub const Host = struct {
             &self.rhi,
             .{ .width = extent.width, .height = extent.height },
             .{
+                .view = rendererViewForScene(&self.scene),
                 .tilemaps = tilemaps[0..self.scene.tilemaps.count],
                 .sprites = instances[0..self.render_count],
             },
@@ -866,6 +873,15 @@ test "neutral Scene without bindings does not require a Behavior package" {
     scene.objects.entries[0].behaviors.count = 0;
     try std.testing.expect(usesBehaviorRuntime(&scene));
     try std.testing.expect(!sceneHasBehaviors(&scene));
+}
+
+test "Host borrows Camera2D view directly from the active Scene" {
+    var scene = scene_api.default_scene;
+    scene.schemaVersion = scene_api.current_schema_version;
+    scene.camera = .{ .origin = .{ 200, 120 }, .zoom = 2 };
+    const view = rendererViewForScene(&scene);
+    try std.testing.expectEqualSlices(f32, &scene.camera.origin, &view.origin);
+    try std.testing.expectEqual(scene.camera.zoom, view.zoom);
 }
 
 fn applyScriptCommandsToGeneration(generation: *scene_generation_api.SceneGeneration, commands: []const script_api.Command) !void {
