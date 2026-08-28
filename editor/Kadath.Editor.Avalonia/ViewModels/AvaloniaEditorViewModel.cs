@@ -75,6 +75,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public ObservableCollection<string> SceneTextureIds { get; } = [];
     public ObservableCollection<SceneObjectDraftViewModel> SceneObjectDrafts { get; } = [];
     public ObservableCollection<ScenePrototypeDraftViewModel> ScenePrototypeDrafts { get; } = [];
+    public SceneCameraDraftViewModel SceneCameraDraft { get; } = new();
 
     public AvaloniaEditorViewModel(EditorWorkspaceViewModel workspace, IEditorViewDispatcher dispatcher, string defaultPackageRoot, TimeSpan? connectionTimeout = null)
     {
@@ -103,6 +104,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             slot.AssetItems = AssetItems;
             slot.PropertyChanged += OnTextureAssignmentPropertyChanged;
         }
+        SceneCameraDraft.PropertyChanged += OnSceneCameraDraftPropertyChanged;
 
         ConnectCommand = AddCommand(new AsyncUiCommand(InitializeAsync, () => !IsBusy, HandleCommandError));
         OpenProjectCommand = AddCommand(new AsyncUiCommand(OpenProjectAsync, () => CanProjectCommand && !IsBusy, HandleCommandError));
@@ -569,7 +571,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && !IsScriptSourceDirty
         && AreSceneBehaviorsStructurallyValid
         && AreScenePrototypeDraftsStructurallyValid
-        && IsSceneTilemapDraftStructurallyValid;
+        && IsSceneTilemapDraftStructurallyValid
+        && IsSceneCameraDraftStructurallyValid;
     public bool CanUndoAuthoring => IsProjectOpen && _workspace.Capabilities.CanUndoAuthoring && _workspace.Authoring.UndoDepth > 0 && !IsScriptSourceDirty;
     public bool CanRedoAuthoring => IsProjectOpen && _workspace.Capabilities.CanRedoAuthoring && _workspace.Authoring.RedoDepth > 0 && !IsScriptSourceDirty;
     public bool SupportsScriptSourceAuthoring => IsProjectOpen
@@ -627,8 +630,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         { ErrorCode: { } code } => $"行为契约不可用 · {code}",
         _ => "行为契约不可用。"
     };
-    public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8;
-    public bool SupportsGameplayProfileAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 7 or 8;
+    public bool UsesBehaviorBindingAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8 or 9;
+    public bool SupportsGameplayProfileAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 7 or 8 or 9;
     public bool HasSelectedBehaviorBinding => SelectedBehaviorBinding is not null;
     public bool CanAddBehaviorBinding => UsesBehaviorBindingAuthoring
         && IsBehaviorContractReady
@@ -671,7 +674,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     public bool CanMoveSelectedSceneObjectDown => SelectedSceneObject is { } selected && !IsBusy
         && SceneObjectDrafts.IndexOf(selected) is var index && index >= 0 && index < SceneObjectDrafts.Count - 1;
     public string SceneObjectCountStatus => $"对象 {SceneObjectDrafts.Count}/64 · Hazard {SceneObjectDrafts.Count(draft => draft.Kind == "patrol_hazard")}";
-    public bool SupportsScenePrototypeAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 6 or 7 or 8;
+    public bool SupportsScenePrototypeAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 6 or 7 or 8 or 9;
     public bool CanAddScenePrototype => SupportsScenePrototypeAuthoring
         && CanApplyAuthoring
         && ScenePrototypeDrafts.Count < 32
@@ -689,7 +692,8 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         && prototypeIndex >= 0
         && prototypeIndex < ScenePrototypeDrafts.Count - 1;
     public string ScenePrototypeCountStatus => $"原型 {ScenePrototypeDrafts.Count}/32";
-    public bool SupportsSceneTilemapAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 7 or 8;
+    public bool SupportsSceneTilemapAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 7 or 8 or 9;
+    public bool SupportsSceneCameraAuthoring => _workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 8 or 9;
     public bool HasSceneTilemapDraft => SceneTilemapDraft is not null;
     public bool CanAddSceneTilemap => SupportsSceneTilemapAuthoring
         && SceneTilemapDraft is null
@@ -802,7 +806,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         var allowedTextureIds = sceneTextures?.Select(texture => texture.TextureId).ToHashSet()
             ?? (project.Scene.Textures ?? []).Select(texture => texture.TextureId).ToHashSet();
         var editsHookScript = project.Script.SchemaVersion == 1;
-        var editsGameplay = project.Scene.SchemaVersion is 7 or 8;
+        var editsGameplay = project.Scene.SchemaVersion is 7 or 8 or 9;
         var patch = new AuthoringPatch(
             ScriptGoalPosition: editsHookScript ? ParseVector(ScriptGoalX, ScriptGoalY, "script.goal.position") : null,
             ScriptGoalVelocity: editsHookScript ? ParseVector(ScriptVelocityX, ScriptVelocityY, "script.goal.velocity") : null,
@@ -812,12 +816,13 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             SceneGameplayTimeLimitSeconds: editsGameplay && IsGameplayEnabled
                 ? ParsePositiveNumber(SceneGameplayTimeLimitSeconds, "scene.gameplay.timeLimitSeconds")
                 : null,
-            ScenePrototypes: project.Scene.SchemaVersion is 6 or 7 or 8
+            ScenePrototypes: project.Scene.SchemaVersion is 6 or 7 or 8 or 9
                 ? ParseScenePrototypeDrafts(allowedTextureIds)
                 : null,
-            SceneTilemaps: project.Scene.SchemaVersion is 7 or 8
+            SceneTilemaps: project.Scene.SchemaVersion is 7 or 8 or 9
                 ? ParseSceneTilemapDrafts(allowedTextureIds)
-                : null);
+                : null,
+            SceneCamera: SupportsSceneCameraAuthoring ? ParseSceneCameraDraft() : null);
         var result = await _workspace.ApplyAuthoringAsync(new AuthoringApplyParameters(session.ProjectName, project.AuthoringRevision, patch), cancellationToken == default ? _lifetime.Token : cancellationToken);
         ReconcileScriptSourceDocument();
         ApplySnapshotProjection(session);
@@ -1214,6 +1219,16 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             draft.Cells.Select(cell => cell.Value).ToArray())];
     }
 
+    private SceneCameraDefinition ParseSceneCameraDraft()
+    {
+        var zoom = ParsePositiveNumber(SceneCameraDraft.Zoom, "scene.camera.zoom");
+        if (zoom is < 0.125 or > 8)
+            throw new EditorRpcException("invalid_authoring_patch", "scene.camera.zoom 必须位于 [0.125, 8]。");
+        return new SceneCameraDefinition(
+            ParseVector(SceneCameraDraft.OriginX, SceneCameraDraft.OriginY, "scene.camera.origin"),
+            zoom);
+    }
+
     private IReadOnlyList<SceneObjectDefinition> ParseSceneObjectDrafts(
         IReadOnlySet<uint> allowedTextureIds,
         bool gameplayEnabled)
@@ -1568,7 +1583,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
                     || draft.Behaviors.Count > 4
                     || draft.Behaviors.Select(binding => binding.ScriptId).Distinct().Count() != draft.Behaviors.Count)
                     return false;
-                if (IsGameplayEnabled && project.Scene.SchemaVersion is 5 or 6 or 7 or 8
+                if (IsGameplayEnabled && project.Scene.SchemaVersion is 5 or 6 or 7 or 8 or 9
                     && draft.IsPatrolHazard && draft.Behaviors.Count == 0) return false;
                 if (project.Scene.SchemaVersion is 5 or 6 && draft.IsPatrolHazard && draft.UsesNativePatrol) return false;
             }
@@ -1629,6 +1644,18 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
             return SceneTextureAssignments.Any(slot =>
                 slot.TextureIdText.Trim().Equals(textureId, StringComparison.Ordinal)
                 && slot.SamplingProfile == "pixel_art");
+        }
+    }
+
+    private bool IsSceneCameraDraftStructurallyValid
+    {
+        get
+        {
+            if (!SupportsSceneCameraAuthoring) return true;
+            return TryParseFiniteNumber(SceneCameraDraft.OriginX, out _)
+                && TryParseFiniteNumber(SceneCameraDraft.OriginY, out _)
+                && TryParseFiniteNumber(SceneCameraDraft.Zoom, out var zoom)
+                && zoom is >= 0.125 and <= 8;
         }
     }
 
@@ -1729,6 +1756,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         ClearSceneObjectDrafts();
         ClearScenePrototypeDrafts();
         SceneTilemapDraft = null;
+        SceneCameraDraft.Reset();
         SceneTextureIds.Clear();
         InspectorText = string.Empty;
         SceneGoalX = string.Empty;
@@ -1781,6 +1809,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         SetSceneObjectDrafts(project.Scene.Objects ?? throw new InvalidOperationException("Project snapshot does not expose Scene Objects."));
         SetScenePrototypeDrafts(project.Scene.Prototypes ?? []);
         SetSceneTilemapDraft(project.Scene.Tilemaps ?? []);
+        SceneCameraDraft.Load(project.Scene.Camera);
     }
     private void ApplySessionProjection(ProjectSessionInfo session)
     {
@@ -1799,6 +1828,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         ClearSceneObjectDrafts();
         ClearScenePrototypeDrafts();
         SceneTilemapDraft = null;
+        SceneCameraDraft.Reset();
         SceneTextureIds.Clear();
         ClearSceneTextureAssignments();
     }
@@ -2022,6 +2052,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
     private void OnSceneObjectDraftPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
     private void OnScenePrototypeDraftPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
     private void OnSceneTilemapDraftPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
+    private void OnSceneCameraDraftPropertyChanged(object? sender, PropertyChangedEventArgs e) { RaiseAll(); }
     private void OnProjectPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(EditorProjectViewModel.Session)) { ReconcileProjectIdentity(); }
@@ -2130,6 +2161,7 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         OnPropertyChanged(nameof(CanMoveSelectedScenePrototypeUp));
         OnPropertyChanged(nameof(CanMoveSelectedScenePrototypeDown));
         OnPropertyChanged(nameof(SupportsSceneTilemapAuthoring));
+        OnPropertyChanged(nameof(SupportsSceneCameraAuthoring));
         OnPropertyChanged(nameof(HasSceneTilemapDraft));
         OnPropertyChanged(nameof(CanAddSceneTilemap));
         OnPropertyChanged(nameof(CanDeleteSceneTilemap));
@@ -2161,7 +2193,12 @@ public sealed class AvaloniaEditorViewModel : ObservableObject, IAsyncDisposable
         {
             if (IsConnected && _workspace.Capabilities.SupportsCommand("shutdown")) { try { await _workspace.ShutdownAsync(CancellationToken.None); } catch { } }
         }
-        finally { await _workspace.DisposeAsync(); _lifetime.Dispose(); }
+        finally
+        {
+            SceneCameraDraft.PropertyChanged -= OnSceneCameraDraftPropertyChanged;
+            await _workspace.DisposeAsync();
+            _lifetime.Dispose();
+        }
     }
 
 }

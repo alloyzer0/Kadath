@@ -402,6 +402,27 @@
                 </StackPanel>
               </Border>
 
+              <Border IsVisible="{Binding SupportsSceneCameraAuthoring}" Padding="8" Background="#252D37" CornerRadius="4">
+                <StackPanel Spacing="6">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock FontWeight="SemiBold" Text="Camera2D" />
+                    <Button Grid.Column="1" Command="{Binding SceneCameraDraft.ResetCommand}" Content="重置" />
+                  </Grid>
+                  <Grid ColumnDefinitions="Auto,*,Auto,*" ColumnSpacing="5">
+                    <TextBlock VerticalAlignment="Center" Text="Origin X" />
+                    <TextBox Grid.Column="1" Text="{Binding SceneCameraDraft.OriginX}" />
+                    <TextBlock Grid.Column="2" VerticalAlignment="Center" Text="Y" />
+                    <TextBox Grid.Column="3" Text="{Binding SceneCameraDraft.OriginY}" />
+                  </Grid>
+                  <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                    <TextBlock VerticalAlignment="Center" Text="Zoom" />
+                    <TextBox Grid.Column="1" Text="{Binding SceneCameraDraft.Zoom}" />
+                  </Grid>
+                  <TextBlock FontSize="11" Foreground="#AEBAC8"
+                             Text="Origin 是视口左上角的世界坐标；Zoom 范围为 0.125–8。" TextWrapping="Wrap" />
+                </StackPanel>
+              </Border>
+
               <Border IsVisible="{Binding SupportsSceneTilemapAuthoring}" Padding="8" Background="#252D37" CornerRadius="4">
                 <StackPanel Spacing="6">
                   <Grid ColumnDefinitions="*,Auto">

@@ -90,7 +90,7 @@ internal static class Program
         var expectedAssetCount = Directory.EnumerateFiles(Path.Combine(packageRoot, "bin", "assets"), "*", SearchOption.AllDirectories).Count();
         var openedHierarchy = workspace.HierarchySnapshot.Value ?? throw new InvalidOperationException("Opened hierarchy snapshot is missing.");
         var expectedOpenedHierarchyCount = openedHierarchy.ProjectModelVersion == EditorSnapshotVersions.ProjectModel
-            && workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8
+            && workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8 or 9
             ? openedHierarchy.Nodes.Length
             : 13;
         Require(avaloniaViewModel.HierarchyItems.Count == expectedOpenedHierarchyCount
@@ -109,10 +109,10 @@ internal static class Program
         Console.WriteLine("workflow_project_open=ok");
 
         var openedProject = workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Opened project snapshot is missing.");
-        if (openedProject.Scene.SchemaVersion is 7 or 8)
+        if (openedProject.Scene.SchemaVersion is 7 or 8 or 9)
         {
             Require(avaloniaViewModel.SupportsSceneTilemapAuthoring,
-                "Avalonia did not expose Tilemap authoring for Scene v7/v8");
+                "Avalonia did not expose Tilemap authoring for Scene v7-v9");
             if (avaloniaViewModel.SceneTilemapDraft is null) avaloniaViewModel.AddSceneTilemapDraft();
             var tilemapDraft = avaloniaViewModel.SceneTilemapDraft
                 ?? throw new InvalidOperationException("Avalonia did not create a Tilemap draft");
@@ -142,7 +142,31 @@ internal static class Program
             openedProject = workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Tilemap Undo snapshot is missing.");
             Console.WriteLine("workflow_tilemap_authoring=ok");
         }
-        if (openedProject.Scene.SchemaVersion is 5 or 6 or 7 or 8)
+        if (openedProject.Scene.SchemaVersion is 8 or 9)
+        {
+            Require(avaloniaViewModel.SupportsSceneCameraAuthoring
+                && avaloniaViewModel.SceneCameraDraft.OriginX == "0"
+                && avaloniaViewModel.SceneCameraDraft.OriginY == "0"
+                && avaloniaViewModel.SceneCameraDraft.Zoom == "1",
+                "Avalonia did not project the identity Camera2D draft");
+            avaloniaViewModel.SceneCameraDraft.OriginX = "200";
+            avaloniaViewModel.SceneCameraDraft.OriginY = "120";
+            avaloniaViewModel.SceneCameraDraft.Zoom = "2";
+            var cameraEdited = await avaloniaViewModel.ApplyAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(cameraEdited.ChangedFields.SequenceEqual(["scene.camera"])
+                && cameraEdited.ProjectSnapshot.Scene.SchemaVersion == 9
+                && cameraEdited.ProjectSnapshot.Scene.Camera is { Origin: [200, 120], Zoom: 2 },
+                "Avalonia did not commit Camera2D through the complete authoring patch seam");
+            var cameraRestored = await avaloniaViewModel.UndoAuthoringForCurrentProjectAsync(cancellationToken);
+            Require(cameraRestored.ProjectSnapshot.Scene.SchemaVersion == openedProject.Scene.SchemaVersion
+                && avaloniaViewModel.SceneCameraDraft.OriginX == "0"
+                && avaloniaViewModel.SceneCameraDraft.OriginY == "0"
+                && avaloniaViewModel.SceneCameraDraft.Zoom == "1",
+                "Avalonia Camera2D Undo did not restore the projected draft");
+            openedProject = workspace.ProjectSnapshot.Value ?? throw new InvalidOperationException("Camera Undo snapshot is missing.");
+            Console.WriteLine("workflow_camera_authoring=ok");
+        }
+        if (openedProject.Scene.SchemaVersion is 5 or 6 or 7 or 8 or 9)
         {
             var expectedBehaviors = CaptureBehaviorSignatures(openedProject);
             var hazardDraft = avaloniaViewModel.SceneObjectDrafts.First(draft => draft.Kind == "patrol_hazard");
@@ -170,7 +194,7 @@ internal static class Program
             Require(avaloniaViewModel.IsBehaviorContractReady
                 && avaloniaViewModel.AvailableBehaviorContracts.Count == 2,
                 "Avalonia did not project the Behavior Contract catalog");
-            if (openedProject.Scene.SchemaVersion is 6 or 7 or 8)
+            if (openedProject.Scene.SchemaVersion is 6 or 7 or 8 or 9)
             {
                 Require(avaloniaViewModel.ScenePrototypeDrafts is [{ PrototypeId: "runtime-orb" }]
                     && !workspace.HierarchySnapshot.Value!.Nodes.Any(node =>
@@ -609,12 +633,12 @@ internal static class Program
             && created.ProjectName == createdProjectName
             && workspace.ProjectSnapshot.Value?.ProjectName == createdProjectName
             && workspace.HierarchySnapshot.Value?.ProjectName == createdProjectName
-            && avaloniaViewModel.HierarchyItems.Count == (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8
+            && avaloniaViewModel.HierarchyItems.Count == (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is 5 or 6 or 7 or 8 or 9
                 ? workspace.HierarchySnapshot.Value?.Nodes.Length
                 : 13)
             && avaloniaViewModel.AssetItems.Count == expectedAssetCount
             && avaloniaViewModel.SceneObjectDrafts.Count == 5
-            && (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is not (6 or 7 or 8)
+            && (workspace.ProjectSnapshot.Value?.Scene.SchemaVersion is not (6 or 7 or 8 or 9)
                 || avaloniaViewModel.ScenePrototypeDrafts is [{ PrototypeId: "runtime-orb" }])
             && avaloniaViewModel.InspectorText.Contains("scene.objects[goal]", StringComparison.Ordinal),
             "Avalonia public Create did not project the new Session snapshots after atomic cache invalidation");
