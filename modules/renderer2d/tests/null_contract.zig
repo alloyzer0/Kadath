@@ -58,6 +58,94 @@ fn traceF32(bytes: []const u8, offset: usize) f32 {
     return @bitCast(bits);
 }
 
+test "Renderer2D applies Camera2D origin and zoom before NDC conversion" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    const sprites = [_]renderer2d.SpriteInstance{sprite(20, 12, texture)};
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .origin = .{ 16, 8 }, .zoom = 2 },
+        .sprites = &sprites,
+    }));
+    const stats = backend.stats();
+    // world (20,12,8,8) -> screen (8,8,16,16) -> NDC (-0.75,0.75,0.5,0.5)。
+    try std.testing.expectApproxEqAbs(@as(f32, -0.75), traceF32(&stats.instance_data_trace, 0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), traceF32(&stats.instance_data_trace, 4), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), traceF32(&stats.instance_data_trace, 8), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), traceF32(&stats.instance_data_trace, 12), 0.0001);
+}
+
+test "Renderer2D culls Tilemap with half-open visible row and column ranges" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    const cells = [_]u16{1} ** 16;
+    const tilemaps = [_]renderer2d.TilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .tile_size = .{ 16, 16 },
+        .columns = 4,
+        .rows = 4,
+        .atlas_columns = 1,
+        .atlas_rows = 1,
+        .texture = texture,
+        .cells = &cells,
+    }};
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .origin = .{ 16, 16 }, .zoom = 2 },
+        .tilemaps = &tilemaps,
+    }));
+    // 可见世界矩形为 [16,48) x [16,48)，精确排除只接触边界的 Tile。
+    try expectRecordingDelta(before, backend.stats(), 1, 1, 1, 1, 4);
+}
+
+test "Renderer2D culls sprites and merges visible texture runs across invisible separators" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const primary = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(primary);
+    const secondary = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(secondary);
+
+    const sprites = [_]renderer2d.SpriteInstance{
+        sprite(0, 4, primary),
+        sprite(64, 4, secondary), // 从右边界起始，按半开区间不可见。
+        sprite(16, 4, primary),
+        sprite(-8, 4, secondary), // 在左边界结束，按半开区间不可见。
+    };
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .sprites = &sprites }));
+    try expectRecordingDelta(before, backend.stats(), 1, 1, 1, 1, 2);
+}
+
+test "Renderer2D rejects invalid invisible camera and sprite data before beginFrame" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+
+    var before = backend.stats();
+    try std.testing.expectError(error.InvalidCameraZoom, renderer.renderFrame(&backend, extent, .{
+        .view = .{ .zoom = 0 },
+    }));
+    try expectNoRecordingDelta(before, backend.stats());
+
+    const invalid_sprites = [_]renderer2d.SpriteInstance{sprite(128, 4, rhi.invalid_texture)};
+    before = backend.stats();
+    try std.testing.expectError(error.InvalidTexture, renderer.renderFrame(&backend, extent, .{ .sprites = &invalid_sprites }));
+    try expectNoRecordingDelta(before, backend.stats());
+}
+
 test "Renderer2D renders bounded tilemap before dynamic sprites in one frame" {
     var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
@@ -112,7 +200,10 @@ test "Renderer2D expands one-based atlas indices into stable UV rectangles" {
         .texture = texture,
         .cells = &cells,
     }};
-    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .zoom = 0.125 },
+        .tilemaps = &tilemaps,
+    }));
 
     const stats = backend.stats();
     try std.testing.expectEqual(@as(usize, 96), stats.instance_data_trace_len);
@@ -145,7 +236,10 @@ test "Renderer2D splits a full 32 by 32 tilemap into eight bounded draws" {
         .cells = &cells,
     }};
     const before = backend.stats();
-    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .zoom = 0.125 },
+        .tilemaps = &tilemaps,
+    }));
     try expectRecordingDelta(before, backend.stats(), 1, 1, 8, 8, 1024);
 }
 
@@ -169,12 +263,18 @@ test "Renderer2D skips empty cells and splits 129 visible tiles" {
         .cells = &cells,
     }};
     var before = backend.stats();
-    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .zoom = 0.125 },
+        .tilemaps = &tilemaps,
+    }));
     try expectNoRecordingDelta(before, backend.stats());
 
     @memset(cells[0..129], 1);
     before = backend.stats();
-    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .zoom = 0.125 },
+        .tilemaps = &tilemaps,
+    }));
     try expectRecordingDelta(before, backend.stats(), 1, 1, 2, 2, 129);
 }
 
@@ -202,6 +302,7 @@ test "Renderer2D accepts the frozen 1024 tile plus 128 sprite frame budget" {
 
     const before = backend.stats();
     try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .zoom = 0.125 },
         .tilemaps = &tilemaps,
         .sprites = &sprites,
     }));
@@ -423,9 +524,9 @@ test "Renderer2D validates an invalid first texture before recording a draw" {
         renderer.renderSprites(&backend, extent, &invalid_sprites),
     );
     const after_failure = backend.stats();
-    // optional 绑定状态不能把 invalid_texture 误当成“已经绑定”的哨兵值。
-    try expectRecordingDelta(before, after_failure, 1, 0, 0, 0, 0);
-    try std.testing.expectEqual(@as(u32, 1), after_failure.failed_frames_consumed - before.failed_frames_consumed);
+    // 完整预检发生在 beginFrame 前，不产生录制状态，也无需消费失败帧。
+    try expectNoRecordingDelta(before, after_failure);
+    try std.testing.expectEqual(before.failed_frames_consumed, after_failure.failed_frames_consumed);
 
     const replacement = try makeTexture(&backend, &renderer);
     defer backend.destroyTexture(replacement);

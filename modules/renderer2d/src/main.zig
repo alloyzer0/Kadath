@@ -58,9 +58,21 @@ pub const TilemapLayerView = struct {
     cells: []const u16,
 };
 
+pub const Camera2DView = struct {
+    // origin 是视口左上角对应的世界坐标；恒等默认值保持历史调用方兼容。
+    origin: [2]f32 = .{ 0.0, 0.0 },
+    zoom: f32 = 1.0,
+};
+
 pub const Frame2D = struct {
+    view: Camera2DView = .{},
     tilemaps: []const TilemapLayerView = &.{},
     sprites: []const SpriteInstance = &.{},
+};
+
+const VisibleWorldRect = struct {
+    min: [2]f32,
+    max: [2]f32,
 };
 
 pub const TextureSamplingProfile = enum {
@@ -146,9 +158,10 @@ pub const Renderer2D = struct {
 
                 const width: f32 = @floatFromInt(extent.width);
                 const height: f32 = @floatFromInt(extent.height);
+                const visible = visibleWorldRect(extent, frame.view);
                 if (instance_count != 0) try encoder.bindPipeline(self.pipeline);
-                for (frame.tilemaps) |tilemap| try renderTilemap(&encoder, width, height, tilemap);
-                try renderSpriteRuns(&encoder, width, height, frame.sprites);
+                for (frame.tilemaps) |tilemap| try renderTilemap(&encoder, width, height, frame.view, visible, tilemap);
+                try renderSpriteRuns(&encoder, width, height, frame.view, visible, frame.sprites);
                 return try encoder.finish();
             },
         }
@@ -156,9 +169,16 @@ pub const Renderer2D = struct {
 };
 
 fn validateFrame(frame: Frame2D) !usize {
+    for (frame.view.origin) |number| {
+        if (!std.math.isFinite(number)) return error.InvalidCameraOrigin;
+    }
+    if (!std.math.isFinite(frame.view.zoom) or frame.view.zoom < 0.125 or frame.view.zoom > 8.0) {
+        return error.InvalidCameraZoom;
+    }
     if (frame.sprites.len > max_sprites_per_frame) return error.SpriteLimitExceeded;
     if (frame.tilemaps.len > max_tilemap_layers_per_frame) return error.TilemapLayerLimitExceeded;
     var total_instances = frame.sprites.len;
+    for (frame.sprites) |sprite| try validateSprite(sprite);
     for (frame.tilemaps) |tilemap| {
         if (tilemap.columns == 0 or tilemap.columns > max_tilemap_columns or
             tilemap.rows == 0 or tilemap.rows > max_tilemap_rows)
@@ -195,47 +215,85 @@ fn validateFrame(frame: Frame2D) !usize {
     return total_instances;
 }
 
+fn validateSprite(sprite: SpriteInstance) !void {
+    for (sprite.position) |number| {
+        if (!std.math.isFinite(number)) return error.InvalidSpritePosition;
+    }
+    for (sprite.size) |number| {
+        if (!std.math.isFinite(number) or number <= 0) return error.InvalidSpriteSize;
+    }
+    for (sprite.color ++ sprite.uv_rect) |number| {
+        if (!std.math.isFinite(number)) return error.InvalidSpriteData;
+    }
+    if (!std.math.isFinite(sprite.position[0] + sprite.size[0]) or
+        !std.math.isFinite(sprite.position[1] + sprite.size[1]))
+    {
+        return error.InvalidSpriteSize;
+    }
+    if (sprite.texture == rhi.invalid_texture) return error.InvalidTexture;
+}
+
+fn visibleWorldRect(extent: rhi.Extent2D, view: Camera2DView) VisibleWorldRect {
+    return .{
+        .min = view.origin,
+        .max = .{
+            view.origin[0] + @as(f32, @floatFromInt(extent.width)) / view.zoom,
+            view.origin[1] + @as(f32, @floatFromInt(extent.height)) / view.zoom,
+        },
+    };
+}
+
 fn renderTilemap(
     encoder: *rhi.FrameEncoder,
     width: f32,
     height: f32,
+    view: Camera2DView,
+    visible: VisibleWorldRect,
     tilemap: TilemapLayerView,
 ) !void {
     var gpu_instances: [max_instances_per_binding]GpuQuadInstance = undefined;
     var batch_count: usize = 0;
     var texture_bound = false;
-    for (tilemap.cells, 0..) |cell, cell_index| {
-        if (cell == 0) continue;
-        const column = cell_index % @as(usize, tilemap.columns);
-        const row = cell_index / @as(usize, tilemap.columns);
-        const atlas_index: usize = cell - 1;
-        const atlas_column = atlas_index % @as(usize, tilemap.atlas_columns);
-        const atlas_row = atlas_index / @as(usize, tilemap.atlas_columns);
-        const position = [2]f32{
-            tilemap.origin[0] + @as(f32, @floatFromInt(column)) * tilemap.tile_size[0],
-            tilemap.origin[1] + @as(f32, @floatFromInt(row)) * tilemap.tile_size[1],
-        };
-        gpu_instances[batch_count] = quadInstance(
-            width,
-            height,
-            position,
-            tilemap.tile_size,
-            .{ 1, 1, 1, 1 },
-            .{
-                @as(f32, @floatFromInt(atlas_column)) / @as(f32, @floatFromInt(tilemap.atlas_columns)),
-                @as(f32, @floatFromInt(atlas_row)) / @as(f32, @floatFromInt(tilemap.atlas_rows)),
-                1.0 / @as(f32, @floatFromInt(tilemap.atlas_columns)),
-                1.0 / @as(f32, @floatFromInt(tilemap.atlas_rows)),
-            },
-        );
-        batch_count += 1;
-        if (batch_count == gpu_instances.len) {
-            if (!texture_bound) {
-                try encoder.bindTexture(tilemap.texture);
-                texture_bound = true;
+    const column_range = visibleTileRange(visible.min[0], visible.max[0], tilemap.origin[0], tilemap.tile_size[0], tilemap.columns);
+    const row_range = visibleTileRange(visible.min[1], visible.max[1], tilemap.origin[1], tilemap.tile_size[1], tilemap.rows);
+    var row = row_range.start;
+    while (row < row_range.end) : (row += 1) {
+        var column = column_range.start;
+        while (column < column_range.end) : (column += 1) {
+            // 只遍历可见行列，但 cell_index 仍按全局 row-major 计算，稳定保持绘制顺序。
+            const cell_index = row * @as(usize, tilemap.columns) + column;
+            const cell = tilemap.cells[cell_index];
+            if (cell == 0) continue;
+            const atlas_index: usize = cell - 1;
+            const atlas_column = atlas_index % @as(usize, tilemap.atlas_columns);
+            const atlas_row = atlas_index / @as(usize, tilemap.atlas_columns);
+            const position = [2]f32{
+                tilemap.origin[0] + @as(f32, @floatFromInt(column)) * tilemap.tile_size[0],
+                tilemap.origin[1] + @as(f32, @floatFromInt(row)) * tilemap.tile_size[1],
+            };
+            gpu_instances[batch_count] = quadInstance(
+                width,
+                height,
+                view,
+                position,
+                tilemap.tile_size,
+                .{ 1, 1, 1, 1 },
+                .{
+                    @as(f32, @floatFromInt(atlas_column)) / @as(f32, @floatFromInt(tilemap.atlas_columns)),
+                    @as(f32, @floatFromInt(atlas_row)) / @as(f32, @floatFromInt(tilemap.atlas_rows)),
+                    1.0 / @as(f32, @floatFromInt(tilemap.atlas_columns)),
+                    1.0 / @as(f32, @floatFromInt(tilemap.atlas_rows)),
+                },
+            );
+            batch_count += 1;
+            if (batch_count == gpu_instances.len) {
+                if (!texture_bound) {
+                    try encoder.bindTexture(tilemap.texture);
+                    texture_bound = true;
+                }
+                try submitBatch(encoder, gpu_instances[0..batch_count]);
+                batch_count = 0;
             }
-            try submitBatch(encoder, gpu_instances[0..batch_count]);
-            batch_count = 0;
         }
     }
     if (batch_count != 0) {
@@ -248,46 +306,66 @@ fn renderSpriteRuns(
     encoder: *rhi.FrameEncoder,
     width: f32,
     height: f32,
+    view: Camera2DView,
+    visible: VisibleWorldRect,
     sprites: []const SpriteInstance,
 ) !void {
     var gpu_instances: [max_instances_per_binding]GpuQuadInstance = undefined;
-    var batch_start: usize = 0;
-    while (batch_start < sprites.len) {
-        const batch_texture = sprites[batch_start].texture;
-        var batch_end = batch_start + 1;
-        // Runtime Snapshot 顺序是正式语义；只合并连续纹理 run。
-        while (batch_end < sprites.len and sprites[batch_end].texture == batch_texture) : (batch_end += 1) {}
-        const batch_count = batch_end - batch_start;
-        for (sprites[batch_start..batch_end], 0..) |sprite, batch_index| {
-            gpu_instances[batch_index] = quadInstance(
-                width,
-                height,
-                sprite.position,
-                sprite.size,
-                sprite.color,
-                sprite.uv_rect,
-            );
+    var batch_texture: ?rhi.TextureHandle = null;
+    var batch_count: usize = 0;
+    for (sprites) |sprite| {
+        if (!aabbIntersects(sprite.position, sprite.size, visible)) continue;
+        if (batch_texture != null and batch_texture.? != sprite.texture) {
+            try encoder.bindTexture(batch_texture.?);
+            try submitBatch(encoder, gpu_instances[0..batch_count]);
+            batch_count = 0;
         }
-        try encoder.bindTexture(batch_texture);
-        try submitBatch(encoder, gpu_instances[0..batch_count]);
-        batch_start = batch_end;
+        // 不可见 Sprite 不形成 run 边界；可见 Sprite 的相对顺序仍与输入完全一致。
+        batch_texture = sprite.texture;
+        gpu_instances[batch_count] = quadInstance(width, height, view, sprite.position, sprite.size, sprite.color, sprite.uv_rect);
+        batch_count += 1;
     }
+    if (batch_count != 0) {
+        try encoder.bindTexture(batch_texture.?);
+        try submitBatch(encoder, gpu_instances[0..batch_count]);
+    }
+}
+
+const TileRange = struct { start: usize, end: usize };
+
+fn visibleTileRange(visible_min: f32, visible_max: f32, origin: f32, tile_size: f32, count: u32) TileRange {
+    const count_f: f32 = @floatFromInt(count);
+    const start_f = std.math.clamp(@floor((visible_min - origin) / tile_size), 0.0, count_f);
+    const end_f = std.math.clamp(@ceil((visible_max - origin) / tile_size), 0.0, count_f);
+    return .{ .start = @intFromFloat(start_f), .end = @intFromFloat(end_f) };
+}
+
+fn aabbIntersects(position: [2]f32, size: [2]f32, visible: VisibleWorldRect) bool {
+    // 半开区间：仅接触任一边界不算可见。
+    return position[0] < visible.max[0] and position[0] + size[0] > visible.min[0] and
+        position[1] < visible.max[1] and position[1] + size[1] > visible.min[1];
 }
 
 fn quadInstance(
     width: f32,
     height: f32,
+    view: Camera2DView,
     position: [2]f32,
     size: [2]f32,
     color: [4]f32,
     uv_rect: [4]f32,
 ) GpuQuadInstance {
+    const screen_position = [2]f32{
+        (position[0] - view.origin[0]) * view.zoom,
+        (position[1] - view.origin[1]) * view.zoom,
+    };
+    const screen_size = [2]f32{ size[0] * view.zoom, size[1] * view.zoom };
     return .{
         .rect_ndc = .{
-            position[0] / width * 2.0 - 1.0,
-            1.0 - position[1] / height * 2.0,
-            size[0] / width * 2.0,
-            size[1] / height * 2.0,
+            screen_position[0] / width * 2.0 - 1.0,
+            1.0 - screen_position[1] / height * 2.0,
+            screen_size[0] / width * 2.0,
+            screen_size[1] / height * 2.0,
         },
         .color = color,
         .uv_rect = uv_rect,
