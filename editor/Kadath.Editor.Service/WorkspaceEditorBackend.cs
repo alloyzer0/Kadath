@@ -578,7 +578,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         }
     }
 
-    private static void ValidateSnapshot<T>(ProjectSessionInfo project, T snapshot)
+    internal static void ValidateSnapshot<T>(ProjectSessionInfo project, T snapshot)
     {
         switch (snapshot)
         {
@@ -590,7 +590,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 var gameplayEnabled = sceneModel?.GameplayProfile == "goal_hazard_v1";
                 var gameplayContractValid = sceneModel is not null && sceneModel.GameplayProfile switch
                 {
-                    "none" => sceneModel.SchemaVersion is 7 or 8 && sceneModel.GameplayTimeLimitSeconds is null,
+                    "none" => sceneModel.SchemaVersion is 7 or 8 or 9 && sceneModel.GameplayTimeLimitSeconds is null,
                     "goal_hazard_v1" => (sceneModel.SchemaVersion <= 6 && sceneModel.GameplayTimeLimitSeconds is null)
                         || (sceneModel.GameplayTimeLimitSeconds is double limit && limit > 0 && double.IsFinite(limit)),
                     _ => false
@@ -618,11 +618,12 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                     || model.AuthoringRevision.Length != 64
                     || model.AuthoringRevision.Any(value => !Uri.IsHexDigit(value))
                     || model.ModelVersion != EditorSnapshotVersions.ProjectModel
-                    || model.Scene.SchemaVersion is not (3 or 4 or 5 or 6 or 7 or 8)
+                    || model.Scene.SchemaVersion is not (3 or 4 or 5 or 6 or 7 or 8 or 9)
                     || !gameplayContractValid
                     || !textureSetValid
                     || !ValidateSceneObjects(objects, textures!, sceneModel!, behaviorDependencySetValid ? scriptDependencies!.Select(dependency => dependency.ScriptId).ToHashSet() : null)
                     || !ValidateSceneTilemaps(sceneModel!.Tilemaps, textures!, sceneModel.SchemaVersion)
+                    || !ValidateSceneCamera(sceneModel.Camera, sceneModel.SchemaVersion)
                     || model.Script.SchemaVersion is not (1 or 2)
                     || model.Preview.SchemaVersion != 1
                     || !string.Equals(model.ProjectName, project.ProjectName, StringComparison.OrdinalIgnoreCase)
@@ -744,6 +745,18 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         return true;
     }
 
+    private static bool ValidateSceneCamera(ProjectModelSceneCamera? camera, int schemaVersion)
+    {
+        // 旧协议调用方可省略 Camera；在 v3-v8 中它等价于恒等视图。
+        if (camera is null) return schemaVersion < 9;
+        if (camera.Origin is not { Length: 2 }
+            || !camera.Origin.All(number => double.IsFinite(number) && float.IsFinite((float)number))
+            || !double.IsFinite(camera.Zoom) || !float.IsFinite((float)camera.Zoom)
+            || camera.Zoom is < 0.125 or > 8) return false;
+        return schemaVersion == 9
+            || camera.Origin.SequenceEqual([0d, 0d]) && camera.Zoom == 1;
+    }
+
     private static bool IsScriptSourcePath(string source)
     {
         if (string.IsNullOrEmpty(source) || System.Text.Encoding.UTF8.GetByteCount(source) > 1024
@@ -763,7 +776,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
         IReadOnlySet<uint>? behaviorScriptIds)
     {
         var gameplayEnabled = scene.GameplayProfile == "goal_hazard_v1";
-        var minimumObjectCount = scene.SchemaVersion is 7 or 8 && !gameplayEnabled ? 1 : 3;
+        var minimumObjectCount = scene.SchemaVersion is 7 or 8 or 9 && !gameplayEnabled ? 1 : 3;
         if (objects is null || objects.Count < minimumObjectCount || objects.Count > 64) return false;
         var textureIds = textures.Select(value => value.TextureId).ToHashSet();
         var objectIds = new HashSet<string>(StringComparer.Ordinal);
@@ -787,7 +800,7 @@ internal sealed class WorkspaceEditorBackend : IEditorSessionBackend
                 if (value.MoveSpeed is null || value.MoveSpeed < 0 || !double.IsFinite(value.MoveSpeed.Value)
                     || value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null) return false;
             }
-            if (scene.SchemaVersion is 5 or 6 or 7 or 8)
+            if (scene.SchemaVersion is 5 or 6 or 7 or 8 or 9)
             {
                 if (value.PatrolMinY is not null || value.PatrolMaxY is not null || value.PatrolSpeed is not null
                     || value.Behaviors is null || value.Behaviors.Count > 4)

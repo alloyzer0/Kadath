@@ -37,6 +37,7 @@ internal static class Program
         {
             Directory.CreateDirectory(root);
             await ScriptAnalysisHostVerifier.VerifyAsync();
+            VerifyCameraSnapshotProtocol();
             await VerifyInitialIdentityBoundariesAsync(root);
             await VerifyRejectedReloadAsync(root);
             await VerifyReloadTimeoutAsync(root);
@@ -47,6 +48,7 @@ internal static class Program
             Console.WriteLine("preview_diagnostics=ok");
             Console.WriteLine("script_analysis_host_concurrency=ok");
             Console.WriteLine("script_analysis_cleanup_mapping=ok");
+            Console.WriteLine("camera_snapshot_protocol=ok");
             Console.WriteLine("preview_initial_identity_boundaries=ok");
             Console.WriteLine("preview_reload_rejected=ok");
             Console.WriteLine("preview_reload_timeout=ok");
@@ -66,6 +68,36 @@ internal static class Program
         {
             if (Directory.Exists(root)) Directory.Delete(root, true);
         }
+    }
+
+    private static void VerifyCameraSnapshotProtocol()
+    {
+        var project = new ProjectSessionInfo("C:/package", "demo", "C:/package/bin/projects/demo",
+            "C:/package/bin/projects/demo/scene.json", "C:/package/bin/projects/demo/script.json",
+            "C:/package/bin/projects/demo/preview.json", 1);
+        var snapshot = new ProjectModelSnapshot(
+            EditorSnapshotVersions.ProjectModel,
+            "demo",
+            new string('a', 64),
+            new ProjectModelFiles("C:/package/bin/projects/demo", "scene.json", "script.json", "preview.json"),
+            new ProjectModelScene(
+                9,
+                [],
+                0,
+                0,
+                0,
+                [new ProjectModelTexture(1, "assets/renderer2d/test.texture", "pixel_art")],
+                [new ProjectModelSceneObject("decor", "sprite", [0, 0], [1, 1], [1, 1, 1, 1], 1, Behaviors: [])],
+                "none",
+                null,
+                [],
+                [],
+                new ProjectModelSceneCamera([1, 0], 1)),
+            new ProjectModelScript(2, [], [], [new ProjectModelScriptDependency(1, "scripts/test.luau")]),
+            new ProjectModelPreview(1));
+
+        // 直接覆盖 Service 防御门禁，避免再次只在 Avalonia 端到端工作流中发现版本漂移。
+        WorkspaceEditorBackend.ValidateSnapshot(project, snapshot);
     }
 
     private static async Task VerifyInitialIdentityBoundariesAsync(string root)
