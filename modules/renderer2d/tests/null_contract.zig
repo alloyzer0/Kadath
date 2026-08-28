@@ -40,8 +40,8 @@ fn expectRecordingDelta(
     try std.testing.expectEqual(expected_pipeline_binds, after.pipeline_binds - before.pipeline_binds);
     try std.testing.expectEqual(expected_texture_binds, after.texture_binds - before.texture_binds);
     try std.testing.expectEqual(expected_instance_data_binds, after.instance_data_binds - before.instance_data_binds);
-    // 实例化路径不再写 per-Sprite push constants；draw 数必须等于连续纹理批次数。
-    try std.testing.expectEqual(@as(u32, 0), after.push_constant_writes - before.push_constant_writes);
+    // 每个非空 Frame 只写一次 world→clip View 常量；draw 数仍等于连续纹理批次数。
+    try std.testing.expectEqual(@as(u32, if (expected_instances == 0) 0 else 1), after.push_constant_writes - before.push_constant_writes);
     try std.testing.expectEqual(expected_draws, after.draws - before.draws);
     try std.testing.expectEqual(expected_instances, after.instances_drawn - before.instances_drawn);
 }
@@ -76,13 +76,13 @@ test "Renderer2D explicit identity Camera2D preserves the instance byte trace" {
     const second = backend.stats();
     try std.testing.expectEqualSlices(
         u8,
-        first.instance_data_trace[0..48],
-        second.instance_data_trace[48..96],
+        first.instance_data_trace[0..64],
+        second.instance_data_trace[64..128],
     );
     std.debug.print("CAMERA_IDENTITY_COMPATIBLE=true\n", .{});
 }
 
-test "Renderer2D applies Camera2D origin and zoom before NDC conversion" {
+test "Renderer2D publishes world-space instances and Camera2D push constants" {
     var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();
     var renderer = try renderer2d.Renderer2D.init(&backend);
@@ -96,11 +96,14 @@ test "Renderer2D applies Camera2D origin and zoom before NDC conversion" {
         .sprites = &sprites,
     }));
     const stats = backend.stats();
-    // world (20,12,8,8) -> screen (8,8,16,16) -> NDC (-0.75,0.75,0.5,0.5)。
-    try std.testing.expectApproxEqAbs(@as(f32, -0.75), traceF32(&stats.instance_data_trace, 0), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), traceF32(&stats.instance_data_trace, 4), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), traceF32(&stats.instance_data_trace, 8), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), traceF32(&stats.instance_data_trace, 12), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), traceF32(&stats.instance_data_trace, 0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), traceF32(&stats.instance_data_trace, 4), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 8), traceF32(&stats.instance_data_trace, 8), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 8), traceF32(&stats.instance_data_trace, 12), 0.0001);
+    // push constants: viewport vec4 后是 Camera origin x/y 与 zoom。
+    try std.testing.expectApproxEqAbs(@as(f32, 16), traceF32(&stats.push_constant_trace, 16), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 8), traceF32(&stats.push_constant_trace, 20), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), traceF32(&stats.push_constant_trace, 24), 0.0001);
 }
 
 test "Renderer2D culls Tilemap with half-open visible row and column ranges" {
@@ -272,14 +275,14 @@ test "Renderer2D expands one-based atlas indices into stable UV rectangles" {
     }));
 
     const stats = backend.stats();
-    try std.testing.expectEqual(@as(usize, 96), stats.instance_data_trace_len);
-    // 48-byte instance 的 uv_rect 位于 32..48；Tile 1 为 (0,0)，Tile 6 为 (1,1)。
+    try std.testing.expectEqual(@as(usize, 128), stats.instance_data_trace_len);
+    // 64-byte instance 的 uv_rect 位于 32..48；Tile 1 为 (0,0)，Tile 6 为 (1,1)。
     try std.testing.expectApproxEqAbs(@as(f32, 0), traceF32(&stats.instance_data_trace, 32), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0), traceF32(&stats.instance_data_trace, 36), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 40), 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 44), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 80), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 84), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 96), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), traceF32(&stats.instance_data_trace, 100), 0.0001);
 }
 
 test "Renderer2D splits a full 32 by 32 tilemap into eight bounded draws" {
@@ -375,6 +378,84 @@ test "Renderer2D accepts the frozen 1024 tile plus 128 sprite frame budget" {
     // Tilemap 与动态 Sprite 是两个语义段，即便 Texture 相同也不能跨边界重排/合批。
     try expectRecordingDelta(before, backend.stats(), 1, 2, 9, 9, 1152);
     std.debug.print("TILEMAP_BATCH_1024=true\n", .{});
+}
+
+test "Renderer2D renders visible multi-source chunks in stable layer and cell order" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const ground = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(ground);
+    const decor = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(decor);
+
+    const sources = [_]renderer2d.TileSourceView{
+        .{ .texture = ground, .tile_size = .{ 16, 16 }, .image_size = .{ 35, 18 }, .columns = 2, .rows = 1, .margin = 1, .spacing = 1 },
+        .{ .texture = decor, .tile_size = .{ 16, 16 }, .image_size = .{ 16, 16 }, .columns = 1, .rows = 1, .margin = 0, .spacing = 0 },
+    };
+    const visible_cells = [_]renderer2d.ChunkedTileCellView{
+        .{ .local_index = 0, .tile_source_index = 0, .local_tile_id = 0 },
+        .{ .local_index = 1, .tile_source_index = 1, .local_tile_id = 0, .transform = .{ .flip_horizontal = true, .flip_vertical = true, .flip_diagonal = true } },
+    };
+    const far_cells = [_]renderer2d.ChunkedTileCellView{.{ .local_index = 0, .tile_source_index = 0, .local_tile_id = 1 }};
+    const background_chunks = [_]renderer2d.TilemapChunkView{
+        .{ .coordinate = .{ 0, 0 }, .cells = &visible_cells },
+        .{ .coordinate = .{ 100, 100 }, .cells = &far_cells },
+    };
+    const foreground_cells = [_]renderer2d.ChunkedTileCellView{.{ .local_index = 0, .tile_source_index = 0, .local_tile_id = 1 }};
+    const foreground_chunks = [_]renderer2d.TilemapChunkView{.{ .coordinate = .{ 0, 0 }, .cells = &foreground_cells }};
+    const layers = [_]renderer2d.ChunkedTilemapLayerView{
+        .{ .origin = .{ 0, 0 }, .offset = .{ 0, 0 }, .grid_size = .{ 16, 16 }, .tile_sources = &sources, .chunks = &background_chunks },
+        .{ .origin = .{ 0, 0 }, .offset = .{ 0, 0 }, .grid_size = .{ 16, 16 }, .opacity = 0.5, .tile_sources = &sources, .chunks = &foreground_chunks },
+    };
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .chunked_tilemap_layers = &layers }));
+    const after = backend.stats();
+    try expectRecordingDelta(before, after, 1, 3, 3, 3, 3);
+    try std.testing.expectEqualSlices(
+        rhi.TextureHandle,
+        &.{ ground, decor, ground },
+        after.draw_texture_trace[before.draw_texture_trace_len..after.draw_texture_trace_len],
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 35.0), traceF32(&after.instance_data_trace, 32), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), traceF32(&after.instance_data_trace, 64 + 48), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), traceF32(&after.instance_data_trace, 128 + 28), 0.0001);
+    std.debug.print("TILEMAP_CHUNKED_LAYERS=true\n", .{});
+}
+
+test "Renderer2D supports negative chunk coordinates without counting offscreen chunks" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+    const sources = [_]renderer2d.TileSourceView{.{
+        .texture = texture,
+        .tile_size = .{ 16, 16 },
+        .image_size = .{ 16, 16 },
+        .columns = 1,
+        .rows = 1,
+        .margin = 0,
+        .spacing = 0,
+    }};
+    const cells = [_]renderer2d.ChunkedTileCellView{.{ .local_index = 1023, .tile_source_index = 0, .local_tile_id = 0 }};
+    const chunks = [_]renderer2d.TilemapChunkView{.{ .coordinate = .{ -1, -1 }, .cells = &cells }};
+    const layers = [_]renderer2d.ChunkedTilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .offset = .{ 0, 0 },
+        .grid_size = .{ 16, 16 },
+        .tile_sources = &sources,
+        .chunks = &chunks,
+    }};
+    const before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{
+        .view = .{ .origin = .{ -16, -16 }, .zoom = 1 },
+        .chunked_tilemap_layers = &layers,
+    }));
+    try expectRecordingDelta(before, backend.stats(), 1, 1, 1, 1, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, -16), traceF32(&backend.stats().instance_data_trace, 0), 0.0001);
 }
 
 test "Renderer2D rejects malformed tilemap before beginning a frame" {

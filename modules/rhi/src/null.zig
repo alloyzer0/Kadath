@@ -6,6 +6,7 @@ const max_textures: usize = 8;
 const max_texture_mip_levels: usize = 32;
 const max_draw_texture_trace: usize = 256;
 const max_instance_data_trace: usize = 4096;
+const max_push_constant_trace: usize = 256;
 
 pub const Extent2D = types.Extent2D;
 pub const FrameOutcome = types.FrameOutcome;
@@ -35,6 +36,8 @@ pub const NullStats = struct {
     pipeline_binds: u32 = 0,
     texture_binds: u32 = 0,
     push_constant_writes: u32 = 0,
+    push_constant_trace: [max_push_constant_trace]u8 = [_]u8{0} ** max_push_constant_trace,
+    push_constant_trace_len: usize = 0,
     instance_data_binds: u32 = 0,
     instance_data_bytes: u32 = 0,
     instance_data_trace: [max_instance_data_trace]u8 = [_]u8{0} ** max_instance_data_trace,
@@ -94,6 +97,13 @@ pub const FrameEncoder = struct {
         if (bytes.len > desc.push_constant_size) return error.PipelinePushConstantTooLarge;
         if (bytes.len % 4 != 0) return error.PushConstantAlignment;
         self.rhi.stats_value.push_constant_writes += 1;
+        const remaining = max_push_constant_trace - self.rhi.stats_value.push_constant_trace_len;
+        const trace_bytes = @min(remaining, bytes.len);
+        if (trace_bytes != 0) {
+            const start = self.rhi.stats_value.push_constant_trace_len;
+            @memcpy(self.rhi.stats_value.push_constant_trace[start .. start + trace_bytes], bytes[0..trace_bytes]);
+            self.rhi.stats_value.push_constant_trace_len += trace_bytes;
+        }
     }
 
     pub fn bindInstanceData(self: *FrameEncoder, bytes: []const u8) !void {
@@ -640,8 +650,8 @@ test "null adapter separates per-binding and per-frame instance budgets" {
     const pipeline = try rhi.createGraphicsPipeline(.{
         .vertex_shader = &shader,
         .fragment_shader = &shader,
-        .push_constant_size = 48,
-        .instance_data_stride = 48,
+        .push_constant_size = 32,
+        .instance_data_stride = 64,
     });
 
     const begin = try rhi.beginFrame(.{ .width = 32, .height = 32 }, .{ 0, 0, 0, 1 });
@@ -652,12 +662,11 @@ test "null adapter separates per-binding and per-frame instance budgets" {
     try encoder.bindPipeline(pipeline);
     try std.testing.expectError(
         error.InstanceDataBindingSizeLimitReached,
-        encoder.bindInstanceData(&([_]u8{0} ** (types.max_instance_data_bytes_per_binding + 48))),
+        encoder.bindInstanceData(&([_]u8{0} ** (types.max_instance_data_bytes_per_binding + 64))),
     );
-    for (0..10) |_| {
+    for (0..types.max_instance_data_bytes_per_frame / types.max_instance_data_bytes_per_binding) |_| {
         try encoder.bindInstanceData(&([_]u8{0} ** types.max_instance_data_bytes_per_binding));
     }
-    try encoder.bindInstanceData(&([_]u8{0} ** 4080));
-    try std.testing.expectError(error.InstanceDataFrameLimitReached, encoder.bindInstanceData(&([_]u8{0} ** 48)));
+    try std.testing.expectError(error.InstanceDataFrameLimitReached, encoder.bindInstanceData(&([_]u8{0} ** 64)));
     encoder.consumeFailedFrame();
 }

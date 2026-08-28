@@ -9,6 +9,8 @@ const content_identity = @import("content_identity.zig");
 const audio_api = @import("audio");
 const player_movement_ownership = @import("player_movement_ownership.zig");
 const runtime_texture_registry = @import("runtime_texture_registry.zig");
+const runtime_tilemap_set = @import("runtime_tilemap_set.zig");
+const tilemap_asset = @import("tilemap_asset.zig");
 const runtime_core = @import("runtime_core");
 const scene_api = @import("scene.zig");
 const scene_generation_api = @import("scene_generation.zig");
@@ -24,13 +26,45 @@ const Renderer2D = @import("renderer2d").Renderer2D;
 const Camera2DView = @import("renderer2d").Camera2DView;
 const SpriteInstance = @import("renderer2d").SpriteInstance;
 const TilemapLayerView = @import("renderer2d").TilemapLayerView;
+const TileSourceView = @import("renderer2d").TileSourceView;
+const TilemapChunkView = @import("renderer2d").TilemapChunkView;
+const ChunkedTilemapLayerView = @import("renderer2d").ChunkedTilemapLayerView;
+const ChunkedTileCellView = @import("renderer2d").ChunkedTileCellView;
 
 const fixed_dt_seconds: f64 = 1.0 / 60.0;
 const max_fixed_steps_per_frame: u8 = 4;
+
+comptime {
+    // Host 是 Tilemap Asset 与 Renderer view 之间唯一的零拷贝 Adapter；布局变化必须显式失败。
+    if (@sizeOf(tilemap_asset.Transform) != @sizeOf(@import("renderer2d").TileTransform) or
+        @sizeOf(tilemap_asset.Cell) != @sizeOf(ChunkedTileCellView) or
+        @offsetOf(tilemap_asset.Cell, "local_index") != @offsetOf(ChunkedTileCellView, "local_index") or
+        @offsetOf(tilemap_asset.Cell, "tile_source_index") != @offsetOf(ChunkedTileCellView, "tile_source_index") or
+        @offsetOf(tilemap_asset.Cell, "local_tile_id") != @offsetOf(ChunkedTileCellView, "local_tile_id") or
+        @offsetOf(tilemap_asset.Cell, "transform") != @offsetOf(ChunkedTileCellView, "transform") or
+        @sizeOf(tilemap_asset.Chunk) != @sizeOf(TilemapChunkView) or
+        @offsetOf(tilemap_asset.Chunk, "coordinate") != @offsetOf(TilemapChunkView, "coordinate") or
+        @offsetOf(tilemap_asset.Chunk, "cells") != @offsetOf(TilemapChunkView, "cells"))
+    {
+        @compileError("Tilemap asset and Renderer view layouts diverged");
+    }
+}
+
+fn rendererChunks(chunks: []const tilemap_asset.Chunk) []const TilemapChunkView {
+    const pointer: [*]const TilemapChunkView = @ptrCast(chunks.ptr);
+    return pointer[0..chunks.len];
+}
 fn validateSceneTextureBindings(registry: *const runtime_texture_registry.RuntimeTextureRegistry, scene: *const scene_api.Scene) !void {
     for (scene.objects.slice()) |object| _ = try registry.resolve(object.sprite.textureId);
     for (scene.prototypes.slice()) |prototype| _ = try registry.resolve(prototype.sprite.textureId);
     for (scene.tilemaps.slice()) |tilemap| _ = try registry.resolve(tilemap.textureId);
+}
+
+fn validateTilemapTextureBindings(registry: *const runtime_texture_registry.RuntimeTextureRegistry, tilemaps: *const runtime_tilemap_set.RuntimeTilemapSet) !void {
+    for (tilemaps.assets[0..tilemaps.count]) |slot| {
+        const asset = slot orelse unreachable;
+        for (asset.tile_sources) |source| _ = try registry.resolve(source.texture_id);
+    }
 }
 
 fn rendererViewForScene(scene: *const scene_api.Scene) Camera2DView {
@@ -82,6 +116,7 @@ pub const Host = struct {
     renderer2d: Renderer2D,
     audio: audio_api.Audio,
     texture_registry: runtime_texture_registry.RuntimeTextureRegistry,
+    tilemap_set: runtime_tilemap_set.RuntimeTilemapSet,
     generation: scene_generation_api.SceneGeneration,
     world_extent: PlatformExtent,
     render_sprites: [runtime_core.max_object_count]runtime_core.RenderSprite = undefined,
@@ -134,6 +169,8 @@ pub const Host = struct {
 
         var prepared_textures = try runtime_texture_registry.prepareScene(io, std.heap.page_allocator, &scene);
         defer prepared_textures.deinit();
+        var tilemap_set = try runtime_tilemap_set.RuntimeTilemapSet.loadForScene(io, std.heap.page_allocator, &scene);
+        errdefer tilemap_set.deinit();
 
         var platform = try Platform.init();
         errdefer platform.deinit();
@@ -156,6 +193,7 @@ pub const Host = struct {
         );
         errdefer texture_registry.deinit(&backend);
         try validateSceneTextureBindings(&texture_registry, &scene);
+        try validateTilemapTextureBindings(&texture_registry, &tilemap_set);
 
         var generation = try scene_generation_api.SceneGeneration.prepare(&scene, extent);
         errdefer generation.deinit();
@@ -181,6 +219,7 @@ pub const Host = struct {
             .renderer2d = renderer2d,
             .audio = audio_api.Audio.init(io, std.heap.page_allocator),
             .texture_registry = undefined,
+            .tilemap_set = undefined,
             .generation = generation,
             .world_extent = extent,
         };
@@ -191,6 +230,7 @@ pub const Host = struct {
         self.last_heartbeat_seconds = now;
         try self.resetScript();
         self.texture_registry = texture_registry.take();
+        self.tilemap_set = tilemap_set.take();
         if (scene.gameplayEnabled()) {
             std.log.info("Runtime host initialized with Vulkan RHI scene objects={d}, player={d}, goal={d}", .{
                 scene.objects.count,
@@ -207,6 +247,7 @@ pub const Host = struct {
         return self.initial_loaded;
     }
     pub fn deinit(self: *Host) void {
+        self.tilemap_set.deinit();
         self.texture_registry.deinit(&self.rhi);
         self.audio.deinit();
         self.behavior_runtime.deinit();
@@ -339,12 +380,47 @@ pub const Host = struct {
                 .cells = tilemap.cellSlice(),
             };
         }
+        var source_views: [scene_api.max_chunked_tilemap_count * tilemap_asset.max_tile_sources]TileSourceView = undefined;
+        var source_count: usize = 0;
+        var layer_views: [tilemap_asset.max_layers]ChunkedTilemapLayerView = undefined;
+        var layer_count: usize = 0;
+        for (self.tilemap_set.assets[0..self.tilemap_set.count], 0..) |slot, asset_index| {
+            const asset = &(slot orelse unreachable);
+            const reference = &self.scene.chunkedTilemaps.entries[asset_index];
+            const source_start = source_count;
+            for (asset.tile_sources) |source| {
+                source_views[source_count] = .{
+                    .texture = try self.texture_registry.resolve(source.texture_id),
+                    .tile_size = .{ source.tile_width, source.tile_height },
+                    .image_size = .{ source.image_width, source.image_height },
+                    .columns = source.columns,
+                    .rows = source.rows,
+                    .margin = source.margin,
+                    .spacing = source.spacing,
+                };
+                source_count += 1;
+            }
+            const resolved_sources = source_views[source_start..source_count];
+            for (asset.layers) |layer| {
+                layer_views[layer_count] = .{
+                    .origin = reference.origin,
+                    .offset = layer.offset,
+                    .grid_size = layer.grid_size,
+                    .visible = layer.visible,
+                    .opacity = layer.opacity,
+                    .tile_sources = resolved_sources,
+                    .chunks = rendererChunks(layer.chunks),
+                };
+                layer_count += 1;
+            }
+        }
         const outcome = try self.renderer2d.renderFrame(
             &self.rhi,
             .{ .width = extent.width, .height = extent.height },
             .{
                 .view = rendererViewForScene(&self.scene),
                 .tilemaps = tilemaps[0..self.scene.tilemaps.count],
+                .chunked_tilemap_layers = layer_views[0..layer_count],
                 .sprites = instances[0..self.render_count],
             },
         );
@@ -521,6 +597,8 @@ pub const Host = struct {
             return error.MissingScenePath;
         };
         const candidate = try scene_api.load(self.io, std.heap.page_allocator, path);
+        var candidate_tilemaps = try runtime_tilemap_set.RuntimeTilemapSet.loadForScene(self.io, std.heap.page_allocator, &candidate);
+        errdefer candidate_tilemaps.deinit();
         var prepared_textures = try runtime_texture_registry.prepareScene(self.io, std.heap.page_allocator, &candidate);
         defer prepared_textures.deinit();
         var candidate_registry = try runtime_texture_registry.RuntimeTextureRegistry.initPrepared(
@@ -531,6 +609,7 @@ pub const Host = struct {
         );
         errdefer candidate_registry.deinit(&self.rhi);
         try validateSceneTextureBindings(&candidate_registry, &candidate);
+        try validateTilemapTextureBindings(&candidate_registry, &candidate_tilemaps);
         var replacement = try scene_generation_api.SceneGeneration.prepareSceneReload(&candidate, self.world_extent, &self.generation);
         errdefer replacement.deinit();
         var candidate_behavior = behavior_host.Runtime{};
@@ -573,9 +652,11 @@ pub const Host = struct {
         try replacement.commitPrepared(&self.generation);
         var previous_generation = self.generation;
         var previous_registry = self.texture_registry;
+        var previous_tilemaps = self.tilemap_set;
         var previous_behavior = self.behavior_runtime;
         self.generation = replacement;
         self.texture_registry = candidate_registry.take();
+        self.tilemap_set = candidate_tilemaps.take();
         self.behavior_runtime = candidate_behavior;
         self.script_program = candidate_program;
         self.script_enabled = candidate_script_enabled;
@@ -585,6 +666,7 @@ pub const Host = struct {
         self.render_count = 0;
         previous_generation.deinit();
         previous_registry.deinit(&self.rhi);
+        previous_tilemaps.deinit();
         previous_behavior.deinit();
         if (candidate_startup) |*startup| self.behavior_runtime.publishCommittedStartupEvents(&self.generation, startup);
         if (candidate.gameplayEnabled()) {

@@ -16,8 +16,10 @@ pub const TextureHandle = u32;
 pub const invalid_texture: TextureHandle = 0;
 
 /// 每次绑定最多携带 128 个 48-byte Quad instance；整帧容量同时覆盖 1024 Tile 与 128 Sprite。
-pub const max_instance_data_bytes_per_binding: usize = 6144;
-pub const max_instance_data_bytes_per_frame: usize = 65536;
+// 64-byte world-space quad × 128 instances；Tilemap 仍以有界批次提交。
+pub const max_instance_data_bytes_per_binding: usize = 8192;
+// 可见实例预算与全地图规模解耦；16384 个 quad 是当前产品门禁。
+pub const max_instance_data_bytes_per_frame: usize = 1024 * 1024;
 pub const max_instance_data_bindings_per_frame: usize = 256;
 
 pub const TextureSamplerProfile = enum {
