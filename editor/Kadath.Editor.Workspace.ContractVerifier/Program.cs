@@ -17,6 +17,7 @@ internal static class Program
         {
             var project = CreateFixture(root);
             VerifyStrictTexturePngCodec(root);
+            await TilemapImportVerifier.VerifyAsync();
             var readModel = new WorkspaceReadModel();
             var before = TreeIdentity(root);
             await VerifyRetainedTextureSnapshotAsync(project, root);
@@ -135,6 +136,7 @@ internal static class Program
             Console.WriteLine("behavior_publication_v2=ok");
             Console.WriteLine("authoring_transaction=ok");
             Console.WriteLine("texture_import=ok");
+            Console.WriteLine("TILEMAP_CHUNKED_ASSET_V1=true");
             Console.WriteLine("native_publication=ok");
             Console.WriteLine("project_lifecycle=ok");
             Console.WriteLine("neutral_scene_authoring=ok");
