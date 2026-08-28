@@ -90,6 +90,11 @@ internal sealed record WorkspaceSceneTilemap(
         Cells.ToArray());
 }
 
+internal sealed record WorkspaceSceneCamera(double[] Origin, double Zoom)
+{
+    internal ProjectModelSceneCamera ToProjectModel() => new(Origin.ToArray(), Zoom);
+}
+
 internal sealed record WorkspaceSceneObject(
     string ObjectId,
     string Kind,
@@ -124,7 +129,8 @@ internal sealed record WorkspaceSceneDocument(
     WorkspaceSceneObject[] Objects,
     WorkspaceScenePrototype[] Prototypes,
     WorkspaceSceneGameplay Gameplay,
-    WorkspaceSceneTilemap[] Tilemaps)
+    WorkspaceSceneTilemap[] Tilemaps,
+    WorkspaceSceneCamera Camera)
 {
     internal WorkspaceSceneObject? Player => Objects.SingleOrDefault(value => value.Kind == WorkspaceSceneDocumentCodec.PlayerKind);
     internal WorkspaceSceneObject? Goal => Objects.SingleOrDefault(value => value.Kind == WorkspaceSceneDocumentCodec.GoalKind);
@@ -137,7 +143,8 @@ internal static partial class WorkspaceSceneDocumentCodec
     internal const int BehaviorSchemaVersion = 5;
     internal const int PrototypeSchemaVersion = 6;
     internal const int GameplaySchemaVersion = 7;
-    internal const int CurrentSchemaVersion = 8;
+    internal const int TilemapSchemaVersion = 8;
+    internal const int CurrentSchemaVersion = 9;
     internal const int MinNeutralObjectCount = 1;
     internal const int MinObjectCount = 3;
     internal const int MaxObjectCount = 64;
@@ -166,6 +173,7 @@ internal static partial class WorkspaceSceneDocumentCodec
 
     internal static readonly WorkspaceSceneGameplay NeutralGameplay = new(NoGameplayProfile, 0);
     internal static readonly WorkspaceSceneGameplay LegacyGameplay = new(GoalHazardGameplayProfile, 3);
+    internal static readonly WorkspaceSceneCamera IdentityCamera = new([0, 0], 1);
 
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -194,10 +202,11 @@ internal static partial class WorkspaceSceneDocumentCodec
                 BehaviorSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects"], [], "Scene"),
                 PrototypeSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], [], "Scene"),
                 GameplaySchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes"], ["gameplay"], "Scene"),
-                CurrentSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes", "tilemaps"], ["gameplay"], "Scene"),
+                TilemapSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes", "tilemaps"], ["gameplay"], "Scene"),
+                CurrentSchemaVersion => ReadProperties(root, ["schemaVersion", "textures", "objects", "prototypes", "tilemaps", "camera"], ["gameplay"], "Scene"),
                 _ => throw Failure("Unsupported Scene schemaVersion.")
             };
-            var textures = ReadTextures(properties["textures"], schemaVersion == CurrentSchemaVersion);
+            var textures = ReadTextures(properties["textures"], schemaVersion >= TilemapSchemaVersion);
             var objects = schemaVersion == 3 ? ReadLegacyObjects(properties) : ReadObjects(properties["objects"], schemaVersion);
             var prototypes = schemaVersion >= PrototypeSchemaVersion
                 ? ReadPrototypes(properties["prototypes"])
@@ -206,11 +215,12 @@ internal static partial class WorkspaceSceneDocumentCodec
             var gameplay = schemaVersion >= GameplaySchemaVersion
                 ? properties.TryGetValue("gameplay", out var gameplayValue) ? ReadGameplay(gameplayValue) : NeutralGameplay
                 : LegacyGameplay;
-            var tilemaps = schemaVersion == CurrentSchemaVersion
+            var tilemaps = schemaVersion >= TilemapSchemaVersion
                 ? ReadTilemaps(properties["tilemaps"])
                 : Array.Empty<WorkspaceSceneTilemap>();
-            Validate(textures, objects, prototypes, schemaVersion == 3 ? LegacySchemaVersion : schemaVersion, gameplay, tilemaps);
-            return new WorkspaceSceneDocument(schemaVersion, textures, objects, prototypes, gameplay, tilemaps);
+            var camera = schemaVersion == CurrentSchemaVersion ? ReadCamera(properties["camera"]) : IdentityCamera;
+            Validate(textures, objects, prototypes, schemaVersion == 3 ? LegacySchemaVersion : schemaVersion, gameplay, tilemaps, camera);
+            return new WorkspaceSceneDocument(schemaVersion, textures, objects, prototypes, gameplay, tilemaps, camera);
         }
         catch (JsonException exception)
         {
@@ -288,6 +298,10 @@ internal static partial class WorkspaceSceneDocumentCodec
             value.AtlasRows,
             value.Cells.ToArray())).ToArray();
 
+    internal static WorkspaceSceneCamera NormalizeCameraDefinition(SceneCameraDefinition definition) => new(
+        CopyVector(definition.Origin, 2, "Scene.camera.origin"),
+        definition.Zoom);
+
     internal static void ValidateNormalized(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects) =>
         Validate(textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacySchemaVersion, LegacyGameplay);
 
@@ -319,7 +333,17 @@ internal static partial class WorkspaceSceneDocumentCodec
         int schemaVersion,
         WorkspaceSceneGameplay gameplay,
         IReadOnlyList<WorkspaceSceneTilemap> tilemaps) =>
-        Validate(textures, objects, prototypes, schemaVersion, gameplay, tilemaps);
+        Validate(textures, objects, prototypes, schemaVersion, gameplay, tilemaps, IdentityCamera);
+
+    internal static void ValidateNormalized(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        int schemaVersion,
+        WorkspaceSceneGameplay gameplay,
+        IReadOnlyList<WorkspaceSceneTilemap> tilemaps,
+        WorkspaceSceneCamera camera) =>
+        Validate(textures, objects, prototypes, schemaVersion, gameplay, tilemaps, camera);
 
     internal static byte[] SerializeV4(IReadOnlyList<WorkspaceSceneTexture> textures, IReadOnlyList<WorkspaceSceneObject> objects)
         => Serialize(LegacySchemaVersion, textures, objects, Array.Empty<WorkspaceScenePrototype>(), LegacyGameplay);
@@ -346,7 +370,16 @@ internal static partial class WorkspaceSceneDocumentCodec
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
         WorkspaceSceneGameplay gameplay,
         IReadOnlyList<WorkspaceSceneTilemap> tilemaps)
-        => Serialize(CurrentSchemaVersion, textures, objects, prototypes, gameplay, tilemaps);
+        => Serialize(TilemapSchemaVersion, textures, objects, prototypes, gameplay, tilemaps, IdentityCamera);
+
+    internal static byte[] SerializeV9(
+        IReadOnlyList<WorkspaceSceneTexture> textures,
+        IReadOnlyList<WorkspaceSceneObject> objects,
+        IReadOnlyList<WorkspaceScenePrototype> prototypes,
+        WorkspaceSceneGameplay gameplay,
+        IReadOnlyList<WorkspaceSceneTilemap> tilemaps,
+        WorkspaceSceneCamera camera)
+        => Serialize(CurrentSchemaVersion, textures, objects, prototypes, gameplay, tilemaps, camera);
 
     private static byte[] Serialize(
         int schemaVersion,
@@ -354,10 +387,12 @@ internal static partial class WorkspaceSceneDocumentCodec
         IReadOnlyList<WorkspaceSceneObject> objects,
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
         WorkspaceSceneGameplay gameplay,
-        IReadOnlyList<WorkspaceSceneTilemap>? tilemaps = null)
+        IReadOnlyList<WorkspaceSceneTilemap>? tilemaps = null,
+        WorkspaceSceneCamera? camera = null)
     {
         tilemaps ??= Array.Empty<WorkspaceSceneTilemap>();
-        Validate(textures, objects, prototypes, schemaVersion, gameplay, tilemaps);
+        camera ??= IdentityCamera;
+        Validate(textures, objects, prototypes, schemaVersion, gameplay, tilemaps, camera);
         var buffer = new ArrayBufferWriter<byte>();
         using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
         {
@@ -370,7 +405,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                 writer.WriteStartObject();
                 writer.WriteNumber("textureId", texture.TextureId);
                 writer.WriteString("artifact", texture.Artifact);
-                if (schemaVersion == CurrentSchemaVersion) writer.WriteString("samplingProfile", texture.SamplingProfile);
+                if (schemaVersion >= TilemapSchemaVersion) writer.WriteString("samplingProfile", texture.SamplingProfile);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
@@ -457,7 +492,7 @@ internal static partial class WorkspaceSceneDocumentCodec
                 writer.WriteNumber("timeLimitSeconds", gameplay.TimeLimitSeconds);
                 writer.WriteEndObject();
             }
-            if (schemaVersion == CurrentSchemaVersion)
+            if (schemaVersion >= TilemapSchemaVersion)
             {
                 writer.WritePropertyName("tilemaps");
                 writer.WriteStartArray();
@@ -479,6 +514,15 @@ internal static partial class WorkspaceSceneDocumentCodec
                     writer.WriteEndObject();
                 }
                 writer.WriteEndArray();
+            }
+            if (schemaVersion == CurrentSchemaVersion)
+            {
+                // v9 把 Camera2D 固定放在 Tilemap 之后，保持规范化输出稳定。
+                writer.WritePropertyName("camera");
+                writer.WriteStartObject();
+                WriteVector(writer, "origin", camera.Origin);
+                writer.WriteNumber("zoom", camera.Zoom);
+                writer.WriteEndObject();
             }
             writer.WriteEndObject();
         }
@@ -636,6 +680,14 @@ internal static partial class WorkspaceSceneDocumentCodec
         return tilemaps.ToArray();
     }
 
+    private static WorkspaceSceneCamera ReadCamera(JsonElement value)
+    {
+        var properties = ReadProperties(value, ["origin", "zoom"], [], "Scene.camera");
+        return new WorkspaceSceneCamera(
+            RequireVector(properties["origin"], 2, "Scene.camera.origin"),
+            RequireFiniteDouble(properties["zoom"], "Scene.camera.zoom"));
+    }
+
     private static WorkspaceSceneGameplay ReadGameplay(JsonElement value)
     {
         var properties = ReadProperties(value, ["profile", "timeLimitSeconds"], [], "Scene.gameplay");
@@ -712,7 +764,7 @@ internal static partial class WorkspaceSceneDocumentCodec
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
         int schemaVersion,
         WorkspaceSceneGameplay gameplay) =>
-        Validate(textures, objects, prototypes, schemaVersion, gameplay, Array.Empty<WorkspaceSceneTilemap>());
+        Validate(textures, objects, prototypes, schemaVersion, gameplay, Array.Empty<WorkspaceSceneTilemap>(), IdentityCamera);
 
     private static void Validate(
         IReadOnlyList<WorkspaceSceneTexture> textures,
@@ -720,9 +772,10 @@ internal static partial class WorkspaceSceneDocumentCodec
         IReadOnlyList<WorkspaceScenePrototype> prototypes,
         int schemaVersion,
         WorkspaceSceneGameplay gameplay,
-        IReadOnlyList<WorkspaceSceneTilemap> tilemaps)
+        IReadOnlyList<WorkspaceSceneTilemap> tilemaps,
+        WorkspaceSceneCamera camera)
     {
-        if (schemaVersion is not (LegacySchemaVersion or BehaviorSchemaVersion or PrototypeSchemaVersion or GameplaySchemaVersion or CurrentSchemaVersion)) throw Failure("Unsupported Scene schemaVersion.");
+        if (schemaVersion is not (LegacySchemaVersion or BehaviorSchemaVersion or PrototypeSchemaVersion or GameplaySchemaVersion or TilemapSchemaVersion or CurrentSchemaVersion)) throw Failure("Unsupported Scene schemaVersion.");
         if (schemaVersion < GameplaySchemaVersion && gameplay.Profile != GoalHazardGameplayProfile)
             throw Failure("Scene v4-v6 must normalize to goal_hazard_v1 Gameplay.");
         if (gameplay.Profile == NoGameplayProfile)
@@ -745,7 +798,7 @@ internal static partial class WorkspaceSceneDocumentCodec
             if (texture.TextureId == 0 || !textureIds.Add(texture.TextureId)) throw Failure("Scene.textures textureId must be unique non-zero u32.");
             if (!WorkspaceProjectValidator.IsTextureArtifactPath(texture.Artifact)) throw Failure("Scene.textures artifact path is invalid.");
             if (!IsSamplingProfile(texture.SamplingProfile)) throw Failure("Scene.textures samplingProfile is invalid.");
-            if (schemaVersion < CurrentSchemaVersion && texture.SamplingProfile != SmoothMipmapAnisotropicProfile)
+            if (schemaVersion < TilemapSchemaVersion && texture.SamplingProfile != SmoothMipmapAnisotropicProfile)
                 throw Failure("Scene v4-v7 textures must preserve the legacy sampling profile.");
         }
         var minimum = MinimumObjectCount(schemaVersion, gameplay);
@@ -823,7 +876,7 @@ internal static partial class WorkspaceSceneDocumentCodec
             prototypeBehaviorCount = checked(prototypeBehaviorCount + prototype.Behaviors.Length);
             if (prototypeBehaviorCount > MaxPrototypeBehaviorBindingCount) throw Failure("Scene prototype behavior binding budget exceeded.");
         }
-        if (schemaVersion != CurrentSchemaVersion && tilemaps.Count != 0) throw Failure("Scene tilemaps require schema v8.");
+        if (schemaVersion < TilemapSchemaVersion && tilemaps.Count != 0) throw Failure("Scene tilemaps require schema v8 or later.");
         if (tilemaps.Count > MaxTilemapCount) throw Failure("Scene.tilemaps exceeds the single-layer limit.");
         var tilemapIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var tilemap in tilemaps)
@@ -844,6 +897,12 @@ internal static partial class WorkspaceSceneDocumentCodec
                 ?? throw Failure($"{owner}.textureId is not declared by Scene.textures.");
             if (texture.SamplingProfile != PixelArtProfile) throw Failure($"{owner} Atlas texture must use pixel_art sampling.");
         }
+        ValidateVector(camera.Origin, 2, "Scene.camera.origin", positive: false, color: false);
+        if (!IsFiniteF32(camera.Zoom) || camera.Zoom is < 0.125 or > 8)
+            throw Failure("Scene.camera.zoom must be a finite f32 value in [0.125, 8].");
+        if (schemaVersion != CurrentSchemaVersion
+            && (!camera.Origin.SequenceEqual(IdentityCamera.Origin) || camera.Zoom != IdentityCamera.Zoom))
+            throw Failure("Non-identity Scene camera requires schema v9.");
     }
 
     private static WorkspaceSceneGameplay GameplayForSchema(int schemaVersion) =>

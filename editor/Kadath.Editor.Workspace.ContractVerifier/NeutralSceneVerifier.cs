@@ -65,6 +65,41 @@ internal static class NeutralSceneVerifier
                 && tilemapCommit.ProjectSnapshot.Scene.Tilemaps[0].Cells.SequenceEqual([1, 0, 6, 16]),
                 "Tilemap v7 to v8 authoring commit mismatch.");
             var tilemapScene = File.ReadAllBytes(project.ScenePath);
+
+            var identityCamera = await authoring.ApplyAsync(
+                project,
+                tilemapCommit.Revision,
+                new AuthoringPatch(SceneCamera: new SceneCameraDefinition([0, 0], 1)),
+                default);
+            Require(identityCamera.State == "unchanged"
+                && identityCamera.ProjectSnapshot.Scene.SchemaVersion == 8
+                && identityCamera.ProjectSnapshot.Scene.Camera is { Origin: [0, 0], Zoom: 1 }
+                && File.ReadAllBytes(project.ScenePath).AsSpan().SequenceEqual(tilemapScene),
+                "Identity Camera patch must not upgrade Scene v8.");
+
+            var cameraCommit = await authoring.ApplyAsync(
+                project,
+                tilemapCommit.Revision,
+                new AuthoringPatch(SceneCamera: new SceneCameraDefinition([200, 120], 2)),
+                default);
+            Require(cameraCommit.ChangedFields.SequenceEqual(["scene.camera"])
+                && cameraCommit.ProjectSnapshot.Scene.SchemaVersion == 9
+                && cameraCommit.ProjectSnapshot.Scene.Camera is { Origin: [200, 120], Zoom: 2 },
+                "Camera v8 to v9 authoring commit mismatch.");
+            var cameraScene = File.ReadAllBytes(project.ScenePath);
+            var cameraUndone = await authoring.UndoAsync(project, cameraCommit.Revision, cameraCommit.UndoToken!, default);
+            Require(cameraUndone.ProjectSnapshot.Scene.SchemaVersion == 8
+                && cameraUndone.ProjectSnapshot.Scene.Camera is { Origin: [0, 0], Zoom: 1 }
+                && File.ReadAllBytes(project.ScenePath).AsSpan().SequenceEqual(tilemapScene),
+                "Camera upgrade undo was not byte-exact.");
+            var cameraRedone = await authoring.UndoAsync(project, cameraUndone.Revision, cameraUndone.UndoToken!, default);
+            Require(cameraRedone.ProjectSnapshot.Scene.SchemaVersion == 9
+                && File.ReadAllBytes(project.ScenePath).AsSpan().SequenceEqual(cameraScene),
+                "Camera redo was not byte-exact.");
+            var cameraRestored = await authoring.UndoAsync(project, cameraRedone.Revision, cameraRedone.UndoToken!, default);
+            Require(cameraRestored.ProjectSnapshot.Scene.SchemaVersion == 8
+                && File.ReadAllBytes(project.ScenePath).AsSpan().SequenceEqual(tilemapScene),
+                "Camera redo cleanup did not restore Scene v8.");
             var tilemapUndone = await authoring.UndoAsync(
                 project,
                 tilemapCommit.Revision,

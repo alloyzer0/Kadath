@@ -299,7 +299,8 @@ public sealed class WorkspaceReadModel
                 scene.Gameplay.Profile,
                 scene.Gameplay.IsEnabled ? scene.Gameplay.TimeLimitSeconds : null,
                 scene.Prototypes.Select(prototype => prototype.ToProjectModel()).ToArray(),
-                scene.Tilemaps.Select(tilemap => tilemap.ToProjectModel()).ToArray()),
+                scene.Tilemaps.Select(tilemap => tilemap.ToProjectModel()).ToArray(),
+                scene.Camera.ToProjectModel()),
             new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity, dependencies), new ProjectModelPreview(previewVersion));
     }
 

@@ -261,7 +261,11 @@ public sealed record ProjectModelScene(
     // Prototype 不是 Scene Object；通过独立只读集合公开，不能投影为 Hierarchy node。
     IReadOnlyList<ProjectModelScenePrototype>? Prototypes = null,
     // Tilemap 是独立的静态背景创作域，不进入 Scene Object / Hierarchy 身份域。
-    IReadOnlyList<ProjectModelSceneTilemap>? Tilemaps = null);
+    IReadOnlyList<ProjectModelSceneTilemap>? Tilemaps = null,
+    // Camera2D 是 Scene 级静态展示配置，不进入 Object / Hierarchy 身份域。
+    ProjectModelSceneCamera? Camera = null);
+
+public sealed record ProjectModelSceneCamera(double[] Origin, double Zoom);
 
 public sealed record ProjectModelTexture(
     uint TextureId,
@@ -445,6 +449,8 @@ public sealed record SceneTilemapDefinition(
     int AtlasRows,
     IReadOnlyList<int> Cells);
 
+public sealed record SceneCameraDefinition(double[] Origin, double Zoom);
+
 public sealed record SceneBehaviorBindingDefinition(
     uint ScriptId,
     IReadOnlyDictionary<string, double>? Parameters = null);
@@ -461,7 +467,8 @@ public sealed record AuthoringPatch(
     string? SceneGameplayProfile = null,
     double? SceneGameplayTimeLimitSeconds = null,
     IReadOnlyList<ScenePrototypeDefinition>? ScenePrototypes = null,
-    IReadOnlyList<SceneTilemapDefinition>? SceneTilemaps = null);
+    IReadOnlyList<SceneTilemapDefinition>? SceneTilemaps = null,
+    SceneCameraDefinition? SceneCamera = null);
 
 public sealed record AuthoringApplyParameters(
     string? ProjectName,

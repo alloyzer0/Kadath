@@ -14,12 +14,14 @@ internal static class WorkspaceSceneCodec
     internal const string BehaviorFormat = "KSCN-SCENE-V5";
     internal const string PrototypeFormat = "KSCN-SCENE-V6";
     internal const string GameplayFormat = "KSCN-SCENE-V7";
-    internal const string CurrentFormat = "KSCN-SCENE-V8";
+    internal const string TilemapFormat = "KSCN-SCENE-V8";
+    internal const string CurrentFormat = "KSCN-SCENE-V9";
     private const int LegacyVersion = 4;
     private const int BehaviorVersion = 5;
     private const int PrototypeVersion = 6;
     private const int GameplayVersion = 7;
-    private const int CurrentVersion = 8;
+    private const int TilemapVersion = 8;
+    private const int CurrentVersion = 9;
     private const int HeaderBytes = 16;
     private const int MaxArtifactBytes = 1024 * 1024;
 
@@ -29,6 +31,7 @@ internal static class WorkspaceSceneCodec
         var artifactVersion = scene.SourceSchemaVersion switch
         {
             WorkspaceSceneDocumentCodec.CurrentSchemaVersion => CurrentVersion,
+            WorkspaceSceneDocumentCodec.TilemapSchemaVersion => TilemapVersion,
             WorkspaceSceneDocumentCodec.GameplaySchemaVersion => GameplayVersion,
             WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => PrototypeVersion,
             WorkspaceSceneDocumentCodec.BehaviorSchemaVersion => BehaviorVersion,
@@ -42,12 +45,13 @@ internal static class WorkspaceSceneCodec
             + sizeof(uint)
             + objects.Sum(value => sizeof(uint) + value.EntryBytes(artifactVersion))
             + (artifactVersion >= PrototypeVersion ? sizeof(uint) + prototypes.Sum(value => sizeof(uint) + value.EntryBytes()) : 0)
-            + (artifactVersion == CurrentVersion ? textures.Length * sizeof(uint) : 0)
+            + (artifactVersion >= TilemapVersion ? textures.Length * sizeof(uint) : 0)
             + (artifactVersion >= GameplayVersion ? 2 * sizeof(uint) : 0)
-            + (artifactVersion == CurrentVersion
+            + (artifactVersion >= TilemapVersion
                 ? sizeof(uint) + scene.Tilemaps.Sum(value => sizeof(uint) + StrictUtf8.GetByteCount(value.TilemapId)
                     + 4 * sizeof(float) + 6 * sizeof(uint) + value.Cells.Length * sizeof(ushort))
-                : 0);
+                : 0)
+            + (artifactVersion == CurrentVersion ? 3 * sizeof(float) : 0);
         var artifact = new byte[HeaderBytes + payloadBytes];
         Encoding.ASCII.GetBytes("KSCN").CopyTo(artifact, 0);
         WriteUInt32(artifact, 4, checked((uint)artifactVersion));
@@ -63,7 +67,7 @@ internal static class WorkspaceSceneCodec
             offset += 2 * sizeof(uint);
             texture.Artifact.CopyTo(artifact, offset);
             offset += texture.Artifact.Length;
-            if (artifactVersion == CurrentVersion)
+            if (artifactVersion >= TilemapVersion)
             {
                 WriteUInt32(artifact, offset, SamplingProfileValue(texture.SamplingProfile));
                 offset += sizeof(uint);
@@ -131,7 +135,7 @@ internal static class WorkspaceSceneCodec
             WriteSingle(artifact, offset + sizeof(uint), (float)scene.Gameplay.TimeLimitSeconds);
             offset += 2 * sizeof(uint);
         }
-        if (artifactVersion == CurrentVersion)
+        if (artifactVersion >= TilemapVersion)
         {
             WriteUInt32(artifact, offset, checked((uint)scene.Tilemaps.Length));
             offset += sizeof(uint);
@@ -161,6 +165,14 @@ internal static class WorkspaceSceneCodec
                 }
             }
         }
+        if (artifactVersion == CurrentVersion)
+        {
+            // KSCN v9 在 v8 Tilemap 尾部后追加 Camera2D origin[2] 与 zoom。
+            WriteSingle(artifact, offset, (float)scene.Camera.Origin[0]);
+            WriteSingle(artifact, offset + 4, (float)scene.Camera.Origin[1]);
+            WriteSingle(artifact, offset + 8, (float)scene.Camera.Zoom);
+            offset += 12;
+        }
         if (offset != artifact.Length) throw new InvalidOperationException("Internal KSCN length mismatch.");
         _ = ValidateArtifact(artifact);
         return artifact;
@@ -173,7 +185,7 @@ internal static class WorkspaceSceneCodec
         var artifactVersion = ReadUInt32(artifact, 4);
         var schemaVersion = ReadUInt32(artifact, 8);
         if (artifactVersion != schemaVersion
-            || artifactVersion is not (LegacyVersion or BehaviorVersion or PrototypeVersion or GameplayVersion or CurrentVersion)
+            || artifactVersion is not (LegacyVersion or BehaviorVersion or PrototypeVersion or GameplayVersion or TilemapVersion or CurrentVersion)
             || ReadUInt32(artifact, 12) != artifact.Length - HeaderBytes)
             throw new InvalidDataException("Scene artifact header mismatch.");
         var offset = HeaderBytes;
@@ -185,7 +197,7 @@ internal static class WorkspaceSceneCodec
             var textureId = ReadRequiredUInt32(artifact, ref offset);
             var pathBytes = ReadRequiredUInt32(artifact, ref offset);
             var path = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, pathBytes));
-            var samplingProfile = artifactVersion == CurrentVersion
+            var samplingProfile = artifactVersion >= TilemapVersion
                 ? SamplingProfileName(ReadRequiredUInt32(artifact, ref offset))
                 : WorkspaceSceneDocumentCodec.SmoothMipmapAnisotropicProfile;
             textures.Add(new WorkspaceSceneTexture(textureId, path, samplingProfile));
@@ -281,7 +293,7 @@ internal static class WorkspaceSceneCodec
                 ReadRequiredSingle(artifact, ref offset));
         }
         var tilemaps = new List<WorkspaceSceneTilemap>();
-        if (artifactVersion == CurrentVersion)
+        if (artifactVersion >= TilemapVersion)
         {
             var tilemapCount = ReadRequiredUInt32(artifact, ref offset);
             if (tilemapCount > WorkspaceSceneDocumentCodec.MaxTilemapCount) throw new InvalidDataException("Scene artifact Tilemap count mismatch.");
@@ -304,12 +316,18 @@ internal static class WorkspaceSceneCodec
                     tilemapId, origin, tileSize, columns, rows, textureId, atlasColumns, atlasRows, cells));
             }
         }
+        var camera = WorkspaceSceneDocumentCodec.IdentityCamera;
+        if (artifactVersion == CurrentVersion)
+        {
+            camera = new WorkspaceSceneCamera(ReadVector(artifact, ref offset, 2), ReadRequiredSingle(artifact, ref offset));
+        }
         if (offset != artifact.Length) throw new InvalidDataException("Scene artifact contains trailing bytes.");
-        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects, prototypes, checked((int)schemaVersion), gameplay, tilemaps); }
+        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects, prototypes, checked((int)schemaVersion), gameplay, tilemaps, camera); }
         catch (WorkspaceProjectValidationException exception) { throw new InvalidDataException(exception.Message, exception); }
         var format = artifactVersion switch
         {
             CurrentVersion => CurrentFormat,
+            TilemapVersion => TilemapFormat,
             GameplayVersion => GameplayFormat,
             PrototypeVersion => PrototypeFormat,
             BehaviorVersion => BehaviorFormat,
