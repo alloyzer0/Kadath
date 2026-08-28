@@ -132,6 +132,39 @@ test "Renderer2D culls Tilemap with half-open visible row and column ranges" {
     std.debug.print("CAMERA_TILEMAP_CULLING=true\n", .{});
 }
 
+test "Renderer2D recomputes Camera visible ranges after extent recreation" {
+    var backend = try rhi.Rhi.init(extent);
+    defer backend.deinit();
+    var renderer = try renderer2d.Renderer2D.init(&backend);
+    defer renderer.deinit(&backend);
+    const texture = try makeTexture(&backend, &renderer);
+    defer backend.destroyTexture(texture);
+
+    const cells = [_]u16{1} ** 8;
+    const tilemaps = [_]renderer2d.TilemapLayerView{.{
+        .origin = .{ 0, 0 },
+        .tile_size = .{ 16, 16 },
+        .columns = 8,
+        .rows = 1,
+        .atlas_columns = 1,
+        .atlas_rows = 1,
+        .texture = texture,
+        .cells = &cells,
+    }};
+    var before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, extent, .{ .tilemaps = &tilemaps }));
+    try expectRecordingDelta(before, backend.stats(), 1, 1, 1, 1, 4);
+
+    const resized = rhi.Extent2D{ .width = 128, .height = 64 };
+    before = backend.stats();
+    try std.testing.expectEqual(.recreated, try renderer.renderFrame(&backend, resized, .{ .tilemaps = &tilemaps }));
+    try expectNoRecordingDelta(before, backend.stats());
+
+    before = backend.stats();
+    try std.testing.expectEqual(.presented, try renderer.renderFrame(&backend, resized, .{ .tilemaps = &tilemaps }));
+    try expectRecordingDelta(before, backend.stats(), 1, 1, 1, 1, 8);
+}
+
 test "Renderer2D culls sprites and merges visible texture runs across invisible separators" {
     var backend = try rhi.Rhi.init(extent);
     defer backend.deinit();

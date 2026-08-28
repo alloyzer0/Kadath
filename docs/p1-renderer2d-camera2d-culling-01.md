@@ -23,7 +23,7 @@
 ## 验证证据
 
 - Scene：24/24 测试通过，覆盖 v9 source/KSCN 往返、非法值、截断与 v8 identity 兼容。
-- Renderer2D Null：20/20 测试通过，输出 `CAMERA_IDENTITY_COMPATIBLE`、`CAMERA_TILEMAP_CULLING`、`CAMERA_SPRITE_CULLING`。
+- Renderer2D Null：21/21 测试通过，覆盖 extent recreation 后从 4 个可见 Tile 重新计算为 8 个，并输出 `CAMERA_IDENTITY_COMPATIBLE`、`CAMERA_TILEMAP_CULLING`、`CAMERA_SPRITE_CULLING`。
 - Zig：全部 10 个公开测试步骤通过，包括 Runtime Core/public C、SceneGeneration、Behavior、Audio、Replay 与 Resource。
 - Editor：Debug/Release 全解决方案均为 0 警告；Workspace、Service、Client 三组 ContractVerifier 通过。
 - Avalonia owned workflow：Camera Apply/Undo、Both Bake、Watch、Preview reload、Shutdown 与 File-ID cleanup 全部通过。
