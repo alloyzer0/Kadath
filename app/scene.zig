@@ -1,13 +1,15 @@
 const std = @import("std");
 const content_identity = @import("content_identity.zig");
 
-pub const current_schema_version: u32 = 9;
+pub const current_schema_version: u32 = 10;
+pub const camera_schema_version: u32 = 9;
 pub const tilemap_schema_version: u32 = 8;
 pub const gameplay_schema_version: u32 = 7;
 pub const prototype_schema_version: u32 = 6;
 pub const behavior_schema_version: u32 = 5;
 pub const legacy_object_schema_version: u32 = 4;
-pub const scene_artifact_version: u32 = 9;
+pub const scene_artifact_version: u32 = 10;
+pub const camera_artifact_version: u32 = 9;
 pub const tilemap_artifact_version: u32 = 8;
 pub const gameplay_artifact_version: u32 = 7;
 pub const prototype_artifact_version: u32 = 6;
@@ -30,6 +32,9 @@ pub const max_tilemap_rows: usize = 32;
 pub const max_tilemap_cell_count: usize = max_tilemap_columns * max_tilemap_rows;
 pub const max_tilemap_atlas_dimension: usize = 256;
 pub const max_tilemap_atlas_tiles: usize = std.math.maxInt(u16);
+pub const max_chunked_tilemap_count: usize = 4;
+pub const max_chunked_tilemap_asset_bytes: u64 = 64 * 1024 * 1024;
+pub const max_chunked_tilemap_artifact_path_bytes: usize = 255;
 pub const min_neutral_scene_object_count: usize = 1;
 
 const scene_artifact_header_bytes: usize = 16;
@@ -281,6 +286,57 @@ pub const TilemapSet = struct {
     }
 };
 
+pub const TilemapArtifactPath = struct {
+    byte_count: u8 = 0,
+    storage: [max_chunked_tilemap_artifact_path_bytes]u8 = [_]u8{0} ** max_chunked_tilemap_artifact_path_bytes,
+
+    pub fn init(bytes: []const u8) !TilemapArtifactPath {
+        try validateTilemapArtifactPath(bytes);
+        var value = TilemapArtifactPath{ .byte_count = @intCast(bytes.len) };
+        @memcpy(value.storage[0..bytes.len], bytes);
+        return value;
+    }
+
+    pub fn slice(self: *const TilemapArtifactPath) []const u8 {
+        return self.storage[0..self.byte_count];
+    }
+};
+
+pub const TilemapArtifactRevision = struct {
+    storage: [64]u8 = [_]u8{'0'} ** 64,
+
+    pub fn init(bytes: []const u8) !TilemapArtifactRevision {
+        if (bytes.len != 64) return error.InvalidTilemapArtifactRevision;
+        for (bytes) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) {
+            return error.InvalidTilemapArtifactRevision;
+        };
+        var value = TilemapArtifactRevision{};
+        @memcpy(&value.storage, bytes);
+        return value;
+    }
+
+    pub fn slice(self: *const TilemapArtifactRevision) []const u8 {
+        return &self.storage;
+    }
+};
+
+pub const ChunkedTilemapRef = struct {
+    tilemapId: TilemapId = .{},
+    origin: [2]f32 = .{ 0, 0 },
+    artifact: TilemapArtifactPath = .{},
+    artifactRevision: TilemapArtifactRevision = .{},
+    artifactBytes: u64 = 0,
+};
+
+pub const ChunkedTilemapSet = struct {
+    count: u8 = 0,
+    entries: [max_chunked_tilemap_count]ChunkedTilemapRef = [_]ChunkedTilemapRef{.{}} ** max_chunked_tilemap_count,
+
+    pub fn slice(self: *const ChunkedTilemapSet) []const ChunkedTilemapRef {
+        return self.entries[0..self.count];
+    }
+};
+
 pub const Camera2DConfig = struct {
     // 相机原点是视口左上角对应的世界坐标；默认值保持 v4-v8 的像素输出不变。
     origin: [2]f32 = .{ 0.0, 0.0 },
@@ -300,6 +356,7 @@ pub const Scene = struct {
     prototypes: SpawnPrototypeSet = .{},
     gameplay: GameplayConfig = .{},
     tilemaps: TilemapSet = .{},
+    chunkedTilemaps: ChunkedTilemapSet = .{},
     camera: Camera2DConfig = .{},
 
     pub fn gameplayProfile(self: *const Scene) GameplayProfile {
@@ -488,6 +545,24 @@ const WireSceneV9 = struct {
     camera: WireCamera2D,
 };
 
+const WireChunkedTilemapRef = struct {
+    tilemapId: []const u8,
+    origin: [2]f32,
+    artifact: []const u8,
+    artifactRevision: []const u8,
+    artifactBytes: u64,
+};
+
+const WireSceneV10 = struct {
+    schemaVersion: u32,
+    textures: []const WireTextureSpecV8,
+    objects: []const WireSceneObjectV5,
+    prototypes: []const WireSpawnPrototype,
+    gameplay: ?WireGameplayConfig = null,
+    tilemaps: []const WireChunkedTilemapRef,
+    camera: WireCamera2D,
+};
+
 const SchemaProbe = struct {
     schemaVersion: u32,
 };
@@ -636,7 +711,8 @@ fn parseInto(allocator: std.mem.Allocator, contents: []const u8, output: *Scene)
         prototype_schema_version => try parseSourceV6Into(allocator, contents, output),
         gameplay_schema_version => try parseSourceV7Into(allocator, contents, output),
         tilemap_schema_version => try parseSourceV8Into(allocator, contents, output),
-        current_schema_version => try parseSourceV9Into(allocator, contents, output),
+        camera_schema_version => try parseSourceV9Into(allocator, contents, output),
+        current_schema_version => try parseSourceV10Into(allocator, contents, output),
         else => return error.UnsupportedSceneSchema,
     }
 }
@@ -784,11 +860,56 @@ fn parseSourceV8Into(allocator: std.mem.Allocator, contents: []const u8, output:
 fn parseSourceV9Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
     const parsed = try std.json.parseFromSlice(WireSceneV9, allocator, contents, .{});
     defer parsed.deinit();
-    if (parsed.value.schemaVersion != current_schema_version) return error.UnsupportedSceneSchema;
-    try normalizeTilemapSceneSourceInto(parsed.value, current_schema_version, .{
+    if (parsed.value.schemaVersion != camera_schema_version) return error.UnsupportedSceneSchema;
+    try normalizeTilemapSceneSourceInto(parsed.value, camera_schema_version, .{
         .origin = parsed.value.camera.origin,
         .zoom = parsed.value.camera.zoom,
     }, output);
+}
+
+fn parseSourceV10Into(allocator: std.mem.Allocator, contents: []const u8, output: *Scene) !void {
+    const parsed = try std.json.parseFromSlice(WireSceneV10, allocator, contents, .{});
+    defer parsed.deinit();
+    if (parsed.value.schemaVersion != current_schema_version) return error.UnsupportedSceneSchema;
+    const wire = parsed.value;
+    const gameplay = if (wire.gameplay) |value|
+        GameplayConfig{ .profile = value.profile, .timeLimitSeconds = value.timeLimitSeconds }
+    else
+        GameplayConfig{};
+    output.* = .{
+        .schemaVersion = current_schema_version,
+        .textures = try normalizeTexturesV8(wire.textures),
+        .objects = undefined,
+        .gameplay = gameplay,
+        .camera = .{ .origin = wire.camera.origin, .zoom = wire.camera.zoom },
+    };
+    try normalizeBehaviorSceneObjectsInto(wire.objects, min_neutral_scene_object_count, &output.objects);
+    if (wire.prototypes.len > max_spawn_prototype_count) return error.SpawnPrototypeCountExceeded;
+    output.prototypes.count = @intCast(wire.prototypes.len);
+    for (wire.prototypes, 0..) |prototype, index| {
+        output.prototypes.entries[index] = .{
+            .prototypeId = try PrototypeId.init(prototype.prototypeId),
+            .kind = prototype.kind,
+            .sprite = .{
+                .size = prototype.sprite.size,
+                .color = prototype.sprite.color,
+                .textureId = prototype.sprite.textureId,
+            },
+            .behaviors = try normalizeBehaviorBindings(prototype.behaviors),
+        };
+    }
+    if (wire.tilemaps.len > max_chunked_tilemap_count) return error.TilemapCountExceeded;
+    output.chunkedTilemaps.count = @intCast(wire.tilemaps.len);
+    for (wire.tilemaps, 0..) |tilemap, index| {
+        output.chunkedTilemaps.entries[index] = .{
+            .tilemapId = try TilemapId.init(tilemap.tilemapId),
+            .origin = tilemap.origin,
+            .artifact = try TilemapArtifactPath.init(tilemap.artifact),
+            .artifactRevision = try TilemapArtifactRevision.init(tilemap.artifactRevision),
+            .artifactBytes = tilemap.artifactBytes,
+        };
+    }
+    try validate(output);
 }
 
 fn normalizeTilemapSceneSourceInto(wire_scene: anytype, schema_version: u32, camera: Camera2DConfig, output: *Scene) !void {
@@ -1017,7 +1138,7 @@ pub fn artifactByteCount(value: *const Scene) !usize {
         // KSCN v7 尾部显式保存 profile 与 time limit，Runtime 不再从角色表猜测模式。
         payload_bytes = try std.math.add(usize, payload_bytes, 8);
     }
-    if (schemaHasTilemaps(value.schemaVersion)) {
+    if (schemaHasLegacyTilemaps(value.schemaVersion)) {
         payload_bytes = try std.math.add(usize, payload_bytes, 4);
         for (value.tilemaps.slice()) |tilemap| {
             const cell_bytes = try std.math.mul(usize, tilemap.cellSlice().len, @sizeOf(u16));
@@ -1025,7 +1146,17 @@ pub fn artifactByteCount(value: *const Scene) !usize {
             payload_bytes = try std.math.add(usize, payload_bytes, cell_bytes);
         }
     }
-    if (value.schemaVersion == current_schema_version) {
+    if (schemaHasChunkedTilemaps(value.schemaVersion)) {
+        payload_bytes = try std.math.add(usize, payload_bytes, 4);
+        for (value.chunkedTilemaps.slice()) |tilemap| {
+            payload_bytes = try std.math.add(
+                usize,
+                payload_bytes,
+                4 + tilemap.tilemapId.slice().len + 8 + 4 + tilemap.artifact.slice().len + 64 + 8,
+            );
+        }
+    }
+    if (schemaHasCamera(value.schemaVersion)) {
         // KSCN v9 在 v8 Tilemap 尾部后追加 Camera2D：origin f32[2] + zoom f32。
         payload_bytes = try std.math.add(usize, payload_bytes, 3 * @sizeOf(f32));
     }
@@ -1117,7 +1248,7 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
         writeLittleF32(output[cursor + 4 ..][0..4], value.gameplay.timeLimitSeconds);
         cursor += 8;
     }
-    if (schemaHasTilemaps(value.schemaVersion)) {
+    if (schemaHasLegacyTilemaps(value.schemaVersion)) {
         writeLittleU32(output[cursor..][0..4], value.tilemaps.count);
         cursor += 4;
         for (value.tilemaps.slice()) |tilemap| {
@@ -1142,7 +1273,28 @@ pub fn writeArtifact(value: *const Scene, output: []u8) ![]u8 {
             }
         }
     }
-    if (value.schemaVersion == current_schema_version) {
+    if (schemaHasChunkedTilemaps(value.schemaVersion)) {
+        writeLittleU32(output[cursor..][0..4], value.chunkedTilemaps.count);
+        cursor += 4;
+        for (value.chunkedTilemaps.slice()) |tilemap| {
+            writeLittleU32(output[cursor..][0..4], tilemap.tilemapId.byte_count);
+            cursor += 4;
+            @memcpy(output[cursor .. cursor + tilemap.tilemapId.byte_count], tilemap.tilemapId.slice());
+            cursor += tilemap.tilemapId.byte_count;
+            writeLittleF32(output[cursor..][0..4], tilemap.origin[0]);
+            writeLittleF32(output[cursor + 4 ..][0..4], tilemap.origin[1]);
+            cursor += 8;
+            writeLittleU32(output[cursor..][0..4], tilemap.artifact.byte_count);
+            cursor += 4;
+            @memcpy(output[cursor .. cursor + tilemap.artifact.byte_count], tilemap.artifact.slice());
+            cursor += tilemap.artifact.byte_count;
+            @memcpy(output[cursor .. cursor + 64], tilemap.artifactRevision.slice());
+            cursor += 64;
+            writeLittleU64(output[cursor..][0..8], tilemap.artifactBytes);
+            cursor += 8;
+        }
+    }
+    if (schemaHasCamera(value.schemaVersion)) {
         writeLittleF32(output[cursor..][0..4], value.camera.origin[0]);
         writeLittleF32(output[cursor + 4 ..][0..4], value.camera.origin[1]);
         writeLittleF32(output[cursor + 8 ..][0..4], value.camera.zoom);
@@ -1159,6 +1311,7 @@ fn artifactVersionForSchema(schema_version: u32) !u32 {
         prototype_schema_version => prototype_artifact_version,
         gameplay_schema_version => gameplay_artifact_version,
         tilemap_schema_version => tilemap_artifact_version,
+        camera_schema_version => camera_artifact_version,
         current_schema_version => scene_artifact_version,
         else => error.UnsupportedSceneSchema,
     };
@@ -1216,32 +1369,31 @@ fn writeBehaviorBindingSet(output: []u8, start: usize, bindings: *const Behavior
 }
 
 fn schemaHasBehaviorBindings(schema_version: u32) bool {
-    return schema_version == behavior_schema_version or
-        schema_version == prototype_schema_version or
-        schema_version == gameplay_schema_version or
-        schema_version == tilemap_schema_version or
-        schema_version == current_schema_version;
+    return schema_version >= behavior_schema_version and schema_version <= current_schema_version;
 }
 
 fn schemaHasSpawnPrototypes(schema_version: u32) bool {
-    return schema_version == prototype_schema_version or
-        schema_version == gameplay_schema_version or
-        schema_version == tilemap_schema_version or
-        schema_version == current_schema_version;
+    return schema_version >= prototype_schema_version and schema_version <= current_schema_version;
 }
 
 fn schemaHasExplicitGameplay(schema_version: u32) bool {
-    return schema_version == gameplay_schema_version or
-        schema_version == tilemap_schema_version or
-        schema_version == current_schema_version;
+    return schema_version >= gameplay_schema_version and schema_version <= current_schema_version;
 }
 
 fn schemaHasTextureSamplingProfiles(schema_version: u32) bool {
-    return schema_version == tilemap_schema_version or schema_version == current_schema_version;
+    return schema_version >= tilemap_schema_version and schema_version <= current_schema_version;
 }
 
-fn schemaHasTilemaps(schema_version: u32) bool {
-    return schema_version == tilemap_schema_version or schema_version == current_schema_version;
+fn schemaHasLegacyTilemaps(schema_version: u32) bool {
+    return schema_version == tilemap_schema_version or schema_version == camera_schema_version;
+}
+
+fn schemaHasChunkedTilemaps(schema_version: u32) bool {
+    return schema_version == current_schema_version;
+}
+
+fn schemaHasCamera(schema_version: u32) bool {
+    return schema_version >= camera_schema_version and schema_version <= current_schema_version;
 }
 
 fn parseArtifact(source: []const u8) !Scene {
@@ -1262,23 +1414,27 @@ fn parseArtifactInto(source: []const u8, output: *Scene) !void {
         legacy_object_artifact_version => try parseArtifactV4Into(source, schema_version, output),
         behavior_artifact_version => {
             if (schema_version != behavior_schema_version) return error.UnsupportedSceneSchema;
-            try parseArtifactBehaviorSceneInto(source, behavior_schema_version, false, false, false, false, output);
+            try parseArtifactBehaviorSceneInto(source, behavior_schema_version, false, false, false, false, false, output);
         },
         prototype_artifact_version => {
             if (schema_version != prototype_schema_version) return error.UnsupportedSceneSchema;
-            try parseArtifactBehaviorSceneInto(source, prototype_schema_version, true, false, false, false, output);
+            try parseArtifactBehaviorSceneInto(source, prototype_schema_version, true, false, false, false, false, output);
         },
         gameplay_artifact_version => {
             if (schema_version != gameplay_schema_version) return error.UnsupportedSceneSchema;
-            try parseArtifactBehaviorSceneInto(source, gameplay_schema_version, true, true, false, false, output);
+            try parseArtifactBehaviorSceneInto(source, gameplay_schema_version, true, true, false, false, false, output);
         },
         tilemap_artifact_version => {
             if (schema_version != tilemap_schema_version) return error.UnsupportedSceneSchema;
-            try parseArtifactBehaviorSceneInto(source, tilemap_schema_version, true, true, true, true, output);
+            try parseArtifactBehaviorSceneInto(source, tilemap_schema_version, true, true, true, true, false, output);
+        },
+        camera_artifact_version => {
+            if (schema_version != camera_schema_version) return error.UnsupportedSceneSchema;
+            try parseArtifactBehaviorSceneInto(source, camera_schema_version, true, true, true, true, false, output);
         },
         scene_artifact_version => {
             if (schema_version != current_schema_version) return error.UnsupportedSceneSchema;
-            try parseArtifactBehaviorSceneInto(source, current_schema_version, true, true, true, true, output);
+            try parseArtifactBehaviorSceneInto(source, current_schema_version, true, true, true, false, true, output);
         },
         else => return error.UnsupportedSceneArtifactVersion,
     }
@@ -1396,6 +1552,7 @@ fn parseArtifactBehaviorSceneInto(
     read_gameplay: bool,
     read_sampling_profiles: bool,
     read_tilemaps: bool,
+    read_chunked_tilemaps: bool,
     output: *Scene,
 ) !void {
     var reader = ByteReader{ .source = source, .cursor = scene_artifact_header_bytes };
@@ -1485,7 +1642,21 @@ fn parseArtifactBehaviorSceneInto(
             for (tilemap.cells[0..cell_count]) |*cell| cell.* = try reader.readU16();
         }
     }
-    if (schema_version == current_schema_version) {
+    if (read_chunked_tilemaps) {
+        const tilemap_count = try reader.readU32();
+        if (tilemap_count > max_chunked_tilemap_count) return error.TilemapCountExceeded;
+        output.chunkedTilemaps.count = @intCast(tilemap_count);
+        for (output.chunkedTilemaps.entries[0..output.chunkedTilemaps.count]) |*tilemap| {
+            const id_bytes = try reader.readU32();
+            tilemap.tilemapId = try TilemapId.init(try reader.readBytes(id_bytes));
+            tilemap.origin = .{ try reader.readF32(), try reader.readF32() };
+            const artifact_bytes = try reader.readU32();
+            tilemap.artifact = try TilemapArtifactPath.init(try reader.readBytes(artifact_bytes));
+            tilemap.artifactRevision = try TilemapArtifactRevision.init(try reader.readBytes(64));
+            tilemap.artifactBytes = try reader.readU64();
+        }
+    }
+    if (schemaHasCamera(schema_version)) {
         // v9 Camera2D 尾部必须完整存在；截断和额外字节均由 ByteReader 拒绝。
         output.camera.origin = .{ try reader.readF32(), try reader.readF32() };
         output.camera.zoom = try reader.readF32();
@@ -1583,6 +1754,7 @@ pub fn validate(value: *const Scene) !void {
         value.schemaVersion != prototype_schema_version and
         value.schemaVersion != gameplay_schema_version and
         value.schemaVersion != tilemap_schema_version and
+        value.schemaVersion != camera_schema_version and
         value.schemaVersion != current_schema_version)
     {
         return error.UnsupportedSceneSchema;
@@ -1685,7 +1857,7 @@ pub fn validate(value: *const Scene) !void {
         }
     }
 
-    if (!schemaHasTilemaps(value.schemaVersion)) {
+    if (!schemaHasLegacyTilemaps(value.schemaVersion)) {
         if (value.tilemaps.count != 0) return error.LegacySceneTilemap;
     } else {
         if (value.tilemaps.count > max_tilemap_count) return error.TilemapCountExceeded;
@@ -1694,7 +1866,25 @@ pub fn validate(value: *const Scene) !void {
         }
     }
 
-    if (value.schemaVersion != current_schema_version) {
+    if (!schemaHasChunkedTilemaps(value.schemaVersion)) {
+        if (value.chunkedTilemaps.count != 0) return error.LegacySceneTilemap;
+    } else {
+        if (value.chunkedTilemaps.count > max_chunked_tilemap_count) return error.TilemapCountExceeded;
+        for (value.chunkedTilemaps.slice(), 0..) |tilemap, index| {
+            _ = TilemapId.init(tilemap.tilemapId.slice()) catch return error.InvalidTilemapId;
+            for (value.chunkedTilemaps.slice()[0..index]) |previous| {
+                if (std.mem.eql(u8, tilemap.tilemapId.slice(), previous.tilemapId.slice())) return error.DuplicateTilemapId;
+            }
+            for (tilemap.origin) |number| if (!std.math.isFinite(number)) return error.InvalidTilemapOrigin;
+            try validateTilemapArtifactPath(tilemap.artifact.slice());
+            _ = try TilemapArtifactRevision.init(tilemap.artifactRevision.slice());
+            if (tilemap.artifactBytes == 0 or tilemap.artifactBytes > max_chunked_tilemap_asset_bytes) {
+                return error.InvalidTilemapArtifactBytes;
+            }
+        }
+    }
+
+    if (!schemaHasCamera(value.schemaVersion)) {
         if (value.camera.origin[0] != 0 or value.camera.origin[1] != 0 or value.camera.zoom != 1) {
             return error.LegacySceneCamera;
         }
@@ -1793,6 +1983,21 @@ fn validateTextureArtifact(artifact: []const u8) !void {
     var segments = std.mem.splitScalar(u8, artifact, '/');
     while (segments.next()) |segment| {
         if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.InvalidTextureArtifact;
+    }
+}
+
+fn validateTilemapArtifactPath(artifact: []const u8) !void {
+    if (artifact.len == 0 or artifact.len > max_chunked_tilemap_artifact_path_bytes) return error.InvalidTilemapArtifactPath;
+    if (!std.unicode.utf8ValidateSlice(artifact)) return error.InvalidTilemapArtifactPath;
+    if (!std.mem.startsWith(u8, artifact, "assets/tilemaps/") or !std.mem.endsWith(u8, artifact, ".tilemap")) {
+        return error.InvalidTilemapArtifactPath;
+    }
+    if (std.mem.indexOfScalar(u8, artifact, '\\') != null or artifact[0] == '/') return error.InvalidTilemapArtifactPath;
+    var segments = std.mem.splitScalar(u8, artifact, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) {
+            return error.InvalidTilemapArtifactPath;
+        }
     }
 }
 
@@ -2307,4 +2512,33 @@ test "scene identity is computed from the validated source buffer" {
     const loaded = try parseWithIdentity(std.testing.allocator, contents, .source_document);
     const expected = try content_identity.ContentIdentity.fromBytes(.source_document, contents);
     try std.testing.expectEqual(expected, loaded.identity);
+}
+
+test "scene and KSCN v10 round trip content addressed chunked Tilemap references" {
+    const source =
+        \\{"schemaVersion":10,"textures":[{"textureId":1,"artifact":"assets/renderer2d/test.texture","samplingProfile":"pixel_art"}],
+        \\"objects":[{"objectId":"decor","kind":"sprite","transform":{"position":[0,0]},"sprite":{"size":[16,16],"color":[1,1,1,1],"textureId":1},"behaviors":[]}],
+        \\"prototypes":[],"gameplay":{"profile":"none","timeLimitSeconds":0},
+        \\"tilemaps":[{"tilemapId":"world","origin":[-32,64],"artifact":"assets/tilemaps/world-01234567.tilemap","artifactRevision":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","artifactBytes":4096}],
+        \\"camera":{"origin":[20,30],"zoom":2}}
+    ;
+    const value = try parse(std.testing.allocator, source);
+    try std.testing.expectEqual(current_schema_version, value.schemaVersion);
+    try std.testing.expectEqual(@as(u8, 0), value.tilemaps.count);
+    try std.testing.expectEqual(@as(u8, 1), value.chunkedTilemaps.count);
+    try std.testing.expectEqualStrings("world", value.chunkedTilemaps.entries[0].tilemapId.slice());
+    try std.testing.expectEqualStrings("assets/tilemaps/world-01234567.tilemap", value.chunkedTilemaps.entries[0].artifact.slice());
+
+    const artifact = try encodeArtifact(std.testing.allocator, &value);
+    defer std.testing.allocator.free(artifact);
+    try std.testing.expectEqual(scene_artifact_version, readLittleU32(artifact[4..8]));
+    const decoded = try parseArtifact(artifact);
+    try std.testing.expectEqualStrings(value.chunkedTilemaps.entries[0].artifactRevision.slice(), decoded.chunkedTilemaps.entries[0].artifactRevision.slice());
+    try std.testing.expectEqual(@as(u64, 4096), decoded.chunkedTilemaps.entries[0].artifactBytes);
+    try std.testing.expectEqual(@as(f32, 2), decoded.camera.zoom);
+    try std.testing.expectError(error.InvalidSceneArtifact, parseArtifact(artifact[0 .. artifact.len - 1]));
+
+    const invalid_path = std.mem.replaceOwned(u8, std.testing.allocator, source, "assets/tilemaps/world-01234567.tilemap", "../world.tilemap") catch unreachable;
+    defer std.testing.allocator.free(invalid_path);
+    try std.testing.expectError(error.InvalidTilemapArtifactPath, parse(std.testing.allocator, invalid_path));
 }

@@ -367,6 +367,7 @@ public sealed class WorkspaceAuthoringModel
         var currentObjects = current.Scene.Objects ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene object set is missing from the snapshot.");
         var currentPrototypes = current.Scene.Prototypes ?? throw Failure(WorkspaceAuthoringFailureKind.Invariant, "Scene Prototype set is missing from the snapshot.");
         var currentTilemaps = current.Scene.Tilemaps ?? Array.Empty<ProjectModelSceneTilemap>();
+        var currentChunkedTilemaps = current.Scene.ChunkedTilemaps ?? Array.Empty<ProjectModelSceneChunkedTilemap>();
         var targetSchema = TargetSceneSchema(current.Scene.SchemaVersion);
         var currentCameraModel = current.Scene.Camera ?? new ProjectModelSceneCamera([0, 0], 1);
         var currentCamera = new WorkspaceSceneCamera(currentCameraModel.Origin.ToArray(), currentCameraModel.Zoom);
@@ -380,17 +381,30 @@ public sealed class WorkspaceAuthoringModel
             if (normalizedCamera.Origin.SequenceEqual(currentCamera.Origin) && normalizedCamera.Zoom == currentCamera.Zoom)
                 normalizedCamera = null;
             else if (current.Scene.SchemaVersion == WorkspaceSceneDocumentCodec.TilemapSchemaVersion)
-                targetSchema = WorkspaceSceneDocumentCodec.CurrentSchemaVersion;
+                targetSchema = WorkspaceSceneDocumentCodec.CameraSchemaVersion;
         }
         WorkspaceSceneTilemap[]? normalizedTilemaps = null;
         if (patch.SceneTilemaps is not null)
         {
-            if (current.Scene.SchemaVersion < WorkspaceSceneDocumentCodec.GameplaySchemaVersion)
-                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "scene.tilemaps can only be authored from Scene v7-v9.");
+            if (current.Scene.SchemaVersion < WorkspaceSceneDocumentCodec.GameplaySchemaVersion || current.Scene.SchemaVersion > WorkspaceSceneDocumentCodec.CameraSchemaVersion)
+                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "legacy scene.tilemaps can only be authored from Scene v7-v9.");
             try { normalizedTilemaps = WorkspaceSceneDocumentCodec.NormalizeTilemapDefinitions(patch.SceneTilemaps); }
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
             if (current.Scene.SchemaVersion == WorkspaceSceneDocumentCodec.GameplaySchemaVersion && normalizedTilemaps.Length != 0)
                 targetSchema = WorkspaceSceneDocumentCodec.TilemapSchemaVersion;
+        }
+        WorkspaceSceneChunkedTilemap[]? normalizedChunkedTilemaps = null;
+        if (patch.SceneChunkedTilemaps is not null)
+        {
+            if (patch.SceneTilemaps is not null)
+                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "legacy and chunked scene.tilemaps cannot be authored together.");
+            if (current.Scene.SchemaVersion < WorkspaceSceneDocumentCodec.GameplaySchemaVersion)
+                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "chunked scene.tilemaps require Scene v7 or later.");
+            if (currentTilemaps.Count != 0)
+                throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "Remove or migrate the legacy inline Tilemap before adding a chunked Tilemap asset.");
+            try { normalizedChunkedTilemaps = WorkspaceSceneDocumentCodec.NormalizeChunkedTilemapDefinitions(patch.SceneChunkedTilemaps); }
+            catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
+            targetSchema = WorkspaceSceneDocumentCodec.CurrentSchemaVersion;
         }
         WorkspaceSceneObject[]? normalizedObjects = null;
         if (patch.SceneObjects is not null)
@@ -404,6 +418,7 @@ public sealed class WorkspaceAuthoringModel
             if (current.Scene.SchemaVersion is not (WorkspaceSceneDocumentCodec.PrototypeSchemaVersion
                 or WorkspaceSceneDocumentCodec.GameplaySchemaVersion
                 or WorkspaceSceneDocumentCodec.TilemapSchemaVersion
+                or WorkspaceSceneDocumentCodec.CameraSchemaVersion
                 or WorkspaceSceneDocumentCodec.CurrentSchemaVersion))
                 throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "scene.prototypes can only be authored for Scene v6 or later.");
             try
@@ -413,6 +428,7 @@ public sealed class WorkspaceAuthoringModel
             catch (WorkspaceProjectValidationException exception) { throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, exception.Message, exception); }
         }
         if (sceneTextures.ResolvedTextures is not null || patch.SceneObjects is not null || patch.ScenePrototypes is not null || patch.SceneTilemaps is not null
+            || patch.SceneChunkedTilemaps is not null
             || normalizedCamera is not null
             || gameplayProfileChanged || gameplayTimeLimitChanged)
         {
@@ -424,6 +440,8 @@ public sealed class WorkspaceAuthoringModel
                     currentPrototypes.Select(ToDefinition).ToArray());
                 var candidateTilemaps = normalizedTilemaps ?? WorkspaceSceneDocumentCodec.NormalizeTilemapDefinitions(
                     currentTilemaps.Select(ToDefinition).ToArray());
+                var candidateChunkedTilemaps = normalizedChunkedTilemaps ?? WorkspaceSceneDocumentCodec.NormalizeChunkedTilemapDefinitions(
+                    currentChunkedTilemaps.Select(ToDefinition).ToArray());
                 // 关键提交前校验：跨 texture/object/prototype/gameplay/tilemap 的约束只在完整 candidate 上裁决一次。
                 WorkspaceSceneDocumentCodec.ValidateNormalized(
                     workspaceTextures,
@@ -432,7 +450,8 @@ public sealed class WorkspaceAuthoringModel
                     targetSchema,
                     gameplay,
                     candidateTilemaps,
-                    normalizedCamera ?? currentCamera);
+                    normalizedCamera ?? currentCamera,
+                    candidateChunkedTilemaps);
             }
             catch (WorkspaceProjectValidationException exception)
             {
@@ -443,7 +462,7 @@ public sealed class WorkspaceAuthoringModel
             || patch.ScenePlayerTextureId is not null || patch.SceneGoalTextureId is not null || patch.SceneHazardTextureId is not null
             || patch.SceneTextures is not null || patch.SceneObjects is not null || patch.SceneGameplayProfile is not null
             || patch.SceneGameplayTimeLimitSeconds is not null || patch.ScenePrototypes is not null || patch.SceneTilemaps is not null
-            || patch.SceneCamera is not null;
+            || patch.SceneCamera is not null || patch.SceneChunkedTilemaps is not null;
         if (!provided) throw Failure(WorkspaceAuthoringFailureKind.InvalidPatch, "At least one authoring field is required.");
 
         var sceneGoal = Changed(patch.SceneGoalPosition, current.Scene.GoalPosition) ? patch.SceneGoalPosition : null;
@@ -464,22 +483,28 @@ public sealed class WorkspaceAuthoringModel
         var tilemapDefinitions = normalizedTilemaps is not null && !TilemapsEqual(currentTilemaps, normalizedTilemaps)
             ? normalizedTilemaps.Select(value => value.ToDefinition()).ToArray()
             : null;
+        var chunkedTilemapDefinitions = normalizedChunkedTilemaps is not null && !ChunkedTilemapsEqual(currentChunkedTilemaps, normalizedChunkedTilemaps)
+            ? normalizedChunkedTilemaps.Select(value => value.ToDefinition()).ToArray()
+            : null;
         var normalized = new AuthoringPatch(sceneGoal, scriptGoal, velocity, playerTexture, goalTexture, hazardTexture,
             sceneTextures.RequestedTextures, objectDefinitions, gameplayProfileChanged ? gameplay.Profile : null,
             gameplayTimeLimitChanged ? gameplay.TimeLimitSeconds : null, prototypeDefinitions, tilemapDefinitions,
-            normalizedCamera is null ? null : new SceneCameraDefinition(normalizedCamera.Origin.ToArray(), normalizedCamera.Zoom));
+            normalizedCamera is null ? null : new SceneCameraDefinition(normalizedCamera.Origin.ToArray(), normalizedCamera.Zoom),
+            chunkedTilemapDefinitions);
         var fields = ChangedFields(normalized);
-        if (fields.Length == 0) return new NormalizedPatch(normalized, [], false, false, null, null, null, null, null, null, targetSchema);
+        if (fields.Length == 0) return new NormalizedPatch(normalized, [], false, false, null, null, null, null, null, null, null, targetSchema);
         return new NormalizedPatch(normalized, fields,
             sceneGoal is not null || playerTexture is not null || goalTexture is not null || hazardTexture is not null
                 || sceneTextures.ResolvedTextures is not null || objectDefinitions is not null || gameplayProfileChanged
-                || gameplayTimeLimitChanged || prototypeDefinitions is not null || tilemapDefinitions is not null || normalizedCamera is not null,
+                || gameplayTimeLimitChanged || prototypeDefinitions is not null || tilemapDefinitions is not null
+                || chunkedTilemapDefinitions is not null || normalizedCamera is not null,
             scriptGoal is not null || velocity is not null,
             sceneTextures.ResolvedTextures,
             objectDefinitions is null ? null : normalizedObjects,
             prototypeDefinitions is null ? null : normalizedPrototypes,
             gameplayProfileChanged || gameplayTimeLimitChanged ? gameplay : null,
             tilemapDefinitions is null ? null : normalizedTilemaps,
+            chunkedTilemapDefinitions is null ? null : normalizedChunkedTilemaps,
             normalizedCamera,
             targetSchema);
     }
@@ -495,12 +520,14 @@ public sealed class WorkspaceAuthoringModel
         var objects = normalized.ResolvedSceneObjects ?? ApplyFixedObjectPatch(current.Objects, normalized.Patch);
         var prototypes = normalized.ResolvedScenePrototypes ?? current.Prototypes;
         var tilemaps = normalized.ResolvedSceneTilemaps ?? current.Tilemaps;
+        var chunkedTilemaps = normalized.ResolvedSceneChunkedTilemaps ?? current.ChunkedTilemaps;
         var camera = normalized.ResolvedSceneCamera ?? current.Camera;
         if (current.SourceSchemaVersion is WorkspaceSceneDocumentCodec.LegacySchemaVersion
             or WorkspaceSceneDocumentCodec.BehaviorSchemaVersion
             or WorkspaceSceneDocumentCodec.PrototypeSchemaVersion
             or WorkspaceSceneDocumentCodec.GameplaySchemaVersion
             or WorkspaceSceneDocumentCodec.TilemapSchemaVersion
+            or WorkspaceSceneDocumentCodec.CameraSchemaVersion
             or WorkspaceSceneDocumentCodec.CurrentSchemaVersion
             || normalized.ResolvedSceneObjects is not null)
         {
@@ -508,7 +535,14 @@ public sealed class WorkspaceAuthoringModel
             {
                 return normalized.TargetSceneSchema switch
                 {
-                    WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV9(
+                    WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV10(
+                        textures,
+                        objects,
+                        prototypes,
+                        normalized.ResolvedSceneGameplay ?? current.Gameplay,
+                        chunkedTilemaps,
+                        camera),
+                    WorkspaceSceneDocumentCodec.CameraSchemaVersion => WorkspaceSceneDocumentCodec.SerializeV9(
                         textures,
                         objects,
                         prototypes,
@@ -620,6 +654,16 @@ public sealed class WorkspaceAuthoringModel
             && pair.First.AtlasRows == pair.Second.AtlasRows
             && pair.First.Cells.SequenceEqual(pair.Second.Cells));
 
+    private static bool ChunkedTilemapsEqual(
+        IReadOnlyList<ProjectModelSceneChunkedTilemap> current,
+        IReadOnlyList<WorkspaceSceneChunkedTilemap> requested) =>
+        current.Count == requested.Count && current.Zip(requested).All(pair =>
+            pair.First.TilemapId == pair.Second.TilemapId
+            && pair.First.Origin.SequenceEqual(pair.Second.Origin)
+            && pair.First.Artifact == pair.Second.Artifact
+            && pair.First.ArtifactRevision == pair.Second.ArtifactRevision
+            && pair.First.ArtifactBytes == pair.Second.ArtifactBytes);
+
     private static bool BehaviorsEqual(
         IReadOnlyList<ProjectModelSceneBehaviorBinding>? current,
         IReadOnlyList<WorkspaceSceneBehaviorBinding>? requested)
@@ -648,6 +692,7 @@ public sealed class WorkspaceAuthoringModel
             or WorkspaceSceneDocumentCodec.PrototypeSchemaVersion
             or WorkspaceSceneDocumentCodec.GameplaySchemaVersion
             or WorkspaceSceneDocumentCodec.TilemapSchemaVersion
+            or WorkspaceSceneDocumentCodec.CameraSchemaVersion
             or WorkspaceSceneDocumentCodec.CurrentSchemaVersion)) return;
         var objectBehaviorsChanged = normalized.ResolvedSceneObjects is { } requestedObjects
             && BehaviorCollectionsChanged(currentObjects, requestedObjects);
@@ -782,10 +827,18 @@ public sealed class WorkspaceAuthoringModel
         value.AtlasRows,
         value.Cells.ToArray());
 
+    private static SceneChunkedTilemapDefinition ToDefinition(ProjectModelSceneChunkedTilemap value) => new(
+        value.TilemapId,
+        value.Origin,
+        value.Artifact,
+        value.ArtifactRevision,
+        value.ArtifactBytes);
+
     private static int TargetSceneSchema(int sourceSchemaVersion) =>
         sourceSchemaVersion switch
         {
             WorkspaceSceneDocumentCodec.CurrentSchemaVersion => WorkspaceSceneDocumentCodec.CurrentSchemaVersion,
+            WorkspaceSceneDocumentCodec.CameraSchemaVersion => WorkspaceSceneDocumentCodec.CameraSchemaVersion,
             WorkspaceSceneDocumentCodec.TilemapSchemaVersion => WorkspaceSceneDocumentCodec.TilemapSchemaVersion,
             WorkspaceSceneDocumentCodec.GameplaySchemaVersion => WorkspaceSceneDocumentCodec.GameplaySchemaVersion,
             WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => WorkspaceSceneDocumentCodec.PrototypeSchemaVersion,
@@ -865,6 +918,7 @@ public sealed class WorkspaceAuthoringModel
         if (patch.SceneObjects is not null) fields.Add("scene.objects");
         if (patch.ScenePrototypes is not null) fields.Add("scene.prototypes");
         if (patch.SceneTilemaps is not null) fields.Add("scene.tilemaps");
+        if (patch.SceneChunkedTilemaps is not null) fields.Add("scene.tilemaps");
         if (patch.SceneCamera is not null) fields.Add("scene.camera");
         if (patch.SceneGameplayProfile is not null) fields.Add("scene.gameplay.profile");
         if (patch.SceneGameplayTimeLimitSeconds is not null) fields.Add("scene.gameplay.timeLimitSeconds");
@@ -955,6 +1009,7 @@ public sealed class WorkspaceAuthoringModel
         WorkspaceScenePrototype[]? ResolvedScenePrototypes,
         WorkspaceSceneGameplay? ResolvedSceneGameplay,
         WorkspaceSceneTilemap[]? ResolvedSceneTilemaps,
+        WorkspaceSceneChunkedTilemap[]? ResolvedSceneChunkedTilemaps,
         WorkspaceSceneCamera? ResolvedSceneCamera,
         int TargetSceneSchema);
     private sealed record SceneTextureNormalization(ProjectModelTexture[]? ResolvedTextures, SceneTextureAssignment[]? RequestedTextures);

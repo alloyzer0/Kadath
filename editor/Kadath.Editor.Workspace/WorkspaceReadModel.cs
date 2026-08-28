@@ -285,6 +285,7 @@ public sealed class WorkspaceReadModel
         var authoringRevision = scriptVersion == 1
             ? AuthoringRevision(loaded.SceneBytes, loaded.ScriptBytes)
             : AuthoringRevision(loaded.SceneBytes, scriptSource.Revision);
+        var chunkedTilemaps = ReadChunkedTilemaps(loaded.Bytes, scene, textures);
         return new ProjectModelSnapshot(EditorSnapshotVersions.ProjectModel, project.ProjectName,
             authoringRevision,
             new ProjectModelFiles(loaded.Bytes.ProjectDirectory, loaded.Bytes.ScenePath, loaded.Bytes.ScriptPath, loaded.Bytes.PreviewPath),
@@ -300,7 +301,8 @@ public sealed class WorkspaceReadModel
                 scene.Gameplay.IsEnabled ? scene.Gameplay.TimeLimitSeconds : null,
                 scene.Prototypes.Select(prototype => prototype.ToProjectModel()).ToArray(),
                 scene.Tilemaps.Select(tilemap => tilemap.ToProjectModel()).ToArray(),
-                scene.Camera.ToProjectModel()),
+                scene.Camera.ToProjectModel(),
+                chunkedTilemaps),
             new ProjectModelScript(scriptVersion, scriptGoal, scriptVelocity, dependencies), new ProjectModelPreview(previewVersion));
     }
 
@@ -542,10 +544,60 @@ public sealed class WorkspaceReadModel
     {
         var value when value.StartsWith("assets/audio/") => "Audio",
         var value when value.StartsWith("assets/renderer2d/") => "Texture",
+        var value when value.StartsWith("assets/tilemaps/") => "Tilemap",
         var value when value.StartsWith("assets/scenes/") => "Scene",
         var value when value.StartsWith("assets/scripts/") => "Script",
         _ => "Other"
     };
+
+    private static ProjectModelSceneChunkedTilemap[] ReadChunkedTilemaps(
+        WorkspaceProjectBytes project,
+        WorkspaceSceneDocument scene,
+        IReadOnlyList<ProjectModelTexture> textures)
+    {
+        var result = new List<ProjectModelSceneChunkedTilemap>();
+        var totalLayers = 0;
+        var binRoot = Path.GetFullPath(Path.Combine(project.PackageRoot, "bin")).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        foreach (var reference in scene.ChunkedTilemaps)
+        {
+            var fullPath = Path.GetFullPath(Path.Combine(binRoot, reference.Artifact.Replace('/', Path.DirectorySeparatorChar)));
+            if (!fullPath.StartsWith(binRoot + Path.DirectorySeparatorChar, PathComparison) || !File.Exists(fullPath))
+                throw Input($"Chunked Tilemap artifact is missing or escapes bin root: {reference.Artifact}.");
+            WorkspaceProjectValidator.RejectReparsePoint(fullPath, "Chunked Tilemap artifact");
+            var bytes = File.ReadAllBytes(fullPath);
+            var revision = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+            if (bytes.LongLength != reference.ArtifactBytes || revision != reference.ArtifactRevision)
+                throw Input($"Chunked Tilemap artifact identity mismatch: {reference.Artifact}.");
+            WorkspaceTilemapAsset asset;
+            try { asset = WorkspaceTilemapAssetCodec.Decode(bytes); }
+            catch (InvalidDataException exception) { throw Input($"Chunked Tilemap artifact is invalid: {reference.Artifact}: {exception.Message}", exception); }
+            var textureIds = textures.ToDictionary(value => value.TextureId);
+            foreach (var source in asset.TileSources)
+            {
+                if (!textureIds.TryGetValue(source.TextureId, out var texture) || texture.SamplingProfile != WorkspaceSceneDocumentCodec.PixelArtProfile)
+                    throw Input($"Chunked Tilemap source {source.SourceId} must reference a pixel_art Scene texture.");
+            }
+            totalLayers = checked(totalLayers + asset.Layers.Length);
+            if (totalLayers > WorkspaceTilemapAssetCodec.MaxLayers) throw Input("Chunked Tilemap visual Layer budget exceeded.");
+            result.Add(new ProjectModelSceneChunkedTilemap(
+                reference.TilemapId,
+                reference.Origin.ToArray(),
+                reference.Artifact,
+                reference.ArtifactRevision,
+                reference.ArtifactBytes,
+                asset.TileSources.Length,
+                asset.Layers.Length,
+                asset.Layers.Sum(layer => layer.Chunks.Length),
+                asset.Layers.Sum(layer => layer.Chunks.Sum(chunk => chunk.Cells.Length)),
+                asset.Layers.Select(layer => new ProjectModelTilemapLayerSummary(
+                    layer.LayerId,
+                    layer.Visible,
+                    layer.Opacity,
+                    layer.Chunks.Length,
+                    layer.Chunks.Sum(chunk => chunk.Cells.Length))).ToArray()));
+        }
+        return result.ToArray();
+    }
     private static bool IsTextureArtifactPath(string artifact) => Encoding.UTF8.GetByteCount(artifact) <= 255
         && artifact.StartsWith("assets/renderer2d/", StringComparison.Ordinal) && artifact.EndsWith(".texture", StringComparison.Ordinal)
         && !artifact.Contains('\\') && artifact.Split('/').All(segment => segment.Length > 0 && segment is not "." and not "..");

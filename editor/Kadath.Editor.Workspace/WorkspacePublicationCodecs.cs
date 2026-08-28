@@ -15,13 +15,15 @@ internal static class WorkspaceSceneCodec
     internal const string PrototypeFormat = "KSCN-SCENE-V6";
     internal const string GameplayFormat = "KSCN-SCENE-V7";
     internal const string TilemapFormat = "KSCN-SCENE-V8";
-    internal const string CurrentFormat = "KSCN-SCENE-V9";
+    internal const string CameraFormat = "KSCN-SCENE-V9";
+    internal const string CurrentFormat = "KSCN-SCENE-V10";
     private const int LegacyVersion = 4;
     private const int BehaviorVersion = 5;
     private const int PrototypeVersion = 6;
     private const int GameplayVersion = 7;
     private const int TilemapVersion = 8;
-    private const int CurrentVersion = 9;
+    private const int CameraVersion = 9;
+    private const int CurrentVersion = 10;
     private const int HeaderBytes = 16;
     private const int MaxArtifactBytes = 1024 * 1024;
 
@@ -31,6 +33,7 @@ internal static class WorkspaceSceneCodec
         var artifactVersion = scene.SourceSchemaVersion switch
         {
             WorkspaceSceneDocumentCodec.CurrentSchemaVersion => CurrentVersion,
+            WorkspaceSceneDocumentCodec.CameraSchemaVersion => CameraVersion,
             WorkspaceSceneDocumentCodec.TilemapSchemaVersion => TilemapVersion,
             WorkspaceSceneDocumentCodec.GameplaySchemaVersion => GameplayVersion,
             WorkspaceSceneDocumentCodec.PrototypeSchemaVersion => PrototypeVersion,
@@ -47,11 +50,15 @@ internal static class WorkspaceSceneCodec
             + (artifactVersion >= PrototypeVersion ? sizeof(uint) + prototypes.Sum(value => sizeof(uint) + value.EntryBytes()) : 0)
             + (artifactVersion >= TilemapVersion ? textures.Length * sizeof(uint) : 0)
             + (artifactVersion >= GameplayVersion ? 2 * sizeof(uint) : 0)
-            + (artifactVersion >= TilemapVersion
+            + (artifactVersion is TilemapVersion or CameraVersion
                 ? sizeof(uint) + scene.Tilemaps.Sum(value => sizeof(uint) + StrictUtf8.GetByteCount(value.TilemapId)
                     + 4 * sizeof(float) + 6 * sizeof(uint) + value.Cells.Length * sizeof(ushort))
                 : 0)
-            + (artifactVersion == CurrentVersion ? 3 * sizeof(float) : 0);
+            + (artifactVersion == CurrentVersion
+                ? sizeof(uint) + scene.ChunkedTilemaps.Sum(value => sizeof(uint) + StrictUtf8.GetByteCount(value.TilemapId)
+                    + 2 * sizeof(float) + sizeof(uint) + StrictUtf8.GetByteCount(value.Artifact) + 64 + sizeof(ulong))
+                : 0)
+            + (artifactVersion >= CameraVersion ? 3 * sizeof(float) : 0);
         var artifact = new byte[HeaderBytes + payloadBytes];
         Encoding.ASCII.GetBytes("KSCN").CopyTo(artifact, 0);
         WriteUInt32(artifact, 4, checked((uint)artifactVersion));
@@ -135,7 +142,7 @@ internal static class WorkspaceSceneCodec
             WriteSingle(artifact, offset + sizeof(uint), (float)scene.Gameplay.TimeLimitSeconds);
             offset += 2 * sizeof(uint);
         }
-        if (artifactVersion >= TilemapVersion)
+        if (artifactVersion is TilemapVersion or CameraVersion)
         {
             WriteUInt32(artifact, offset, checked((uint)scene.Tilemaps.Length));
             offset += sizeof(uint);
@@ -167,7 +174,33 @@ internal static class WorkspaceSceneCodec
         }
         if (artifactVersion == CurrentVersion)
         {
-            // KSCN v9 在 v8 Tilemap 尾部后追加 Camera2D origin[2] 与 zoom。
+            WriteUInt32(artifact, offset, checked((uint)scene.ChunkedTilemaps.Length));
+            offset += sizeof(uint);
+            foreach (var tilemap in scene.ChunkedTilemaps)
+            {
+                var tilemapId = StrictUtf8.GetBytes(tilemap.TilemapId);
+                var path = StrictUtf8.GetBytes(tilemap.Artifact);
+                var revision = StrictUtf8.GetBytes(tilemap.ArtifactRevision);
+                WriteUInt32(artifact, offset, checked((uint)tilemapId.Length));
+                offset += sizeof(uint);
+                tilemapId.CopyTo(artifact, offset);
+                offset += tilemapId.Length;
+                WriteSingle(artifact, offset, (float)tilemap.Origin[0]);
+                WriteSingle(artifact, offset + 4, (float)tilemap.Origin[1]);
+                offset += 8;
+                WriteUInt32(artifact, offset, checked((uint)path.Length));
+                offset += sizeof(uint);
+                path.CopyTo(artifact, offset);
+                offset += path.Length;
+                revision.CopyTo(artifact, offset);
+                offset += 64;
+                WriteUInt64(artifact, offset, checked((ulong)tilemap.ArtifactBytes));
+                offset += sizeof(ulong);
+            }
+        }
+        if (artifactVersion >= CameraVersion)
+        {
+            // KSCN v9+ 在 Tilemap 段后追加 Camera2D origin[2] 与 zoom。
             WriteSingle(artifact, offset, (float)scene.Camera.Origin[0]);
             WriteSingle(artifact, offset + 4, (float)scene.Camera.Origin[1]);
             WriteSingle(artifact, offset + 8, (float)scene.Camera.Zoom);
@@ -185,7 +218,7 @@ internal static class WorkspaceSceneCodec
         var artifactVersion = ReadUInt32(artifact, 4);
         var schemaVersion = ReadUInt32(artifact, 8);
         if (artifactVersion != schemaVersion
-            || artifactVersion is not (LegacyVersion or BehaviorVersion or PrototypeVersion or GameplayVersion or TilemapVersion or CurrentVersion)
+            || artifactVersion is not (LegacyVersion or BehaviorVersion or PrototypeVersion or GameplayVersion or TilemapVersion or CameraVersion or CurrentVersion)
             || ReadUInt32(artifact, 12) != artifact.Length - HeaderBytes)
             throw new InvalidDataException("Scene artifact header mismatch.");
         var offset = HeaderBytes;
@@ -293,7 +326,7 @@ internal static class WorkspaceSceneCodec
                 ReadRequiredSingle(artifact, ref offset));
         }
         var tilemaps = new List<WorkspaceSceneTilemap>();
-        if (artifactVersion >= TilemapVersion)
+        if (artifactVersion is TilemapVersion or CameraVersion)
         {
             var tilemapCount = ReadRequiredUInt32(artifact, ref offset);
             if (tilemapCount > WorkspaceSceneDocumentCodec.MaxTilemapCount) throw new InvalidDataException("Scene artifact Tilemap count mismatch.");
@@ -316,17 +349,35 @@ internal static class WorkspaceSceneCodec
                     tilemapId, origin, tileSize, columns, rows, textureId, atlasColumns, atlasRows, cells));
             }
         }
-        var camera = WorkspaceSceneDocumentCodec.IdentityCamera;
+        var chunkedTilemaps = new List<WorkspaceSceneChunkedTilemap>();
         if (artifactVersion == CurrentVersion)
+        {
+            var tilemapCount = ReadRequiredUInt32(artifact, ref offset);
+            if (tilemapCount > WorkspaceSceneDocumentCodec.MaxChunkedTilemapCount) throw new InvalidDataException("Scene artifact chunked Tilemap count mismatch.");
+            for (var index = 0; index < tilemapCount; index++)
+            {
+                var idBytes = ReadRequiredUInt32(artifact, ref offset);
+                var id = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, idBytes));
+                var origin = ReadVector(artifact, ref offset, 2);
+                var pathBytes = ReadRequiredUInt32(artifact, ref offset);
+                var path = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, pathBytes));
+                var revision = DecodeStrictUtf8(ReadRequiredBytes(artifact, ref offset, 64));
+                var bytes = checked((long)ReadRequiredUInt64(artifact, ref offset));
+                chunkedTilemaps.Add(new WorkspaceSceneChunkedTilemap(id, origin, path, revision, bytes));
+            }
+        }
+        var camera = WorkspaceSceneDocumentCodec.IdentityCamera;
+        if (artifactVersion >= CameraVersion)
         {
             camera = new WorkspaceSceneCamera(ReadVector(artifact, ref offset, 2), ReadRequiredSingle(artifact, ref offset));
         }
         if (offset != artifact.Length) throw new InvalidDataException("Scene artifact contains trailing bytes.");
-        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects, prototypes, checked((int)schemaVersion), gameplay, tilemaps, camera); }
+        try { WorkspaceSceneDocumentCodec.ValidateNormalized(textures, objects, prototypes, checked((int)schemaVersion), gameplay, tilemaps, camera, chunkedTilemaps); }
         catch (WorkspaceProjectValidationException exception) { throw new InvalidDataException(exception.Message, exception); }
         var format = artifactVersion switch
         {
             CurrentVersion => CurrentFormat,
+            CameraVersion => CameraFormat,
             TilemapVersion => TilemapFormat,
             GameplayVersion => GameplayFormat,
             PrototypeVersion => PrototypeFormat,
@@ -399,6 +450,14 @@ internal static class WorkspaceSceneCodec
         if (offset > bytes.Length - sizeof(ushort)) throw new InvalidDataException("Scene artifact is truncated.");
         var value = BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(offset, sizeof(ushort)));
         offset += sizeof(ushort);
+        return value;
+    }
+
+    private static ulong ReadRequiredUInt64(byte[] bytes, ref int offset)
+    {
+        if (offset > bytes.Length - sizeof(ulong)) throw new InvalidDataException("Scene artifact is truncated.");
+        var value = BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(offset, sizeof(ulong)));
+        offset += sizeof(ulong);
         return value;
     }
 
@@ -492,6 +551,7 @@ internal static class WorkspaceSceneCodec
     private static float ReadSingle(byte[] bytes, int offset) => BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset, 4)));
     private static void WriteUInt32(byte[] bytes, int offset, uint value) => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), value);
     private static void WriteUInt16(byte[] bytes, int offset, ushort value) => BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(offset, 2), value);
+    private static void WriteUInt64(byte[] bytes, int offset, ulong value) => BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(offset, 8), value);
     private static void WriteSingle(byte[] bytes, int offset, float value) => BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(offset, 4), BitConverter.SingleToInt32Bits(value));
     private static void WriteDouble(byte[] bytes, int offset, double value) => BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(offset, 8), BitConverter.DoubleToInt64Bits(value));
     private sealed record TextureEntry(uint TextureId, byte[] Artifact, string SamplingProfile);

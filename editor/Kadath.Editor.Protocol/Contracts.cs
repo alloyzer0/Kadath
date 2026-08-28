@@ -263,7 +263,9 @@ public sealed record ProjectModelScene(
     // Tilemap 是独立的静态背景创作域，不进入 Scene Object / Hierarchy 身份域。
     IReadOnlyList<ProjectModelSceneTilemap>? Tilemaps = null,
     // Camera2D 是 Scene 级静态展示配置，不进入 Object / Hierarchy 身份域。
-    ProjectModelSceneCamera? Camera = null);
+    ProjectModelSceneCamera? Camera = null,
+    // v10 Chunked Tilemap 只在 Scene 保存内容寻址引用；Layer/Chunk/Cell 位于独立 artifact。
+    IReadOnlyList<ProjectModelSceneChunkedTilemap>? ChunkedTilemaps = null);
 
 public sealed record ProjectModelSceneCamera(double[] Origin, double Zoom);
 
@@ -309,6 +311,25 @@ public sealed record ProjectModelSceneTilemap(
     int AtlasColumns,
     int AtlasRows,
     IReadOnlyList<int> Cells);
+
+public sealed record ProjectModelSceneChunkedTilemap(
+    string TilemapId,
+    double[] Origin,
+    string Artifact,
+    string ArtifactRevision,
+    long ArtifactBytes,
+    int TileSourceCount = 0,
+    int LayerCount = 0,
+    int ChunkCount = 0,
+    int CellCount = 0,
+    IReadOnlyList<ProjectModelTilemapLayerSummary>? Layers = null);
+
+public sealed record ProjectModelTilemapLayerSummary(
+    string LayerId,
+    bool Visible,
+    double Opacity,
+    int ChunkCount,
+    int CellCount);
 
 public sealed record ProjectModelScriptDependency(uint ScriptId, string Source);
 
@@ -449,6 +470,13 @@ public sealed record SceneTilemapDefinition(
     int AtlasRows,
     IReadOnlyList<int> Cells);
 
+public sealed record SceneChunkedTilemapDefinition(
+    string TilemapId,
+    double[] Origin,
+    string Artifact,
+    string ArtifactRevision,
+    long ArtifactBytes);
+
 public sealed record SceneCameraDefinition(double[] Origin, double Zoom);
 
 public sealed record SceneBehaviorBindingDefinition(
@@ -468,7 +496,45 @@ public sealed record AuthoringPatch(
     double? SceneGameplayTimeLimitSeconds = null,
     IReadOnlyList<ScenePrototypeDefinition>? ScenePrototypes = null,
     IReadOnlyList<SceneTilemapDefinition>? SceneTilemaps = null,
-    SceneCameraDefinition? SceneCamera = null);
+    SceneCameraDefinition? SceneCamera = null,
+    IReadOnlyList<SceneChunkedTilemapDefinition>? SceneChunkedTilemaps = null);
+
+public sealed record TilemapImportParameters(
+    string? ProjectName,
+    string ExpectedRevision,
+    string SourcePath,
+    string AssetName,
+    string TilemapId,
+    IReadOnlyList<uint> TextureIds,
+    string? LevelIid = null,
+    bool Strict = false);
+
+public sealed record TilemapImportDiagnostic(
+    string Severity,
+    string Code,
+    string SourcePath,
+    string JsonPath,
+    string Message);
+
+public sealed record TilemapImportResult(
+    string State,
+    string ProjectName,
+    string PreviousRevision,
+    string Revision,
+    string SourceKind,
+    string SourceVersion,
+    string AssetId,
+    string RelativePath,
+    string ArtifactRevision,
+    long ArtifactBytes,
+    int TileSourceCount,
+    int LayerCount,
+    int ChunkCount,
+    int CellCount,
+    IReadOnlyList<TilemapImportDiagnostic> Diagnostics,
+    ProjectModelSnapshot ProjectSnapshot,
+    HierarchySnapshot HierarchySnapshot,
+    AssetCatalogSnapshot AssetCatalogSnapshot);
 
 public sealed record AuthoringApplyParameters(
     string? ProjectName,
