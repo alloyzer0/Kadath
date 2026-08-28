@@ -20,9 +20,10 @@ kadath.exe
 -----------------
 
 - `bin\assets\scenes\preview.scene.json` 是 Scene authoring 源，
-  `bin\assets\scenes\preview.scene` 是 Runtime 消费的 KSCN v8 artifact；默认场景携带
-  `pixel_art` 2×2 Atlas、8×5 静态背景 Tilemap（含空 Cell 与重复 Tile）以及只读
-  `runtime-orb` Spawn Prototype，用于同时验证 Tilemap 背景顺序、无串色采样与瞬态对象生命周期。
+  `bin\assets\scenes\preview.scene` 是 Runtime 消费的 KSCN v9 artifact；默认场景携带
+  `[1,0]/1` Camera2D、`pixel_art` 2×2 Atlas、12×6 静态背景 Tilemap（含空 Cell、重复 Tile
+  与视口外 Cell）以及只读 `runtime-orb` Spawn Prototype，用于同时验证 Camera 平移、
+  Tilemap 裁剪/背景顺序、无串色采样与瞬态对象生命周期。
 - `bin\assets\scripts\preview.script.json` 声明 Script v2 项目，
   `bin\assets\scripts\preview.script` 是 Runtime 消费的 KSCP v2 artifact。
 - KSCP v2 固定使用 Host Interface v4。包中保留两个参与构建的 Luau 源：

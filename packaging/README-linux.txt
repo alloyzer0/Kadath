@@ -31,7 +31,7 @@ Editor 诊断工具
 - `assets/renderer2d/test.texture`：TextureId 1；
 - `assets/renderer2d/goal.texture`：TextureId 2；
 - `assets/audio/won.audio.wav` 与 `lost.audio.wav`：规范 PCM WAV；
-- `assets/scenes/preview.scene`：KSCN v8，携带 `pixel_art` 2×2 Atlas、8×5 静态背景 Tilemap（含空 Cell 与重复 Tile）、全部五个 source object 的 Behavior Binding，以及只读 `runtime-orb` Spawn Prototype；
+- `assets/scenes/preview.scene`：KSCN v9，携带 `[1,0]/1` Camera2D、`pixel_art` 2×2 Atlas、12×6 静态背景 Tilemap（含空 Cell、重复 Tile 与视口外 Cell）、全部五个 source object 的 Behavior Binding，以及只读 `runtime-orb` Spawn Prototype；
 - `assets/scripts/preview.script`：聚合 KSCP v2 / Host Interface v4，包含默认 `patrol.luau` 与 `player_controller.luau`；
 - `assets/scenes/preview.scene.json`、`assets/scripts/preview.script.json`、`assets/scripts/patrol.luau` 与 `assets/scripts/player_controller.luau`：Linux 默认行为项目的 source dependency set，不是 Runtime 启动输入。
 
@@ -45,4 +45,4 @@ Editor 诊断工具
 
 仓库开发验证说明
 ----------------
-Linux Runtime 包的默认资产由 Zig + Luau tooling 生成 KSCN v8/KSCP v2，不依赖 PowerShell。clean-extract 产品验证同时检查 Atlas Tile、空 Cell、边缘无串色和动态 Sprite 背景覆盖。Runtime 与 Workspace 继续读取 KSCN v4—v7；Editor Service 的 legacy v4/v1 Publication 路径继续兼容旧项目。包内只携带受控 Behavior Tool，不包含完整 Linux Editor。
+Linux Runtime 包的默认资产由 Zig + Luau tooling 生成 KSCN v9/KSCP v2，不依赖 PowerShell。clean-extract 产品验证同时检查 Camera 平移、Atlas Tile、空 Cell、边缘无串色和动态 Sprite 背景覆盖。Runtime 与 Workspace 继续读取 KSCN v4—v8；Editor Service 的 legacy v4/v1 Publication 路径继续兼容旧项目。包内只携带受控 Behavior Tool，不包含完整 Linux Editor。

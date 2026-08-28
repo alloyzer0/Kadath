@@ -2,9 +2,9 @@
 
 ## 元信息
 
-- **状态**: 已确认；2026-08-27 Runtime Core 迁移与 Scene Neutral 能力收口
+- **状态**: 已确认；2026-08-28 Camera2D / Culling 候选实现收口
 - **初始日期**: 2026-06-04
-- **更新日期**: 2026-08-27
+- **更新日期**: 2026-08-28
 - **主题**: Kadath Runtime 当前态、目标态与迁移 seam
 - **依据**:
   - `ADR-0002`: 构建系统与项目结构
@@ -21,15 +21,15 @@
 
 本文同时记录：
 
-- **CURRENT**：截至 Inner `main@2d13c4a` 的实现事实；
+- **CURRENT**：截至 `codex/p1-renderer2d-camera2d-culling-01` 候选分支的实现事实；
 - **TARGET**：`ADR-0009` 冻结的长期 ownership 边界；当前三个迁移增量已经达到该边界；
 - **MIGRATION**：从历史基线 `bfc5504` 到当前固定点的已完成迁移记录。
 
-图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。历史章节中的 TARGET 措辞只描述候选合并前的状态；当前应以 `main@2d13c4a` 及本文 CURRENT 为准。
+图中的语言标签表示 Module 的 authority implementation，不表示调用关系只能发生在同一语言。历史章节中的 TARGET 措辞只描述候选合并前的状态；当前应以 Camera2D 候选分支及本文 CURRENT 为准。
 
 ---
 
-## 2. CURRENT：`2d13c4a` 当前实现
+## 2. CURRENT：Camera2D / Culling 候选实现
 
 ```mermaid
 graph TD
@@ -46,13 +46,13 @@ graph TD
         ZigPlatform["Zig Platform / Input / Clock"]
         ZigMemory["Zig Memory / Allocator Policy"]
         ZigResource["Zig Resource / Artifact Adapter"]
-        ZigScene["Zig Scene v8 / KSCN v8 / KSCP Adapter"]
+        ZigScene["Zig Scene v9 / KSCN v9 / KSCP Adapter"]
         ZigLuauAdapter["Zig / C++ Luau Adapter"]
         ZigCoreAdapter["Zig Runtime Core Adapter<br/>稳定 C ABI + 版本化接口描述符"]
         RustCore["Rust Runtime Core<br/>Object Authority / Phase Commit / Optional Gameplay"]
         Snapshot["Caller-owned Render / Event Snapshot"]
         RustScheduler["Rust Scheduler<br/>bounded read worker"]
-        ZigRenderer["Zig Renderer2D / RHI"]
+        ZigRenderer["Zig Renderer2D Camera2D / Culling / RHI"]
         ZigAudio["Zig Audio"]
     end
 
@@ -86,10 +86,10 @@ graph TD
 - `Zig Host` 是实际组合根，拥有 Platform pump、Clock、fixed accumulator、阶段调用时机、reload/restart 外层事务和产品生命周期；
 - `Zig Scene/Behavior Adapter` 负责 Scene/KSCN/KSCP 解码、Luau VM callback、caller-owned POD 转换、调用编排和错误映射，不保存跨 step 的对象、阶段或 Gameplay authority；
 - `Rust Runtime Core` 通过同一 opaque Core 后的 versioned Object、Phase 与 Gameplay Interface，唯一拥有 ObjectId/Entity/generation/stale、对象生命周期、阶段队列/预算以及启用时的 collision/contact、GameSession、outcome；Gameplay candidate 明确区分未准备、中立和 `goal_hazard_v1`；
-- `Renderer2D` 先消费 Scene v8 的静态 Tilemap，再消费 Runtime Core 的 caller-owned snapshot；Audio 与日志只消费 outcome，三者均不反向写入 Core 状态；
+- `Renderer2D` 先消费 Scene 的静态 Tilemap，再消费 Runtime Core 的 caller-owned snapshot，并在内部完成 Camera2D 变换、Tilemap 行列裁剪与 Sprite AABB 裁剪；Audio 与日志只消费 outcome，三者均不反向写入 Core 状态；
 - `Rust Scheduler` 是隔离的异步读取 Module，不拥有主线程 Runtime 推进；
 - `Zig Memory / Allocator Policy` 保留原 C4 的底层内存职责；当前实现可以分散使用显式 allocator，不宣称已经存在一个成熟的独立 Memory Module；
-- `C# Editor`、Asset Tool pipeline 与 `Luau Behavior` 已是实际产品入口；Editor 可读取、编辑、字节级 Undo/Redo、烘焙和预览 Scene v8 Tilemap，并兼容 Scene v4—v7。
+- `C# Editor`、Asset Tool pipeline 与 `Luau Behavior` 已是实际产品入口；Editor 可读取、编辑、字节级 Undo/Redo、烘焙和预览 Scene v9 Camera/Tilemap，并兼容 Scene v4—v8。
 
 ### 2.2 迁移收口判断
 
@@ -103,7 +103,7 @@ graph TD
 |---|---|---|---|---|
 | Host 时序与泵状态：clock、`last_time_seconds`、fixed accumulator、frame/heartbeat counter、quit flag | Runtime 进程 / frame loop | Zig Host | 是 | **保留 Zig**。它决定何时推进 Core，不决定 Core 内状态如何变化。 |
 | Platform 窗口、设备、键位 held/pressed edge、reload requestId | 进程 / 窗口 / 两次 event pump 之间 | Zig Platform | 是 | **保留 Zig**。Platform state 不进入 Runtime Core；每帧只向 Host 发布 caller-owned `InputSnapshot` / command。 |
-| Scene Document、显式 Gameplay Profile、artifact 路径、Script Program 与纹理注册表 | 项目打开至 reload / Runtime 进程 | Zig Host、Resource 与 Scene Adapter | 是 | **不迁移 authoring / I/O authority**。Profile 是已解码配置，不是 GameSession mirror；成功 reload 只在受控 seam 生成新的 Core candidate。 |
+| Scene Document、Camera2D、显式 Gameplay Profile、artifact 路径、Script Program 与纹理注册表 | 项目打开至 reload / Runtime 进程 | Zig Host、Resource 与 Scene Adapter | 是 | **不迁移 authoring / I/O authority**。Camera 是只读展示配置，Profile 是已解码配置；二者都不是 Core mirror。成功 reload 只在受控 seam 发布完整候选。 |
 | `SceneGeneration` 的 `target`、`extent`、可选 Player/Goal source index 和 `phase_candidate_ready` | 单个 Scene Generation / candidate transaction | Zig Scene Adapter；对象和可选 Gameplay 当代事实仍由 Rust Core 拥有 | 是；candidate-ready 只跨事务调用，不跨已完成 step | **保留 Adapter 投影**。索引只为启用的兼容 Gameplay 构造 descriptor；Neutral 不伪造角色。这些字段不得扩张为对象位置、生命周期、contact 或 session mirror。 |
 | Behavior `Package`、`ActiveSet`、Luau VM / coroutine / binding 私有状态 | Script package / Scene Generation | Zig/C++ Luau Adapter 与 Luau VM | 是 | **保留 Zig/C++**。这是 Behavior Instance 的执行状态，不是 Runtime Object/Phase/Gameplay authority；Rust Core 不拥有 VM layout。 |
 | `active_phase`（domain + sequence） | 一次 fixed/frame Phase begin→end | Zig Behavior Adapter 的调用游标；队列、generation 与预算在 Rust Core | 否；成功 step/frame 结束必须清空 | **保留薄游标**。不得增加持久 queue、admission 或 sequence writer。 |
@@ -125,7 +125,7 @@ Runtime ownership 迁移完成后，Scene 曾继续强制一个 Player、一个 
 - 旧 Scene v4—v6 通过 Scene Adapter 归一化为兼容 `goal_hazard_v1` Gameplay Profile，产品行为不变；
 - Zig Host 只根据已解码 profile 选择调用顺序；Neutral fixed-step 执行 Behavior/Phase settle/end，不调用 Gameplay begin/commit、Outcome 或 Audio；
 - Render publication 复用 Object Authority `ACTIVE_OBJECTS` 的同一 ordered read view，经 Zig Adapter 写入 caller-owned `RenderSnapshot`，没有新增第二套 C Interface、缓存或排序权威；
-- C# Editor/Workspace 已贯通 v8 投影、通用 Object/Prototype/Tilemap authoring、字节级 Undo/Redo、KSCN v8 Bake、Live Bake Preview 与真实产品 fixture。
+- C# Editor/Workspace 已贯通 v9 投影、通用 Object/Prototype/Tilemap/Camera authoring、字节级 Undo/Redo、KSCN v9 Bake、Live Bake Preview 与真实产品 fixture。
 
 ### 2.5 静态 Tilemap 渲染边界
 
@@ -134,6 +134,14 @@ Runtime ownership 迁移完成后，Scene 曾继续强制一个 Player、一个 
 - Host 只把已验证的 Cell slice 与 TextureHandle 借给 `Renderer2D.renderFrame`；Renderer 隐藏 UV 展开、零 Cell 跳过和每 128 instance 分块；
 - RHI 仍只接收 48-byte opaque Quad instance，不理解 Tilemap、Atlas 或 Scene 类型；per-binding 为 6144 bytes，per-frame 为 65536 bytes；
 - Tilemap 不进入 Runtime Object、Behavior、Gameplay、collision/contact、spawn/destroy 或 Rust Core snapshot authority。
+
+### 2.6 Camera2D 与可见性裁剪边界
+
+- Scene v9 顶层保存有限 `origin f32[2]` 与 `zoom f32`；v4—v8 归一为恒等 Camera，KSCN v9 只在 v8 Tilemap 尾部追加 12 字节；
+- Host 不维护动态 Camera state，只把活动 Scene 的值借给 `Frame2D.view`；reload/restart 继续使用完整 Scene 事务；
+- Renderer2D 以 `screen=(world-origin)*zoom` 计算 NDC，在内部生成可见世界矩形、Tilemap 行列范围与 Sprite 半开 AABB；可见项保持原 row-major/source order；
+- 被裁剪 Sprite 不形成纹理 run；所有 Camera、Sprite、Tilemap 输入仍在 `beginFrame` 前完整校验；
+- RHI 仅提供通用 opaque TextureHandle 生命周期预检，48-byte instance、Rust Runtime Core 与公共 C ABI 均未增加 Camera 类型或状态。
 
 ---
 
@@ -263,7 +271,8 @@ Luau ObjectRef 的同步直接修改语义保持不变。Adapter 可以同步调
 - `a11e4dc`：SceneGeneration、Behavior 与 Host 中立 fixed-step 生命周期；
 - `25d1c25`：Editor Authoring/Bake/Undo/Redo/Preview 与产品 fixture 的历史固定点；
 - `752f299`：Renderer2D Instance Batching 与 Spawn Prototype Authoring 的本地集成基线；
-- `2d13c4a`：Scene/KSCN v8、静态 Tilemap、Atlas sampling、Editor 创作与双平台产品证据；当前 C4 的 CURRENT 图以此主线固定点为准。
+- `2d13c4a`：Scene/KSCN v8、静态 Tilemap、Atlas sampling、Editor 创作与双平台产品证据；这是 Camera2D 候选的主线前置固定点。
+- `codex/p1-renderer2d-camera2d-culling-01`：Scene/KSCN v9、静态 Camera2D、Renderer 可见性裁剪、Editor 创作与双平台产品证据；合并前以候选分支为实现固定点。
 
 ### 6.2 迁移顺序
 
